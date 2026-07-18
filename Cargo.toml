@@ -1,0 +1,9 @@
+[package]
+name = "savio"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = "0.35"
+rfd = "0.17"
+serde_json = "1"
