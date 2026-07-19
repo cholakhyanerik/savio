@@ -95,12 +95,39 @@ pub struct Tools {
     pub ffmpeg: Option<PathBuf>,
 }
 
+/// Откуда взялся найденный бинарник.
+///
+/// Нужно не для поиска, а для обновления: свою копию Savio вправе заменить, а
+/// чужую — нет. Молча положить свежий yt-dlp в каталог данных, когда работает
+/// копия из PATH, нельзя вдвойне: порядок поиска оставит в деле старую, и
+/// «обновление» окажется пустышкой, о которой пользователь никак не узнает.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Origin {
+    /// Лежит рядом с exe Savio — портативная поставка. Её собрал тот, кто
+    /// раздаёт сборку, и подменять её файлы мы не вправе.
+    Portable,
+    /// Найден в PATH: системная установка или пакетный менеджер
+    /// (winget, brew, apt). Обновляется своим менеджером, а не нами.
+    System,
+    /// Каталог данных Savio — единственное, что мы скачали сами
+    /// и можем заменять.
+    Owned,
+}
+
 pub fn locate(name: &str) -> Option<PathBuf> {
+    locate_with_origin(name).map(|(path, _)| path)
+}
+
+/// То же, что `locate`, но сообщает и происхождение файла.
+///
+/// Порядок обхода обязан совпадать с `locate` до последнего шага: разойдись
+/// они, и обновлялся бы не тот файл, который потом запускается.
+pub fn locate_with_origin(name: &str) -> Option<(PathBuf, Origin)> {
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent() {
             let candidate = dir.join(name);
             if candidate.is_file() {
-                return Some(candidate);
+                return Some((candidate, Origin::Portable));
             }
         }
 
@@ -109,12 +136,14 @@ pub fn locate(name: &str) -> Option<PathBuf> {
             .map(|dir| dir.join(name))
             .find(|candidate| candidate.is_file())
     {
-        return Some(found);
+        return Some((found, Origin::System));
     }
 
     // Последний шаг — то, что Savio скачал себе сам при первом запуске.
     let candidate = data_dir()?.join(name);
-    candidate.is_file().then_some(candidate)
+    candidate
+        .is_file()
+        .then_some((candidate, Origin::Owned))
 }
 
 pub fn discover() -> Result<Tools, String> {

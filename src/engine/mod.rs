@@ -197,19 +197,7 @@ fn run(
             })
             .unwrap_or_default();
 
-        let code = status.code().unwrap_or(-1);
-        let hint = match code {
-            101 => "загрузка остановлена (лимит или файл уже есть)",
-            2 => "yt-dlp не принял аргументы — это баг Savio",
-            _ if tail.is_empty() => "yt-dlp завершился с ошибкой без подробностей",
-            _ => "",
-        };
-
-        Err(if tail.is_empty() {
-            format!("Ошибка (код {code}): {hint}")
-        } else {
-            format!("Ошибка (код {code}):\n{tail}")
-        })
+        Err(ytdlp::explain_failure(status.code().unwrap_or(-1), &tail))
     }
 }
 

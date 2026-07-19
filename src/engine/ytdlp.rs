@@ -153,6 +153,50 @@ pub fn parse_line(line: &str) -> Line {
     Line::Other(line.to_owned())
 }
 
+/// Ссылка на список сайтов, которые умеет yt-dlp.
+///
+/// Savio своего списка не ведёт и вести не должен: он меняется с каждым
+/// выпуском yt-dlp, и любая наша копия устареет молча.
+const SUPPORTED_SITES: &str =
+    "https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md";
+
+/// Превращает провал yt-dlp в сообщение для пользователя.
+///
+/// Сырой хвост stderr показывать можно не всегда: для самой частой причины —
+/// сайт просто не поддерживается — строка `ERROR: Unsupported URL: …` ничего
+/// не объясняет тому, кто не знает, что внутри Savio работает yt-dlp. Человек
+/// видит «ошибку» и считает, что сломалось приложение, хотя ломаться нечему.
+///
+/// Остальные случаи оставляем как были: чужую диагностику лучше показать
+/// целиком, чем подменить догадкой.
+pub fn explain_failure(code: i32, tail: &str) -> String {
+    // Признак ищем по подстроке, а не по началу строки: yt-dlp печатает
+    // `ERROR: Unsupported URL: …`, но перед этим может идти префикс
+    // экстрактора, а с `--no-warnings` — и вовсе другая раскладка.
+    if tail.contains("Unsupported URL") {
+        return format!(
+            "Этот сайт не поддерживается.\n\n\
+             Savio скачивает через yt-dlp, а он не умеет работать с этим адресом. \
+             Дело не в ссылке и не в приложении — сайта просто нет в списке \
+             поддерживаемых:\n{SUPPORTED_SITES}\n\n\
+             Если сайт там есть, движок устарел — нажмите «Обновить движок»."
+        );
+    }
+
+    let hint = match code {
+        101 => "загрузка остановлена (лимит или файл уже есть)",
+        2 => "yt-dlp не принял аргументы — это баг Savio",
+        _ if tail.is_empty() => "yt-dlp завершился с ошибкой без подробностей",
+        _ => "",
+    };
+
+    if tail.is_empty() {
+        format!("Ошибка (код {code}): {hint}")
+    } else {
+        format!("Ошибка (код {code}):\n{tail}")
+    }
+}
+
 pub fn parse_media_info(json: &str) -> MediaInfo {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
         return MediaInfo::default();
@@ -226,6 +270,55 @@ mod tests {
         assert!(matches!(parse_line("   "), Line::Other(s) if s.is_empty()));
         // Оборванный JSON не должен ронять разбор.
         assert!(matches!(parse_line(r#"{"status":"#), Line::Other(_)));
+    }
+
+    /// Строка ровно та, что yt-dlp напечатал на kinobase.org — сайт, которого
+    /// он не знает. Раньше она уходила в UI как есть, и человек видел
+    /// английский дамп вместо объяснения.
+    #[test]
+    fn unsupported_site_is_explained_not_dumped() {
+        let tail = "ERROR: Unsupported URL: https://kinobase.org/film/204049-menyu";
+        let message = explain_failure(1, tail);
+
+        assert!(
+            message.contains("не поддерживается"),
+            "нет объяснения: {message}"
+        );
+        assert!(
+            message.contains(SUPPORTED_SITES),
+            "нет ссылки на список сайтов: {message}"
+        );
+        // Про обновление сказать надо: сайт мог появиться в свежем выпуске.
+        assert!(message.contains("Обновить движок"), "нет совета: {message}");
+        // Сырую английскую строку показывать больше не нужно.
+        assert!(
+            !message.contains("Unsupported URL"),
+            "утёк сырой вывод: {message}"
+        );
+    }
+
+    /// Всё, что не про неподдерживаемый сайт, обязано остаться как было:
+    /// чужую диагностику лучше показать целиком, чем подменить догадкой.
+    #[test]
+    fn other_failures_keep_their_output() {
+        let tail = "ERROR: unable to download video data: HTTP Error 403";
+        let message = explain_failure(1, tail);
+        assert!(message.contains("код 1"), "{message}");
+        assert!(message.contains(tail), "хвост stderr обязан остаться: {message}");
+
+        // Коды с готовой подсказкой и пустой хвост — поведение прежнее.
+        assert_eq!(
+            explain_failure(101, ""),
+            "Ошибка (код 101): загрузка остановлена (лимит или файл уже есть)"
+        );
+        assert_eq!(
+            explain_failure(2, ""),
+            "Ошибка (код 2): yt-dlp не принял аргументы — это баг Savio"
+        );
+        assert_eq!(
+            explain_failure(-1, ""),
+            "Ошибка (код -1): yt-dlp завершился с ошибкой без подробностей"
+        );
     }
 
     #[test]

@@ -67,36 +67,73 @@ enum FfmpegSource {
     },
 }
 
+/// Источники ffmpeg по порядку предпочтения: первый рабочий выигрывает.
+///
+/// Список, а не одна ссылка, потому что все источники здесь — чужие серверы,
+/// и любой из них может отдать 404 или лечь. Раньше единственный сбойный адрес
+/// означал, что ffmpeg не поставится вовсе; теперь это лишь повод взять
+/// следующий. Полный провал по-прежнему не фатален — установка ffmpeg
+/// заканчивается предупреждением, а не ошибкой (см. `run`).
+///
+/// На каждой ОС свой список, поэтому имя одно, а определений несколько.
 // Windows и Linux — сборки BtbN, там оба бинарника лежат в одном архиве.
 // Windows получает .zip, Linux — .tar.xz: см. `extract`.
 #[cfg(all(windows, target_arch = "x86_64"))]
-const FFMPEG_SOURCE: FfmpegSource = FfmpegSource::Bundle(
+const FFMPEG_SOURCES: &[FfmpegSource] = &[FfmpegSource::Bundle(
     "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip",
-);
+)];
 #[cfg(all(windows, target_arch = "aarch64"))]
-const FFMPEG_SOURCE: FfmpegSource = FfmpegSource::Bundle(
+const FFMPEG_SOURCES: &[FfmpegSource] = &[FfmpegSource::Bundle(
     "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-winarm64-gpl.zip",
-);
+)];
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-const FFMPEG_SOURCE: FfmpegSource = FfmpegSource::Bundle(
+const FFMPEG_SOURCES: &[FfmpegSource] = &[FfmpegSource::Bundle(
     "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz",
-);
+)];
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-const FFMPEG_SOURCE: FfmpegSource = FfmpegSource::Bundle(
+const FFMPEG_SOURCES: &[FfmpegSource] = &[FfmpegSource::Bundle(
     "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linuxarm64-gpl.tar.xz",
-);
+)];
 // Под macOS готовых сборок «всё в одном» нет: BtbN её не собирает, а у
 // оставшихся источников ffmpeg и ffprobe разложены по отдельным архивам.
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-const FFMPEG_SOURCE: FfmpegSource = FfmpegSource::Split {
-    ffmpeg: "https://evermeet.cx/ffmpeg/getrelease/ffmpeg/zip",
-    ffprobe: "https://evermeet.cx/ffmpeg/getrelease/ffprobe/zip",
-};
+const FFMPEG_SOURCES: &[FfmpegSource] = &[
+    FfmpegSource::Split {
+        ffmpeg: "https://evermeet.cx/ffmpeg/getrelease/ffmpeg/zip",
+        ffprobe: "https://evermeet.cx/ffmpeg/getrelease/ffprobe/zip",
+    },
+    // Запасной — тот же сервер, что основной у ARM: сборки Мартина Ридля
+    // покрывают обе архитектуры macOS.
+    FfmpegSource::Split {
+        ffmpeg: "https://ffmpeg.martin-riedl.de/redirect/latest/macos/amd64/release/ffmpeg.zip",
+        ffprobe: "https://ffmpeg.martin-riedl.de/redirect/latest/macos/amd64/release/ffprobe.zip",
+    },
+];
+// Apple Silicon. Основной источник — ffmpeg.martin-riedl.de: в ссылке **нет
+// номера версии**, сервер сам отдаёт текущую сборку. Именно этим он лучше
+// osxexperts.net, где адрес вида `ffmpeg81arm.zip` намертво зашивает версию
+// 8.1 и превращается в 404 в день, когда автор выкладывает 8.2, — а узнать
+// об этом можно только от пользователя, у которого установка молча отвалилась.
+//
+// Проверено на скачанном файле, а не по описанию сайта: архив плоский (одна
+// запись `ffmpeg` в корне, отсюда `strip = 0`), внутри Mach-O с cputype
+// 0x0100000C, то есть настоящий arm64, а не Intel под Rosetta. Все динамические
+// зависимости — только `/usr/lib/*`, которые есть на любой macOS: на Homebrew
+// сборка не завязана и работает на чистой системе.
+//
+// osxexperts.net остаётся запасным: он живой и его стоит держать на случай,
+// если основной ляжет, — но первым его ставить нельзя из-за версии в адресе.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-const FFMPEG_SOURCE: FfmpegSource = FfmpegSource::Split {
-    ffmpeg: "https://www.osxexperts.net/ffmpeg81arm.zip",
-    ffprobe: "https://www.osxexperts.net/ffprobe81arm.zip",
-};
+const FFMPEG_SOURCES: &[FfmpegSource] = &[
+    FfmpegSource::Split {
+        ffmpeg: "https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release/ffmpeg.zip",
+        ffprobe: "https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release/ffprobe.zip",
+    },
+    FfmpegSource::Split {
+        ffmpeg: "https://www.osxexperts.net/ffmpeg81arm.zip",
+        ffprobe: "https://www.osxexperts.net/ffprobe81arm.zip",
+    },
+];
 
 /// Размер чанка при чтении из сети. 64 КБ — компромисс: меньше даёт лишние
 /// системные вызовы, больше — рваный прогресс на медленном канале.
@@ -105,6 +142,26 @@ const CHUNK: usize = 64 * 1024;
 /// Как часто отдавать прогресс в UI. Каждый чанк — это сотни событий в секунду
 /// на быстром канале, и все они приводят к перерисовке окна.
 const PROGRESS_EVERY: Duration = Duration::from_millis(100);
+
+/// Сколько раз пытаться получить ответ, прежде чем считать источник мёртвым.
+///
+/// Это не перестраховка «на всякий случай». У `ffmpeg.martin-riedl.de` за
+/// балансировщиком стоит узел, который отвечает 404 на совершенно правильный
+/// адрес: шесть HEAD-запросов подряд по одной ссылке дали 200, 404, 200, 404,
+/// 200, 404 — строго через раз, а GET следом прошёл и вернул целый архив.
+/// Проверено вживую, а не предположено. Без повтора примерно половина
+/// пользователей Apple Silicon оставалась бы без ffmpeg, причём каждый раз
+/// с разным исходом — то есть с неповторяемой жалобой.
+///
+/// Четырёх попыток хватает: вероятность попасть на битый узел четыре раза
+/// подряд — около одной шестнадцатой, а платим мы за это лишь парой секунд
+/// в том случае, когда сервер и правда лежит.
+const REQUEST_ATTEMPTS: u32 = 4;
+
+/// Пауза между попытками. Короткая намеренно: сбой здесь мгновенный (чужой
+/// узел отвечает сразу), и растягивать паузу значит просто заставлять
+/// пользователя смотреть на неподвижную полосу.
+const RETRY_PAUSE: Duration = Duration::from_millis(700);
 
 // ---------------------------------------------------------------------------
 // Проверка
@@ -231,7 +288,22 @@ fn install_ytdlp(
     stage(tx, notify, "Ищу свежий выпуск yt-dlp…");
     let tag = latest_ytdlp_tag(agent)?;
     let _ = tx.send(Event::Log(format!("yt-dlp: выпуск {tag}")));
+    install_ytdlp_tag(agent, dir, &tag, tx, notify, cancelled)
+}
 
+/// Ставит заранее известный выпуск.
+///
+/// Отделено от `install_ytdlp` ради обновления: там выпуск уже разрешён —
+/// его номер нужен, чтобы сравнить с установленной версией и не качать
+/// двадцать мегабайт впустую, когда обновляться не на что.
+fn install_ytdlp_tag(
+    agent: &ureq::Agent,
+    dir: &Path,
+    tag: &str,
+    tx: &Sender<Event>,
+    notify: &impl Fn(),
+    cancelled: &AtomicBool,
+) -> Result<(), String> {
     let base = format!("https://github.com/yt-dlp/yt-dlp/releases/download/{tag}");
 
     // Суммы тянем из того же выпуска, что и бинарник.
@@ -270,7 +342,69 @@ fn install_ytdlp(
     Ok(())
 }
 
+/// Ставит ffmpeg, перебирая источники по очереди до первого удачного.
+///
+/// Ошибка одного источника — не отказ: он лишь вычёркивается, и берётся
+/// следующий. Наружу ошибка уходит, только когда кончились все, и даже тогда
+/// это предупреждение, а не срыв установки (см. `run`).
+///
+/// Отмена — исключение: перебирать источники дальше после неё нельзя, иначе
+/// нажатие «Отменить» приводило бы не к остановке, а к загрузке со следующего
+/// сервера.
 fn install_ffmpeg(
+    agent: &ureq::Agent,
+    dir: &Path,
+    tx: &Sender<Event>,
+    notify: &impl Fn(),
+    cancelled: &AtomicBool,
+) -> Result<(), String> {
+    let mut last = String::new();
+
+    for (index, source) in FFMPEG_SOURCES.iter().enumerate() {
+        match install_ffmpeg_from(source, agent, dir, tx, notify, cancelled) {
+            Ok(()) => {
+                let _ = tx.send(Event::Log(format!(
+                    "ffmpeg установлен: {}",
+                    dir.join(FFMPEG_NAME).display()
+                )));
+                notify();
+                return Ok(());
+            }
+            Err(err) => {
+                if cancelled.load(Ordering::Relaxed) {
+                    return Err(err);
+                }
+                // Незавершённая попытка обязана убрать за собой: иначе от
+                // первого источника остался бы один ffmpeg без ffprobe, и
+                // проверка существования у следующего приняла бы разнородную
+                // пару за целую установку.
+                for name in [FFMPEG_NAME, FFPROBE_NAME] {
+                    let _ = fs::remove_file(dir.join(name));
+                }
+                let _ = tx.send(Event::Log(format!(
+                    "Источник ffmpeg №{} не сработал: {err}",
+                    index + 1
+                )));
+                notify();
+                last = err;
+            }
+        }
+    }
+
+    Err(if last.is_empty() {
+        "не задан ни один источник ffmpeg".into()
+    } else {
+        // Число источников важно в сообщении: без него «не удалось скачать»
+        // читается как «сайт полежал минуту», хотя перепробовано было всё.
+        format!(
+            "перепробованы все источники ({}), последняя ошибка — {last}",
+            FFMPEG_SOURCES.len()
+        )
+    })
+}
+
+fn install_ffmpeg_from(
+    source: &FfmpegSource,
     agent: &ureq::Agent,
     dir: &Path,
     tx: &Sender<Event>,
@@ -279,7 +413,7 @@ fn install_ffmpeg(
 ) -> Result<(), String> {
     stage(tx, notify, "Скачиваю ffmpeg…");
 
-    match FFMPEG_SOURCE {
+    match *source {
         FfmpegSource::Bundle(url) => {
             let name = archive_tmp_name(url);
             download(agent, url, &dir.join(&name), tx, notify, cancelled)?;
@@ -313,22 +447,177 @@ fn install_ffmpeg(
 
     // tar завершается с кодом 0, даже если по шаблону не нашлось ни одного
     // файла, — существование проверяем сами, коду возврата верить нельзя.
+    // Здесь же проходит граница «источник сработал»: пара найдена целиком,
+    // значит можно не трогать остальные.
     for name in [FFMPEG_NAME, FFPROBE_NAME] {
         let path = dir.join(name);
         if !path.is_file() {
             return Err(format!(
-                "После распаковки не найден {name}: содержимое архива отличается от ожидаемого."
+                "после распаковки не найден {name}: содержимое архива отличается от ожидаемого"
             ));
         }
         make_executable(&path)?;
     }
 
-    let _ = tx.send(Event::Log(format!(
-        "ffmpeg установлен: {}",
-        dir.join(FFMPEG_NAME).display()
-    )));
-    notify();
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Обновление yt-dlp
+// ---------------------------------------------------------------------------
+
+/// Версия установленного yt-dlp — то, что он сам печатает по `--version`.
+///
+/// Формат совпадает с тегом выпуска на GitHub (`2026.07.04`), поэтому строки
+/// можно сравнивать напрямую, не разбирая на числа. Если это когда-нибудь
+/// перестанет быть правдой, худшее следствие — лишняя загрузка уже имеющейся
+/// версии, а не поломка.
+///
+/// `None` означает «спросить не удалось»: файла нет, он битый или не
+/// запускается. Это не ошибка — просто сравнивать будет не с чем.
+fn ytdlp_version(path: &Path) -> Option<String> {
+    let mut cmd = Command::new(path);
+    cmd.arg("--version")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null());
+    crate::engine::ytdlp::hide_console(&mut cmd);
+
+    let output = cmd.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (!version.is_empty()).then_some(version)
+}
+
+/// Чем пользователю обновлять чужую копию. У каждой ОС свой менеджер, и
+/// совет «обновите пакет» без имени команды бесполезен.
+#[cfg(windows)]
+const SYSTEM_UPDATE_HINT: &str = "winget upgrade yt-dlp";
+#[cfg(target_os = "macos")]
+const SYSTEM_UPDATE_HINT: &str = "brew upgrade yt-dlp";
+#[cfg(all(unix, not(target_os = "macos")))]
+const SYSTEM_UPDATE_HINT: &str = "менеджером пакетов вашей системы";
+
+/// Запускает обновление yt-dlp в отдельном потоке.
+///
+/// Заменяем **только свою** копию — ту, что Savio скачал в каталог данных.
+/// Копию из PATH или лежащую рядом с exe не трогаем: первая принадлежит
+/// пакетному менеджеру и подмена файла рассинхронизировала бы его с системой,
+/// вторая — часть портативной поставки. В обоих случаях честнее сказать,
+/// откуда взят файл и чем его обновить, чем сделать вид, что обновили.
+///
+/// Скачать свежую копию в каталог данных «про запас» тоже нельзя: каталог
+/// данных в порядке поиска последний, работать продолжила бы прежняя версия,
+/// и кнопка стала бы ровно той молчаливой пустышкой, ради которой её и завели.
+pub fn start_update(tx: Sender<Event>, notify: impl Fn() + Send + 'static) -> Handle {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let handle = Handle {
+        cancelled: Arc::clone(&cancelled),
+    };
+
+    std::thread::spawn(move || {
+        match run_update(&tx, &notify, &cancelled) {
+            Ok(Outcome::Updated(text)) => {
+                let _ = tx.send(Event::Notice(text));
+                let _ = tx.send(Event::Ready);
+            }
+            // Отказ трогать чужой файл — не сбой: делать было нечего, и всё
+            // работает как прежде. Показать это красной «Ошибкой» значило бы
+            // напугать человека там, где приложение поступило правильно;
+            // `Warning` ровно для такого и заведён — «можно, но с оговоркой».
+            Ok(Outcome::Declined(text)) => {
+                let _ = tx.send(Event::Warning(text));
+                let _ = tx.send(Event::Ready);
+            }
+            Err(err) => {
+                let _ = tx.send(Event::Failed(err));
+            }
+        }
+        notify();
+    });
+
+    handle
+}
+
+/// Чем кончилось обновление, если оно не сорвалось.
+enum Outcome {
+    /// Своя копия обновлена, поставлена заново или уже была свежей.
+    Updated(String),
+    /// Копия чужая — не тронули и объяснили, чем её обновить.
+    Declined(String),
+}
+
+fn run_update(
+    tx: &Sender<Event>,
+    notify: &impl Fn(),
+    cancelled: &AtomicBool,
+) -> Result<Outcome, String> {
+    use super::binaries::Origin;
+
+    let dir = binaries::data_dir()
+        .ok_or("Не удалось определить папку для инструментов: не задана домашняя папка.")?;
+
+    let found = binaries::locate_with_origin(YTDLP_NAME);
+
+    // Чужую копию не трогаем — объясняем, откуда она и чем её обновить.
+    if let Some((path, origin @ (Origin::System | Origin::Portable))) = &found {
+        let where_from = match origin {
+            Origin::System => format!(
+                "yt-dlp установлен в системе, а не Savio:\n{}\n\n\
+                 Обновите его так же, как ставили: {SYSTEM_UPDATE_HINT}. \
+                 Savio подменять чужой файл не станет — иначе он разойдётся \
+                 с пакетным менеджером.",
+                path.display()
+            ),
+            Origin::Portable => format!(
+                "yt-dlp лежит рядом с Savio:\n{}\n\n\
+                 Это портативная поставка — обновите её целиком или замените \
+                 этот файл вручную. Savio его не трогает, чтобы не сломать сборку.",
+                path.display()
+            ),
+            Origin::Owned => unreachable!("своя копия обрабатывается ниже"),
+        };
+        return Ok(Outcome::Declined(where_from));
+    }
+
+    fs::create_dir_all(&dir)
+        .map_err(|e| format!("Не удалось создать папку {}: {e}", dir.display()))?;
+
+    let agent = agent();
+
+    stage(tx, notify, "Ищу свежий выпуск yt-dlp…");
+    let tag = latest_ytdlp_tag(&agent)?;
+
+    // Версию спрашиваем у самого бинарника, а не запоминаем при установке:
+    // запомненная разъехалась бы с настоящей, если файл подменили снаружи.
+    let current = found.as_ref().and_then(|(path, _)| ytdlp_version(path));
+
+    // Сравниваем строки, а не числа. Nightly-сборка (`2026.07.14.233956`)
+    // со стабильным тегом никогда не совпадёт, и такую копию мы заменим
+    // стабильной. Это осознанный размен: разбирать версии ради редкого случая
+    // сложнее, чем один лишний раз скачать, а ошибка здесь безопасна в обе
+    // стороны — худшее следствие — загрузка того, что уже есть.
+    if let Some(current) = &current
+        && current == &tag
+    {
+        return Ok(Outcome::Updated(format!(
+            "yt-dlp уже последней версии ({current})."
+        )));
+    }
+
+    // Стадию «Скачиваю yt-dlp…» ставит сам `install_ytdlp_tag` — здесь её
+    // дублировать не надо.
+    let _ = tx.send(Event::Log(format!("yt-dlp: выпуск {tag}")));
+    install_ytdlp_tag(&agent, &dir, &tag, tx, notify, cancelled)?;
+
+    Ok(Outcome::Updated(match current {
+        Some(current) => format!("yt-dlp обновлён: {current} → {tag}."),
+        // Версии до обновления не было — значит, это первая установка своей
+        // копии, а не обновление. Обещать «обновлено с …» здесь нечестно.
+        None => format!("yt-dlp установлен, версия {tag}."),
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -374,12 +663,45 @@ fn latest_ytdlp_tag(agent: &ureq::Agent) -> Result<String, String> {
         .ok_or_else(|| "В ответе GitHub нет номера выпуска yt-dlp.".to_string())
 }
 
+/// GET с повтором при неудаче.
+///
+/// Повторяем в том числе на 404: ровно им и отвечает битый узел балансировщика
+/// (см. `REQUEST_ATTEMPTS`). Настоящий, честный 404 — например, когда
+/// osxexperts.net поднял версию и старый адрес умер, — тоже пройдёт все
+/// попытки, но заплатим мы за это лишь двумя секундами, а различить эти два
+/// случая по ответу невозможно.
+///
+/// `cancelled` проверяем **между** попытками: без этого нажатие «Отменить»
+/// на мёртвом сервере не давало бы никакого эффекта, пока не выйдут все
+/// попытки со всеми паузами.
+fn get_with_retry(
+    agent: &ureq::Agent,
+    url: &str,
+    cancelled: Option<&AtomicBool>,
+) -> Result<ureq::http::Response<ureq::Body>, String> {
+    let mut last = String::new();
+
+    for attempt in 1..=REQUEST_ATTEMPTS {
+        if cancelled.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            return Err("Установка отменена.".into());
+        }
+
+        match agent.get(url).call() {
+            Ok(response) => return Ok(response),
+            Err(err) => {
+                last = human_net_error(&err);
+                if attempt < REQUEST_ATTEMPTS {
+                    std::thread::sleep(RETRY_PAUSE);
+                }
+            }
+        }
+    }
+
+    Err(last)
+}
+
 fn fetch_text(agent: &ureq::Agent, url: &str) -> Result<String, String> {
-    let mut body = agent
-        .get(url)
-        .call()
-        .map_err(|e| human_net_error(&e))?
-        .into_body();
+    let mut body = get_with_retry(agent, url, None)?.into_body();
     body.read_to_string()
         .map_err(|e| format!("не удалось прочитать ответ: {e}"))
 }
@@ -422,7 +744,7 @@ fn download_inner(
     let _ = tx.send(Event::Progress(Progress::default()));
     notify();
 
-    let response = agent.get(url).call().map_err(|e| human_net_error(&e))?;
+    let response = get_with_retry(agent, url, Some(cancelled))?;
     // Размер снимаем до того, как тело поглощено читателем.
     let total = response.body().content_length().unwrap_or(0);
     let mut reader = response.into_body().into_reader();
@@ -666,6 +988,46 @@ mod tests {
         assert!(archive_tmp_name("https://x/ffmpeg-win64-gpl.zip").ends_with(".zip"));
         // У evermeet расширения в ссылке нет вовсе — там отдаётся zip.
         assert!(archive_tmp_name("https://evermeet.cx/ffmpeg/getrelease/ffmpeg/zip").ends_with(".zip"));
+    }
+
+    /// Источник обязан быть хотя бы один, иначе ffmpeg не поставится никогда,
+    /// а сообщать об этом будет некому: сбой ffmpeg — всего лишь предупреждение.
+    #[test]
+    fn ffmpeg_has_at_least_one_source() {
+        assert!(!FFMPEG_SOURCES.is_empty());
+    }
+
+    /// Основной источник для Apple Silicon не должен зашивать версию в адрес.
+    ///
+    /// Ровно на этом всё и ломалось: `ffmpeg81arm.zip` живёт до дня, когда
+    /// автор выложит 8.2, и превращается в 404 без единого предупреждения.
+    /// Ссылка без номера версии — единственное, что защищает от повтора,
+    /// поэтому проверяем машинно, а не «помним».
+    /// Кросс-компиляции под macOS на машине разработчика обычно нет (сборочному
+    /// скрипту зависимости нужен C-компилятор под цель), поэтому этот тест
+    /// впервые выполняется на CI. Написан нарочно скучно — без хитрых образцов
+    /// и выводов типов: ошибка компиляции здесь всплыла бы уже в CI, а не тут.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn macos_arm_primary_source_has_no_version_in_url() {
+        let urls: Vec<&str> = match &FFMPEG_SOURCES[0] {
+            FfmpegSource::Split { ffmpeg, ffprobe } => vec![*ffmpeg, *ffprobe],
+            FfmpegSource::Bundle(url) => vec![*url],
+        };
+
+        for url in urls {
+            let file = url.rsplit('/').next().unwrap_or_default();
+            assert!(
+                !file.chars().any(|c| c.is_ascii_digit()),
+                "в имени файла основного источника зашита версия: {url}"
+            );
+        }
+
+        // Запасной источник обязан быть: основной — чужой сервер, и он падает.
+        assert!(
+            FFMPEG_SOURCES.len() >= 2,
+            "у macOS ARM обязан быть запасной источник ffmpeg"
+        );
     }
 
     #[test]

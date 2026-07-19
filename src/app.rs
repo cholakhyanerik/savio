@@ -38,9 +38,21 @@ enum Setup {
     /// Всё на месте — обычный случай при любом запуске, кроме первого.
     Ready,
     Installing,
+    /// Обновление движка по кнопке. Отдельно от `Installing` только ради
+    /// подписи в модалке: «Установка зависимостей» при обновлении сбивала бы
+    /// с толку — пользователь ничего не устанавливал.
+    Updating,
     /// Установка не удалась. Приложение всё равно открывается: без `yt-dlp`
     /// пользователь увидит привычную подсказку, что делать дальше.
     Failed(String),
+}
+
+impl Setup {
+    /// Идёт ли работа с внешними инструментами прямо сейчас. Пока идёт,
+    /// показана модалка и занят единственный канал событий.
+    fn busy(&self) -> bool {
+        matches!(self, Setup::Installing | Setup::Updating)
+    }
 }
 
 pub struct SavioApp {
@@ -63,6 +75,10 @@ pub struct SavioApp {
     /// поставить не удалось. Живёт до конца сеанса и не стирается вместе
     /// с журналом при старте загрузки.
     warning: Option<String>,
+    /// Хорошая новость с тем же сроком жизни: до какой версии обновился
+    /// движок или что он и так был свежим. Без неё удачное обновление
+    /// выглядело бы как молча закрывшаяся модалка.
+    notice: Option<String>,
     /// Ручка установки — нужна, чтобы её можно было прервать.
     setup_handle: Option<setup::Handle>,
 
@@ -114,6 +130,7 @@ impl SavioApp {
             setup_error: None,
             setup: Setup::Ready,
             warning: None,
+            notice: None,
             setup_handle: None,
             meta_line: String::new(),
             progress_line: String::new(),
@@ -158,6 +175,32 @@ impl SavioApp {
             handle.cancel();
         }
         self.finish_setup(Setup::Ready);
+    }
+
+    /// Обновление движка по кнопке.
+    ///
+    /// Идёт по тому же каналу и в ту же модалку, что и установка при первом
+    /// запуске: задача та же — скачать бинарник и показать прогресс, поэтому
+    /// заводить второй механизм незачем.
+    fn start_update(&mut self, ctx: &egui::Context) {
+        let (tx, rx) = channel();
+        let notify_ctx = ctx.clone();
+
+        // Прошлый исход убираем: иначе рядом со свежим результатом висела бы
+        // причина позапрошлой неудачи и было бы не понять, к чему она.
+        self.notice = None;
+        if matches!(self.setup, Setup::Failed(_)) {
+            self.setup = Setup::Ready;
+        }
+
+        self.setup_handle = Some(setup::start_update(tx, move || {
+            notify_ctx.request_repaint()
+        }));
+        self.rx = Some(rx);
+        self.setup = Setup::Updating;
+        self.progress = Progress::default();
+        self.stage = "Проверяю версию…".into();
+        self.rebuild_progress_line();
     }
 }
 
@@ -353,7 +396,7 @@ impl SavioApp {
                     // Один и тот же вариант обслуживает обе задачи, поэтому
                     // разводим их по текущему режиму: во время установки это
                     // сбой установки, а не сорвавшаяся загрузка ролика.
-                    if matches!(self.setup, Setup::Installing) {
+                    if self.setup.busy() {
                         self.finish_setup(Setup::Failed(err));
                     } else {
                         self.stage = "Ошибка".into();
@@ -367,6 +410,9 @@ impl SavioApp {
                 }
                 Event::Warning(text) => {
                     self.warning = Some(text);
+                }
+                Event::Notice(text) => {
+                    self.notice = Some(text);
                 }
             }
         }
@@ -431,6 +477,10 @@ impl eframe::App for SavioApp {
                                     banner(ui, text, theme::STATE_WARNING);
                                     ui.add_space(12.0);
                                 }
+                                if let Some(text) = &self.notice {
+                                    banner(ui, text, theme::STATE_SUCCESS);
+                                    ui.add_space(12.0);
+                                }
                                 if let Some(err) = &self.setup_error {
                                     banner(ui, err, theme::STATE_ERROR);
                                     ui.add_space(12.0);
@@ -439,13 +489,14 @@ impl eframe::App for SavioApp {
                                 self.controls_card(ui);
                                 ui.add_space(16.0);
                                 self.status_section(ui);
+                                self.maintenance_row(ui);
                                 self.log_section(ui);
                             });
                     });
             });
 
         // Модалка рисуется последней, поверх всего остального.
-        if matches!(self.setup, Setup::Installing) {
+        if self.setup.busy() {
             let ctx = ui.ctx().clone();
             self.install_modal(&ctx);
         }
@@ -461,6 +512,21 @@ impl SavioApp {
     /// выход — кнопка «Отменить», иначе оборвавшаяся загрузка заперла бы
     /// пользователя в окне без выхода.
     fn install_modal(&mut self, ctx: &egui::Context) {
+        // Строки статические и выбираются по режиму — в кадре ничего
+        // не собирается и не выделяется.
+        let (title, subtitle) = if matches!(self.setup, Setup::Updating) {
+            (
+                "Обновление движка",
+                "Savio скачивает свежий yt-dlp. Это занимает несколько секунд.",
+            )
+        } else {
+            (
+                "Установка зависимостей",
+                "Savio догружает недостающие программы. \
+                 Это нужно только при первом запуске — пожалуйста, подождите.",
+            )
+        };
+
         let cancelled = egui::Modal::new(egui::Id::new("savio-setup"))
             .backdrop_color(theme::MODAL_BACKDROP)
             .frame(
@@ -477,19 +543,13 @@ impl SavioApp {
                 ui.set_width(400.0);
 
                 ui.label(
-                    egui::RichText::new("Установка зависимостей")
+                    egui::RichText::new(title)
                         .heading()
                         .strong()
                         .color(theme::TEXT_PRIMARY),
                 );
                 ui.add_space(6.0);
-                ui.label(
-                    egui::RichText::new(
-                        "Savio догружает недостающие программы. \
-                         Это нужно только при первом запуске — пожалуйста, подождите.",
-                    )
-                    .color(theme::TEXT_SECONDARY),
-                );
+                ui.label(egui::RichText::new(subtitle).color(theme::TEXT_SECONDARY));
 
                 ui.add_space(16.0);
 
@@ -899,6 +959,50 @@ impl SavioApp {
                         .color(theme::TEXT_SECONDARY),
                 );
             }
+        }
+    }
+
+    /// Обслуживание: обновление движка.
+    ///
+    /// Стоит внизу, рядом с журналом, а не у кнопки «Скачать», и намеренно:
+    /// это то, за чем идут, когда что-то перестало работать, — соседство
+    /// с журналом и версией в шапке тут уместнее, чем спор за внимание
+    /// с главным действием экрана.
+    ///
+    /// Подпись на отдельной строке под кнопкой, а не сбоку: в окне минимальной
+    /// ширины (520) строка рядом с кнопкой не поместилась бы.
+    fn maintenance_row(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(16.0);
+        ui.separator();
+        ui.add_space(12.0);
+
+        // Пока занят единственный канал событий — обновляться нечем: и
+        // загрузка, и установка ходят через тот же `rx`.
+        let enabled = !matches!(self.state, State::Running) && !self.setup.busy();
+
+        let clicked = ui
+            .add_enabled_ui(enabled, |ui| {
+                ui.add(
+                    egui::Button::new("Обновить движок")
+                        .min_size(egui::vec2(0.0, theme::CONTROL_HEIGHT)),
+                )
+                .clicked()
+            })
+            .inner;
+
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new(
+                "Сайты меняются, и старый yt-dlp перестаёт их скачивать. \
+                 Если ссылка вдруг не работает — обновите движок.",
+            )
+            .small()
+            .color(theme::TEXT_MUTED),
+        );
+
+        if clicked {
+            let ctx = ui.ctx().clone();
+            self.start_update(&ctx);
         }
     }
 
