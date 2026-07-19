@@ -24,10 +24,14 @@
     <string>Savio</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
+    <!-- Обе версии ниже — заглушка, править их руками не нужно. На сборке их
+         перезаписывает PlistBuddy значением из Cargo.toml: единственный
+         источник правды о версии — там. Две копии одного числа неминуемо
+         разъезжаются, и замечают это уже после выпуска. -->
     <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
+    <string>0.0.0</string>
     <key>CFBundleVersion</key>
-    <string>0.1.0</string>
+    <string>0.0.0</string>
     <!-- Ниже 11.0 универсальный бинарник с arm64-половиной не имеет смысла. -->
     <key>LSMinimumSystemVersion</key>
     <string>11.0</string>

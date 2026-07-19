@@ -14,6 +14,14 @@ use crate::theme;
 
 const LOG_LIMIT: usize = 400;
 
+/// Версия для шапки.
+///
+/// Берётся из `Cargo.toml` на этапе компиляции, руками здесь ничего дублировать
+/// не нужно — иначе рано или поздно разъедется. `concat!` тоже раскрывается
+/// компилятором, так что в кадре отрисовки это просто готовая строка без
+/// единой аллокации.
+const VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
+
 enum State {
     Idle,
     Running,
@@ -547,6 +555,20 @@ impl SavioApp {
                     ui.label(
                         egui::RichText::new("видео и аудио по ссылке")
                             .color(theme::TEXT_SECONDARY),
+                    );
+
+                    // Версию прижимаем к правому краю: она нужна, когда
+                    // выясняют, почему что-то не работает, но в остальное
+                    // время не должна тянуть на себя внимание.
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            ui.label(
+                                egui::RichText::new(VERSION)
+                                    .small()
+                                    .color(theme::TEXT_MUTED),
+                            );
+                        },
                     );
                 });
             });

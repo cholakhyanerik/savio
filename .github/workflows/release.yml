@@ -118,6 +118,16 @@ jobs:
             target/aarch64-apple-darwin/release/savio
           cp packaging/Info.plist Savio.app/Contents/
 
+          # Версию подставляем из Cargo.toml, а не держим второй копией в
+          # Info.plist: две копии одного числа рано или поздно разъезжаются,
+          # и заметно это становится уже после выпуска.
+          VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          /usr/libexec/PlistBuddy -c \
+            "Set :CFBundleShortVersionString $VERSION" Savio.app/Contents/Info.plist
+          /usr/libexec/PlistBuddy -c \
+            "Set :CFBundleVersion $VERSION" Savio.app/Contents/Info.plist
+          echo "Собрана версия $VERSION"
+
           # Иконку macOS понимает только в формате .icns, поэтому собираем её
           # из того же PNG, что идёт в AppImage: иконка у всех систем одна.
           # Набор размеров обязателен — по одной картинке iconutil не соберёт.
