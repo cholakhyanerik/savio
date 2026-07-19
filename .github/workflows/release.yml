@@ -1,0 +1,170 @@
+# Сборка готовых бинарников для всех трёх ОС.
+#
+# Запускается по тегу `v*` (`git tag v0.1.0 && git push origin v0.1.0`) или
+# вручную из вкладки Actions. Черновик релиза создаётся с прикреплёнными
+# файлами — опубликовать его нужно руками, чтобы было где написать
+# что изменилось.
+#
+# Ни yt-dlp, ни ffmpeg в артефакты не кладутся: сборки ffmpeg собраны с
+# `--enable-gpl`, и класть их в дистрибутив значило бы распространять
+# GPL-код со всеми обязательствами по исходникам. Savio качает их
+# на машину пользователя при первом запуске.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Версия Ubuntu закреплена намеренно. Собранный бинарник требует ту
+          # версию glibc, что была на сборочной машине, и README обещает
+          # пользователям конкретную: «не ниже 2.39» (это Ubuntu 24.04).
+          # С `ubuntu-latest` обещание протухло бы молча — в день, когда GitHub
+          # переведёт ярлык на следующий LTS, сборка потребует более свежую
+          # glibc и перестанет запускаться у части пользователей.
+          # Меняете версию здесь — правьте и README.
+          - os: ubuntu-24.04
+            name: Linux (x86_64)
+          - os: windows-latest
+            name: Windows (x86_64)
+          - os: macos-latest
+            name: macOS (universal)
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Системные зависимости (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libssl-dev
+
+      # ------------------------------------------------------------------
+      # Windows: просто exe. Консоль в релизе скрыта через windows_subsystem.
+      # ------------------------------------------------------------------
+      - name: Сборка (Windows)
+        if: runner.os == 'Windows'
+        run: cargo build --release
+
+      - name: Упаковка (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/savio.exe dist/savio-windows-x86_64.exe
+
+      # ------------------------------------------------------------------
+      # Linux: обычный бинарник и AppImage.
+      # ------------------------------------------------------------------
+      - name: Сборка (Linux)
+        if: runner.os == 'Linux'
+        run: cargo build --release
+
+      - name: Упаковка (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p dist
+          cp target/release/savio dist/savio-linux-x86_64
+
+          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          chmod +x linuxdeploy-x86_64.AppImage
+          # На ubuntu-latest нет FUSE, поэтому AppImage-инструменты должны
+          # распаковывать себя, а не монтировать.
+          #
+          # AppDir руками не набиваем: linuxdeploy сам разложит бинарник,
+          # .desktop и иконку по нужным местам и подтянет зависимости.
+          export APPIMAGE_EXTRACT_AND_RUN=1
+          ./linuxdeploy-x86_64.AppImage --appimage-extract-and-run \
+            --appdir AppDir \
+            --executable target/release/savio \
+            --desktop-file packaging/savio.desktop \
+            --icon-file packaging/savio.png \
+            --output appimage
+          mv Savio*.AppImage dist/savio-linux-x86_64.AppImage
+
+      # ------------------------------------------------------------------
+      # macOS: универсальный бинарник (Intel + Apple Silicon), .app и .dmg.
+      # ------------------------------------------------------------------
+      - name: Сборка (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          rustup target add x86_64-apple-darwin aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+          cargo build --release --target aarch64-apple-darwin
+
+      - name: Упаковка (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p dist Savio.app/Contents/MacOS Savio.app/Contents/Resources
+          lipo -create -output Savio.app/Contents/MacOS/savio \
+            target/x86_64-apple-darwin/release/savio \
+            target/aarch64-apple-darwin/release/savio
+          cp packaging/Info.plist Savio.app/Contents/
+
+          # Иконку macOS понимает только в формате .icns, поэтому собираем её
+          # из того же PNG, что идёт в AppImage: иконка у всех систем одна.
+          # Набор размеров обязателен — по одной картинке iconutil не соберёт.
+          mkdir -p savio.iconset
+          for s in 16 32 128 256 512; do
+            sips -z $s $s packaging/savio.png --out savio.iconset/icon_${s}x${s}.png
+            sips -z $((s*2)) $((s*2)) packaging/savio.png \
+              --out savio.iconset/icon_${s}x${s}@2x.png
+          done
+          iconutil -c icns savio.iconset -o Savio.app/Contents/Resources/savio.icns
+
+          # Ad-hoc подпись обязательна: на Apple Silicon ядро отказывается
+          # запускать arm64-бинарник вообще без подписи. Она НЕ заменяет
+          # нотаризацию — Gatekeeper всё равно предупредит пользователя,
+          # об этом написано в README.
+          #
+          # `--deep` не используем: Apple прямо не рекомендует этот флаг,
+          # а для одиночного бинарника внутри бандла он бесполезен.
+          codesign --force --sign - Savio.app/Contents/MacOS/savio
+          codesign --force --sign - Savio.app
+
+          hdiutil create -volname Savio -srcfolder Savio.app \
+            -ov -format UDZO dist/savio-macos-universal.dmg
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: savio-${{ runner.os }}
+          path: dist/*
+          # Молчаливо пустой артефакт хуже упавшей сборки: релиз уехал бы
+          # без половины файлов, и заметили бы это уже пользователи.
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    # Без этого создание релиза падает с 403 — уже после того, как все три
+    # сборки отработали.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+          draft: true
+          generate_release_notes: true

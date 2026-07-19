@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Savio
+Comment=Скачивание видео и аудио по ссылке
+Comment[en]=Download video and audio by link
+Exec=savio
+Icon=savio
+Categories=AudioVideo;Network;
+Terminal=false

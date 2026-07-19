@@ -1,0 +1,62 @@
+# Проверка на каждый push и pull request.
+#
+# Три ОС здесь не для галочки: половина кода установки живёт под `#[cfg]`,
+# и ветки macOS с Linux на машине разработчика под Windows не компилируются
+# вообще. Без матрицы опечатка в них всплыла бы только у пользователя.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Новый push в ту же ветку отменяет предыдущий прогон: держать очередь
+# из устаревших сборок незачем.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Не отменять остальные ОС из-за падения одной: полезно видеть,
+      # сломалось везде или только на одной платформе.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Системные библиотеки нужны только Linux: на Windows и macOS
+      # оконная подсистема идёт с ОС.
+      #
+      # `libgtk-3-dev` в списке нет намеренно: rfd 0.17 с настройками по
+      # умолчанию использует бэкенд xdg-portal поверх D-Bus, а не GTK.
+      - name: Системные зависимости (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libssl-dev
+
+      # Ровно те три команды, что перечислены в CLAUDE.md, и в том же порядке.
+      # `cargo fmt --check` сюда намеренно не добавлен: в коде есть места, где
+      # переносы расставлены руками ради читаемости, и rustfmt их схлопывает.
+      - run: cargo build --all-targets
+      - run: cargo clippy --all-targets -- -D warnings
+      # Тесты с `#[ignore]` ходят в сеть и качают сотни мегабайт — в CI их не
+      # гоняем. Запускать вручную: `cargo test -- --ignored`.
+      - run: cargo test

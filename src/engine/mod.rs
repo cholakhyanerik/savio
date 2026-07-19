@@ -4,6 +4,8 @@
 //! Благодаря этому движок можно прицепить к CLI или к тестам, не трогая код.
 
 pub mod binaries;
+pub mod setup;
+pub mod sha256;
 pub mod ytdlp;
 
 use std::io::{BufRead, BufReader};

@@ -5,6 +5,7 @@ use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
 use eframe::egui;
 
+use crate::engine::setup;
 use crate::engine::{self, Handle};
 use crate::model::{
     Event, Format, MediaInfo, Progress, human_bytes, human_duration, looks_like_url,
@@ -21,6 +22,19 @@ enum State {
     Cancelled,
 }
 
+/// Установка недостающих инструментов при первом запуске.
+///
+/// Отдельно от `State`: это состояние подготовки, а не загрузки, и живёт оно
+/// строго до первого показа основного экрана.
+enum Setup {
+    /// Всё на месте — обычный случай при любом запуске, кроме первого.
+    Ready,
+    Installing,
+    /// Установка не удалась. Приложение всё равно открывается: без `yt-dlp`
+    /// пользователь увидит привычную подсказку, что делать дальше.
+    Failed(String),
+}
+
 pub struct SavioApp {
     url: String,
     format: Format,
@@ -35,6 +49,14 @@ pub struct SavioApp {
     /// Проверяем наличие yt-dlp один раз на старте, чтобы сразу показать
     /// внятную подсказку вместо провала при первой попытке скачать.
     setup_error: Option<String>,
+    /// Ход установки недостающих инструментов.
+    setup: Setup,
+    /// Предупреждение, которое переживает установку: например, что ffmpeg
+    /// поставить не удалось. Живёт до конца сеанса и не стирается вместе
+    /// с журналом при старте загрузки.
+    warning: Option<String>,
+    /// Ручка установки — нужна, чтобы её можно было прервать.
+    setup_handle: Option<setup::Handle>,
 
     // Строки ниже пересобираются только при изменении состояния, а не в кадре.
     // `ui()` вызывается 60 раз в секунду: `format!` и `join` здесь стоили бы
@@ -49,12 +71,27 @@ pub struct SavioApp {
     done_path_display: String,
     /// Ссылка не похожа на ссылку. Только подсветка поля — кнопку не блокирует.
     url_invalid: bool,
+    /// Окно нужно развернуть на первом кадре.
+    ///
+    /// Одного `with_maximized(true)` в `main.rs` мало: вместе с
+    /// `with_inner_size` он выставляет окну признак развёрнутого, но не
+    /// применяет саму геометрию — окно открывается прежнего размера, хотя
+    /// `IsZoomed` уже отвечает «развёрнуто». Проверено на Windows 11.
+    /// Команду шлём **однократно**: каждый кадр — и пользователь не смог бы
+    /// вернуть окну обычный размер.
+    maximize_pending: bool,
 }
 
-impl Default for SavioApp {
-    fn default() -> Self {
+impl SavioApp {
+    /// Собирает приложение и, если нужно, сразу запускает установку.
+    ///
+    /// Проверка наличия инструментов — это несколько обращений к файловой
+    /// системе, поэтому её можно делать прямо здесь: когда всё на месте (любой
+    /// запуск, кроме первого) окно открывается без единой задержки, как и
+    /// требуется. Сама загрузка идёт в отдельном потоке.
+    pub fn new(ctx: &egui::Context) -> Self {
         let out_dir = default_download_dir();
-        Self {
+        let mut app = Self {
             url: String::new(),
             format: Format::Mp4,
             out_dir_display: display_dir(out_dir.as_deref()),
@@ -66,12 +103,53 @@ impl Default for SavioApp {
             log: Vec::new(),
             rx: None,
             handle: None,
-            setup_error: engine::discover().err(),
+            setup_error: None,
+            setup: Setup::Ready,
+            warning: None,
+            setup_handle: None,
             meta_line: String::new(),
             progress_line: String::new(),
             done_path_display: String::new(),
             url_invalid: false,
+            maximize_pending: true,
+        };
+
+        let what = setup::missing();
+        if what.any() {
+            let (tx, rx) = channel();
+            let notify_ctx = ctx.clone();
+            app.setup_handle = Some(setup::start(what, tx, move || {
+                notify_ctx.request_repaint()
+            }));
+            app.rx = Some(rx);
+            app.setup = Setup::Installing;
+            app.stage = "Проверяю, чего не хватает…".into();
+            app.rebuild_progress_line();
+        } else {
+            app.setup_error = engine::discover().err();
         }
+
+        app
+    }
+
+    /// Вызывается, когда установка закончилась — успехом или нет.
+    /// Инструменты после неё нужно искать заново: до установки их не было.
+    fn finish_setup(&mut self, outcome: Setup) {
+        self.setup = outcome;
+        self.setup_handle = None;
+        self.rx = None;
+        self.handle = None;
+        self.setup_error = engine::discover().err();
+        self.stage.clear();
+        self.progress = Progress::default();
+        self.progress_line.clear();
+    }
+
+    fn cancel_setup(&mut self) {
+        if let Some(handle) = &self.setup_handle {
+            handle.cancel();
+        }
+        self.finish_setup(Setup::Ready);
     }
 }
 
@@ -264,10 +342,23 @@ impl SavioApp {
                     progress_dirty = true;
                 }
                 Event::Failed(err) => {
-                    self.stage = "Ошибка".into();
-                    self.state = State::Failed(err);
-                    self.handle = None;
-                    progress_dirty = true;
+                    // Один и тот же вариант обслуживает обе задачи, поэтому
+                    // разводим их по текущему режиму: во время установки это
+                    // сбой установки, а не сорвавшаяся загрузка ролика.
+                    if matches!(self.setup, Setup::Installing) {
+                        self.finish_setup(Setup::Failed(err));
+                    } else {
+                        self.stage = "Ошибка".into();
+                        self.state = State::Failed(err);
+                        self.handle = None;
+                        progress_dirty = true;
+                    }
+                }
+                Event::Ready => {
+                    self.finish_setup(Setup::Ready);
+                }
+                Event::Warning(text) => {
+                    self.warning = Some(text);
                 }
             }
         }
@@ -302,6 +393,12 @@ impl eframe::App for SavioApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_events();
 
+        if self.maximize_pending {
+            self.maximize_pending = false;
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+        }
+
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::BG_ROOT))
             .show(ui, |ui| {
@@ -315,6 +412,17 @@ impl eframe::App for SavioApp {
                         egui::Frame::new()
                             .inner_margin(egui::Margin::symmetric(20, 18))
                             .show(ui, |ui| {
+                                // Причина неудавшейся установки идёт первой:
+                                // она объясняет, почему инструмента нет, а
+                                // баннер ниже — что с этим делать.
+                                if let Setup::Failed(err) = &self.setup {
+                                    banner(ui, err, theme::STATE_WARNING);
+                                    ui.add_space(12.0);
+                                }
+                                if let Some(text) = &self.warning {
+                                    banner(ui, text, theme::STATE_WARNING);
+                                    ui.add_space(12.0);
+                                }
                                 if let Some(err) = &self.setup_error {
                                     banner(ui, err, theme::STATE_ERROR);
                                     ui.add_space(12.0);
@@ -327,10 +435,94 @@ impl eframe::App for SavioApp {
                             });
                     });
             });
+
+        // Модалка рисуется последней, поверх всего остального.
+        if matches!(self.setup, Setup::Installing) {
+            let ctx = ui.ctx().clone();
+            self.install_modal(&ctx);
+        }
     }
 }
 
 impl SavioApp {
+    /// Модальное окно установки.
+    ///
+    /// Закрыться само не может и не должно: `ModalResponse::should_close()`
+    /// намеренно не вызывается — это не только предикат «щёлкнули мимо или
+    /// нажали Esc», он ещё и поглощает Esc. Пока установка идёт, единственный
+    /// выход — кнопка «Отменить», иначе оборвавшаяся загрузка заперла бы
+    /// пользователя в окне без выхода.
+    fn install_modal(&mut self, ctx: &egui::Context) {
+        let cancelled = egui::Modal::new(egui::Id::new("savio-setup"))
+            .backdrop_color(theme::MODAL_BACKDROP)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::BG_SURFACE)
+                    .stroke(egui::Stroke::new(1.0, theme::BORDER_SUBTLE))
+                    .corner_radius(egui::CornerRadius::same(12))
+                    .inner_margin(egui::Margin::same(22)),
+            )
+            .show(ctx, |ui| {
+                // Ширину задаём явно: иначе окно скачет по кадрам вслед за
+                // длиной строки прогресса. 400 подобрано так, чтобы строка
+                // «стадия · проценты · объём · скорость» помещалась целиком.
+                ui.set_width(400.0);
+
+                ui.label(
+                    egui::RichText::new("Установка зависимостей")
+                        .heading()
+                        .strong()
+                        .color(theme::TEXT_PRIMARY),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Savio догружает недостающие программы. \
+                         Это нужно только при первом запуске — пожалуйста, подождите.",
+                    )
+                    .color(theme::TEXT_SECONDARY),
+                );
+
+                ui.add_space(16.0);
+
+                ui.scope(|ui| {
+                    ui.visuals_mut().extreme_bg_color = theme::PROGRESS_TRACK;
+                    // Скругление бару не задаём: вместе с `animate` оно
+                    // отключает отрисовку бегущей полосы, а она здесь —
+                    // единственный признак, что установка не зависла.
+                    let bar = match self.progress.fraction() {
+                        Some(f) => egui::ProgressBar::new(f),
+                        None => egui::ProgressBar::new(0.0).animate(true),
+                    };
+                    ui.add(bar.fill(theme::ACCENT).desired_height(8.0));
+                });
+
+                if !self.progress_line.is_empty() {
+                    ui.add_space(8.0);
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&self.progress_line)
+                                .small()
+                                .color(theme::TEXT_SECONDARY),
+                        )
+                        .truncate(),
+                    );
+                }
+
+                ui.add_space(18.0);
+                ui.add(
+                    egui::Button::new("Отменить")
+                        .min_size(egui::vec2(0.0, theme::CONTROL_HEIGHT)),
+                )
+                .clicked()
+            })
+            .inner;
+
+        if cancelled {
+            self.cancel_setup();
+        }
+    }
+
     fn header(&self, ui: &mut egui::Ui) {
         let header = egui::Frame::new()
             .fill(theme::BG_SURFACE)
