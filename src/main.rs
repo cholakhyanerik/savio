@@ -4,6 +4,7 @@
 mod app;
 mod engine;
 mod model;
+mod theme;
 
 use eframe::egui;
 
@@ -18,6 +19,11 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Savio",
         options,
-        Box::new(|_cc| Ok(Box::new(app::SavioApp::default()))),
+        Box::new(|cc| {
+            // Тему ставим один раз при старте: пересобирать `Style` в кадре
+            // отрисовки незачем, он не меняется во время работы.
+            theme::apply(&cc.egui_ctx);
+            Ok(Box::new(app::SavioApp::default()))
+        }),
     )
 }

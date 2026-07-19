@@ -66,6 +66,33 @@ pub enum Event {
     Failed(String),
 }
 
+/// Похожа ли строка на ссылку, которую есть смысл отдавать yt-dlp.
+///
+/// Проверка намеренно грубая: её задача — поймать очевидную опечатку
+/// (забытый протокол, случайный текст из буфера обмена), а не отфильтровать
+/// всё неверное. Список поддерживаемых сайтов знает yt-dlp, а не Savio,
+/// поэтому UI только подсвечивает поле и **не** блокирует кнопку: решение
+/// всегда остаётся за пользователем.
+pub fn looks_like_url(text: &str) -> bool {
+    let text = text.trim();
+    let Some(rest) = text
+        .strip_prefix("https://")
+        .or_else(|| text.strip_prefix("http://"))
+    else {
+        return false;
+    };
+
+    // Хост — всё до первого разделителя пути. Он обязан существовать и
+    // содержать точку: «https://» и «https://youtube» ссылками ещё не являются.
+    let host = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .trim();
+
+    host.contains('.') && !host.starts_with('.') && !host.ends_with('.') && !host.contains(' ')
+}
+
 pub fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["Б", "КБ", "МБ", "ГБ"];
     let mut value = bytes as f64;
@@ -87,5 +114,80 @@ pub fn human_duration(secs: u64) -> String {
         format!("{h}:{m:02}:{s:02}")
     } else {
         format!("{m}:{s:02}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn url_accepts_real_links() {
+        assert!(looks_like_url("https://youtube.com/watch?v=abc"));
+        assert!(looks_like_url("http://vk.com/video-1_2"));
+        assert!(looks_like_url("https://www.kinobase.org/film/123"));
+        // Пробелы по краям — обычное дело при вставке из буфера.
+        assert!(looks_like_url("  https://youtu.be/abc  "));
+    }
+
+    #[test]
+    fn url_rejects_obvious_junk() {
+        assert!(!looks_like_url(""));
+        assert!(!looks_like_url("youtube.com"), "нет протокола");
+        assert!(!looks_like_url("https://"), "нет хоста");
+        assert!(!looks_like_url("https://youtube"), "хост без точки");
+        assert!(!looks_like_url("ftp://example.com"), "не http(s)");
+        assert!(!looks_like_url("просто текст"));
+        assert!(!looks_like_url("https://.com"), "хост начинается с точки");
+        assert!(!looks_like_url("https://example."), "хост кончается точкой");
+    }
+
+    #[test]
+    fn bytes_switch_units() {
+        assert_eq!(human_bytes(0), "0 Б");
+        assert_eq!(human_bytes(512), "512 Б");
+        assert_eq!(human_bytes(1024), "1.0 КБ");
+        assert_eq!(human_bytes(1536), "1.5 КБ");
+        assert_eq!(human_bytes(1024 * 1024), "1.0 МБ");
+        assert_eq!(human_bytes(1024 * 1024 * 1024), "1.0 ГБ");
+        // Больше гигабайта единица не растёт — дальше просто копятся ГБ.
+        assert_eq!(human_bytes(5 * 1024 * 1024 * 1024), "5.0 ГБ");
+    }
+
+    #[test]
+    fn duration_hides_zero_hours() {
+        assert_eq!(human_duration(0), "0:00");
+        assert_eq!(human_duration(9), "0:09");
+        assert_eq!(human_duration(75), "1:15");
+        assert_eq!(human_duration(3600), "1:00:00");
+        assert_eq!(human_duration(3671), "1:01:11");
+    }
+
+    #[test]
+    fn fraction_is_none_without_total() {
+        // Потоковые источники присылают total = 0 — процент показать нечем.
+        let p = Progress {
+            downloaded: 100,
+            total: 0,
+            ..Progress::default()
+        };
+        assert_eq!(p.fraction(), None);
+    }
+
+    #[test]
+    fn fraction_clamps_to_one() {
+        let p = Progress {
+            downloaded: 150,
+            total: 100,
+            ..Progress::default()
+        };
+        assert_eq!(p.fraction(), Some(1.0));
+
+        let half = Progress {
+            downloaded: 50,
+            total: 100,
+            ..Progress::default()
+        };
+        assert_eq!(half.fraction(), Some(0.5));
     }
 }
