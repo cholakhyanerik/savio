@@ -4,6 +4,7 @@
 //! Благодаря этому движок можно прицепить к CLI или к тестам, не трогая код.
 
 pub mod binaries;
+pub mod metadata;
 pub mod setup;
 pub mod sha256;
 pub mod ytdlp;
@@ -199,6 +200,52 @@ fn run(
 
         Err(ytdlp::explain_failure(status.code().unwrap_or(-1), &tail))
     }
+}
+
+/// Что делаем с метаданными выбранного файла.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MetaTask {
+    Read,
+    Clean,
+}
+
+/// Запускает работу с метаданными локального файла в отдельном потоке.
+///
+/// Ручки, как у загрузки, здесь нет намеренно: обе операции — это чтение
+/// заголовков и копирование файла, они укладываются в доли секунды даже на
+/// сотне мегабайт. Отменять нечего, а кнопка «Отмена», которая не успевает
+/// нажаться, только запутывала бы.
+///
+/// Отдельный канал `Event` на вызов, а не общий с загрузкой: пользователь
+/// вправе чистить метаданные, пока идёт скачивание, и события двух задач
+/// не должны попадать в один приёмник.
+pub fn start_metadata(
+    path: PathBuf,
+    task: MetaTask,
+    tx: Sender<Event>,
+    notify: impl Fn() + Send + 'static,
+) {
+    std::thread::spawn(move || {
+        let result = match task {
+            MetaTask::Read => {
+                let _ = tx.send(Event::Stage("Читаю метаданные…".into()));
+                notify();
+                // ffprobe нужен только для MP3 и только ради битрейта с
+                // длительностью. Его отсутствие — не повод отказать в работе:
+                // изображения разбираются без единой внешней программы.
+                let ffprobe = binaries::locate(binaries::FFPROBE_NAME);
+                metadata::read(&path, ffprobe.as_deref()).map(Event::Tags)
+            }
+            MetaTask::Clean => {
+                let _ = tx.send(Event::Stage("Удаляю метаданные…".into()));
+                notify();
+                metadata::strip(&path).map(Event::Cleaned)
+            }
+        };
+
+        let _ = tx.send(result.unwrap_or_else(Event::Failed));
+        notify();
+    });
 }
 
 /// Быстрый запрос метаданных. Ошибки глушим: это украшение, а не необходимость.

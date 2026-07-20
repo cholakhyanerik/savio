@@ -6,9 +6,9 @@ use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use eframe::egui;
 
 use crate::engine::setup;
-use crate::engine::{self, Handle};
+use crate::engine::{self, Handle, MetaTask, metadata};
 use crate::model::{
-    Event, Format, MediaInfo, Progress, human_bytes, human_duration, looks_like_url,
+    Event, Format, MediaInfo, Progress, Tag, human_bytes, human_duration, looks_like_url, meta_kind,
 };
 use crate::theme;
 
@@ -55,6 +55,158 @@ impl Setup {
     }
 }
 
+/// Какой экран показан.
+///
+/// Вкладки, а не один длинный экран: в окне минимального размера (520×420)
+/// загрузка и работа с метаданными вместе уехали бы в прокрутку целиком.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Download,
+    Metadata,
+}
+
+/// Состояние вкладки «Метаданные».
+///
+/// Со своим приёмником событий: чистить метаданные во время скачивания —
+/// законный сценарий, и события двух задач не должны попадать в один канал.
+/// Движка это не касается, он по-прежнему знает только `Sender<Event>`.
+struct MetaPanel {
+    path: Option<PathBuf>,
+    /// Путь строкой. Собирается при выборе файла, а не в кадре отрисовки.
+    path_display: String,
+    /// Почему с этим файлом работать нельзя. `None` — можно.
+    blocked: Option<String>,
+    readable: bool,
+    cleanable: bool,
+    busy: bool,
+    stage: String,
+    /// Прочитанные метаданные: `Some` — показываем окно со списком.
+    /// Пустой список внутри — законный исход, а не ошибка.
+    tags: Option<Vec<Tag>>,
+    /// Итог последней операции: текст и цвет плашки.
+    outcome: Option<(String, egui::Color32)>,
+    /// Показан вопрос «точно перезаписать?».
+    confirming: bool,
+    rx: Option<Receiver<Event>>,
+}
+
+impl MetaPanel {
+    fn new() -> Self {
+        Self {
+            path: None,
+            path_display: "файл не выбран".to_owned(),
+            blocked: None,
+            readable: false,
+            cleanable: false,
+            busy: false,
+            stage: String::new(),
+            tags: None,
+            outcome: None,
+            confirming: false,
+            rx: None,
+        }
+    }
+
+    /// Запоминает выбранный файл и сразу решает, что с ним можно делать.
+    ///
+    /// Решение принимается один раз здесь, а не в кадре отрисовки: иначе
+    /// расширение разбиралось бы 60 раз в секунду ради двух флагов.
+    fn select(&mut self, path: PathBuf) {
+        let kind = meta_kind(&path);
+        self.readable = kind.readable();
+        self.cleanable = kind.cleanable();
+        self.blocked =
+            (!kind.readable() || !kind.cleanable()).then(|| metadata::unsupported_message(kind));
+        self.path_display = path.display().to_string();
+        self.path = Some(path);
+        // Результаты относились к прошлому файлу — показывать их рядом
+        // с новым нельзя, это прямой повод перепутать.
+        self.tags = None;
+        self.outcome = None;
+        self.stage.clear();
+    }
+
+    fn start(&mut self, task: MetaTask, ctx: &egui::Context) {
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+
+        let (tx, rx) = channel();
+        let notify_ctx = ctx.clone();
+        engine::start_metadata(path, task, tx, move || notify_ctx.request_repaint());
+
+        self.rx = Some(rx);
+        self.busy = true;
+        self.tags = None;
+        self.outcome = None;
+        self.stage = "Запуск…".to_owned();
+    }
+
+    fn drain(&mut self) {
+        let mut events = Vec::new();
+        let mut disconnected = false;
+
+        if let Some(rx) = &self.rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(event) => events.push(event),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        for event in events {
+            match event {
+                Event::Stage(stage) => self.stage = stage,
+                Event::Tags(tags) => {
+                    self.tags = Some(tags);
+                    self.busy = false;
+                }
+                Event::Cleaned(freed) => {
+                    // Ноль освобождённых байт — это не неудача, а чистый файл.
+                    // Сказать об этом надо иначе, иначе «освобождено 0 Б»
+                    // выглядит как сломавшаяся операция.
+                    self.outcome = Some(if freed == 0 {
+                        (
+                            "Удалять было нечего: метаданных в файле нет.".to_owned(),
+                            theme::TEXT_SECONDARY,
+                        )
+                    } else {
+                        (
+                            format!("Метаданные удалены, освобождено {}", human_bytes(freed)),
+                            theme::STATE_SUCCESS,
+                        )
+                    });
+                    self.busy = false;
+                }
+                Event::Failed(err) => {
+                    self.outcome = Some((err, theme::STATE_ERROR));
+                    self.busy = false;
+                }
+                // Остальные варианты рождаются только загрузкой и установкой,
+                // а у них свой приёмник. Пустая ветка вместо `_` — чтобы
+                // компилятор и дальше ловил здесь новые варианты `Event`.
+                Event::Info(_)
+                | Event::Progress(_)
+                | Event::Log(_)
+                | Event::Done(_)
+                | Event::Ready
+                | Event::Warning(_)
+                | Event::Notice(_) => {}
+            }
+        }
+
+        if disconnected {
+            self.rx = None;
+            self.busy = false;
+        }
+    }
+}
+
 pub struct SavioApp {
     url: String,
     format: Format,
@@ -95,6 +247,10 @@ pub struct SavioApp {
     done_path_display: String,
     /// Ссылка не похожа на ссылку. Только подсветка поля — кнопку не блокирует.
     url_invalid: bool,
+    /// Показанная вкладка.
+    tab: Tab,
+    /// Состояние вкладки «Метаданные».
+    meta: MetaPanel,
     /// Окно нужно развернуть на первом кадре.
     ///
     /// Одного `with_maximized(true)` в `main.rs` мало: вместе с
@@ -136,6 +292,8 @@ impl SavioApp {
             progress_line: String::new(),
             done_path_display: String::new(),
             url_invalid: false,
+            tab: Tab::Download,
+            meta: MetaPanel::new(),
             maximize_pending: true,
         };
 
@@ -143,9 +301,7 @@ impl SavioApp {
         if what.any() {
             let (tx, rx) = channel();
             let notify_ctx = ctx.clone();
-            app.setup_handle = Some(setup::start(what, tx, move || {
-                notify_ctx.request_repaint()
-            }));
+            app.setup_handle = Some(setup::start(what, tx, move || notify_ctx.request_repaint()));
             app.rx = Some(rx);
             app.setup = Setup::Installing;
             app.stage = "Проверяю, чего не хватает…".into();
@@ -414,6 +570,11 @@ impl SavioApp {
                 Event::Notice(text) => {
                     self.notice = Some(text);
                 }
+                // Метаданные ходят по своему каналу — сюда эти события
+                // попасть не могут. Ветка выписана явно, а не через `_`,
+                // чтобы компилятор и дальше требовал разбирать новые
+                // варианты `Event` в обоих приёмниках.
+                Event::Tags(_) | Event::Cleaned(_) => {}
             }
         }
 
@@ -446,6 +607,7 @@ impl eframe::App for SavioApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_events();
+        self.meta.drain();
 
         if self.maximize_pending {
             self.maximize_pending = false;
@@ -466,40 +628,81 @@ impl eframe::App for SavioApp {
                         egui::Frame::new()
                             .inner_margin(egui::Margin::symmetric(20, 18))
                             .show(ui, |ui| {
-                                // Причина неудавшейся установки идёт первой:
-                                // она объясняет, почему инструмента нет, а
-                                // баннер ниже — что с этим делать.
-                                if let Setup::Failed(err) = &self.setup {
-                                    banner(ui, err, theme::STATE_WARNING);
-                                    ui.add_space(12.0);
-                                }
-                                if let Some(text) = &self.warning {
-                                    banner(ui, text, theme::STATE_WARNING);
-                                    ui.add_space(12.0);
-                                }
-                                if let Some(text) = &self.notice {
-                                    banner(ui, text, theme::STATE_SUCCESS);
-                                    ui.add_space(12.0);
-                                }
-                                if let Some(err) = &self.setup_error {
-                                    banner(ui, err, theme::STATE_ERROR);
-                                    ui.add_space(12.0);
-                                }
-
-                                self.controls_card(ui);
+                                self.tab_bar(ui);
                                 ui.add_space(16.0);
-                                self.status_section(ui);
-                                self.maintenance_row(ui);
-                                self.log_section(ui);
+
+                                match self.tab {
+                                    Tab::Download => self.download_tab(ui),
+                                    Tab::Metadata => self.metadata_tab(ui),
+                                }
                             });
                     });
             });
 
-        // Модалка рисуется последней, поверх всего остального.
+        // Модалки рисуются последними, поверх всего остального.
+        let ctx = ui.ctx().clone();
         if self.setup.busy() {
-            let ctx = ui.ctx().clone();
             self.install_modal(&ctx);
         }
+        if self.meta.tags.is_some() {
+            self.tags_modal(&ctx);
+        }
+        if self.meta.confirming {
+            self.confirm_modal(&ctx);
+        }
+    }
+}
+
+impl SavioApp {
+    /// Переключатель вкладок под шапкой.
+    fn tab_bar(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::new()
+            .fill(theme::BG_INPUT)
+            .stroke(egui::Stroke::new(1.0, theme::BORDER_STRONG))
+            .corner_radius(egui::CornerRadius::same(theme::RADIUS))
+            .inner_margin(egui::Margin::same(3))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    const GAP: f32 = 3.0;
+                    ui.spacing_mut().item_spacing.x = GAP;
+                    let width = (ui.available_width() - GAP) / 2.0;
+
+                    for (tab, label) in [(Tab::Download, "Загрузка"), (Tab::Metadata, "Метаданные")]
+                    {
+                        if segment_button(ui, label, self.tab == tab, width) {
+                            self.tab = tab;
+                        }
+                    }
+                });
+            });
+    }
+
+    /// Вкладка загрузки — прежний экран целиком.
+    fn download_tab(&mut self, ui: &mut egui::Ui) {
+        // Причина неудавшейся установки идёт первой: она объясняет, почему
+        // инструмента нет, а баннер ниже — что с этим делать.
+        if let Setup::Failed(err) = &self.setup {
+            banner(ui, err, theme::STATE_WARNING);
+            ui.add_space(12.0);
+        }
+        if let Some(text) = &self.warning {
+            banner(ui, text, theme::STATE_WARNING);
+            ui.add_space(12.0);
+        }
+        if let Some(text) = &self.notice {
+            banner(ui, text, theme::STATE_SUCCESS);
+            ui.add_space(12.0);
+        }
+        if let Some(err) = &self.setup_error {
+            banner(ui, err, theme::STATE_ERROR);
+            ui.add_space(12.0);
+        }
+
+        self.controls_card(ui);
+        ui.add_space(16.0);
+        self.status_section(ui);
+        self.maintenance_row(ui);
+        self.log_section(ui);
     }
 }
 
@@ -579,8 +782,7 @@ impl SavioApp {
 
                 ui.add_space(18.0);
                 ui.add(
-                    egui::Button::new("Отменить")
-                        .min_size(egui::vec2(0.0, theme::CONTROL_HEIGHT)),
+                    egui::Button::new("Отменить").min_size(egui::vec2(0.0, theme::CONTROL_HEIGHT)),
                 )
                 .clicked()
             })
@@ -610,26 +812,21 @@ impl SavioApp {
                     // Акцентная точка — единственный «логотип», который нужен.
                     let (dot, _) =
                         ui.allocate_exact_size(egui::vec2(7.0, 7.0), egui::Sense::hover());
-                    ui.painter()
-                        .circle_filled(dot.center(), 3.5, theme::ACCENT);
+                    ui.painter().circle_filled(dot.center(), 3.5, theme::ACCENT);
                     ui.label(
-                        egui::RichText::new("видео и аудио по ссылке")
-                            .color(theme::TEXT_SECONDARY),
+                        egui::RichText::new("видео и аудио по ссылке").color(theme::TEXT_SECONDARY),
                     );
 
                     // Версию прижимаем к правому краю: она нужна, когда
                     // выясняют, почему что-то не работает, но в остальное
                     // время не должна тянуть на себя внимание.
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            ui.label(
-                                egui::RichText::new(VERSION)
-                                    .small()
-                                    .color(theme::TEXT_MUTED),
-                            );
-                        },
-                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(VERSION)
+                                .small()
+                                .color(theme::TEXT_MUTED),
+                        );
+                    });
                 });
             });
 
@@ -726,54 +923,8 @@ impl SavioApp {
     }
 
     /// Одна половина переключателя формата.
-    ///
-    /// Цвета задаём через `visuals`, а не через `Button::fill`: последний,
-    /// по документации egui, отключает реакцию на наведение — кнопка
-    /// выглядела бы мёртвой.
     fn segment(&mut self, ui: &mut egui::Ui, format: Format, width: f32) {
-        let selected = self.format == format;
-
-        let clicked = ui
-            .scope(|ui| {
-                let v = ui.visuals_mut();
-                let (rest, hover, press, text) = if selected {
-                    (
-                        theme::ACCENT,
-                        theme::ACCENT_HOVER,
-                        theme::ACCENT_ACTIVE,
-                        theme::TEXT_ON_ACCENT,
-                    )
-                } else {
-                    (
-                        theme::BG_INPUT,
-                        theme::BG_ELEVATED,
-                        theme::BG_PRESSED,
-                        theme::TEXT_SECONDARY,
-                    )
-                };
-
-                for (state, fill) in [
-                    (&mut v.widgets.inactive, rest),
-                    (&mut v.widgets.hovered, hover),
-                    (&mut v.widgets.active, press),
-                ] {
-                    state.weak_bg_fill = fill;
-                    state.bg_stroke = egui::Stroke::NONE;
-                    state.fg_stroke = egui::Stroke::new(1.0, text);
-                    state.corner_radius = egui::CornerRadius::same(theme::RADIUS_SMALL);
-                    // Сегмент не должен «распухать» — он зажат в дорожке.
-                    state.expansion = 0.0;
-                }
-
-                ui.add(
-                    egui::Button::new(format.label())
-                        .min_size(egui::vec2(width, theme::CONTROL_HEIGHT - 6.0)),
-                )
-                .clicked()
-            })
-            .inner;
-
-        if clicked {
+        if segment_button(ui, format.label(), self.format == format, width) {
             self.format = format;
         }
     }
@@ -781,8 +932,7 @@ impl SavioApp {
     fn folder_row(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             let button = ui.add(
-                egui::Button::new("Выбрать…")
-                    .min_size(egui::vec2(0.0, theme::CONTROL_HEIGHT)),
+                egui::Button::new("Выбрать…").min_size(egui::vec2(0.0, theme::CONTROL_HEIGHT)),
             );
             if button.clicked()
                 && let Some(dir) = rfd::FileDialog::new().pick_folder()
@@ -877,7 +1027,9 @@ impl SavioApp {
             {
                 ui.add(
                     egui::Label::new(
-                        egui::RichText::new(title).strong().color(theme::TEXT_PRIMARY),
+                        egui::RichText::new(title)
+                            .strong()
+                            .color(theme::TEXT_PRIMARY),
                     )
                     .truncate(),
                 )
@@ -887,7 +1039,11 @@ impl SavioApp {
 
         if !self.meta_line.is_empty() {
             ui.add_space(4.0);
-            ui.label(egui::RichText::new(&self.meta_line).small().color(theme::TEXT_SECONDARY));
+            ui.label(
+                egui::RichText::new(&self.meta_line)
+                    .small()
+                    .color(theme::TEXT_SECONDARY),
+            );
         }
 
         ui.add_space(10.0);
@@ -1013,7 +1169,9 @@ impl SavioApp {
 
         ui.add_space(14.0);
         egui::CollapsingHeader::new(
-            egui::RichText::new("Журнал").small().color(theme::TEXT_SECONDARY),
+            egui::RichText::new("Журнал")
+                .small()
+                .color(theme::TEXT_SECONDARY),
         )
         .show(ui, |ui| {
             egui::Frame::new()
@@ -1040,8 +1198,423 @@ impl SavioApp {
 }
 
 // ---------------------------------------------------------------------------
+// Вкладка «Метаданные»
+// ---------------------------------------------------------------------------
+
+impl SavioApp {
+    fn metadata_tab(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::new()
+            .fill(theme::BG_SURFACE)
+            .stroke(egui::Stroke::new(1.0, theme::BORDER_SUBTLE))
+            .corner_radius(egui::CornerRadius::same(12))
+            .inner_margin(egui::Margin::same(18))
+            .show(ui, |ui| {
+                field_label(ui, "Файл");
+                self.meta_file_row(ui);
+
+                if let Some(blocked) = &self.meta.blocked {
+                    ui.add_space(12.0);
+                    banner(ui, blocked, theme::STATE_WARNING);
+                }
+
+                ui.add_space(18.0);
+                self.meta_buttons(ui);
+            });
+
+        ui.add_space(16.0);
+        self.meta_status(ui);
+    }
+
+    fn meta_file_row(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let pick = ui.add_enabled(
+                !self.meta.busy,
+                egui::Button::new("Выбрать файл…").min_size(egui::vec2(0.0, theme::CONTROL_HEIGHT)),
+            );
+
+            if pick.clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .add_filter(
+                        "Поддерживаемые файлы",
+                        &["mp3", "jpg", "jpeg", "png", "webp", "gif", "tif", "tiff"],
+                    )
+                    .add_filter("Все файлы", &["*"])
+                    .pick_file()
+            {
+                self.meta.select(path);
+            }
+
+            let color = if self.meta.path.is_some() {
+                theme::TEXT_SECONDARY
+            } else {
+                theme::TEXT_MUTED
+            };
+            // Длинный путь обрезаем, иначе он растягивает окно.
+            ui.add(
+                egui::Label::new(egui::RichText::new(&self.meta.path_display).color(color))
+                    .truncate(),
+            )
+            .on_hover_text(&self.meta.path_display);
+        });
+    }
+
+    fn meta_buttons(&mut self, ui: &mut egui::Ui) {
+        // Пока файл не выбран, подсказка должна объяснять именно это, а не
+        // молча выключенную кнопку.
+        let hint = match (&self.meta.path, &self.meta.blocked) {
+            (None, _) => Some("Сначала выберите файл."),
+            (Some(_), Some(_)) => None, // причина уже показана баннером выше
+            _ => None,
+        };
+
+        let (read_on, clean_on) = (
+            self.meta.readable && !self.meta.busy,
+            self.meta.cleanable && !self.meta.busy,
+        );
+
+        ui.horizontal(|ui| {
+            const GAP: f32 = 10.0;
+            ui.spacing_mut().item_spacing.x = GAP;
+            let width = (ui.available_width() - GAP) / 2.0;
+
+            let read = ui.add_enabled(
+                read_on,
+                egui::Button::new("Читать").min_size(egui::vec2(width, theme::CTA_HEIGHT)),
+            );
+            let read = match hint {
+                Some(text) => read.on_disabled_hover_text(text),
+                None => read.on_disabled_hover_text(
+                    self.meta
+                        .blocked
+                        .as_deref()
+                        .unwrap_or("Сначала выберите файл."),
+                ),
+            };
+            if read.clicked() {
+                let ctx = ui.ctx().clone();
+                self.meta.start(MetaTask::Read, &ctx);
+            }
+
+            // «Удалить» — главное действие вкладки, поэтому акцентная заливка.
+            // Выключенный вид задаём явно: `ui.disable()` не переключает виджет
+            // на `noninteractive`, а только глушит прозрачность, и выключенная
+            // кнопка стала бы неотличима от включённой.
+            let clicked = ui
+                .scope(|ui| {
+                    let v = ui.visuals_mut();
+                    let (rest, hover, press) = if clean_on {
+                        (theme::ACCENT, theme::ACCENT_HOVER, theme::ACCENT_ACTIVE)
+                    } else {
+                        (
+                            theme::ACCENT_DISABLED,
+                            theme::ACCENT_DISABLED,
+                            theme::ACCENT_DISABLED,
+                        )
+                    };
+                    for (state, fill) in [
+                        (&mut v.widgets.inactive, rest),
+                        (&mut v.widgets.hovered, hover),
+                        (&mut v.widgets.active, press),
+                    ] {
+                        state.weak_bg_fill = fill;
+                        state.bg_stroke = egui::Stroke::NONE;
+                        state.fg_stroke = egui::Stroke::new(1.0, theme::TEXT_ON_ACCENT);
+                        state.corner_radius = egui::CornerRadius::same(theme::RADIUS);
+                    }
+                    v.disabled_alpha = 1.0;
+
+                    ui.add_enabled(
+                        clean_on,
+                        egui::Button::new(egui::RichText::new("Удалить").strong())
+                            .min_size(egui::vec2(width, theme::CTA_HEIGHT)),
+                    )
+                    .on_disabled_hover_text(
+                        self.meta
+                            .blocked
+                            .as_deref()
+                            .unwrap_or("Сначала выберите файл."),
+                    )
+                    .clicked()
+                })
+                .inner;
+
+            if clicked {
+                // Файл перезаписывается на месте, и вернуть метаданные будет
+                // нельзя. Один вопрос дешевле безвозвратно очищенного оригинала.
+                self.meta.confirming = true;
+            }
+        });
+    }
+
+    fn meta_status(&mut self, ui: &mut egui::Ui) {
+        if self.meta.busy {
+            ui.scope(|ui| {
+                ui.visuals_mut().extreme_bg_color = theme::PROGRESS_TRACK;
+                // Сколько осталось, здесь неизвестно и не нужно: операция
+                // укладывается в доли секунды. Крутим неопределённый индикатор.
+                ui.add(
+                    egui::ProgressBar::new(0.0)
+                        .animate(true)
+                        .fill(theme::ACCENT)
+                        .desired_height(8.0),
+                );
+            });
+            if !self.meta.stage.is_empty() {
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(&self.meta.stage)
+                        .small()
+                        .color(theme::TEXT_SECONDARY),
+                );
+            }
+            return;
+        }
+
+        if let Some((text, color)) = &self.meta.outcome {
+            banner(ui, text, *color);
+            return;
+        }
+
+        ui.label(
+            egui::RichText::new(
+                "Выберите MP3 или изображение. «Читать» покажет, что записано \
+                 в файле, «Удалить» — сотрёт теги, геометку и обложку, \
+                 не трогая само содержимое.",
+            )
+            .small()
+            .color(theme::TEXT_MUTED),
+        );
+    }
+
+    /// Окно со списком прочитанных метаданных.
+    fn tags_modal(&mut self, ctx: &egui::Context) {
+        let Some(tags) = &self.meta.tags else {
+            return;
+        };
+
+        // Размеры считаем от окна, а не константами. При фиксированных 440×320
+        // в окне минимального размера (520×420) модалка не помещалась: заголовок
+        // срезало сверху, кнопку «Закрыть» — снизу, и окно становилось нечем
+        // закрыть. Сборка такого не ловит, видно только глазами.
+        let screen = ctx.content_rect();
+        let width = 440.0_f32.min(screen.width() - 48.0);
+        // Вычитаем то, что модалка занимает помимо списка: поля, заголовок,
+        // отступы и кнопку.
+        let list_height = (screen.height() - 230.0).clamp(110.0, 320.0);
+
+        let close = egui::Modal::new(egui::Id::new("savio-tags"))
+            .backdrop_color(theme::MODAL_BACKDROP)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::BG_SURFACE)
+                    .stroke(egui::Stroke::new(1.0, theme::BORDER_SUBTLE))
+                    .corner_radius(egui::CornerRadius::same(12))
+                    .inner_margin(egui::Margin::same(22)),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(width);
+
+                ui.label(
+                    egui::RichText::new("Метаданные файла")
+                        .heading()
+                        .strong()
+                        .color(theme::TEXT_PRIMARY),
+                );
+                ui.add_space(10.0);
+
+                if tags.is_empty() {
+                    ui.label(
+                        egui::RichText::new("Метаданные не найдены.").color(theme::TEXT_SECONDARY),
+                    );
+                } else {
+                    // Список может быть длинным (у снимка с телефона легко
+                    // набирается пара десятков строк) — держим его в прокрутке,
+                    // иначе окно вылезет за экран.
+                    egui::ScrollArea::vertical()
+                        .max_height(list_height)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            for tag in tags {
+                                ui.horizontal_top(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 10.0;
+                                    // Имя фиксированной ширины: иначе значения
+                                    // не выстроятся в колонку и читать список
+                                    // станет заметно тяжелее.
+                                    ui.add_sized(
+                                        [150.0, ui.text_style_height(&egui::TextStyle::Body)],
+                                        egui::Label::new(
+                                            egui::RichText::new(&tag.name)
+                                                .small()
+                                                .color(theme::TEXT_MUTED),
+                                        )
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(&tag.name);
+
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&tag.value)
+                                                .color(theme::TEXT_PRIMARY),
+                                        )
+                                        .wrap(),
+                                    );
+                                });
+                                ui.add_space(6.0);
+                            }
+                        });
+                }
+
+                ui.add_space(18.0);
+                ui.add(
+                    egui::Button::new("Закрыть").min_size(egui::vec2(0.0, theme::CONTROL_HEIGHT)),
+                )
+                .clicked()
+            });
+
+        // В отличие от модалки установки, здесь `should_close` уместен:
+        // окно ничего не делает и запереть в нём пользователя нечем, поэтому
+        // Esc и щелчок мимо должны закрывать его как обычно.
+        if close.inner || close.should_close() {
+            self.meta.tags = None;
+        }
+    }
+
+    /// Подтверждение перезаписи файла.
+    fn confirm_modal(&mut self, ctx: &egui::Context) {
+        #[derive(PartialEq)]
+        enum Answer {
+            None,
+            Yes,
+            No,
+        }
+
+        let answer = egui::Modal::new(egui::Id::new("savio-confirm"))
+            .backdrop_color(theme::MODAL_BACKDROP)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::BG_SURFACE)
+                    .stroke(egui::Stroke::new(1.0, theme::BORDER_SUBTLE))
+                    .corner_radius(egui::CornerRadius::same(12))
+                    .inner_margin(egui::Margin::same(22)),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(400.0_f32.min(ctx.content_rect().width() - 48.0));
+
+                ui.label(
+                    egui::RichText::new("Перезаписать файл?")
+                        .heading()
+                        .strong()
+                        .color(theme::TEXT_PRIMARY),
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Метаданные будут стёрты из самого файла, копия не создаётся. \
+                         Вернуть их обратно будет нельзя.",
+                    )
+                    .color(theme::TEXT_SECONDARY),
+                );
+                ui.add_space(8.0);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(&self.meta.path_display)
+                            .small()
+                            .color(theme::TEXT_MUTED),
+                    )
+                    .truncate(),
+                );
+
+                ui.add_space(18.0);
+                ui.horizontal(|ui| {
+                    const GAP: f32 = 10.0;
+                    ui.spacing_mut().item_spacing.x = GAP;
+                    let width = (ui.available_width() - GAP) / 2.0;
+
+                    if ui
+                        .add(
+                            egui::Button::new("Отмена")
+                                .min_size(egui::vec2(width, theme::CONTROL_HEIGHT)),
+                        )
+                        .clicked()
+                    {
+                        return Answer::No;
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new("Удалить")
+                                .min_size(egui::vec2(width, theme::CONTROL_HEIGHT)),
+                        )
+                        .clicked()
+                    {
+                        return Answer::Yes;
+                    }
+                    Answer::None
+                })
+                .inner
+            });
+
+        // Esc и щелчок мимо — это отказ. Трактовать их как согласие на
+        // необратимую операцию нельзя.
+        let dismissed = answer.should_close();
+        match answer.inner {
+            Answer::Yes => {
+                self.meta.confirming = false;
+                self.meta.start(MetaTask::Clean, ctx);
+            }
+            Answer::No => self.meta.confirming = false,
+            Answer::None if dismissed => self.meta.confirming = false,
+            Answer::None => {}
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Мелкие элементы
 // ---------------------------------------------------------------------------
+
+/// Один сегмент переключателя: выбранный — жёлтый, остальные — утопленные.
+///
+/// Цвета задаём через `visuals`, а не через `Button::fill`: последний,
+/// по документации egui, отключает реакцию на наведение — кнопка выглядела бы
+/// мёртвой. Одна функция на переключатель формата и на вкладки: разъехавшись,
+/// два одинаковых на вид элемента смотрелись бы досадной небрежностью.
+fn segment_button(ui: &mut egui::Ui, label: &str, selected: bool, width: f32) -> bool {
+    ui.scope(|ui| {
+        let v = ui.visuals_mut();
+        let (rest, hover, press, text) = if selected {
+            (
+                theme::ACCENT,
+                theme::ACCENT_HOVER,
+                theme::ACCENT_ACTIVE,
+                theme::TEXT_ON_ACCENT,
+            )
+        } else {
+            (
+                theme::BG_INPUT,
+                theme::BG_ELEVATED,
+                theme::BG_PRESSED,
+                theme::TEXT_SECONDARY,
+            )
+        };
+
+        for (state, fill) in [
+            (&mut v.widgets.inactive, rest),
+            (&mut v.widgets.hovered, hover),
+            (&mut v.widgets.active, press),
+        ] {
+            state.weak_bg_fill = fill;
+            state.bg_stroke = egui::Stroke::NONE;
+            state.fg_stroke = egui::Stroke::new(1.0, text);
+            state.corner_radius = egui::CornerRadius::same(theme::RADIUS_SMALL);
+            // Сегмент не должен «распухать» — он зажат в дорожке.
+            state.expansion = 0.0;
+        }
+
+        ui.add(egui::Button::new(label).min_size(egui::vec2(width, theme::CONTROL_HEIGHT - 6.0)))
+            .clicked()
+    })
+    .inner
+}
 
 fn field_label(ui: &mut egui::Ui, text: &'static str) {
     ui.label(
