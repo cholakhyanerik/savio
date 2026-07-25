@@ -8,7 +8,8 @@ use eframe::egui;
 use crate::engine::setup;
 use crate::engine::{self, Handle, MetaTask, metadata};
 use crate::model::{
-    Event, Format, MediaInfo, Progress, Tag, human_bytes, human_duration, looks_like_url, meta_kind,
+    Event, Format, MediaInfo, Progress, Tag, human_bytes, human_duration, human_speed,
+    looks_like_url, meta_kind,
 };
 use crate::theme;
 
@@ -472,7 +473,7 @@ impl SavioApp {
         }
         if let Some(speed) = p.speed_bps {
             sep(line);
-            let _ = write!(line, "{}/с", human_bytes(speed as u64));
+            line.push_str(&human_speed(speed));
         }
         if let Some(eta) = p.eta_secs {
             sep(line);

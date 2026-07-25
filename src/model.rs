@@ -204,18 +204,58 @@ pub fn looks_like_url(text: &str) -> bool {
     host.contains('.') && !host.starts_with('.') && !host.ends_with('.') && !host.contains(' ')
 }
 
-pub fn human_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 4] = ["Б", "КБ", "МБ", "ГБ"];
-    let mut value = bytes as f64;
+/// Единицы объёма, шаг 1024. Терабайт — не запас на будущее: качая
+/// плейлист целиком, за него выходят уже сегодня, а без верхней единицы
+/// такой размер показывался бы как «5120.0 ГБ» — число, которое глазами
+/// не читается.
+const BYTE_UNITS: [&str; 5] = ["Б", "КБ", "МБ", "ГБ", "ТБ"];
+
+/// Подбирает единицу под значение: делит на 1024, пока влезает.
+///
+/// Общая часть `human_bytes` и `human_speed`: шкала у них одна, и разъезжаться
+/// ей нельзя. Стоит одной из функций остановиться на единицу раньше — и рядом
+/// окажутся «5.0 ГБ из 10.0 ГБ» и «5120.0 МБ/с», числа одного порядка,
+/// выглядящие как разные.
+///
+/// Не число и не положительное значение схлопываются в ноль: делить на 1024
+/// такое бессмысленно, а до цикла эти случаи всё равно надо отсечь, иначе
+/// `NaN >= 1024.0` даёт `false` и NaN уходит прямиком в вывод.
+fn scale_bytes(value: f64) -> (f64, usize) {
+    let mut value = if value.is_finite() && value > 0.0 {
+        value
+    } else {
+        0.0
+    };
     let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
+    while value >= 1024.0 && unit < BYTE_UNITS.len() - 1 {
         value /= 1024.0;
         unit += 1;
     }
+    (value, unit)
+}
+
+pub fn human_bytes(bytes: u64) -> String {
+    let (value, unit) = scale_bytes(bytes as f64);
     if unit == 0 {
-        format!("{bytes} {}", UNITS[0])
+        format!("{bytes} {}", BYTE_UNITS[0])
     } else {
-        format!("{value:.1} {}", UNITS[unit])
+        format!("{value:.1} {}", BYTE_UNITS[unit])
+    }
+}
+
+/// Скорость загрузки: байты в секунду вместе с единицей, готовые к показу.
+///
+/// Отдельная функция, а не `human_bytes(speed as u64)` на стороне UI: у
+/// скорости своя размерность («/с»), и собирать её из двух кусков в кадре
+/// незачем. Плюс `as`-приведение отбрасывает дробную часть, и на медленном
+/// соединении 0.9 Б/с превращались в «0 Б/с» — то есть в «встало», хотя
+/// загрузка идёт.
+pub fn human_speed(bytes_per_sec: f64) -> String {
+    let (value, unit) = scale_bytes(bytes_per_sec);
+    if unit == 0 {
+        format!("{value:.0} {}/с", BYTE_UNITS[0])
+    } else {
+        format!("{value:.1} {}/с", BYTE_UNITS[unit])
     }
 }
 
@@ -261,8 +301,35 @@ mod tests {
         assert_eq!(human_bytes(1536), "1.5 КБ");
         assert_eq!(human_bytes(1024 * 1024), "1.0 МБ");
         assert_eq!(human_bytes(1024 * 1024 * 1024), "1.0 ГБ");
-        // Больше гигабайта единица не растёт — дальше просто копятся ГБ.
         assert_eq!(human_bytes(5 * 1024 * 1024 * 1024), "5.0 ГБ");
+        assert_eq!(human_bytes(1024_u64.pow(4)), "1.0 ТБ");
+        assert_eq!(human_bytes(5 * 1024_u64.pow(4)), "5.0 ТБ");
+        // Терабайт — последняя единица, дальше просто копятся ТБ.
+        assert_eq!(human_bytes(5 * 1024_u64.pow(5)), "5120.0 ТБ");
+        // Верхняя граница типа не должна ни паниковать, ни переполняться.
+        assert!(human_bytes(u64::MAX).ends_with(" ТБ"));
+    }
+
+    #[test]
+    fn speed_carries_its_unit() {
+        assert_eq!(human_speed(0.0), "0 Б/с");
+        assert_eq!(human_speed(512.0), "512 Б/с");
+        // Дробные байты в секунду — не «стоит»: округляем вверх, а не в ноль.
+        assert_eq!(human_speed(0.9), "1 Б/с");
+        assert_eq!(human_speed(1024.0), "1.0 КБ/с");
+        assert_eq!(human_speed(1_572_864.0), "1.5 МБ/с");
+        // Ровно то, что приходит от yt-dlp: 15943362.460976 Б/с.
+        assert_eq!(human_speed(15_943_362.460976), "15.2 МБ/с");
+    }
+
+    #[test]
+    fn speed_survives_nonsense_input() {
+        // Оба поставщика `speed_bps` отсекают неположительное и NaN, но
+        // формат вывода не должен зависеть от их бдительности: «NaN Б/с»
+        // в строке прогресса — это доклад об ошибке чужим языком.
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, -0.0] {
+            assert_eq!(human_speed(bad), "0 Б/с", "вход: {bad}");
+        }
     }
 
     #[test]
