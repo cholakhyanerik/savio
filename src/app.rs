@@ -14,6 +14,13 @@ use crate::theme;
 
 const LOG_LIMIT: usize = 400;
 
+/// Сколько секунд висит подпись «Скопировано» после нажатия.
+///
+/// Буфер обмена пользователю не виден, и без подтверждения кнопка выглядит
+/// не сработавшей. Держать подпись постоянно тоже нельзя: через минуту она
+/// уже не про текущий журнал.
+const COPIED_NOTICE_SECS: f64 = 2.0;
+
 /// Версия для шапки.
 ///
 /// Берётся из `Cargo.toml` на этапе компиляции, руками здесь ничего дублировать
@@ -247,6 +254,9 @@ pub struct SavioApp {
     done_path_display: String,
     /// Ссылка не похожа на ссылку. Только подсветка поля — кнопку не блокирует.
     url_invalid: bool,
+    /// Когда журнал скопировали, по часам egui. Нужно только для подписи
+    /// «Скопировано»: она живёт `COPIED_NOTICE_SECS` и гаснет сама.
+    log_copied_at: Option<f64>,
     /// Показанная вкладка.
     tab: Tab,
     /// Состояние вкладки «Метаданные».
@@ -292,6 +302,7 @@ impl SavioApp {
             progress_line: String::new(),
             done_path_display: String::new(),
             url_invalid: false,
+            log_copied_at: None,
             tab: Tab::Download,
             meta: MetaPanel::new(),
             maximize_pending: true,
@@ -1164,6 +1175,9 @@ impl SavioApp {
 
     fn log_section(&mut self, ui: &mut egui::Ui) {
         if self.log.is_empty() {
+            // Журнал очистили перед новой загрузкой — старое подтверждение
+            // относилось бы уже не к нему.
+            self.log_copied_at = None;
             return;
         }
 
@@ -1174,6 +1188,9 @@ impl SavioApp {
                 .color(theme::TEXT_SECONDARY),
         )
         .show(ui, |ui| {
+            self.log_copy_row(ui);
+            ui.add_space(8.0);
+
             egui::Frame::new()
                 .fill(theme::BG_ELEVATED)
                 .corner_radius(egui::CornerRadius::same(theme::RADIUS_SMALL))
@@ -1193,6 +1210,58 @@ impl SavioApp {
                             }
                         });
                 });
+        });
+    }
+
+    /// Кнопка «Скопировать» над телом журнала.
+    ///
+    /// Строки журнала рисуются метками, а не полем ввода, и мышью не
+    /// выделяются: без кнопки просьба «пришлите журнал» упирается в то, что
+    /// переписывать его вручную никто не станет. Кнопка ничего не разбирает
+    /// и не запускает — берёт уже готовые строки, поэтому и работы с потоками
+    /// здесь нет.
+    fn log_copy_row(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let now = ui.input(|i| i.time);
+
+            let copied = ui
+                .add(
+                    egui::Button::new("Скопировать")
+                        .min_size(egui::vec2(0.0, theme::CONTROL_HEIGHT)),
+                )
+                .on_hover_text(
+                    "Журнал уйдёт в буфер обмена — его можно вставить \
+                     в сообщение о проблеме.",
+                )
+                .clicked();
+
+            if copied {
+                // Единственная аллокация во всей кнопке, и происходит она по
+                // нажатию, а не в кадре: `join` выделяет буфер один раз, сразу
+                // нужного размера. Журнал уже ограничен `LOG_LIMIT`, так что
+                // размер строки предсказуем.
+                ui.ctx().copy_text(self.log.join("\n"));
+                self.log_copied_at = Some(now);
+            }
+
+            if let Some(at) = self.log_copied_at {
+                let left = COPIED_NOTICE_SECS - (now - at);
+                if left > 0.0 {
+                    // 10.7:1 на `BG_ROOT` — порог 4.5:1 проходит с запасом.
+                    ui.label(
+                        egui::RichText::new("Скопировано")
+                            .small()
+                            .color(theme::STATE_SUCCESS),
+                    );
+                    // Кадр к сроку приходится просить: без ввода egui окно не
+                    // перерисовывает, и подпись висела бы до первого движения
+                    // мыши — то есть заметно дольше положенного.
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_secs_f64(left));
+                } else {
+                    self.log_copied_at = None;
+                }
+            }
         });
     }
 }
