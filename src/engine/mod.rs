@@ -7,6 +7,7 @@ pub mod binaries;
 pub mod metadata;
 pub mod setup;
 pub mod sha256;
+pub mod thumbnail;
 pub mod ytdlp;
 
 use std::io::{BufRead, BufReader};
@@ -82,8 +83,34 @@ fn run(
     // Метаданные тянем отдельным быстрым вызовом, чтобы показать название
     // ещё до старта загрузки. Если не вышло — не страшно, идём дальше.
     if let Some(info) = probe(&request.url, tools) {
-        let _ = tx.send(Event::Info(info));
+        // Адрес забираем до отправки: `Info` уходит в UI вместе со структурой.
+        let cover = info.thumbnail_url.clone();
+        // Провал отправки означает, что приёмник закрыт, то есть загрузку уже
+        // отменили. Проверяем это именно здесь и именно ради обложки: запрос
+        // за ней стоит **перед** запуском yt-dlp и занимает до нескольких
+        // секунд. Всё это время «Отмена» убивать ещё нечего, и без проверки
+        // нажатие на неё оборачивалось бы ожиданием чужого сервера впустую.
+        let listening = tx.send(Event::Info(info)).is_ok();
         notify();
+
+        // Обложку тянем после `Info`, а не вместо него: название должно
+        // появиться сразу, не дожидаясь картинки.
+        //
+        // Любая неудача здесь — строка в журнале, и только. Ни `Failed`, ни
+        // даже `Warning`: превью — украшение, а баннер во весь экран из-за
+        // мёртвой ссылки на картинку выглядел бы поломкой загрузки, которой
+        // не произошло.
+        if listening && let Some(url) = cover {
+            match thumbnail::fetch(&url) {
+                Ok(cover) => {
+                    let _ = tx.send(Event::Thumbnail(cover));
+                    notify();
+                }
+                Err(err) => {
+                    let _ = tx.send(Event::Log(format!("Обложка не загрузилась: {err}")));
+                }
+            }
+        }
     }
 
     let args = ytdlp::download_args(request, out_dir, tools);

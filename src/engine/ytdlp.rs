@@ -326,6 +326,100 @@ pub fn parse_media_info(json: &str) -> MediaInfo {
         uploader: text("uploader"),
         duration_secs: v.get("duration").and_then(|x| x.as_f64()),
         heights: parse_heights(v.get("formats")),
+        thumbnail_url: parse_thumbnail_url(&v),
+    }
+}
+
+/// Ширина обложки, которой нам достаточно. Превью в окне — около 240 точек.
+///
+/// Значение выбрано по настоящему ответу YouTube, а не на глаз, и трогать его
+/// стоит только с таким же ответом перед глазами. Размеры там объявлены у
+/// девяти вариантов: 120, 168, 196, 246, **320**, 336, 480, 640 и 1920 точек
+/// в ширину — и среди них ровно два широкоэкранных, `mqdefault` (320×180) и
+/// `maxresdefault` (1920×1080). Остальные — 4:3, то есть `hqdefault` 480×360
+/// и `sddefault` 640×480 несут **чёрные полосы сверху и снизу, вжатые в саму
+/// картинку**. Ни ошибкой, ни предупреждением это не оборачивается: превью
+/// просто выглядит обрезанным огрызком в рамке.
+///
+/// 320 берёт `mqdefault` — самый дешёвый вариант без полос. Подними порог
+/// до 640, и вернутся полосы; опусти до 240 — придёт 246×138, а это уже
+/// заметно мыльно. Для сайтов, у которых мелких вариантов нет, порог работает
+/// как раньше: возьмётся ближайший больший, а лишнее срежет `thumbnail::TARGET_WIDTH`.
+const THUMBNAIL_TARGET_WIDTH: u64 = 320;
+
+/// Выбирает адрес обложки из ответа `-J`.
+///
+/// Берём не самую большую картинку, а **самую маленькую из тех, что не меньше**
+/// `THUMBNAIL_TARGET_WIDTH`. Причина в цене: `maxresdefault` у YouTube — это
+/// 1920×1080, то есть лишние сотни килобайт из сети и восемь мегабайт RGBA
+/// после разбора ради превью шириной 240 точек. Если такой нет — самая крупная
+/// из мелких: растянутая мелкая картинка всё равно лучше пустого места.
+///
+/// Поэтому же список перебирается сам, а не берётся готовое поле `thumbnail`:
+/// в нём лежит «лучшая» по мнению yt-dlp, то есть как раз самая большая. Полем
+/// пользуемся, когда выбирать не из чего: часть экстракторов `thumbnails[]`
+/// не заполняет вовсе.
+fn parse_thumbnail_url(v: &serde_json::Value) -> Option<String> {
+    let list = v.get("thumbnails").and_then(|x| x.as_array());
+
+    let mut best: Option<(u64, &str)> = None;
+    let mut last_unsized: Option<&str> = None;
+
+    for item in list.into_iter().flatten() {
+        let Some(url) = item
+            .get("url")
+            .and_then(|x| x.as_str())
+            .filter(|url| !url.is_empty())
+        else {
+            continue;
+        };
+
+        // `as_f64`, а не `as_u64`, по той же причине, что и у высот дорожек:
+        // часть экстракторов пишет размер дробным числом, и на `as_u64` такая
+        // запись молча превращается в «размер неизвестен».
+        let width = item
+            .get("width")
+            .and_then(|x| x.as_f64())
+            .filter(|w| *w >= 1.0)
+            .map(|w| w as u64);
+
+        match width {
+            Some(width) => {
+                best = Some(match best {
+                    Some(current) => better_thumbnail(current, (width, url)),
+                    None => (width, url),
+                });
+            }
+            // Список yt-dlp отсортирован от худшей картинки к лучшей, так что
+            // последняя запись без размера — лучшая среди безразмерных.
+            None => last_unsized = Some(url),
+        }
+    }
+
+    let field = || {
+        v.get("thumbnail")
+            .and_then(|x| x.as_str())
+            .filter(|url| !url.is_empty())
+    };
+
+    best.map(|(_, url)| url)
+        .or_else(field)
+        .or(last_unsized)
+        .map(str::to_owned)
+}
+
+/// Какая из двух обложек нам нужнее. Вынесено из цикла, чтобы правило выбора
+/// читалось целиком, а не собиралось из вложенных условий.
+fn better_thumbnail<'a>(a: (u64, &'a str), b: (u64, &'a str)) -> (u64, &'a str) {
+    let fits = |width: u64| width >= THUMBNAIL_TARGET_WIDTH;
+
+    match (fits(a.0), fits(b.0)) {
+        // Обе крупнее нужного — берём меньшую: разбирать 1920 точек ради 240 незачем.
+        (true, true) => if b.0 < a.0 { b } else { a },
+        (true, false) => a,
+        (false, true) => b,
+        // Ни одна не дотягивает — берём самую крупную из того, что есть.
+        (false, false) => if b.0 > a.0 { b } else { a },
     }
 }
 
@@ -524,6 +618,156 @@ mod tests {
         assert_eq!(
             explain_failure(-1, ""),
             "Ошибка (код -1): yt-dlp завершился с ошибкой без подробностей"
+        );
+    }
+
+    /// Список обложек, снятый с настоящего ответа `yt-dlp -J` (YouTube,
+    /// dQw4w9WgXcQ) и сокращённый по числу записей, но не по их устройству.
+    ///
+    /// Важно здесь ровно то, что в выдуманном образце угадать не выйдет:
+    /// **у большинства записей размеров нет вовсе** (все `.webp` и все
+    /// пронумерованные), один и тот же `hqdefault.jpg` объявлен пять раз
+    /// с разными размерами, а поле `thumbnail` указывает на самый тяжёлый
+    /// вариант. Дробная ширина у `mqdefault` — от других экстракторов: на
+    /// `as_u64` такая запись молча теряется.
+    const REAL_THUMBNAILS: &str = r#"{
+        "title":"Ролик",
+        "thumbnail":"https://i.ytimg.com/vi/abc/maxresdefault.jpg",
+        "thumbnails":[
+            {"url":"https://i.ytimg.com/vi/abc/3.jpg","preference":-37,"id":"0"},
+            {"url":"https://i.ytimg.com/vi_webp/abc/mq3.webp","preference":-34,"id":"3"},
+            {"url":"https://i.ytimg.com/vi/abc/default.jpg","height":90,"width":120,"id":"12"},
+            {"url":"https://i.ytimg.com/vi/abc/mqdefault.jpg","height":180,"width":320.0,"id":"14"},
+            {"url":"https://i.ytimg.com/vi_webp/abc/mqdefault.webp","id":"15"},
+            {"url":"https://i.ytimg.com/vi/abc/hqdefault.jpg","height":94,"width":168,"id":"17"},
+            {"url":"https://i.ytimg.com/vi/abc/hqdefault.jpg","height":188,"width":336,"id":"20"},
+            {"url":"https://i.ytimg.com/vi/abc/hqdefault.jpg","height":360,"width":480,"id":"21"},
+            {"url":"https://i.ytimg.com/vi/abc/sddefault.jpg","height":480,"width":640,"id":"23"},
+            {"url":"https://i.ytimg.com/vi/abc/hq720.jpg","id":"25"},
+            {"url":"https://i.ytimg.com/vi/abc/maxresdefault.jpg","height":1080,"width":1920,"id":"27"},
+            {"url":"https://i.ytimg.com/vi_webp/abc/maxresdefault.webp","id":"28"}
+        ]
+    }"#;
+
+    /// Из настоящего ответа YouTube обязан выбраться `mqdefault`.
+    ///
+    /// Он единственный дешёвый вариант без чёрных полос: `hqdefault` (480×360)
+    /// и `sddefault` (640×480) — это 4:3, и полосы у них **впечатаны в саму
+    /// картинку**. Проверено на живом ответе, потому что по одному только JSON
+    /// этого не видно: поля `width` и `height` там честные, а то, что часть
+    /// кадра занимает чернота, в них не написано.
+    ///
+    /// Второй промах, который стережёт этот тест, — `maxresdefault`: на него
+    /// указывает поле `thumbnail`, и взять его проще всего. Ошибка была бы
+    /// незаметной (картинка та же), но стоила бы сотен килобайт из сети и
+    /// восьми мегабайт RGBA после разбора — ради превью шириной 240 точек.
+    #[test]
+    fn thumbnail_is_the_cheapest_one_without_black_bars() {
+        let info = parse_media_info(REAL_THUMBNAILS);
+        assert_eq!(
+            info.thumbnail_url.as_deref(),
+            Some("https://i.ytimg.com/vi/abc/mqdefault.jpg"),
+            "выбран не самый дешёвый широкоэкранный вариант"
+        );
+    }
+
+    #[test]
+    fn thumbnail_takes_the_largest_when_all_are_small() {
+        // Ни одна не дотягивает до нужной ширины — берём самую крупную,
+        // а не отказываемся от превью вовсе: мелкая картинка лучше пустоты.
+        let json = r#"{"thumbnails":[
+            {"url":"https://x/small.jpg","width":168},
+            {"url":"https://x/medium.jpg","width":240},
+            {"url":"https://x/tiny.jpg","width":48}
+        ]}"#;
+        assert_eq!(
+            parse_media_info(json).thumbnail_url.as_deref(),
+            Some("https://x/medium.jpg")
+        );
+
+        // А когда подходящие есть, порядок в списке роли не играет: правило
+        // про «самую маленькую из достаточных» не зависит от того, встретилась
+        // она первой или последней.
+        let json = r#"{"thumbnails":[
+            {"url":"https://x/huge.jpg","width":1920},
+            {"url":"https://x/fits.jpg","width":320},
+            {"url":"https://x/big.jpg","width":640},
+            {"url":"https://x/small.jpg","width":120}
+        ]}"#;
+        assert_eq!(
+            parse_media_info(json).thumbnail_url.as_deref(),
+            Some("https://x/fits.jpg")
+        );
+    }
+
+    #[test]
+    fn thumbnail_falls_back_to_the_plain_field() {
+        // Списка нет вовсе — у части экстракторов так и бывает.
+        let json = r#"{"thumbnail":"https://x/cover.jpg"}"#;
+        assert_eq!(
+            parse_media_info(json).thumbnail_url.as_deref(),
+            Some("https://x/cover.jpg")
+        );
+
+        // Список есть, но в нём нет ни одного адреса: поле надёжнее пустоты.
+        let json = r#"{"thumbnail":"https://x/cover.jpg","thumbnails":[{"width":640}]}"#;
+        assert_eq!(
+            parse_media_info(json).thumbnail_url.as_deref(),
+            Some("https://x/cover.jpg")
+        );
+
+        // Размеров не знает никто. Список yt-dlp отсортирован от худшего
+        // к лучшему, но поле — это выбор самого yt-dlp, и оно вперёд.
+        let json = r#"{"thumbnail":"https://x/cover.jpg","thumbnails":[
+            {"url":"https://x/a.jpg"},{"url":"https://x/b.jpg"}
+        ]}"#;
+        assert_eq!(
+            parse_media_info(json).thumbnail_url.as_deref(),
+            Some("https://x/cover.jpg")
+        );
+
+        // Поля нет — тогда последняя безразмерная, то есть лучшая из них.
+        let json = r#"{"thumbnails":[{"url":"https://x/a.jpg"},{"url":"https://x/b.jpg"}]}"#;
+        assert_eq!(
+            parse_media_info(json).thumbnail_url.as_deref(),
+            Some("https://x/b.jpg")
+        );
+    }
+
+    /// Обложки может не быть, и это законный случай, а не ошибка: превью
+    /// просто не появится. Ронять на этом разбор метаданных нельзя.
+    #[test]
+    fn broken_thumbnails_do_not_break_the_probe() {
+        for json in [
+            "{}",
+            r#"{"thumbnails":[]}"#,
+            r#"{"thumbnails":"нет"}"#,
+            r#"{"thumbnails":[1,2,3]}"#,
+            r#"{"thumbnails":[{"url":""}]}"#,
+            r#"{"thumbnail":""}"#,
+            r#"{"thumbnail":42}"#,
+            "не json",
+        ] {
+            assert_eq!(
+                parse_media_info(json).thumbnail_url,
+                None,
+                "вход: {json}"
+            );
+        }
+    }
+
+    /// Обложка не должна ничего изменить в разборе остальных полей: список
+    /// высот и название приезжают из того же ответа.
+    #[test]
+    fn thumbnail_does_not_disturb_the_rest_of_the_probe() {
+        let info = parse_media_info(REAL_THUMBNAILS);
+        assert_eq!(info.title.as_deref(), Some("Ролик"));
+        // 180, 360, 480, 720 и 1080 в этом ответе — размеры картинок, а не
+        // дорожек: `formats[]` здесь нет, и высотам взяться неоткуда.
+        assert!(
+            info.heights.is_empty(),
+            "высоты обложек попали в качества: {:?}",
+            info.heights
         );
     }
 

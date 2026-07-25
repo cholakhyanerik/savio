@@ -15,6 +15,21 @@ use crate::theme;
 
 const LOG_LIMIT: usize = 400;
 
+/// Ширина превью обложки в точках.
+///
+/// 240 — половина того, что остаётся от окна минимальной ширины (520 минус
+/// поля дают 480): картинка заметна, но не выдавливает прогресс и журнал
+/// за нижнюю кромку. Движок уменьшает обложку до 480 настоящих точек, так что
+/// на экране с двойной плотностью превью остаётся резким.
+const PREVIEW_WIDTH: f32 = 240.0;
+
+/// Потолок высоты превью.
+///
+/// Нужен из-за вертикальных роликов: обложка 9:16 при ширине 240 заняла бы
+/// 427 точек — больше, чем всё окно минимальной высоты (420). С потолком такая
+/// картинка просто становится узкой, а не выдавливает содержимое в прокрутку.
+const PREVIEW_MAX_HEIGHT: f32 = 150.0;
+
 /// Сколько секунд висит подпись «Скопировано» после нажатия.
 ///
 /// Буфер обмена пользователю не виден, и без подтверждения кнопка выглядит
@@ -199,6 +214,7 @@ impl MetaPanel {
                 // а у них свой приёмник. Пустая ветка вместо `_` — чтобы
                 // компилятор и дальше ловил здесь новые варианты `Event`.
                 Event::Info(_)
+                | Event::Thumbnail(_)
                 | Event::Progress(_)
                 | Event::Log(_)
                 | Event::Done(_)
@@ -226,6 +242,13 @@ pub struct SavioApp {
     progress: Progress,
     stage: String,
     info: Option<MediaInfo>,
+    /// Обложка ролика, уже залитая в текстуру egui.
+    ///
+    /// Именно текстура, а не байты: заводится она один раз, на приёме
+    /// `Event::Thumbnail`, и в кадре отрисовки остаётся только нарисовать.
+    /// Живёт до старта следующей загрузки — освобождает текстуру egui сам,
+    /// когда ручку заменяют или бросают.
+    thumbnail: Option<egui::TextureHandle>,
     log: Vec<String>,
     rx: Option<Receiver<Event>>,
     handle: Option<Handle>,
@@ -298,6 +321,7 @@ impl SavioApp {
             progress: Progress::default(),
             stage: String::new(),
             info: None,
+            thumbnail: None,
             log: Vec::new(),
             rx: None,
             handle: None,
@@ -426,6 +450,10 @@ impl SavioApp {
                 self.state = State::Running;
                 self.progress = Progress::default();
                 self.info = None;
+                // Обложка относилась к прошлой ссылке. Оставить её рядом
+                // с новой — прямой повод перепутать ролики, а ровно от этого
+                // превью и должно спасать.
+                self.thumbnail = None;
                 self.stage = "Запуск…".into();
                 self.log.clear();
                 self.meta_line.clear();
@@ -563,7 +591,10 @@ impl SavioApp {
 
     /// Сначала собираем сообщения, потом применяем: иначе заимствование
     /// `self.rx` живёт во время мутации `self` и код не компилируется.
-    fn drain_events(&mut self) {
+    ///
+    /// `ctx` нужен обложке: текстура заводится здесь, на приёме события, —
+    /// единственный момент, когда это делается за всю загрузку.
+    fn drain_events(&mut self, ctx: &egui::Context) {
         let mut events = Vec::new();
         let mut disconnected = false;
 
@@ -590,6 +621,26 @@ impl SavioApp {
                 Event::Info(info) => {
                     self.info = Some(info);
                     meta_dirty = true;
+                }
+                Event::Thumbnail(cover) => {
+                    // Единственная заливка текстуры за всю загрузку — и она
+                    // здесь, на приёме события, а не в кадре. Разбор картинки
+                    // уже сделал движок: сюда приезжает готовый RGBA.
+                    //
+                    // Размеры проверяем, хотя движок это уже сделал: между ним
+                    // и нами канал, а `ColorImage` на несовпадении не возвращает
+                    // ошибку, а паникует. Уронить окно из-за украшения нельзя,
+                    // поэтому проверка на обеих сторонах.
+                    if cover.is_valid() {
+                        self.thumbnail = Some(ctx.load_texture(
+                            "savio-cover",
+                            egui::ColorImage::from_rgba_unmultiplied(
+                                [cover.width, cover.height],
+                                &cover.rgba,
+                            ),
+                            egui::TextureOptions::LINEAR,
+                        ));
+                    }
                 }
                 Event::Stage(stage) => {
                     self.stage = stage;
@@ -671,7 +722,7 @@ impl eframe::App for SavioApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.drain_events();
+        self.drain_events(ui.ctx());
         self.meta.drain();
 
         if self.maximize_pending {
@@ -1171,6 +1222,26 @@ impl SavioApp {
                 egui::RichText::new(&self.meta_line)
                     .small()
                     .color(theme::TEXT_SECONDARY),
+            );
+        }
+
+        // Обложка идёт под названием, а не над плашкой состояния: плашка
+        // с названием — это заголовок блока, и картинка над ним оторвала бы
+        // его от того, к чему он относится.
+        //
+        // В кадре здесь ничего не считается и не выделяется: текстура готова,
+        // а `Image` — это две пары чисел.
+        if let Some(cover) = &self.thumbnail {
+            ui.add_space(10.0);
+            ui.add(
+                egui::Image::new(cover)
+                    // `max_size`, а не `max_width`: у вертикальных роликов
+                    // ограничивать надо высоту (см. `PREVIEW_MAX_HEIGHT`),
+                    // а пропорцию egui сохраняет сам. Ширину окна учитывать
+                    // отдельно не нужно — по умолчанию картинка вписывается
+                    // в доступное место и лишь потом упирается в этот потолок.
+                    .max_size(egui::vec2(PREVIEW_WIDTH, PREVIEW_MAX_HEIGHT))
+                    .corner_radius(egui::CornerRadius::same(theme::RADIUS_SMALL)),
             );
         }
 
