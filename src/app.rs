@@ -1725,7 +1725,12 @@ fn banner(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
                     ui.allocate_exact_size(egui::vec2(3.0, height), egui::Sense::hover());
                 ui.painter()
                     .rect_filled(stripe, egui::CornerRadius::same(2), color);
-                ui.label(egui::RichText::new(text).color(color));
+                // `wrap()` обязателен: в горизонтальной раскладке egui берёт
+                // для текста режим `Extend`, то есть кладёт абзац в одну
+                // строку любой длины и молча срезает её кромкой окна. Ни
+                // сборка, ни тесты этого не видят, а объяснения в баннерах —
+                // длинные: без переноса читалась бы только их первая треть.
+                ui.add(egui::Label::new(egui::RichText::new(text).color(color)).wrap());
             });
         });
 }
