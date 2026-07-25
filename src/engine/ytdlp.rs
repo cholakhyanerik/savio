@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::binaries::Tools;
-use crate::model::{Format, MediaInfo, Progress};
+use crate::model::{Format, MediaInfo, Progress, Quality, Request};
 
 /// Каждое поле, способное прийти пустым, обязано иметь `|default`.
 /// Иначе yt-dlp подставит голое `NA` без кавычек и сломает JSON —
@@ -40,7 +40,33 @@ pub fn probe_args(url: &str) -> Vec<String> {
     ]
 }
 
-pub fn download_args(url: &str, format: Format, out_dir: &Path, tools: &Tools) -> Vec<String> {
+/// Собирает значение `-f` для видео.
+///
+/// Цепочка читается слева направо и разбирается по `/`: берётся первое звено,
+/// под которое нашлись дорожки. Порядок звеньев прежний — чистый MP4/M4A
+/// (склейка без перекодирования), затем любые лучшие дорожки, затем готовый
+/// совмещённый файл, — а ограничение по высоте просто навешивается на каждое.
+///
+/// **Хвостовой `/b` без ограничения обязателен.** Без него ролик, у которого
+/// нет ни одной дорожки нужной высоты (720p просят у записи, снятой в 480p),
+/// не скачается вовсе: yt-dlp ответит «Requested format is not available» и
+/// выйдет с ошибкой. С хвостом завышенное качество молча опускается до лучшего
+/// доступного — а это ровно то, чего ждёт человек, выбравший «не больше 720p».
+fn video_format(quality: Quality) -> String {
+    let Some(height) = quality.max_height() else {
+        // Без ограничения — строка ровно та же, что была до появления выбора.
+        return "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b".to_owned();
+    };
+
+    format!(
+        "bv*[height<={height}][ext=mp4]+ba[ext=m4a]\
+         /bv*[height<={height}]+ba\
+         /b[height<={height}]\
+         /b"
+    )
+}
+
+pub fn download_args(request: &Request, out_dir: &Path, tools: &Tools) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "--newline".into(),
         // --quiet глушит обычный вывод, --progress возвращает обратно
@@ -61,12 +87,10 @@ pub fn download_args(url: &str, format: Format, out_dir: &Path, tools: &Tools) -
         "%(title)s.%(ext)s".into(),
     ];
 
-    match format {
-        // Сначала пробуем чистый MP4/M4A (склейка без перекодирования),
-        // затем любые лучшие дорожки, затем готовый совмещённый файл.
+    match request.format {
         Format::Mp4 => args.extend([
             "-f".into(),
-            "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b".into(),
+            video_format(request.quality),
             "--merge-output-format".into(),
             "mp4".into(),
         ]),
@@ -75,7 +99,11 @@ pub fn download_args(url: &str, format: Format, out_dir: &Path, tools: &Tools) -
             "--audio-format".into(),
             "mp3".into(),
             "--audio-quality".into(),
-            "0".into(),
+            // `0` — не «ноль килобит», а верх шкалы VBR у LAME (V0). Так Savio
+            // качал звук до появления выбора, и для «Макс.» это поведение
+            // сохраняется дословно. Остальные ступени — обычный битрейт,
+            // ffmpeg отличает одно от другого по букве «K» в конце.
+            request.quality.audio_bitrate().unwrap_or("0").into(),
         ]),
     }
 
@@ -84,7 +112,7 @@ pub fn download_args(url: &str, format: Format, out_dir: &Path, tools: &Tools) -
         args.push(ffmpeg.to_string_lossy().into_owned());
     }
 
-    args.push(url.into());
+    args.push(request.url.clone());
     args
 }
 
@@ -297,7 +325,43 @@ pub fn parse_media_info(json: &str) -> MediaInfo {
         title: text("title"),
         uploader: text("uploader"),
         duration_secs: v.get("duration").and_then(|x| x.as_f64()),
+        heights: parse_heights(v.get("formats")),
     }
+}
+
+/// Вытаскивает высоты видеодорожек из `formats[]` ответа `-J`.
+///
+/// Разбирается уже скачанный JSON — второго вызова yt-dlp здесь нет и быть
+/// не должно: `probe` и так тянет полный ответ, а раньше просто выбрасывал
+/// из него всё, кроме названия и длительности.
+///
+/// Дорожки без видео отсеиваем по `vcodec == "none"`, и это не перестраховка:
+/// раскадровки предпросмотра (`sb0`, `sb1`, …) — тоже элементы `formats[]`,
+/// со своими `width` и `height` в пару сотен точек. Без проверки в списке
+/// доступных высот у любого ролика с YouTube появилось бы «180p», которого
+/// там нет. Ни сборка, ни код возврата такого не ловят.
+///
+/// `as_f64`, а не `as_u64`: часть экстракторов отдаёт высоту дробным числом
+/// (`1080.0`), и `as_u64` на таком молча возвращает `None` — список высот
+/// оказался бы пустым без единого признака ошибки.
+fn parse_heights(formats: Option<&serde_json::Value>) -> Vec<u32> {
+    let Some(list) = formats.and_then(|x| x.as_array()) else {
+        return Vec::new();
+    };
+
+    let mut heights: Vec<u32> = list
+        .iter()
+        .filter(|f| f.get("vcodec").and_then(|x| x.as_str()) != Some("none"))
+        .filter_map(|f| f.get("height").and_then(|x| x.as_f64()))
+        .filter(|h| *h >= 1.0)
+        .map(|h| h as u32)
+        .collect();
+
+    // По убыванию: наверху то, что интереснее всего показать, — максимум.
+    // `dedup` работает только на отсортированном, поэтому порядок сначала.
+    heights.sort_unstable_by(|a, b| b.cmp(a));
+    heights.dedup();
+    heights
 }
 
 #[cfg(test)]
@@ -469,6 +533,8 @@ mod tests {
         assert_eq!(info.title.as_deref(), Some("Ролик"));
         assert_eq!(info.uploader.as_deref(), Some("Автор"));
         assert_eq!(info.duration_secs, Some(75.0));
+        // Списка форматов в ответе нет — это не ошибка, просто показывать нечего.
+        assert!(info.heights.is_empty());
 
         // Метаданные — украшение: их отсутствие не должно ничего ломать.
         let empty = parse_media_info("{}");
@@ -477,5 +543,145 @@ mod tests {
 
         let broken = parse_media_info("не json");
         assert_eq!(broken.title, None);
+    }
+
+    /// Заготовка `Tools` для проверки аргументов. Пути ненастоящие: ни один
+    /// процесс здесь не запускается, важен только состав командной строки.
+    fn fake_tools() -> Tools {
+        Tools {
+            ytdlp: PathBuf::from("yt-dlp"),
+            ffmpeg: None,
+        }
+    }
+
+    /// Достаёт значение ключа из собранных аргументов.
+    fn value_of<'a>(args: &'a [String], key: &str) -> Option<&'a str> {
+        let at = args.iter().position(|a| a == key)?;
+        args.get(at + 1).map(String::as_str)
+    }
+
+    /// Аргументы одной загрузки: ссылка здесь любая, проверяется состав
+    /// командной строки, а не сама ссылка.
+    fn args_for(format: Format, quality: Quality) -> Vec<String> {
+        let request = Request {
+            url: "https://example.com/video".to_owned(),
+            format,
+            quality,
+        };
+        download_args(&request, &PathBuf::from("out"), &fake_tools())
+    }
+
+    /// «Макс.» обязана давать ровно ту строку, что была до появления выбора:
+    /// иначе новая возможность молча изменила бы старую.
+    #[test]
+    fn best_quality_keeps_the_old_arguments() {
+        let args = args_for(Format::Mp4, Quality::Best);
+        assert_eq!(
+            value_of(&args, "-f"),
+            Some("bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b")
+        );
+        assert_eq!(value_of(&args, "--merge-output-format"), Some("mp4"));
+
+        let args = args_for(Format::Mp3, Quality::Best);
+        assert_eq!(value_of(&args, "--audio-quality"), Some("0"));
+        assert_eq!(value_of(&args, "--audio-format"), Some("mp3"));
+        // Звук берётся `-x`, а не отбором формата: `-f` здесь лишний.
+        assert_eq!(value_of(&args, "-f"), None);
+    }
+
+    #[test]
+    fn height_is_pushed_into_every_link_of_the_chain() {
+        let args = args_for(Format::Mp4, Quality::P720);
+        assert_eq!(
+            value_of(&args, "-f"),
+            Some(
+                "bv*[height<=720][ext=mp4]+ba[ext=m4a]\
+                 /bv*[height<=720]+ba\
+                 /b[height<=720]\
+                 /b"
+            )
+        );
+    }
+
+    /// Главная ловушка задачи: без хвостового `/b` ролик, у которого нет
+    /// дорожки нужной высоты, не скачается вовсе — yt-dlp ответит
+    /// «Requested format is not available». Ни сборка, ни остальные тесты
+    /// этого не увидят, поэтому проверяем каждую ступень отдельно.
+    #[test]
+    fn every_quality_keeps_the_unrestricted_fallback() {
+        for quality in Quality::ALL {
+            let args = args_for(Format::Mp4, quality);
+            let selector = value_of(&args, "-f").expect("нет -f");
+            assert!(
+                selector.ends_with("/b"),
+                "{quality:?}: цепочка без общего запасного варианта: {selector}"
+            );
+            // Именно голый `b`, а не `b[height<=…]`: последнее звено обязано
+            // остаться без ограничения, иначе запас не работает.
+            let last = selector.rsplit('/').next().unwrap_or_default();
+            assert_eq!(last, "b", "{quality:?}: последнее звено с ограничением");
+        }
+    }
+
+    #[test]
+    fn audio_quality_follows_the_scale() {
+        for (quality, expected) in [
+            (Quality::Best, "0"),
+            (Quality::P2160, "320K"),
+            (Quality::P1080, "192K"),
+            (Quality::P480, "96K"),
+        ] {
+            let args = args_for(Format::Mp3, quality);
+            assert_eq!(value_of(&args, "--audio-quality"), Some(expected));
+        }
+    }
+
+    /// Ответ `-J` в том виде, в каком его отдаёт yt-dlp: аудиодорожки без
+    /// высоты, раскадровки предпросмотра с высотой и `vcodec: "none"`,
+    /// повторы одной высоты в разных контейнерах и дробное `1080.0`.
+    const REAL_FORMATS: &str = r#"{
+        "title":"Ролик",
+        "formats":[
+            {"format_id":"sb0","vcodec":"none","acodec":"none","ext":"mhtml","height":180},
+            {"format_id":"140","vcodec":"none","acodec":"mp4a.40.2","ext":"m4a"},
+            {"format_id":"251","vcodec":"none","acodec":"opus","ext":"webm","height":null},
+            {"format_id":"18","vcodec":"avc1.42001E","acodec":"mp4a.40.2","ext":"mp4","height":360},
+            {"format_id":"136","vcodec":"avc1.4d401f","acodec":"none","ext":"mp4","height":720},
+            {"format_id":"247","vcodec":"vp9","acodec":"none","ext":"webm","height":720},
+            {"format_id":"137","vcodec":"avc1.640028","acodec":"none","ext":"mp4","height":1080.0}
+        ]
+    }"#;
+
+    #[test]
+    fn heights_come_from_formats_sorted_and_deduped() {
+        let info = parse_media_info(REAL_FORMATS);
+        assert_eq!(info.heights, vec![1080, 720, 360]);
+        assert_eq!(info.max_height(), Some(1080));
+    }
+
+    #[test]
+    fn storyboards_do_not_pretend_to_be_video() {
+        let info = parse_media_info(REAL_FORMATS);
+        // 180 — высота раскадровки предпросмотра, а не дорожки ролика.
+        assert!(
+            !info.heights.contains(&180),
+            "раскадровка попала в список качеств: {:?}",
+            info.heights
+        );
+    }
+
+    #[test]
+    fn broken_formats_do_not_break_the_probe() {
+        // Не массив, не объекты, высота строкой — всё это должно молча
+        // дать пустой список, а не панику.
+        for json in [
+            r#"{"formats":"нет"}"#,
+            r#"{"formats":[]}"#,
+            r#"{"formats":[1,2,3]}"#,
+            r#"{"formats":[{"height":"720"}]}"#,
+            r#"{"formats":[{"height":0},{"height":-1}]}"#,
+        ] {
+            assert!(parse_media_info(json).heights.is_empty(), "вход: {json}");
+        }
     }
 }

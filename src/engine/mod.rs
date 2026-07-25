@@ -15,7 +15,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
-use crate::model::{Event, Format};
+use crate::model::{Event, Request};
 
 pub use binaries::{Tools, discover};
 
@@ -39,8 +39,7 @@ impl Handle {
 ///
 /// `notify` вызывается после каждого события — UI на нём делает repaint.
 pub fn start(
-    url: String,
-    format: Format,
+    request: Request,
     out_dir: PathBuf,
     tx: Sender<Event>,
     notify: impl Fn() + Send + 'static,
@@ -59,7 +58,7 @@ pub fn start(
     };
 
     std::thread::spawn(move || {
-        let result = run(&url, format, &out_dir, &tools, &tx, &notify, &child_slot);
+        let result = run(&request, &out_dir, &tools, &tx, &notify, &child_slot);
         if let Err(err) = result {
             let _ = tx.send(Event::Failed(err));
             notify();
@@ -70,8 +69,7 @@ pub fn start(
 }
 
 fn run(
-    url: &str,
-    format: Format,
+    request: &Request,
     out_dir: &Path,
     tools: &Tools,
     tx: &Sender<Event>,
@@ -83,12 +81,12 @@ fn run(
 
     // Метаданные тянем отдельным быстрым вызовом, чтобы показать название
     // ещё до старта загрузки. Если не вышло — не страшно, идём дальше.
-    if let Some(info) = probe(url, tools) {
+    if let Some(info) = probe(&request.url, tools) {
         let _ = tx.send(Event::Info(info));
         notify();
     }
 
-    let args = ytdlp::download_args(url, format, out_dir, tools);
+    let args = ytdlp::download_args(request, out_dir, tools);
     let _ = tx.send(Event::Log(format!("yt-dlp {}", args.join(" "))));
 
     let mut cmd = Command::new(&tools.ytdlp);
@@ -249,6 +247,10 @@ pub fn start_metadata(
 }
 
 /// Быстрый запрос метаданных. Ошибки глушим: это украшение, а не необходимость.
+///
+/// Разбор ответа (в том числе списка доступных высот) идёт здесь, на потоке
+/// движка, а не в UI: `-J` у длинного плейлиста весит мегабайты, и разбирать
+/// его в кадре отрисовки нельзя.
 fn probe(url: &str, tools: &Tools) -> Option<crate::model::MediaInfo> {
     let mut cmd = Command::new(&tools.ytdlp);
     cmd.args(ytdlp::probe_args(url))

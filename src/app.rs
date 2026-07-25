@@ -8,8 +8,8 @@ use eframe::egui;
 use crate::engine::setup;
 use crate::engine::{self, Handle, MetaTask, metadata};
 use crate::model::{
-    Event, Format, MediaInfo, Progress, Tag, human_bytes, human_duration, human_speed,
-    looks_like_url, meta_kind,
+    Event, Format, MediaInfo, Progress, Quality, Request, Tag, human_bytes, human_duration,
+    human_speed, looks_like_url, meta_kind,
 };
 use crate::theme;
 
@@ -218,6 +218,9 @@ impl MetaPanel {
 pub struct SavioApp {
     url: String,
     format: Format,
+    /// Выбранная ступень качества. Отдельно от формата, как и в модели:
+    /// переключение MP4 ↔ MP3 не должно её сбрасывать.
+    quality: Quality,
     out_dir: Option<PathBuf>,
     state: State,
     progress: Progress,
@@ -253,6 +256,9 @@ pub struct SavioApp {
     progress_line: String,
     /// Путь к готовому файлу.
     done_path_display: String,
+    /// Оговорка под переключателем качества: источник не отдаёт столько,
+    /// сколько запросили. Пустая строка — оговорки нет.
+    quality_note: String,
     /// Ссылка не похожа на ссылку. Только подсветка поля — кнопку не блокирует.
     url_invalid: bool,
     /// Когда журнал скопировали, по часам egui. Нужно только для подписи
@@ -285,6 +291,7 @@ impl SavioApp {
         let mut app = Self {
             url: String::new(),
             format: Format::Mp4,
+            quality: Quality::default(),
             out_dir_display: display_dir(out_dir.as_deref()),
             out_dir,
             state: State::Idle,
@@ -302,6 +309,7 @@ impl SavioApp {
             meta_line: String::new(),
             progress_line: String::new(),
             done_path_display: String::new(),
+            quality_note: String::new(),
             url_invalid: false,
             log_copied_at: None,
             tab: Tab::Download,
@@ -405,13 +413,13 @@ impl SavioApp {
         let (tx, rx) = channel();
         let notify_ctx = ctx.clone();
 
-        match engine::start(
-            self.url.trim().to_owned(),
-            self.format,
-            out_dir,
-            tx,
-            move || notify_ctx.request_repaint(),
-        ) {
+        let request = Request {
+            url: self.url.trim().to_owned(),
+            format: self.format,
+            quality: self.quality,
+        };
+
+        match engine::start(request, out_dir, tx, move || notify_ctx.request_repaint()) {
             Ok(handle) => {
                 self.rx = Some(rx);
                 self.handle = Some(handle);
@@ -422,6 +430,9 @@ impl SavioApp {
                 self.log.clear();
                 self.meta_line.clear();
                 self.done_path_display.clear();
+                // Оговорка относилась к прошлой ссылке: новые высоты приедут
+                // вместе с `Event::Info`, а до тех пор говорить нечего.
+                self.quality_note.clear();
                 self.rebuild_progress_line();
             }
             Err(err) => {
@@ -482,6 +493,8 @@ impl SavioApp {
     }
 
     fn rebuild_meta_line(&mut self) {
+        use std::fmt::Write as _;
+
         self.meta_line.clear();
         let Some(info) = &self.info else {
             return;
@@ -494,6 +507,45 @@ impl SavioApp {
                 self.meta_line.push_str(" · ");
             }
             self.meta_line.push_str(&human_duration(secs as u64));
+        }
+        // Что источник вообще способен отдать. Показываем и при выборе MP3:
+        // это свойство ролика, а не запроса, и знать его полезно до того,
+        // как выбирать высоту в следующий раз.
+        if let Some(height) = info.max_height() {
+            if !self.meta_line.is_empty() {
+                self.meta_line.push_str(" · ");
+            }
+            let _ = write!(self.meta_line, "до {height}p");
+        }
+    }
+
+    /// Оговорка под переключателем качества.
+    ///
+    /// Ошибкой это не является: цепочка `-f` заканчивается общим запасным
+    /// вариантом и молча опустится до лучшего доступного. Но молча — плохо:
+    /// «1080p» в окне и 480p в файле выглядят как обман, поэтому о разнице
+    /// говорим сразу, как только высоты приехали от `probe`.
+    fn rebuild_quality_note(&mut self) {
+        use std::fmt::Write as _;
+
+        self.quality_note.clear();
+
+        // У звука высота ни при чём: там ступень — это битрейт, и потолка,
+        // о котором `probe` мог бы рассказать, у него нет.
+        if self.format != Format::Mp4 {
+            return;
+        }
+        let (Some(want), Some(have)) = (
+            self.quality.max_height(),
+            self.info.as_ref().and_then(MediaInfo::max_height),
+        ) else {
+            return;
+        };
+        if want > have {
+            let _ = write!(
+                self.quality_note,
+                "Выше {have}p этот ролик не отдают — скачается {have}p."
+            );
         }
     }
 
@@ -595,6 +647,7 @@ impl SavioApp {
         }
         if meta_dirty {
             self.rebuild_meta_line();
+            self.rebuild_quality_note();
         }
 
         if disconnected {
@@ -867,6 +920,12 @@ impl SavioApp {
                 self.format_selector(ui);
 
                 ui.add_space(14.0);
+                // Подпись зависит от формата: у видео ступени — это высота
+                // кадра, у звука — килобиты в секунду.
+                field_label(ui, self.format.quality_label());
+                self.quality_selector(ui);
+
+                ui.add_space(14.0);
                 field_label(ui, "Папка сохранения");
                 self.folder_row(ui);
 
@@ -938,6 +997,63 @@ impl SavioApp {
     fn segment(&mut self, ui: &mut egui::Ui, format: Format, width: f32) {
         if segment_button(ui, format.label(), self.format == format, width) {
             self.format = format;
+            // Подписи сегментов качества и оговорка под ними зависят от
+            // формата — пересобрать их надо здесь, а не в кадре отрисовки.
+            self.rebuild_quality_note();
+        }
+    }
+
+    /// Переключатель качества: шесть ступеней в одной дорожке.
+    ///
+    /// Ширину сегмента считаем на каждом шаге заново, а не делим доступную
+    /// один раз: шесть округлений до пиксельной сетки накопили бы ошибку,
+    /// и дорожка либо не дотянулась бы до правого края, либо вылезла за него.
+    /// Так каждому достаётся честная доля остатка, а последнему — ровно то,
+    /// что осталось.
+    fn quality_selector(&mut self, ui: &mut egui::Ui) {
+        let format = self.format;
+        let mut changed = false;
+
+        egui::Frame::new()
+            .fill(theme::BG_INPUT)
+            .stroke(egui::Stroke::new(1.0, theme::BORDER_STRONG))
+            .corner_radius(egui::CornerRadius::same(theme::RADIUS))
+            .inner_margin(egui::Margin::same(3))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    const GAP: f32 = 3.0;
+                    ui.spacing_mut().item_spacing.x = GAP;
+
+                    let mut left = Quality::ALL.len() as f32;
+                    for quality in Quality::ALL {
+                        let width = (ui.available_width() - GAP * (left - 1.0)) / left;
+                        left -= 1.0;
+
+                        if segment_button(ui, quality.label(format), self.quality == quality, width)
+                        {
+                            self.quality = quality;
+                            changed = true;
+                        }
+                    }
+                });
+            });
+
+        if changed {
+            self.rebuild_quality_note();
+        }
+
+        if !self.quality_note.is_empty() {
+            ui.add_space(6.0);
+            // `wrap()` обязателен: без него длинная оговорка ушла бы за
+            // кромку окна одной строкой — см. комментарий в `banner`.
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(&self.quality_note)
+                        .small()
+                        .color(theme::TEXT_SECONDARY),
+                )
+                .wrap(),
+            );
         }
     }
 
@@ -1650,6 +1766,14 @@ impl SavioApp {
 /// два одинаковых на вид элемента смотрелись бы досадной небрежностью.
 fn segment_button(ui: &mut egui::Ui, label: &str, selected: bool, width: f32) -> bool {
     ui.scope(|ui| {
+        // Поля кнопки урезаем: `width` для сегмента — это минимум, а не
+        // потолок. egui не сжимает кнопку под доступное место, а раздвигает
+        // раскладку, поэтому при штатных 14 точках с каждой стороны шесть
+        // сегментов качества («2160p») в окне шириной 520 вылезли бы за
+        // кромку. Подпись всё равно стоит по центру выделенной ширины, так
+        // что на широких сегментах — вкладках и формате — разницы не видно.
+        ui.spacing_mut().button_padding.x = 6.0;
+
         let v = ui.visuals_mut();
         let (rest, hover, press, text) = if selected {
             (
