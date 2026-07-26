@@ -5,6 +5,7 @@ use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
 use eframe::egui;
 
+use crate::engine::settings;
 use crate::engine::setup;
 use crate::engine::{self, Handle, MetaTask, metadata};
 use crate::model::{
@@ -307,6 +308,11 @@ pub struct SavioApp {
     /// Команду шлём **однократно**: каждый кадр — и пользователь не смог бы
     /// вернуть окну обычный размер.
     maximize_pending: bool,
+    /// Кто запоминает выбор на следующий запуск.
+    ///
+    /// Пишет на своём потоке: сама запись — это ввод-вывод, а зовут её из
+    /// обработчика щелчка, то есть из кадра отрисовки.
+    saver: settings::Saver,
 }
 
 impl SavioApp {
@@ -317,11 +323,16 @@ impl SavioApp {
     /// запуск, кроме первого) окно открывается без единой задержки, как и
     /// требуется. Сама загрузка идёт в отдельном потоке.
     pub fn new(ctx: &egui::Context) -> Self {
-        let out_dir = default_download_dir();
+        // Выбор прошлого запуска. Файла нет, он битый или папка исчезла —
+        // получаем ровно те умолчания, что раньше были зашиты здесь: MP4,
+        // максимальное качество и каталог загрузок.
+        let saved = settings::load();
+        let out_dir = saved.out_dir.or_else(default_download_dir);
+
         let mut app = Self {
             url: String::new(),
-            format: Format::Mp4,
-            quality: Quality::default(),
+            format: saved.format,
+            quality: saved.quality,
             options: DownloadOptions::default(),
             ffmpeg_missing: false,
             out_dir_display: display_dir(out_dir.as_deref()),
@@ -348,6 +359,7 @@ impl SavioApp {
             tab: Tab::Download,
             meta: MetaPanel::new(),
             maximize_pending: true,
+            saver: settings::Saver::spawn(),
         };
 
         app.ffmpeg_missing = !engine::has_ffmpeg();
@@ -414,6 +426,22 @@ impl SavioApp {
         self.progress = Progress::default();
         self.stage = "Проверяю версию…".into();
         self.rebuild_progress_line();
+    }
+
+    /// Отдаёт текущий выбор писателю настроек.
+    ///
+    /// Зовётся из обработчиков переключателей — там же, где вызывается
+    /// `rebuild_*`, и ровно по той же причине: собирать снимок 60 раз
+    /// в секунду незачем, меняется он от щелчка. **Новое запоминаемое поле
+    /// нужно не только добавить в `Settings`, но и не забыть позвать
+    /// `remember` там, где его меняют**: пропуск ничего не сломает и никак
+    /// не проявится, кроме как «эта настройка почему-то не запоминается».
+    fn remember(&self) {
+        self.saver.save(settings::Settings {
+            format: self.format,
+            quality: self.quality,
+            out_dir: self.out_dir.clone(),
+        });
     }
 }
 
@@ -733,6 +761,23 @@ impl eframe::App for SavioApp {
     /// запуске и ресайзе видна светлая вспышка.
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         theme::BG_ROOT.to_normalized_gamma_f32()
+    }
+
+    /// Последнее, что успевает случиться перед закрытием.
+    ///
+    /// Здесь дописывается отложенная настройка: переключить формат и тут же
+    /// закрыть окно — обычное дело, а окно дебаунса к этому моменту ещё не
+    /// истекло. Полагаться вместо этого на `Drop` нельзя: eframe сразу после
+    /// `on_exit` зовёт `std::process::exit(0)`, и деструкторы не выполняются.
+    ///
+    /// `App::save` не годится по другой причине: он вызывается только с фичей
+    /// `persistence`, а она тянет `ron`, `serde` и `home` ради файла, который
+    /// у нас и так пишется своими силами через уже имеющийся `serde_json`.
+    ///
+    /// Подпись без аргумента — вариант для сборки без `glow`; Savio собирается
+    /// на wgpu, то есть на умолчаниях eframe.
+    fn on_exit(&mut self) {
+        self.saver.flush();
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -1069,6 +1114,7 @@ impl SavioApp {
             // Подписи сегментов качества и оговорка под ними зависят от
             // формата — пересобрать их надо здесь, а не в кадре отрисовки.
             self.rebuild_quality_note();
+            self.remember();
         }
     }
 
@@ -1109,6 +1155,7 @@ impl SavioApp {
 
         if changed {
             self.rebuild_quality_note();
+            self.remember();
         }
 
         if !self.quality_note.is_empty() {
@@ -1204,6 +1251,7 @@ impl SavioApp {
             {
                 self.out_dir_display = display_dir(Some(&dir));
                 self.out_dir = Some(dir);
+                self.remember();
             }
 
             let color = if self.out_dir.is_some() {

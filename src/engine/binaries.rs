@@ -32,7 +32,8 @@ pub const FFPROBE_NAME: &str = "ffprobe.exe";
 #[cfg(not(windows))]
 pub const FFPROBE_NAME: &str = "ffprobe";
 
-/// Каталог, куда Savio кладёт докачанные инструменты.
+/// Каталог Savio в данных пользователя — корень для всего, что мы храним
+/// между запусками: докачанные инструменты (`bin`) и запомненные настройки.
 ///
 /// Соглашения разные на каждой ОС, но идея одна: у пользователя, без прав
 /// администратора и без записи в системные каталоги.
@@ -42,7 +43,7 @@ pub const FFPROBE_NAME: &str = "ffprobe";
 /// ffmpeg по сети при каждом входе. Заодно `%LOCALAPPDATA%` не попадает под
 /// перенос папок в OneDrive — в `Документах` бинарник мог бы стать заглушкой
 /// «файл доступен онлайн» и не запуститься.
-pub fn data_dir() -> Option<PathBuf> {
+pub fn app_dir() -> Option<PathBuf> {
     #[cfg(windows)]
     {
         let base = std::env::var_os("LOCALAPPDATA")
@@ -53,7 +54,7 @@ pub fn data_dir() -> Option<PathBuf> {
                     .filter(|v| !v.is_empty())
                     .map(|p| PathBuf::from(p).join("AppData").join("Local"))
             })?;
-        Some(base.join("Savio").join("bin"))
+        Some(base.join("Savio"))
     }
 
     #[cfg(target_os = "macos")]
@@ -63,8 +64,7 @@ pub fn data_dir() -> Option<PathBuf> {
             PathBuf::from(home)
                 .join("Library")
                 .join("Application Support")
-                .join("Savio")
-                .join("bin"),
+                .join("Savio"),
         )
     }
 
@@ -80,10 +80,20 @@ pub fn data_dir() -> Option<PathBuf> {
                     .filter(|v| !v.is_empty())
                     .map(|h| PathBuf::from(h).join(".local").join("share"))
             })?;
-        // Не `~/.local/bin`: он лежит в PATH, и наш ffmpeg молча подменил бы
-        // системный для всех остальных программ пользователя.
-        Some(base.join("savio").join("bin"))
+        Some(base.join("savio"))
     }
+}
+
+/// Каталог, куда Savio кладёт докачанные инструменты.
+///
+/// Отдельная подпапка внутри `app_dir`, а не сам `app_dir`: рядом лежат и
+/// другие наши файлы (настройки), и мешать их с бинарниками не стоит — по
+/// имени папки должно быть видно, что в ней лежит.
+///
+/// И не `~/.local/bin` на Linux: он лежит в PATH, и наш ffmpeg молча подменил
+/// бы системный для всех остальных программ пользователя.
+pub fn data_dir() -> Option<PathBuf> {
+    Some(app_dir()?.join("bin"))
 }
 
 /// Найденные инструменты.
@@ -158,4 +168,24 @@ pub fn discover() -> Result<Tools, String> {
         ytdlp,
         ffmpeg: locate(FFMPEG_NAME),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Каталог инструментов обязан остаться прежним — `<данные>/bin`.
+    ///
+    /// Сместись он на уровень выше, и ошибки не случилось бы ни при сборке,
+    /// ни в работе: Savio просто перестал бы находить уже скачанные ffmpeg
+    /// и yt-dlp и молча выкачал бы триста мегабайт заново, в новое место.
+    #[test]
+    fn tools_live_in_a_bin_subfolder_of_the_app_folder() {
+        let (Some(app), Some(data)) = (app_dir(), data_dir()) else {
+            // Ни `LOCALAPPDATA`, ни `HOME` — сравнивать нечего.
+            return;
+        };
+        assert_eq!(data.parent(), Some(app.as_path()));
+        assert_eq!(data.file_name(), Some(std::ffi::OsStr::new("bin")));
+    }
 }

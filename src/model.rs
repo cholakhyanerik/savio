@@ -3,9 +3,12 @@
 use std::path::PathBuf;
 
 /// Что именно скачиваем.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Format {
-    /// Видео со звуком, максимум в пределах MP4-контейнера.
+    /// Видео со звуком, максимум в пределах MP4-контейнера. Значение по
+    /// умолчанию: с ним Savio открывался всегда, и запомненные настройки
+    /// откатываются именно к нему.
+    #[default]
     Mp4,
     /// Только аудиодорожка, перекодированная в MP3.
     Mp3,
@@ -593,6 +596,14 @@ mod tests {
         assert_eq!(Quality::default(), Quality::Best);
         assert_eq!(Quality::Best.max_height(), None);
         assert_eq!(Quality::Best.audio_bitrate(), None);
+    }
+
+    /// То же и про формат: к этому значению откатываются запомненные
+    /// настройки, когда файла нет или он не читается. Переедь `#[default]`
+    /// на MP3 — и первый запуск Savio молча начал бы предлагать звук.
+    #[test]
+    fn default_format_is_video() {
+        assert_eq!(Format::default(), Format::Mp4);
     }
 
     /// По умолчанию не вшивается ничего. Стоит одному флажку оказаться

@@ -5,6 +5,7 @@
 
 pub mod binaries;
 pub mod metadata;
+pub mod settings;
 pub mod setup;
 pub mod sha256;
 pub mod thumbnail;
