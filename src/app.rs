@@ -87,6 +87,85 @@ impl Setup {
 enum Tab {
     Download,
     Metadata,
+    History,
+}
+
+/// Сколько загрузок помним.
+///
+/// Потолок обязателен по Правилу 1, как и `LOG_LIMIT`: без него список рос бы
+/// всё время работы окна, а по одной ссылке-плейлисту приезжают сотни готовых
+/// файлов подряд. 50 — заведомо больше, чем скачивают за один запуск, и при
+/// этом столько, сколько ещё можно пролистать глазами.
+const HISTORY_LIMIT: usize = 50;
+
+/// Одна строка истории: что скачали и где оно лежит.
+///
+/// Строки собираются один раз, на приёме `Event::Done`, — в кадре отрисовки
+/// не остаётся ни `format!`, ни `display()` (Правило 1).
+struct HistoryEntry {
+    /// Имя файла.
+    name: String,
+    /// Папка, которую открывает кнопка. `None` — открывать нечего,
+    /// и кнопки тогда нет.
+    dir: Option<PathBuf>,
+    /// Та же папка строкой. Пустая, когда `dir` — `None`.
+    dir_display: String,
+    /// Полный путь: по нему узнаём повторную загрузку того же файла.
+    path: PathBuf,
+}
+
+/// История загрузок за текущий запуск.
+///
+/// Живёт только в памяти и только до закрытия окна — на диск не пишется
+/// ничего. Отдельный тип, а не голый `Vec`, ровно ради потолка: держать его
+/// в одном месте надёжнее, чем помнить про `truncate` в каждом месте, где
+/// в список что-то кладут.
+#[derive(Default)]
+struct History {
+    /// Сверху самое свежее: ищут обычно последнее скачанное.
+    entries: Vec<HistoryEntry>,
+}
+
+impl History {
+    /// Запоминает готовый файл.
+    ///
+    /// Тот же путь второй раз не заводит новую строку, а поднимает старую
+    /// наверх: перекачать файл заново — обычное дело (выбрали не тот формат,
+    /// оборвалась связь), и две одинаковые строки подряд выглядели бы сбоем.
+    fn remember(&mut self, path: &Path) {
+        self.entries.retain(|entry| entry.path.as_path() != path);
+
+        // Пустого родителя отбрасываем вместе с отсутствующим: у относительного
+        // «file.mp4» `parent()` возвращает не `None`, а `Some("")`, и такой
+        // «папкой» проводнику открывать нечего. От yt-dlp приходят абсолютные
+        // пути, так что это страховка, а не рабочий случай.
+        let dir = path
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .map(Path::to_path_buf);
+
+        self.entries.insert(
+            0,
+            HistoryEntry {
+                // Путь без имени файла (корень диска) в `Event::Done` прийти
+                // не может, но пустая строка в списке выглядела бы поломкой —
+                // показываем тогда путь целиком.
+                name: path
+                    .file_name()
+                    .unwrap_or(path.as_os_str())
+                    .to_string_lossy()
+                    .into_owned(),
+                dir_display: dir
+                    .as_deref()
+                    .map(|dir| dir.display().to_string())
+                    .unwrap_or_default(),
+                dir,
+                path: path.to_path_buf(),
+            },
+        );
+
+        self.entries.truncate(HISTORY_LIMIT);
+    }
 }
 
 /// Состояние вкладки «Метаданные».
@@ -299,6 +378,8 @@ pub struct SavioApp {
     tab: Tab,
     /// Состояние вкладки «Метаданные».
     meta: MetaPanel,
+    /// Что скачано за этот запуск. Наполняется из `Event::Done`.
+    history: History,
     /// Окно нужно развернуть на первом кадре.
     ///
     /// Одного `with_maximized(true)` в `main.rs` мало: вместе с
@@ -358,6 +439,7 @@ impl SavioApp {
             log_copied_at: None,
             tab: Tab::Download,
             meta: MetaPanel::new(),
+            history: History::default(),
             maximize_pending: true,
             saver: settings::Saver::spawn(),
         };
@@ -701,6 +783,11 @@ impl SavioApp {
                 Event::Done(path) => {
                     self.stage = "Готово".into();
                     self.done_path_display = path.display().to_string();
+                    // Единственное место, где пополняется история: другого
+                    // признака «файл готов и лежит вот здесь» у UI нет.
+                    // Успех без пути (`Event::Stage("Готово (файл уже
+                    // существовал)")`) сюда не попадает — записывать нечего.
+                    self.history.remember(&path);
                     self.state = State::Done(path);
                     self.handle = None;
                     progress_dirty = true;
@@ -809,6 +896,7 @@ impl eframe::App for SavioApp {
                                 match self.tab {
                                     Tab::Download => self.download_tab(ui),
                                     Tab::Metadata => self.metadata_tab(ui),
+                                    Tab::History => self.history_tab(ui),
                                 }
                             });
                     });
@@ -830,7 +918,22 @@ impl eframe::App for SavioApp {
 
 impl SavioApp {
     /// Переключатель вкладок под шапкой.
+    ///
+    /// Ширину сегмента считаем на каждом шаге заново, а не делим доступную
+    /// один раз на число вкладок, — по той же причине, что и в переключателе
+    /// качества: округления до пиксельной сетки накапливаются, и дорожка либо
+    /// не дотягивается до правого края, либо вылезает за него. Так последнему
+    /// сегменту достаётся ровно то, что осталось.
     fn tab_bar(&mut self, ui: &mut egui::Ui) {
+        // Порядок здесь — порядок на экране. Новая вкладка добавляется строкой
+        // сюда: ширину сегментов пересчитает цикл, делённого пополам числа
+        // в коде больше нет.
+        const TABS: [(Tab, &str); 3] = [
+            (Tab::Download, "Загрузка"),
+            (Tab::Metadata, "Метаданные"),
+            (Tab::History, "История"),
+        ];
+
         egui::Frame::new()
             .fill(theme::BG_INPUT)
             .stroke(egui::Stroke::new(1.0, theme::BORDER_STRONG))
@@ -840,10 +943,12 @@ impl SavioApp {
                 ui.horizontal(|ui| {
                     const GAP: f32 = 3.0;
                     ui.spacing_mut().item_spacing.x = GAP;
-                    let width = (ui.available_width() - GAP) / 2.0;
 
-                    for (tab, label) in [(Tab::Download, "Загрузка"), (Tab::Metadata, "Метаданные")]
-                    {
+                    let mut left = TABS.len() as f32;
+                    for (tab, label) in TABS {
+                        let width = (ui.available_width() - GAP * (left - 1.0)) / left;
+                        left -= 1.0;
+
                         if segment_button(ui, label, self.tab == tab, width) {
                             self.tab = tab;
                         }
@@ -1960,6 +2065,113 @@ impl SavioApp {
 }
 
 // ---------------------------------------------------------------------------
+// Вкладка «История»
+// ---------------------------------------------------------------------------
+
+impl SavioApp {
+    /// Список скачанного за этот запуск.
+    ///
+    /// `&self`, а не `&mut self`: вкладка ничего не меняет — она только
+    /// показывает уже собранные строки и открывает папку.
+    fn history_tab(&self, ui: &mut egui::Ui) {
+        let Some((first, rest)) = self.history.entries.split_first() else {
+            // Пустой экран без объяснения читается как поломка. Про то, что
+            // список не переживает закрытие окна, говорим здесь же: иначе
+            // после перезапуска пустая вкладка выглядит потерянными данными.
+            note(
+                ui,
+                "Пока пусто. Сюда попадёт всё, что вы скачаете за этот запуск, — \
+                 с кнопкой, открывающей папку файла. На диск список не пишется \
+                 и при закрытии Savio очищается.",
+                theme::TEXT_MUTED,
+            );
+            return;
+        };
+
+        self.history_card(ui, first);
+        for entry in rest {
+            ui.add_space(8.0);
+            self.history_card(ui, entry);
+        }
+    }
+
+    /// Одна строка истории.
+    ///
+    /// Карточка на каждую запись, а не одна на весь список: строки отделяются
+    /// друг от друга сами, без разделителей, и список любой длины выглядит
+    /// одинаково. Своей прокрутки здесь нет — вкладка целиком лежит в общей,
+    /// и вложенная полоса рядом с внешней только мешала бы.
+    fn history_card(&self, ui: &mut egui::Ui, entry: &HistoryEntry) {
+        egui::Frame::new()
+            .fill(theme::BG_SURFACE)
+            .stroke(egui::Stroke::new(1.0, theme::BORDER_SUBTLE))
+            .corner_radius(egui::CornerRadius::same(theme::RADIUS_SMALL))
+            .inner_margin(egui::Margin::symmetric(14, 12))
+            .show(ui, |ui| {
+                // Без этого карточка сжалась бы по ширине имени файла: у
+                // короткого имени получилась бы узкая полоска посреди окна.
+                ui.set_width(ui.available_width());
+
+                // Имя длинное почти всегда (yt-dlp кладёт в него название
+                // ролика целиком) — обрезаем, полное показывается по наведению.
+                //
+                // `on_hover_text` для этого звать НЕ надо, хотя рука тянется:
+                // у `Label` есть `show_tooltip_when_elided`, по умолчанию
+                // включённый, и обрезанная метка сама вешает подсказку с
+                // полным текстом. Свой вызов её не заменяет, а добавляет
+                // вторую: egui считает подсказки на виджет и ставит их одна
+                // под другой — выходит две коробки с одним и тем же именем.
+                // Ни сборка, ни тесты этого не видят.
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(&entry.name)
+                            .strong()
+                            .color(theme::TEXT_PRIMARY),
+                    )
+                    .truncate(),
+                );
+
+                // Папки нет — значит, и открывать нечего: показываем только имя.
+                let Some(dir) = &entry.dir else {
+                    return;
+                };
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    // Кнопка слева, путь справа — как в «Папке сохранения» на
+                    // соседней вкладке: одинаковые по смыслу пары должны
+                    // выглядеть одинаково.
+                    if ui
+                        .add(
+                            egui::Button::new("Открыть папку")
+                                .min_size(egui::vec2(0.0, theme::CONTROL_HEIGHT)),
+                        )
+                        .clicked()
+                    {
+                        // Лежит ли файл на месте, не спрашиваем: это обращение
+                        // к диску, а `ui()` идёт 60 раз в секунду (Правило 1).
+                        // Папку могли переименовать или унести вместе с
+                        // флешкой — тогда об этом скажет проводник, и это
+                        // честнее выключенной без объяснения кнопки.
+                        open_dir(dir);
+                    }
+
+                    // Подсказку с полным путём, как и у имени выше, вешает
+                    // сама обрезанная метка.
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&entry.dir_display)
+                                .small()
+                                .color(theme::TEXT_SECONDARY),
+                        )
+                        .truncate(),
+                    );
+                });
+            });
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Мелкие элементы
 // ---------------------------------------------------------------------------
 
@@ -2102,4 +2314,80 @@ fn open_dir(dir: &Path) {
     let (program, args) = ("xdg-open", vec![dir.to_string_lossy().into_owned()]);
 
     let _ = std::process::Command::new(program).args(args).spawn();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Потолок обязателен: по одной ссылке-плейлисту `Event::Done` приходит
+    /// столько раз, сколько в нём роликов, и без обрезки список рос бы вместе
+    /// с памятью — ровно то, от чего защищает `LOG_LIMIT` у журнала.
+    #[test]
+    fn history_stays_bounded() {
+        let mut history = History::default();
+        for i in 0..HISTORY_LIMIT + 10 {
+            let path = format!("/dl/{i}.mp4");
+            history.remember(Path::new(&path));
+        }
+
+        assert_eq!(history.entries.len(), HISTORY_LIMIT);
+        // Выбрасывается самое старое, а не самое свежее.
+        let newest = format!("{}.mp4", HISTORY_LIMIT + 9);
+        assert_eq!(history.entries[0].name, newest);
+        assert!(
+            history.entries.iter().all(|entry| entry.name != "0.mp4"),
+            "самая старая запись обязана уйти первой"
+        );
+    }
+
+    /// Сверху — последнее скачанное: за ним возвращаются чаще всего.
+    #[test]
+    fn newest_download_comes_first() {
+        let mut history = History::default();
+        history.remember(Path::new("/dl/первый.mp4"));
+        history.remember(Path::new("/dl/второй.mp3"));
+
+        assert_eq!(history.entries[0].name, "второй.mp3");
+        assert_eq!(history.entries[1].name, "первый.mp4");
+    }
+
+    /// Повторная загрузка того же файла (выбрали не тот формат, оборвалась
+    /// связь) не должна плодить одинаковые строки подряд.
+    #[test]
+    fn repeat_moves_the_entry_up_instead_of_duplicating_it() {
+        let mut history = History::default();
+        history.remember(Path::new("/dl/a.mp4"));
+        history.remember(Path::new("/dl/b.mp4"));
+        history.remember(Path::new("/dl/a.mp4"));
+
+        assert_eq!(history.entries.len(), 2);
+        assert_eq!(history.entries[0].name, "a.mp4");
+        assert_eq!(history.entries[1].name, "b.mp4");
+    }
+
+    #[test]
+    fn entry_splits_the_path_into_name_and_folder() {
+        let mut history = History::default();
+        history.remember(Path::new("/dl/Ролик [id].mp4"));
+
+        let entry = &history.entries[0];
+        assert_eq!(entry.name, "Ролик [id].mp4");
+        assert_eq!(entry.dir.as_deref(), Some(Path::new("/dl")));
+        assert!(!entry.dir_display.is_empty());
+    }
+
+    /// От yt-dlp приходят абсолютные пути, но UI не должен зависеть от их
+    /// формы: у имени без папки `parent()` возвращает не `None`, а `Some("")`,
+    /// и открывать такую «папку» нельзя — кнопки в этой строке не будет.
+    #[test]
+    fn entry_without_a_folder_has_nothing_to_open() {
+        let mut history = History::default();
+        history.remember(Path::new("file.mp4"));
+
+        let entry = &history.entries[0];
+        assert_eq!(entry.name, "file.mp4");
+        assert_eq!(entry.dir, None);
+        assert!(entry.dir_display.is_empty());
+    }
 }
