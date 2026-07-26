@@ -110,6 +110,36 @@ pub fn download_args(request: &Request, out_dir: &Path, tools: &Tools) -> Vec<St
     if let Some(ffmpeg) = &tools.ffmpeg {
         args.push("--ffmpeg-location".into());
         args.push(ffmpeg.to_string_lossy().into_owned());
+
+        // Вшивание навешиваем **только** при живом ffmpeg, и это не
+        // перестраховка. Проверено вживую (yt-dlp 2026.07.04): с любым из этих
+        // ключей и без ffmpeg yt-dlp скачивает ролик, а потом выходит с кодом 1
+        // и `ERROR: Postprocessing: ffmpeg not found`, оставляя рядом с готовым
+        // файлом ещё и скачанную обложку `.jpg`. То есть галочка не «просто не
+        // сработала» — она превращает удавшуюся загрузку в ошибку без пути
+        // к файлу (стадия `after_move` не наступает). Пропустить ключи и сказать
+        // об этом словами (`Event::Warning` в `engine::start`) — единственный
+        // исход, при котором пользователь получает и файл, и правду.
+        let options = request.options;
+        if options.embed_metadata {
+            args.push("--embed-metadata".into());
+        }
+        if options.embed_thumbnail {
+            args.push("--embed-thumbnail".into());
+        }
+        // Субтитры бывают только у видео: в MP3 их положить некуда, и yt-dlp
+        // на такой просьбе ругается на пустом месте.
+        //
+        // `--write-subs` рядом не нужен, хотя его и тянет дописать «чтобы
+        // субтитры точно скачались». Проверено: `--embed-subs` сам включает их
+        // загрузку (без него yt-dlp субтитры даже не запрашивает, с ним —
+        // сообщает «There are no subtitles for the requested languages»).
+        // Единственное, что добавляет `--write-subs`, — это **сохранённый рядом
+        // `.vtt`**: yt-dlp считает такой файл затребованным пользователем и
+        // после вшивания не убирает. Просили вшить, а не положить рядом.
+        if options.embed_subs && request.format == Format::Mp4 {
+            args.push("--embed-subs".into());
+        }
     }
 
     args.push(request.url.clone());
@@ -327,7 +357,29 @@ pub fn parse_media_info(json: &str) -> MediaInfo {
         duration_secs: v.get("duration").and_then(|x| x.as_f64()),
         heights: parse_heights(v.get("formats")),
         thumbnail_url: parse_thumbnail_url(&v),
+        has_subtitles: parse_has_subtitles(&v),
     }
+}
+
+/// Есть ли у ролика собственные субтитры.
+///
+/// Смотрим только `subtitles` — то, что выложил автор, — и намеренно не
+/// заглядываем в `automatic_captions`: `--embed-subs` без `--write-auto-subs`
+/// берёт ровно этот список, и посчитать автоматические значило бы обещать
+/// субтитры, которых не будет.
+///
+/// `live_chat` из счёта выбрасываем: YouTube кладёт в `subtitles` запись чата
+/// прошедшей трансляции, и по формату ответа она неотличима от дорожки
+/// субтитров. Без этой проверки у любой записи стрима «субтитры есть» —
+/// подсказка соврала бы ровно там, где нужна.
+fn parse_has_subtitles(v: &serde_json::Value) -> bool {
+    let Some(tracks) = v.get("subtitles").and_then(|x| x.as_object()) else {
+        return false;
+    };
+
+    tracks.iter().any(|(lang, files)| {
+        lang != "live_chat" && files.as_array().is_some_and(|files| !files.is_empty())
+    })
 }
 
 /// Ширина обложки, которой нам достаточно. Превью в окне — около 240 точек.
@@ -461,6 +513,7 @@ fn parse_heights(formats: Option<&serde_json::Value>) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::DownloadOptions;
 
     /// Строки взяты из реального вывода yt-dlp: префикса `download:` в них
     /// нет — он остаётся в аргументах, а не в потоке.
@@ -791,10 +844,10 @@ mod tests {
 
     /// Заготовка `Tools` для проверки аргументов. Пути ненастоящие: ни один
     /// процесс здесь не запускается, важен только состав командной строки.
-    fn fake_tools() -> Tools {
+    fn fake_tools(ffmpeg: bool) -> Tools {
         Tools {
             ytdlp: PathBuf::from("yt-dlp"),
-            ffmpeg: None,
+            ffmpeg: ffmpeg.then(|| PathBuf::from("ffmpeg")),
         }
     }
 
@@ -804,16 +857,42 @@ mod tests {
         args.get(at + 1).map(String::as_str)
     }
 
+    /// Есть ли ключ-переключатель среди аргументов.
+    fn has(args: &[String], flag: &str) -> bool {
+        args.iter().any(|a| a == flag)
+    }
+
     /// Аргументы одной загрузки: ссылка здесь любая, проверяется состав
     /// командной строки, а не сама ссылка.
-    fn args_for(format: Format, quality: Quality) -> Vec<String> {
+    fn args_with(
+        format: Format,
+        quality: Quality,
+        options: DownloadOptions,
+        ffmpeg: bool,
+    ) -> Vec<String> {
         let request = Request {
             url: "https://example.com/video".to_owned(),
             format,
             quality,
+            options,
         };
-        download_args(&request, &PathBuf::from("out"), &fake_tools())
+        download_args(&request, &PathBuf::from("out"), &fake_tools(ffmpeg))
     }
+
+    fn args_for(format: Format, quality: Quality) -> Vec<String> {
+        args_with(format, quality, DownloadOptions::default(), true)
+    }
+
+    /// Все три флажка сразу — самый ходовой случай «поставил галочки и забыл».
+    fn all_options() -> DownloadOptions {
+        DownloadOptions {
+            embed_metadata: true,
+            embed_thumbnail: true,
+            embed_subs: true,
+        }
+    }
+
+    const EMBED_FLAGS: [&str; 3] = ["--embed-metadata", "--embed-thumbnail", "--embed-subs"];
 
     /// «Макс.» обязана давать ровно ту строку, что была до появления выбора:
     /// иначе новая возможность молча изменила бы старую.
@@ -877,6 +956,136 @@ mod tests {
         ] {
             let args = args_for(Format::Mp3, quality);
             assert_eq!(value_of(&args, "--audio-quality"), Some(expected));
+        }
+    }
+
+    /// Пока галочки не поставлены, командная строка обязана остаться прежней:
+    /// новая возможность не имеет права менять то, что скачивают люди,
+    /// ни разу её не включавшие.
+    #[test]
+    fn nothing_is_embedded_until_asked() {
+        for format in [Format::Mp4, Format::Mp3] {
+            let args = args_for(format, Quality::Best);
+            for flag in EMBED_FLAGS {
+                assert!(!has(&args, flag), "{format:?}: непрошеный {flag}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_checkbox_adds_its_own_flag() {
+        let args = args_with(Format::Mp4, Quality::Best, all_options(), true);
+        for flag in EMBED_FLAGS {
+            assert!(has(&args, flag), "нет {flag}");
+        }
+
+        // По одной галочке за раз: соседние ключи появляться не должны.
+        for (options, expected) in [
+            (
+                DownloadOptions {
+                    embed_metadata: true,
+                    ..DownloadOptions::default()
+                },
+                "--embed-metadata",
+            ),
+            (
+                DownloadOptions {
+                    embed_thumbnail: true,
+                    ..DownloadOptions::default()
+                },
+                "--embed-thumbnail",
+            ),
+            (
+                DownloadOptions {
+                    embed_subs: true,
+                    ..DownloadOptions::default()
+                },
+                "--embed-subs",
+            ),
+        ] {
+            let args = args_with(Format::Mp4, Quality::Best, options, true);
+            for flag in EMBED_FLAGS {
+                assert_eq!(
+                    has(&args, flag),
+                    flag == expected,
+                    "{options:?}: неверный состав ключей, споткнулись на {flag}"
+                );
+            }
+        }
+    }
+
+    /// Главная ловушка задачи. Без ffmpeg yt-dlp с этими ключами скачивает
+    /// ролик и **падает** на постобработке с кодом 1 — то есть галочка
+    /// превращает удавшуюся загрузку в ошибку, да ещё и оставляет рядом
+    /// скачанную обложку. Ни сборка, ни остальные тесты этого не видят.
+    #[test]
+    fn embedding_is_skipped_without_ffmpeg() {
+        for format in [Format::Mp4, Format::Mp3] {
+            let args = args_with(format, Quality::Best, all_options(), false);
+            for flag in EMBED_FLAGS {
+                assert!(
+                    !has(&args, flag),
+                    "{format:?}: {flag} без ffmpeg — загрузка сорвётся на постобработке"
+                );
+            }
+            // Сама загрузка при этом обязана остаться на месте.
+            assert!(has(&args, "https://example.com/video"), "потеряна ссылка");
+        }
+    }
+
+    /// В MP3 субтитры класть некуда: просить их — значит получить ругань
+    /// yt-dlp на ровном месте. Остальные две галочки у звука работают.
+    #[test]
+    fn audio_does_not_ask_for_subtitles() {
+        let args = args_with(Format::Mp3, Quality::Best, all_options(), true);
+        assert!(!has(&args, "--embed-subs"), "субтитры запрошены у MP3");
+        assert!(has(&args, "--embed-metadata"));
+        assert!(has(&args, "--embed-thumbnail"));
+    }
+
+    /// `--write-subs` выглядит обязательным спутником `--embed-subs` и первым
+    /// просится в цепочку при доработке. На деле загрузку субтитров включает
+    /// сам `--embed-subs`, а `--write-subs` только оставляет `.vtt` лежать
+    /// рядом с роликом: просили вшить, а не положить рядом.
+    #[test]
+    fn subtitles_are_embedded_without_leaving_a_file() {
+        let args = args_with(Format::Mp4, Quality::Best, all_options(), true);
+        assert!(has(&args, "--embed-subs"));
+        assert!(!has(&args, "--write-subs"), "рядом с роликом останется .vtt");
+        assert!(!has(&args, "--write-auto-subs"));
+    }
+
+    /// Субтитры в ответе `-J` — те, что выложил автор. `live_chat` там же:
+    /// это запись чата трансляции, и по форме она от дорожки субтитров
+    /// не отличается.
+    #[test]
+    fn subtitles_are_detected_from_the_probe() {
+        let cases = [
+            (r#"{"subtitles":{"en":[{"ext":"vtt","url":"https://x/en"}]}}"#, true),
+            (
+                r#"{"subtitles":{"live_chat":[{"ext":"json","url":"https://x/chat"}]}}"#,
+                false,
+            ),
+            (
+                r#"{"subtitles":{"live_chat":[{"ext":"json"}],"ru":[{"ext":"vtt"}]}}"#,
+                true,
+            ),
+            // Автоматических субтитров мало: `--embed-subs` их не берёт,
+            // и обещать их пользователю нельзя.
+            (r#"{"automatic_captions":{"en":[{"ext":"vtt"}]}}"#, false),
+            (r#"{"subtitles":{}}"#, false),
+            (r#"{"subtitles":{"en":[]}}"#, false),
+            (r#"{"subtitles":"нет"}"#, false),
+            ("{}", false),
+            ("не json", false),
+        ];
+
+        for (json, expected) in cases {
+            assert_eq!(
+                parse_media_info(json).has_subtitles,
+                expected,
+                "вход: {json}"
+            );
         }
     }
 

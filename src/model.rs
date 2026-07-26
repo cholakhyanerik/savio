@@ -204,6 +204,30 @@ impl Tag {
     }
 }
 
+/// Что дополнительно вшить в готовый файл.
+///
+/// Плоская структура из трёх флажков, а не варианты перечисления: галочки
+/// независимы, и любая их комбинация осмысленна. Значение по умолчанию —
+/// все выключены, то есть ровно то, что Savio делал до появления опций.
+///
+/// Вшивание целиком лежит на `ffmpeg`, и это не деталь реализации, а свойство,
+/// от которого зависит поведение: без него запрошенное вшивание не просто
+/// не сработает, а **уронит всю загрузку** (подробности — в `download_args`).
+/// Отсюда `any()`: спрашивать про ffmpeg надо один раз на все три флажка.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct DownloadOptions {
+    pub embed_metadata: bool,
+    pub embed_thumbnail: bool,
+    pub embed_subs: bool,
+}
+
+impl DownloadOptions {
+    /// Просят ли вшить хоть что-нибудь.
+    pub fn any(self) -> bool {
+        self.embed_metadata || self.embed_thumbnail || self.embed_subs
+    }
+}
+
 /// Что именно просят скачать.
 ///
 /// Отдельная структура, а не тройка параметров: формат и качество ходят
@@ -214,6 +238,7 @@ pub struct Request {
     pub url: String,
     pub format: Format,
     pub quality: Quality,
+    pub options: DownloadOptions,
 }
 
 /// Метаданные ролика, полученные до начала загрузки.
@@ -230,6 +255,12 @@ pub struct MediaInfo {
     /// отдельным событием: `-J` отдаёт только ссылку, а тянуть по ней байты —
     /// это ещё один запрос в сеть.
     pub thumbnail_url: Option<String>,
+    /// Есть ли у ролика собственные субтитры — те, что выложил автор.
+    ///
+    /// Нужно ровно для одного: сказать человеку, что вшивать нечего. `false`
+    /// значит «мы точно знаем, что их нет»; когда `probe` не прошёл вовсе,
+    /// `MediaInfo` до UI не доезжает, и молчать — правильно.
+    pub has_subtitles: bool,
 }
 
 impl MediaInfo {
@@ -562,6 +593,41 @@ mod tests {
         assert_eq!(Quality::default(), Quality::Best);
         assert_eq!(Quality::Best.max_height(), None);
         assert_eq!(Quality::Best.audio_bitrate(), None);
+    }
+
+    /// По умолчанию не вшивается ничего. Стоит одному флажку оказаться
+    /// включённым по умолчанию — и у всех, кто ни разу их не трогал, молча
+    /// изменится содержимое скачанных файлов.
+    #[test]
+    fn nothing_is_embedded_by_default() {
+        let options = DownloadOptions::default();
+        assert!(!options.embed_metadata);
+        assert!(!options.embed_thumbnail);
+        assert!(!options.embed_subs);
+        assert!(!options.any());
+    }
+
+    /// `any()` обязан замечать каждый флажок по отдельности: на нём держится
+    /// проверка наличия ffmpeg, и пропущенная галочка означает загрузку,
+    /// сорвавшуюся на постобработке.
+    #[test]
+    fn any_notices_every_single_checkbox() {
+        for options in [
+            DownloadOptions {
+                embed_metadata: true,
+                ..DownloadOptions::default()
+            },
+            DownloadOptions {
+                embed_thumbnail: true,
+                ..DownloadOptions::default()
+            },
+            DownloadOptions {
+                embed_subs: true,
+                ..DownloadOptions::default()
+            },
+        ] {
+            assert!(options.any(), "{options:?}: галочка не замечена");
+        }
     }
 
     #[test]

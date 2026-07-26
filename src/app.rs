@@ -8,8 +8,8 @@ use eframe::egui;
 use crate::engine::setup;
 use crate::engine::{self, Handle, MetaTask, metadata};
 use crate::model::{
-    Event, Format, MediaInfo, Progress, Quality, Request, Tag, human_bytes, human_duration,
-    human_speed, looks_like_url, meta_kind,
+    DownloadOptions, Event, Format, MediaInfo, Progress, Quality, Request, Tag, human_bytes,
+    human_duration, human_speed, looks_like_url, meta_kind,
 };
 use crate::theme;
 
@@ -237,6 +237,13 @@ pub struct SavioApp {
     /// Выбранная ступень качества. Отдельно от формата, как и в модели:
     /// переключение MP4 ↔ MP3 не должно её сбрасывать.
     quality: Quality,
+    /// Галочки «вшить метаданные / обложку / субтитры».
+    options: DownloadOptions,
+    /// ffmpeg не нашёлся при последней проверке. Снимок с запуска (и с конца
+    /// установки) — единственное, что можно спросить, не трогая диск в кадре.
+    /// Нужен, чтобы предупредить о бесполезных галочках **до** нажатия
+    /// «Скачать»; окончательное слово всё равно за движком в момент запуска.
+    ffmpeg_missing: bool,
     out_dir: Option<PathBuf>,
     state: State,
     progress: Progress,
@@ -315,6 +322,8 @@ impl SavioApp {
             url: String::new(),
             format: Format::Mp4,
             quality: Quality::default(),
+            options: DownloadOptions::default(),
+            ffmpeg_missing: false,
             out_dir_display: display_dir(out_dir.as_deref()),
             out_dir,
             state: State::Idle,
@@ -341,6 +350,8 @@ impl SavioApp {
             maximize_pending: true,
         };
 
+        app.ffmpeg_missing = !engine::has_ffmpeg();
+
         let what = setup::missing();
         if what.any() {
             let (tx, rx) = channel();
@@ -365,6 +376,8 @@ impl SavioApp {
         self.rx = None;
         self.handle = None;
         self.setup_error = engine::discover().err();
+        // Ради этой строки установка и затевалась: до неё ffmpeg могло не быть.
+        self.ffmpeg_missing = !engine::has_ffmpeg();
         self.stage.clear();
         self.progress = Progress::default();
         self.progress_line.clear();
@@ -441,6 +454,7 @@ impl SavioApp {
             url: self.url.trim().to_owned(),
             format: self.format,
             quality: self.quality,
+            options: self.options,
         };
 
         match engine::start(request, out_dir, tx, move || notify_ctx.request_repaint()) {
@@ -977,6 +991,10 @@ impl SavioApp {
                 self.quality_selector(ui);
 
                 ui.add_space(14.0);
+                field_label(ui, "Вшить в файл");
+                self.embed_options(ui);
+
+                ui.add_space(14.0);
                 field_label(ui, "Папка сохранения");
                 self.folder_row(ui);
 
@@ -1095,15 +1113,83 @@ impl SavioApp {
 
         if !self.quality_note.is_empty() {
             ui.add_space(6.0);
-            // `wrap()` обязателен: без него длинная оговорка ушла бы за
-            // кромку окна одной строкой — см. комментарий в `banner`.
-            ui.add(
-                egui::Label::new(
-                    egui::RichText::new(&self.quality_note)
-                        .small()
-                        .color(theme::TEXT_SECONDARY),
-                )
-                .wrap(),
+            note(ui, &self.quality_note, theme::TEXT_SECONDARY);
+        }
+    }
+
+    /// Три галочки «вшить в файл».
+    ///
+    /// Столбиком, а не в строку: подписи русские и длинные, а в горизонтальной
+    /// раскладке egui берёт для текста режим `Extend` — три штуки подряд в окне
+    /// шириной 520 ушли бы за правую кромку. Столбик переносится сам.
+    fn embed_options(&mut self, ui: &mut egui::Ui) {
+        // Субтитры бывают только у видео: в MP3 их положить некуда. Галочку
+        // гасим, но причину говорим по наведению — молча выключенный элемент
+        // выглядит поломкой, а не запретом.
+        let subs_enabled = self.format == Format::Mp4;
+
+        ui.scope(|ui| {
+            // Штатная строка виджета — 32 точки (высота поля ввода). Для галочки
+            // это много: три подряд съели бы четверть окна минимальной высоты.
+            ui.spacing_mut().interact_size.y = 24.0;
+
+            let v = ui.visuals_mut();
+            // `noninteractive` в списке не для полноты: выключенную галочку
+            // egui рисует именно им, и без него она осталась бы с чужим
+            // скруглением, то есть кружком-радиокнопкой.
+            for state in [
+                &mut v.widgets.noninteractive,
+                &mut v.widgets.inactive,
+                &mut v.widgets.hovered,
+                &mut v.widgets.active,
+            ] {
+                // Галочку egui рисует цветом `fg_stroke` — тем же, каким красит
+                // подпись рядом. Акцент нужен только самой галочке (в покое
+                // коробка пуста, и без цвета выбранное не отличить от
+                // невыбранного), поэтому подписям цвет задаётся отдельно,
+                // через `RichText`: он перебивает цвет по умолчанию.
+                state.fg_stroke = egui::Stroke::new(1.6, theme::ACCENT);
+                state.corner_radius = egui::CornerRadius::same(theme::RADIUS_TINY);
+                state.expansion = 0.0;
+            }
+            // Коробка «утоплена», как поле ввода и дорожка переключателя: на
+            // заливке карточки она иначе держится на одной тонкой рамке.
+            v.widgets.inactive.bg_fill = theme::BG_INPUT;
+
+            checkbox(
+                ui,
+                &mut self.options.embed_metadata,
+                "Метаданные: название, автор, дата",
+                true,
+            );
+            checkbox(ui, &mut self.options.embed_thumbnail, "Обложку ролика", true);
+            checkbox(ui, &mut self.options.embed_subs, "Субтитры", subs_enabled)
+                .on_disabled_hover_text("Субтитры бывают только у видео — выберите MP4.");
+        });
+
+        // Обе оговорки ниже — статические строки: в кадре ничего не собирается.
+        if self.ffmpeg_missing && self.options.any() {
+            ui.add_space(6.0);
+            note(
+                ui,
+                "Вшивать нечем: ffmpeg не найден. Файл скачается, но без \
+                 метаданных, обложки и субтитров.",
+                theme::STATE_WARNING,
+            );
+        }
+
+        // Говорим только тогда, когда знаем наверняка: `probe` уже ответил,
+        // и собственных субтитров у ролика нет. Молчание здесь честнее догадки.
+        if self.options.embed_subs
+            && subs_enabled
+            && self.info.as_ref().is_some_and(|info| !info.has_subtitles)
+        {
+            ui.add_space(6.0);
+            note(
+                ui,
+                "У этого ролика нет своих субтитров — вшивать нечего. \
+                 Автоматические Savio не берёт: их пишет робот, и в них ошибки.",
+                theme::TEXT_SECONDARY,
             );
         }
     }
@@ -1879,6 +1965,34 @@ fn segment_button(ui: &mut egui::Ui, label: &str, selected: bool, width: f32) ->
             .clicked()
     })
     .inner
+}
+
+/// Одна галочка «вшить в файл».
+///
+/// Цвет подписи задаём явно и не полагаемся на стиль: egui красит текст
+/// флажка тем же `fg_stroke`, которым рисует саму галочку, а он у нас
+/// акцентный — иначе весь список подписей стал бы жёлтым.
+fn checkbox(
+    ui: &mut egui::Ui,
+    checked: &mut bool,
+    label: &'static str,
+    enabled: bool,
+) -> egui::Response {
+    ui.add_enabled(
+        enabled,
+        egui::Checkbox::new(
+            checked,
+            egui::RichText::new(label).color(theme::TEXT_PRIMARY),
+        ),
+    )
+}
+
+/// Мелкая оговорка под элементом управления.
+///
+/// `wrap()` обязателен: без него длинная строка ушла бы за кромку окна
+/// и растянула бы содержимое прокрутки — см. комментарий в `banner`.
+fn note(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
+    ui.add(egui::Label::new(egui::RichText::new(text).small().color(color)).wrap());
 }
 
 fn field_label(ui: &mut egui::Ui, text: &'static str) {
