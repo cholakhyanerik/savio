@@ -207,6 +207,85 @@ impl Tag {
     }
 }
 
+/// Откуда взять cookies для роликов, которые без входа в аккаунт не отдаются.
+///
+/// Перечисление, а не строка из поля ввода: значение уходит прямо в аргумент
+/// `--cookies-from-browser`, и список имён, которые yt-dlp понимает, закрытый.
+/// Со свободным вводом опечатка оборачивалась бы английской руганью вместо
+/// выбора из того, что заведомо работает.
+///
+/// Safari в списке нет, хотя yt-dlp его знает, и это не забывчивость. На
+/// Windows и Linux он отвечает `unsupported platform` (проверено вживую,
+/// yt-dlp 2026.07.04), а на macOS база cookies лежит под защитой системы и
+/// читается только приложением с «Полным доступом к диску» — у неподписанного
+/// Savio его нет. Пункт, который заведомо не сработает, хуже отсутствующего.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum CookieSource {
+    /// Не передавать cookies вовсе — ровно то, что Savio делал до появления
+    /// этого выбора. Значение по умолчанию и единственное безопасное: читать
+    /// чужой профиль браузера мы начинаем только по прямой просьбе.
+    #[default]
+    None,
+    Chrome,
+    Edge,
+    Firefox,
+    Opera,
+    Brave,
+    Vivaldi,
+    Chromium,
+}
+
+impl CookieSource {
+    /// Все источники в том порядке, в каком их рисует выпадающий список.
+    ///
+    /// «Не использовать» первым: это и значение по умолчанию, и то, к чему
+    /// возвращаются, когда cookies сделали хуже (см. `explain_failure`).
+    pub const ALL: [CookieSource; 8] = [
+        CookieSource::None,
+        CookieSource::Chrome,
+        CookieSource::Edge,
+        CookieSource::Firefox,
+        CookieSource::Opera,
+        CookieSource::Brave,
+        CookieSource::Vivaldi,
+        CookieSource::Chromium,
+    ];
+
+    /// Имя браузера в том виде, в каком его понимает `--cookies-from-browser`.
+    ///
+    /// `None` — cookies не нужны, и ключа в командной строке не будет вовсе.
+    /// Имена строчные и без пробелов: yt-dlp сверяет их со своим списком
+    /// дословно и на любое другое написание отвечает отказом.
+    pub fn browser(self) -> Option<&'static str> {
+        match self {
+            CookieSource::None => Option::None,
+            CookieSource::Chrome => Some("chrome"),
+            CookieSource::Edge => Some("edge"),
+            CookieSource::Firefox => Some("firefox"),
+            CookieSource::Opera => Some("opera"),
+            CookieSource::Brave => Some("brave"),
+            CookieSource::Vivaldi => Some("vivaldi"),
+            CookieSource::Chromium => Some("chromium"),
+        }
+    }
+
+    /// Подпись в списке. Полные имена, а не токены yt-dlp: в списке человек
+    /// ищет свой браузер глазами, и «Mozilla Firefox» узнаётся быстрее, чем
+    /// «firefox».
+    pub fn label(self) -> &'static str {
+        match self {
+            CookieSource::None => "Не использовать",
+            CookieSource::Chrome => "Google Chrome",
+            CookieSource::Edge => "Microsoft Edge",
+            CookieSource::Firefox => "Mozilla Firefox",
+            CookieSource::Opera => "Opera",
+            CookieSource::Brave => "Brave",
+            CookieSource::Vivaldi => "Vivaldi",
+            CookieSource::Chromium => "Chromium",
+        }
+    }
+}
+
 /// Что дополнительно вшить в готовый файл.
 ///
 /// Плоская структура из трёх флажков, а не варианты перечисления: галочки
@@ -242,6 +321,13 @@ pub struct Request {
     pub format: Format,
     pub quality: Quality,
     pub options: DownloadOptions,
+    /// Откуда взять вход в аккаунт. Поле запроса, а не четвёртый флажок внутри
+    /// `DownloadOptions`: там собрано то, что вшивается в готовый файл, и
+    /// держится на этом `any()` — единственная проверка «нужен ли ffmpeg».
+    /// Cookies к ffmpeg отношения не имеют, и попади они в ту же структуру,
+    /// первый же, кто честно допишет их в `any()`, начнёт ругаться на
+    /// отсутствие ffmpeg там, где он не нужен.
+    pub cookies: CookieSource,
 }
 
 /// Метаданные ролика, полученные до начала загрузки.
@@ -638,6 +724,61 @@ mod tests {
             },
         ] {
             assert!(options.any(), "{options:?}: галочка не замечена");
+        }
+    }
+
+    /// Cookies не передаются, пока их не попросили. Переедь `#[default]`
+    /// на любой браузер — и Savio у всех, кто ни разу не открывал этот
+    /// список, начал бы молча читать профиль браузера.
+    #[test]
+    fn cookies_are_off_by_default() {
+        assert_eq!(CookieSource::default(), CookieSource::None);
+        assert_eq!(CookieSource::None.browser(), None);
+        assert_eq!(CookieSource::ALL[0], CookieSource::None);
+    }
+
+    /// Имя браузера уходит в командную строку дословно, и yt-dlp сверяет его
+    /// со своим списком буква в букву. Заглавная буква или пробел — отказ
+    /// вместо загрузки, причём такой, которого не увидят ни сборка, ни clippy.
+    #[test]
+    fn browser_tokens_are_written_the_way_ytdlp_reads_them() {
+        // Список yt-dlp 2026.07.04 целиком, минус `safari` и `whale`:
+        // первый не работает ни на Windows, ни на Linux, второй — корейский
+        // браузер, которого нет в нашем списке.
+        const SUPPORTED: [&str; 7] = [
+            "brave", "chrome", "chromium", "edge", "firefox", "opera", "vivaldi",
+        ];
+
+        let mut seen = Vec::new();
+        for source in CookieSource::ALL {
+            let Some(browser) = source.browser() else {
+                assert_eq!(source, CookieSource::None, "{source:?}: браузер без имени");
+                continue;
+            };
+            assert!(
+                SUPPORTED.contains(&browser),
+                "{browser}: yt-dlp такого браузера не знает"
+            );
+            assert!(
+                browser.chars().all(|c| c.is_ascii_lowercase()),
+                "{browser}: yt-dlp принимает только строчные имена без пробелов"
+            );
+            assert!(!seen.contains(&browser), "{browser}: повтор в списке");
+            seen.push(browser);
+        }
+        assert_eq!(seen.len(), CookieSource::ALL.len() - 1);
+    }
+
+    /// Подписи в списке человек читает глазами: одинаковые или пустые
+    /// превратили бы выбор в угадайку.
+    #[test]
+    fn cookie_labels_are_distinct() {
+        let mut seen: Vec<&str> = Vec::new();
+        for source in CookieSource::ALL {
+            let label = source.label();
+            assert!(!label.trim().is_empty(), "{source:?}: пустая подпись");
+            assert!(!seen.contains(&label), "{label}: подпись повторяется");
+            seen.push(label);
         }
     }
 

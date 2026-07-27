@@ -107,7 +107,7 @@ fn run(
 
     // Метаданные тянем отдельным быстрым вызовом, чтобы показать название
     // ещё до старта загрузки. Если не вышло — не страшно, идём дальше.
-    if let Some(info) = probe(&request.url, tools) {
+    if let Some(info) = probe(request, tools) {
         // Адрес забираем до отправки: `Info` уходит в UI вместе со структурой.
         let cover = info.thumbnail_url.clone();
         // Провал отправки означает, что приёмник закрыт, то есть загрузку уже
@@ -248,7 +248,11 @@ fn run(
             })
             .unwrap_or_default();
 
-        Err(ytdlp::explain_failure(status.code().unwrap_or(-1), &tail))
+        Err(ytdlp::explain_failure(
+            status.code().unwrap_or(-1),
+            &tail,
+            request.cookies,
+        ))
     }
 }
 
@@ -303,9 +307,14 @@ pub fn start_metadata(
 /// Разбор ответа (в том числе списка доступных высот) идёт здесь, на потоке
 /// движка, а не в UI: `-J` у длинного плейлиста весит мегабайты, и разбирать
 /// его в кадре отрисовки нельзя.
-fn probe(url: &str, tools: &Tools) -> Option<crate::model::MediaInfo> {
+///
+/// Берём весь `Request`, а не одну ссылку: спрашивать надо тем же, чем потом
+/// качаем, — вместе с cookies. Иначе у закрытого ролика этот вызов молча
+/// провалится, и человек будет смотреть на пустую карточку у загрузки,
+/// которая на самом деле идёт.
+fn probe(request: &Request, tools: &Tools) -> Option<crate::model::MediaInfo> {
     let mut cmd = Command::new(&tools.ytdlp);
-    cmd.args(ytdlp::probe_args(url))
+    cmd.args(ytdlp::probe_args(&request.url, request.cookies))
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .stdin(Stdio::null());

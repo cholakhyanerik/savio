@@ -9,8 +9,8 @@ use crate::engine::settings;
 use crate::engine::setup;
 use crate::engine::{self, Handle, MetaTask, metadata};
 use crate::model::{
-    DownloadOptions, Event, Format, MediaInfo, Progress, Quality, Request, Tag, human_bytes,
-    human_duration, human_speed, looks_like_url, meta_kind,
+    CookieSource, DownloadOptions, Event, Format, MediaInfo, Progress, Quality, Request, Tag,
+    human_bytes, human_duration, human_speed, looks_like_url, meta_kind,
 };
 use crate::theme;
 
@@ -30,6 +30,14 @@ const PREVIEW_WIDTH: f32 = 240.0;
 /// 427 точек — больше, чем всё окно минимальной высоты (420). С потолком такая
 /// картинка просто становится узкой, а не выдавливает содержимое в прокрутку.
 const PREVIEW_MAX_HEIGHT: f32 = 150.0;
+
+/// Потолок высоты раскрытого списка браузеров.
+///
+/// Считается от числа источников, а не подобран на глаз: добавится браузер —
+/// список подрастёт сам, и никто не будет гадать, почему последний пункт
+/// уехал в прокрутку. 28 — строка списка (26 точек) плюс промежуток (2),
+/// 12 — поля рамки меню сверху и снизу.
+const COOKIE_LIST_HEIGHT: f32 = CookieSource::ALL.len() as f32 * 28.0 + 12.0;
 
 /// Сколько секунд висит подпись «Скопировано» после нажатия.
 ///
@@ -319,6 +327,13 @@ pub struct SavioApp {
     quality: Quality,
     /// Галочки «вшить метаданные / обложку / субтитры».
     options: DownloadOptions,
+    /// Из какого браузера брать вход в аккаунт.
+    ///
+    /// Между запусками намеренно не запоминается, в отличие от формата,
+    /// качества и папки: это доступ к чужому профилю браузера, и включаться
+    /// он должен осознанно, а не сам собой через неделю после того, как
+    /// понадобился один раз.
+    cookies: CookieSource,
     /// ffmpeg не нашёлся при последней проверке. Снимок с запуска (и с конца
     /// установки) — единственное, что можно спросить, не трогая диск в кадре.
     /// Нужен, чтобы предупредить о бесполезных галочках **до** нажатия
@@ -415,6 +430,7 @@ impl SavioApp {
             format: saved.format,
             quality: saved.quality,
             options: DownloadOptions::default(),
+            cookies: CookieSource::default(),
             ffmpeg_missing: false,
             out_dir_display: display_dir(out_dir.as_deref()),
             out_dir,
@@ -565,6 +581,7 @@ impl SavioApp {
             format: self.format,
             quality: self.quality,
             options: self.options,
+            cookies: self.cookies,
         };
 
         match engine::start(request, out_dir, tx, move || notify_ctx.request_repaint()) {
@@ -1145,6 +1162,10 @@ impl SavioApp {
                 self.embed_options(ui);
 
                 ui.add_space(14.0);
+                field_label(ui, "Cookies из браузера");
+                self.cookie_selector(ui);
+
+                ui.add_space(14.0);
                 field_label(ui, "Папка сохранения");
                 self.folder_row(ui);
 
@@ -1342,6 +1363,78 @@ impl SavioApp {
                 "У этого ролика нет своих субтитров — вшивать нечего. \
                  Автоматические Savio не берёт: их пишет робот, и в них ошибки.",
                 theme::TEXT_SECONDARY,
+            );
+        }
+    }
+
+    /// Выпадающий список «взять вход из браузера».
+    ///
+    /// Список, а не поле ввода: имена браузеров принадлежат yt-dlp, их список
+    /// закрытый, и опечатка в нём обернулась бы английской руганью вместо
+    /// загрузки.
+    ///
+    /// Оговорка под ним меняется вместе с выбором и в обоих случаях статична —
+    /// в кадре отрисовки здесь ничего не собирается.
+    fn cookie_selector(&mut self, ui: &mut egui::Ui) {
+        // Ширину берём до `ComboBox`: внутри он заводит свою горизонтальную
+        // раскладку, и `available_width` там уже другая.
+        let width = ui.available_width();
+
+        ui.scope(|ui| {
+            let v = ui.visuals_mut();
+            // Список — такое же поле ввода, как ссылка и дорожки
+            // переключателей, поэтому и «утоплен» глубже карточки. Иначе на
+            // заливке `BG_SURFACE` он держался бы на одной тонкой рамке.
+            // `open` в списке обязателен: пока раскрыт список, egui рисует
+            // кнопку именно этим состоянием, и без него она бы перекрашивалась
+            // в момент нажатия.
+            for state in [&mut v.widgets.inactive, &mut v.widgets.open] {
+                state.weak_bg_fill = theme::BG_INPUT;
+            }
+            v.widgets.hovered.weak_bg_fill = theme::BG_ELEVATED;
+
+            egui::ComboBox::from_id_salt("savio-cookies")
+                .selected_text(self.cookies.label())
+                .width(width)
+                // Список обязан помещаться целиком. У egui потолок раскрытого
+                // списка — `combo_height`, то есть 200 точек: при штатной
+                // строке в 32 точки туда влезает пять пунктов из восьми,
+                // а остальные три уезжают в прокрутку, полосы которой в покое
+                // не видно. В окне минимального размера это выглядит так,
+                // будто браузеров всего пять.
+                .height(COOKIE_LIST_HEIGHT)
+                .show_ui(ui, |ui| {
+                    // Строки в списке плотнее, чем кнопки на экране: восемь
+                    // штатных строк не поместились бы и в окно минимальной
+                    // высоты (420), а для меню 26 точек — обычный размер.
+                    let spacing = ui.spacing_mut();
+                    spacing.interact_size.y = 26.0;
+                    spacing.button_padding.y = 3.0;
+                    spacing.item_spacing.y = 2.0;
+
+                    for source in CookieSource::ALL {
+                        ui.selectable_value(&mut self.cookies, source, source.label());
+                    }
+                });
+        });
+
+        ui.add_space(6.0);
+        if self.cookies.browser().is_some() {
+            note(
+                ui,
+                "Закройте браузер перед загрузкой: пока он открыт, файл cookies \
+                 занят и не читается. И учтите: у YouTube cookies чаще мешают — \
+                 сайт отвечает пустым списком дорожек. Перестало скачиваться — \
+                 верните «Не использовать».",
+                theme::STATE_WARNING,
+            );
+        } else {
+            note(
+                ui,
+                "Для возрастных, приватных и «подтвердите, что вы не робот» \
+                 роликов: Savio возьмёт из браузера ваш вход на сайт. Обычные \
+                 ссылки скачиваются и без этого.",
+                theme::TEXT_MUTED,
             );
         }
     }

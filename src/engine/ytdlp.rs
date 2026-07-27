@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::binaries::Tools;
-use crate::model::{Format, MediaInfo, Progress, Quality, Request};
+use crate::model::{CookieSource, Format, MediaInfo, Progress, Quality, Request};
 
 /// Каждое поле, способное прийти пустым, обязано иметь `|default`.
 /// Иначе yt-dlp подставит голое `NA` без кавычек и сломает JSON —
@@ -31,13 +31,28 @@ const POSTPROCESS_TEMPLATE: &str = concat!(
 /// На этой стадии `--print` не включает `--simulate`, поэтому загрузка идёт как обычно.
 const DONE_TEMPLATE: &str = r#"after_move:{"event":"done","path":%(filepath)j}"#;
 
-pub fn probe_args(url: &str) -> Vec<String> {
-    vec![
+pub fn probe_args(url: &str, cookies: CookieSource) -> Vec<String> {
+    let mut args: Vec<String> = vec![
         "-J".into(),
         "--no-playlist".into(),
         "--no-warnings".into(),
-        url.into(),
-    ]
+    ];
+    push_cookies(&mut args, cookies);
+    args.push(url.into());
+    args
+}
+
+/// Дописывает `--cookies-from-browser`, если пользователь выбрал браузер.
+///
+/// Общая для `probe_args` и `download_args` намеренно: спрашивать сайт двумя
+/// разными личностями нельзя. У закрытого ролика анонимный `-J` проваливается,
+/// и человек получил бы пустую карточку — без названия, длительности и обложки —
+/// у загрузки, которая на самом деле идёт и заканчивается файлом на диске.
+fn push_cookies(args: &mut Vec<String>, cookies: CookieSource) {
+    if let Some(browser) = cookies.browser() {
+        args.push("--cookies-from-browser".into());
+        args.push(browser.to_owned());
+    }
 }
 
 /// Собирает значение `-f` для видео.
@@ -142,6 +157,8 @@ pub fn download_args(request: &Request, out_dir: &Path, tools: &Tools) -> Vec<St
         }
     }
 
+    push_cookies(&mut args, request.cookies);
+
     args.push(request.url.clone());
     args
 }
@@ -239,13 +256,48 @@ const SUPPORTED_SITES: &str =
 /// Неподдерживаемого сайта в таблице нет: его объяснение подставляет ссылку
 /// на список сайтов, а в константе форматировать нечем.
 const FAILURE_HINTS: &[(&[&str], &str)] = &[
+    // Три приметы ниже — про сами cookies, и стоят они выше остальных
+    // намеренно: пока браузер не отдал cookies, ни возраста, ни приватности
+    // yt-dlp даже не проверял. Все формулировки сняты с живого вывода
+    // (yt-dlp 2026.07.04, Windows 11), а не выписаны из документации.
+    (
+        // «Could not copy Chrome cookie database» — и слово «Chrome» здесь
+        // **захардкожено**: ровно этот текст пришёл на выбранный Edge.
+        // Поэтому в объяснении браузер не называем.
+        //
+        // Примета — только «cookie database», без «could not copy»: последнее
+        // слишком общее и однажды поймает чужую беду, а совет «закройте
+        // браузер» к ней не подойдёт. С «cookies database» из соседней приметы
+        // (браузера нет вовсе) эта не пересекается: там «cookies» с «s».
+        &["cookie database"],
+        "Браузер не отдал cookies: файл занят.\n\n\
+         Пока браузер работает, он держит свою базу cookies открытой, и \
+         прочитать её нельзя. Закройте браузер полностью — вместе со значком \
+         в области уведомлений — и попробуйте снова.",
+    ),
+    (
+        &["decrypt with dpapi", "failed to decrypt cookie"],
+        "Этот браузер не отдаёт cookies.\n\n\
+         Chrome и браузеры на его основе (Edge, Brave, Opera, Vivaldi) в \
+         свежих версиях шифруют cookies так, что снаружи их не прочитать. \
+         Это защита самого браузера, обойти её Savio не может. Выберите \
+         в списке Firefox — его cookies читаются.",
+    ),
+    (
+        &["cookies database in", "could not find cookies"],
+        "В этом браузере cookies не нашлись.\n\n\
+         Savio не нашёл его базу cookies: скорее всего браузер не установлен \
+         или вы ни разу его не открывали. Выберите тот браузер, в котором \
+         открыт нужный сайт.",
+    ),
     (
         &["not a bot"],
         "Сайт требует подтвердить, что вы не робот.\n\n\
          Так отвечают, когда с вашего адреса приходит слишком много запросов. \
          Нажмите «Обновить движок» и попробуйте снова через несколько минут. \
          Если включён VPN — выключите его: одним адресом пользуются многие, \
-         и проверка на нём срабатывает чаще.",
+         и проверка на нём срабатывает чаще. А если вы вошли на этот сайт \
+         в браузере — выберите его в списке «Cookies из браузера».",
     ),
     (
         &[
@@ -255,16 +307,18 @@ const FAILURE_HINTS: &[(&[&str], &str)] = &[
             "inappropriate for some users",
         ],
         "Видео с возрастным ограничением.\n\n\
-         Сайт отдаёт его только тем, кто вошёл в аккаунт, а Savio входить \
-         не умеет. Иногда помогает «Обновить движок»: свежий yt-dlp обходит \
+         Сайт отдаёт его только тем, кто вошёл в аккаунт. Выберите в списке \
+         «Cookies из браузера» тот браузер, где вы вошли, — Savio возьмёт вход \
+         оттуда. Иногда помогает и «Обновить движок»: свежий yt-dlp обходит \
          часть таких проверок.",
     ),
     (
         &["private video", "is private"],
         "Доступ к видео закрыт.\n\n\
          Владелец сделал его приватным — оно отдаётся только тем, кому он \
-         открыл доступ. Savio входить в аккаунт не умеет, поэтому скачать \
-         не получится. Проверьте, нет ли открытой копии по другой ссылке.",
+         открыл доступ. Если доступ открыт вам, выберите в списке «Cookies \
+         из браузера» тот браузер, где вы вошли в аккаунт. Иначе остаётся \
+         поискать открытую копию по другой ссылке.",
     ),
     (
         // «in your country» без отрицания: YouTube строит фразу тремя
@@ -303,7 +357,11 @@ const FAILURE_HINTS: &[(&[&str], &str)] = &[
 /// Подменой диагностики это не становится: каждая строка stderr уходит ещё
 /// и в журнал (`Event::Log`), откуда её можно скопировать целиком. Незнакомый
 /// случай так и остаётся сырым хвостом — догадкой его подменять нельзя.
-pub fn explain_failure(code: i32, tail: &str) -> String {
+///
+/// `cookies` нужен ровно одной подсказке и потому в таблицу не убран: пустой
+/// список дорожек значит совершенно разное с cookies и без них, и различить
+/// эти два случая по хвосту stderr нечем.
+pub fn explain_failure(code: i32, tail: &str, cookies: CookieSource) -> String {
     // Признак ищем по подстроке, а не по началу строки: yt-dlp печатает
     // `ERROR: Unsupported URL: …`, но перед этим может идти префикс
     // экстрактора, а с `--no-warnings` — и вовсе другая раскладка.
@@ -322,6 +380,31 @@ pub fn explain_failure(code: i32, tail: &str) -> String {
     // `to_ascii_lowercase` вместо `to_lowercase`: приметы английские, а
     // трогать чужой юникод в чужой диагностике незачем.
     let lower = tail.to_ascii_lowercase();
+
+    // Самая обидная неудача этой возможности, и обнаружить её можно только
+    // вживую. Проверено (yt-dlp 2026.07.04, 2026-07-27): YouTube на запрос
+    // с cookies из браузера переключается на урезанный ответ плеера, в
+    // котором дорожек нет **вовсе**, — ролик, прекрасно скачивавшийся
+    // минуту назад, перестаёт скачиваться совсем. Формулировка отказа при
+    // этом зависит от того, был ли `-f`: у видео это «Requested format is
+    // not available», у MP3 (там `-x` без `-f`) — «No video formats found».
+    //
+    // Без этой ветки человек получил бы совет из соседней таблицы про
+    // качество или сырой английский хвост — и никогда бы не догадался, что
+    // виноват список, который он сам только что переключил.
+    if cookies.browser().is_some()
+        && (lower.contains("requested format is not available")
+            || lower.contains("no video formats found"))
+    {
+        return "Сайт не отдал ни одной дорожки — похоже, из-за cookies.\n\n\
+                Верните в списке «Cookies из браузера» пункт «Не использовать» \
+                и попробуйте снова. YouTube почти всегда отвечает так на запрос \
+                с cookies: он переключается на урезанный ответ, в котором \
+                дорожек нет вовсе. Включать cookies стоит только для тех \
+                роликов, которые без них не скачиваются."
+            .to_owned();
+    }
+
     for (phrases, message) in FAILURE_HINTS {
         if phrases.iter().any(|phrase| lower.contains(phrase)) {
             return (*message).to_owned();
@@ -513,7 +596,9 @@ fn parse_heights(formats: Option<&serde_json::Value>) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::DownloadOptions;
+    use crate::model::{CookieSource, DownloadOptions};
+
+    const COOKIE_FLAG: &str = "--cookies-from-browser";
 
     /// Строки взяты из реального вывода yt-dlp: префикса `download:` в них
     /// нет — он остаётся в аргументах, а не в потоке.
@@ -576,7 +661,7 @@ mod tests {
     #[test]
     fn unsupported_site_is_explained_not_dumped() {
         let tail = "ERROR: Unsupported URL: https://kinobase.org/film/204049-menyu";
-        let message = explain_failure(1, tail);
+        let message = explain_failure(1, tail, CookieSource::None);
 
         assert!(
             message.contains("не поддерживается"),
@@ -628,7 +713,7 @@ mod tests {
         ];
 
         for (tail, expected) in cases {
-            let message = explain_failure(1, tail);
+            let message = explain_failure(1, tail, CookieSource::None);
             assert!(
                 message.contains(expected),
                 "нет объяснения «{expected}»: {message}"
@@ -646,7 +731,7 @@ mod tests {
     #[test]
     fn common_words_do_not_trigger_a_hint() {
         let tail = "ERROR: unable to rename file: Usage message from /page/1";
-        let message = explain_failure(1, tail);
+        let message = explain_failure(1, tail, CookieSource::None);
         assert!(message.contains(tail), "подсказка сработала зря: {message}");
     }
 
@@ -655,21 +740,21 @@ mod tests {
     #[test]
     fn other_failures_keep_their_output() {
         let tail = "ERROR: unable to rename file: Permission denied";
-        let message = explain_failure(1, tail);
+        let message = explain_failure(1, tail, CookieSource::None);
         assert!(message.contains("код 1"), "{message}");
         assert!(message.contains(tail), "хвост stderr обязан остаться: {message}");
 
         // Коды с готовой подсказкой и пустой хвост — поведение прежнее.
         assert_eq!(
-            explain_failure(101, ""),
+            explain_failure(101, "", CookieSource::None),
             "Ошибка (код 101): загрузка остановлена (лимит или файл уже есть)"
         );
         assert_eq!(
-            explain_failure(2, ""),
+            explain_failure(2, "", CookieSource::None),
             "Ошибка (код 2): yt-dlp не принял аргументы — это баг Savio"
         );
         assert_eq!(
-            explain_failure(-1, ""),
+            explain_failure(-1, "", CookieSource::None),
             "Ошибка (код -1): yt-dlp завершился с ошибкой без подробностей"
         );
     }
@@ -870,11 +955,22 @@ mod tests {
         options: DownloadOptions,
         ffmpeg: bool,
     ) -> Vec<String> {
+        args_full(format, quality, options, ffmpeg, CookieSource::None)
+    }
+
+    fn args_full(
+        format: Format,
+        quality: Quality,
+        options: DownloadOptions,
+        ffmpeg: bool,
+        cookies: CookieSource,
+    ) -> Vec<String> {
         let request = Request {
             url: "https://example.com/video".to_owned(),
             format,
             quality,
             options,
+            cookies,
         };
         download_args(&request, &PathBuf::from("out"), &fake_tools(ffmpeg))
     }
@@ -1085,6 +1181,193 @@ mod tests {
                 parse_media_info(json).has_subtitles,
                 expected,
                 "вход: {json}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Cookies
+    // -----------------------------------------------------------------------
+
+    /// Пока браузер не выбран, командная строка обязана остаться прежней —
+    /// и у загрузки, и у запроса метаданных. Лишний `--cookies-from-browser`
+    /// здесь означал бы чтение чужого профиля браузера без просьбы.
+    #[test]
+    fn cookies_are_not_requested_until_asked() {
+        for format in [Format::Mp4, Format::Mp3] {
+            let args = args_for(format, Quality::Best);
+            assert!(!has(&args, COOKIE_FLAG), "{format:?}: непрошеные cookies");
+        }
+        let probe = probe_args("https://example.com/video", CookieSource::None);
+        assert!(!has(&probe, COOKIE_FLAG), "непрошеные cookies у -J");
+        // Прежний состав `-J` при этом не поехал: ссылка идёт последней.
+        assert_eq!(
+            probe,
+            vec![
+                "-J",
+                "--no-playlist",
+                "--no-warnings",
+                "https://example.com/video"
+            ]
+        );
+    }
+
+    /// Выбранный браузер обязан доехать до командной строки — и именно тем
+    /// именем, которое понимает yt-dlp.
+    #[test]
+    fn chosen_browser_reaches_the_command_line() {
+        for source in CookieSource::ALL {
+            let Some(browser) = source.browser() else {
+                continue;
+            };
+            let args = args_full(
+                Format::Mp4,
+                Quality::Best,
+                DownloadOptions::default(),
+                true,
+                source,
+            );
+            assert_eq!(
+                value_of(&args, COOKIE_FLAG),
+                Some(browser),
+                "{source:?}: браузер не доехал до аргументов"
+            );
+            // Ссылка обязана остаться последней: `--cookies-from-browser`
+            // берёт следующее слово как своё значение, и вклинься он между
+            // ключом и ссылкой — качать стали бы браузер.
+            assert_eq!(
+                args.last().map(String::as_str),
+                Some("https://example.com/video"),
+                "{source:?}: ссылка перестала быть последней"
+            );
+        }
+    }
+
+    /// Метаданные и сам файл обязаны спрашиваться одной и той же личностью.
+    /// Разойдись они — у закрытого ролика `-J` провалится, и человек увидит
+    /// пустую карточку у загрузки, которая на самом деле идёт.
+    #[test]
+    fn probe_asks_with_the_same_cookies_as_the_download() {
+        for source in CookieSource::ALL {
+            let download = args_full(
+                Format::Mp4,
+                Quality::Best,
+                DownloadOptions::default(),
+                true,
+                source,
+            );
+            let probe = probe_args("https://example.com/video", source);
+            assert_eq!(
+                value_of(&probe, COOKIE_FLAG),
+                value_of(&download, COOKIE_FLAG),
+                "{source:?}: `-J` и загрузка спрашивают по-разному"
+            );
+        }
+    }
+
+    /// Cookies не должны трогать ничего остального: отбор дорожек, вшивание
+    /// и звук остаются теми же, что и без них.
+    #[test]
+    fn cookies_do_not_disturb_the_rest_of_the_command() {
+        let plain = args_with(Format::Mp4, Quality::P720, all_options(), true);
+        let with_cookies = args_full(
+            Format::Mp4,
+            Quality::P720,
+            all_options(),
+            true,
+            CookieSource::Firefox,
+        );
+        assert_eq!(value_of(&plain, "-f"), value_of(&with_cookies, "-f"));
+        for flag in EMBED_FLAGS {
+            assert_eq!(has(&plain, flag), has(&with_cookies, flag), "разъехался {flag}");
+        }
+        assert_eq!(with_cookies.len(), plain.len() + 2, "лишние аргументы");
+    }
+
+    /// Хвосты сняты с живого вывода yt-dlp 2026.07.04 на Windows 11 —
+    /// выдумать их нельзя, а промах подстроки не ловится ничем.
+    #[test]
+    fn cookie_failures_are_explained_in_russian() {
+        let cases = [
+            // Браузер работает и держит базу открытой. Слово «Chrome» в этом
+            // сообщении захардкожено: выбран был Edge.
+            (
+                "ERROR: Could not copy Chrome cookie database. See  \
+                 https://github.com/yt-dlp/yt-dlp/issues/7271  for more info",
+                "Закройте браузер",
+            ),
+            // Chrome со свежим шифрованием cookies.
+            (
+                "ERROR: Failed to decrypt with DPAPI. See  \
+                 https://github.com/yt-dlp/yt-dlp/issues/10927  for more info",
+                "Firefox",
+            ),
+            // Браузер не установлен.
+            (
+                r#"ERROR: could not find vivaldi cookies database in "C:\Users\me\AppData\Local\Vivaldi\User Data""#,
+                "не нашлись",
+            ),
+        ];
+
+        for (tail, expected) in cases {
+            let message = explain_failure(1, tail, CookieSource::Edge);
+            assert!(
+                message.contains(expected),
+                "нет объяснения «{expected}»: {message}"
+            );
+            assert!(!message.contains("ERROR"), "утёк сырой вывод: {message}");
+        }
+    }
+
+    /// Приметы «файл занят» и «браузера нет» не должны срабатывать друг
+    /// за друга: разница между ними — одна буква «s» в `cookie(s) database`,
+    /// а советы противоположные («закройте браузер» против «выберите другой»).
+    #[test]
+    fn locked_and_missing_cookie_databases_do_not_swap_hints() {
+        let locked = explain_failure(
+            1,
+            "ERROR: Could not copy Chrome cookie database.",
+            CookieSource::Edge,
+        );
+        let missing = explain_failure(
+            1,
+            "ERROR: could not find brave cookies database in \"C:\\x\"",
+            CookieSource::Brave,
+        );
+        assert!(locked.contains("Закройте браузер"), "{locked}");
+        assert!(!locked.contains("не нашлись"), "{locked}");
+        assert!(missing.contains("не нашлись"), "{missing}");
+        assert!(!missing.contains("Закройте браузер"), "{missing}");
+    }
+
+    /// Главная ловушка задачи, и увидеть её можно только вживую: YouTube на
+    /// запрос с cookies отвечает пустым списком дорожек, то есть ролик,
+    /// скачивавшийся минуту назад, перестаёт скачиваться совсем. Один и тот
+    /// же хвост без cookies значит другое, поэтому объяснение появляется
+    /// только тогда, когда браузер выбран.
+    #[test]
+    fn empty_format_list_blames_cookies_only_when_they_were_used() {
+        let tails = [
+            "ERROR: [youtube] dQw4w9WgXcQ: Requested format is not available. \
+             Use --list-formats for a list of available formats",
+            "ERROR: [youtube] jNQXAC9IVRw: No video formats found!; please report \
+             this issue on  https://github.com/yt-dlp/yt-dlp/issues?q=",
+        ];
+
+        for tail in tails {
+            let with_cookies = explain_failure(1, tail, CookieSource::Firefox);
+            assert!(
+                with_cookies.contains("Не использовать"),
+                "нет совета вернуть список: {with_cookies}"
+            );
+            assert!(!with_cookies.contains("ERROR"), "утёк сырой вывод");
+
+            // Без cookies винить их нельзя: причина совсем другая, и уверенное
+            // объяснение не про свою беду хуже английского хвоста.
+            let without = explain_failure(1, tail, CookieSource::None);
+            assert!(
+                without.contains(tail),
+                "хвост stderr обязан остаться: {without}"
             );
         }
     }

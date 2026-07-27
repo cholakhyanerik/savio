@@ -254,7 +254,16 @@ mod tests {
         const URL: &str = "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
 
         let tools = crate::engine::discover().expect("yt-dlp обязан быть установлен");
-        let info = super::super::probe(URL, &tools).expect("метаданные обязаны прийти");
+        // Обычный запрос без cookies: обложка у публичного ролика видна и так,
+        // а читать профиль браузера в тесте незачем.
+        let request = crate::model::Request {
+            url: URL.to_owned(),
+            format: crate::model::Format::Mp4,
+            quality: crate::model::Quality::Best,
+            options: crate::model::DownloadOptions::default(),
+            cookies: crate::model::CookieSource::None,
+        };
+        let info = super::super::probe(&request, &tools).expect("метаданные обязаны прийти");
         let url = info
             .thumbnail_url
             .expect("у ролика с YouTube обложка есть всегда");
