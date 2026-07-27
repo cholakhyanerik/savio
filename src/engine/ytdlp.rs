@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::binaries::Tools;
-use crate::model::{CookieSource, Format, MediaInfo, Progress, Quality, Request};
+use crate::model::{CookieSource, Format, MediaInfo, Progress, Quality, Request, Section};
 
 /// Каждое поле, способное прийти пустым, обязано иметь `|default`.
 /// Иначе yt-dlp подставит голое `NA` без кавычек и сломает JSON —
@@ -79,6 +79,35 @@ fn video_format(quality: Quality) -> String {
          /b[height<={height}]\
          /b"
     )
+}
+
+/// Значение ключа `--download-sections` для запрошенного фрагмента.
+/// `None` — фрагмент не просят, и ключа в командной строке быть не должно.
+///
+/// Две мелочи в этой строке — не вкусовщина, а защита от тихих бед.
+///
+/// **Звёздочка обязательна.** Без неё yt-dlp считает строку регулярным
+/// выражением по названиям глав, ни одной не находит и **не скачивает
+/// ничего**: проверено вживую (2026.07.04) — `--download-sections "5-15"`
+/// печатает `There are no chapters matching the regex` и выходит с кодом 0.
+/// Ни ошибки, ни файла.
+///
+/// **Границы печатаем числом секунд**, а не в том виде, в каком их набрал
+/// человек. Голое число — единственная запись, в которой нельзя ошибиться
+/// разделителем, а yt-dlp на непонятом диапазоне отвечает не отказом
+/// разобрать, а `usage`-ошибкой на весь экран.
+///
+/// Открытый конец — `inf`: так его называет сам yt-dlp.
+fn section_arg(section: Section) -> Option<String> {
+    if !section.any() {
+        return None;
+    }
+
+    let start = section.start.unwrap_or(0);
+    Some(match section.end {
+        Some(end) => format!("*{start}-{end}"),
+        None => format!("*{start}-inf"),
+    })
 }
 
 pub fn download_args(request: &Request, out_dir: &Path, tools: &Tools) -> Vec<String> {
@@ -154,6 +183,33 @@ pub fn download_args(request: &Request, out_dir: &Path, tools: &Tools) -> Vec<St
         // после вшивания не убирает. Просили вшить, а не положить рядом.
         if options.embed_subs && request.format == Format::Mp4 {
             args.push("--embed-subs".into());
+        }
+
+        // Обрезка лежит на ffmpeg целиком, и без него она не «просто не
+        // сработает». Проверено вживую (yt-dlp 2026.07.04): с этим ключом и
+        // без ffmpeg загрузка обрывается ещё до начала — `ERROR: You have
+        // requested downloading the video partially, but ffmpeg is not
+        // installed. Aborting`, код 1, файла нет вовсе. Поэтому ключ живёт
+        // здесь, внутри ветки с живым ffmpeg, как и ключи вшивания, а про
+        // пропуск говорит `Event::Warning` в `engine::start`.
+        if let Some(section) = section_arg(request.section) {
+            args.push("--download-sections".into());
+            args.push(section);
+
+            // `--force-keyframes-at-cuts` — только для MP3, и это не выбор
+            // «точнее или быстрее». Без него у `-x` **молча теряется начало
+            // фрагмента**: проверено, диапазоны 5–15 и 10–15 у одного ролика
+            // дали одинаковые 15 секунд, считая от нуля, — то есть не тот
+            // кусок при коде возврата 0. Вырезанная дорожка приезжает со
+            // смещённой шкалой времени, и перекодирование в MP3 отсчитывает
+            // её от нуля; ключ заставляет резать заново и точно.
+            //
+            // У MP4 такой беды нет (5–15 даёт ровно 10 секунд), а ключ там
+            // стоил бы полного перекодирования видео — поэтому он не общий.
+            // Звук и так перекодируется в MP3, так что для него это даром.
+            if request.format == Format::Mp3 {
+                args.push("--force-keyframes-at-cuts".into());
+            }
         }
     }
 
@@ -971,9 +1027,26 @@ mod tests {
             quality,
             options,
             cookies,
+            section: Section::default(),
         };
         download_args(&request, &PathBuf::from("out"), &fake_tools(ffmpeg))
     }
+
+    /// Аргументы загрузки с запрошенным фрагментом.
+    fn args_section(format: Format, section: Section, ffmpeg: bool) -> Vec<String> {
+        let request = Request {
+            url: "https://example.com/video".to_owned(),
+            format,
+            quality: Quality::Best,
+            options: DownloadOptions::default(),
+            cookies: CookieSource::None,
+            section,
+        };
+        download_args(&request, &PathBuf::from("out"), &fake_tools(ffmpeg))
+    }
+
+    const SECTION_FLAG: &str = "--download-sections";
+    const KEYFRAMES_FLAG: &str = "--force-keyframes-at-cuts";
 
     fn args_for(format: Format, quality: Quality) -> Vec<String> {
         args_with(format, quality, DownloadOptions::default(), true)
@@ -1127,6 +1200,98 @@ mod tests {
             // Сама загрузка при этом обязана остаться на месте.
             assert!(has(&args, "https://example.com/video"), "потеряна ссылка");
         }
+    }
+
+    /// Пока фрагмент не просят, командной строке меняться не с чего:
+    /// обрезка ведёт загрузку совсем другим путём (медленным, через ffmpeg),
+    /// и попасть на него нечаянно — заметная беда.
+    #[test]
+    fn nothing_is_trimmed_until_asked() {
+        for format in [Format::Mp4, Format::Mp3] {
+            let args = args_section(format, Section::default(), true);
+            assert!(!has(&args, SECTION_FLAG), "{format:?}: непрошеная обрезка");
+            assert!(!has(&args, KEYFRAMES_FLAG), "{format:?}: лишний ключ");
+        }
+    }
+
+    /// Диапазон уходит числом секунд и всегда со звёздочкой. Без неё yt-dlp
+    /// ищет главу по регулярному выражению, не находит и молча не скачивает
+    /// ничего — при коде возврата 0.
+    #[test]
+    fn section_is_written_the_way_ytdlp_reads_it() {
+        for (section, expected) in [
+            (
+                Section {
+                    start: Some(90),
+                    end: Some(240),
+                },
+                "*90-240",
+            ),
+            // Открытый конец — «до конца ролика».
+            (
+                Section {
+                    start: Some(90),
+                    end: None,
+                },
+                "*90-inf",
+            ),
+            // Открытое начало — «с начала»: нижняя граница всё равно нужна.
+            (
+                Section {
+                    start: None,
+                    end: Some(240),
+                },
+                "*0-240",
+            ),
+        ] {
+            let args = args_section(Format::Mp4, section, true);
+            assert_eq!(value_of(&args, SECTION_FLAG), Some(expected), "{section:?}");
+        }
+    }
+
+    /// Без ffmpeg ключ обрезки не просто бесполезен: yt-dlp обрывает загрузку
+    /// до её начала («requested downloading the video partially, but ffmpeg is
+    /// not installed») и не оставляет файла вовсе. Ролик целиком — плохой
+    /// исход, но несравнимо лучше пустой папки и красной «Ошибки».
+    #[test]
+    fn section_is_skipped_without_ffmpeg() {
+        let section = Section {
+            start: Some(90),
+            end: Some(240),
+        };
+        for format in [Format::Mp4, Format::Mp3] {
+            let args = args_section(format, section, false);
+            assert!(
+                !has(&args, SECTION_FLAG),
+                "{format:?}: обрезка без ffmpeg — загрузка оборвётся, файла не будет"
+            );
+            assert!(!has(&args, KEYFRAMES_FLAG), "{format:?}: лишний ключ");
+            assert!(has(&args, "https://example.com/video"), "потеряна ссылка");
+        }
+    }
+
+    /// Самая тихая беда этой возможности: у MP3 без `--force-keyframes-at-cuts`
+    /// начало фрагмента теряется. Проверено вживую — 5–15 и 10–15 дают
+    /// одинаковые 15 секунд от нуля, код возврата 0, файл на месте. У MP4
+    /// ключа быть не должно: там он не нужен и стоит перекодирования видео.
+    #[test]
+    fn audio_cuts_are_forced_to_be_exact() {
+        let section = Section {
+            start: Some(90),
+            end: Some(240),
+        };
+        let audio = args_section(Format::Mp3, section, true);
+        assert!(
+            has(&audio, KEYFRAMES_FLAG),
+            "у MP3 без этого ключа фрагмент молча начнётся с нуля"
+        );
+
+        let video = args_section(Format::Mp4, section, true);
+        assert!(
+            !has(&video, KEYFRAMES_FLAG),
+            "у MP4 ключ лишний: он заставляет перекодировать видео целиком"
+        );
+        assert!(has(&video, SECTION_FLAG), "потерялась сама обрезка");
     }
 
     /// В MP3 субтитры класть некуда: просить их — значит получить ругань

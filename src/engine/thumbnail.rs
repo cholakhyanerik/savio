@@ -262,6 +262,7 @@ mod tests {
             quality: crate::model::Quality::Best,
             options: crate::model::DownloadOptions::default(),
             cookies: crate::model::CookieSource::None,
+            section: crate::model::Section::default(),
         };
         let info = super::super::probe(&request, &tools).expect("метаданные обязаны прийти");
         let url = info

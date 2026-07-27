@@ -9,8 +9,9 @@ use crate::engine::settings;
 use crate::engine::setup;
 use crate::engine::{self, Handle, MetaTask, metadata};
 use crate::model::{
-    CookieSource, DownloadOptions, Event, Format, MediaInfo, Progress, Quality, Request, Tag,
-    human_bytes, human_duration, human_speed, looks_like_url, meta_kind,
+    CookieSource, DownloadOptions, Event, Format, MediaInfo, Progress, Quality, Request, Section,
+    SectionError, Tag, human_bytes, human_duration, human_speed, looks_like_url, meta_kind,
+    parse_section,
 };
 use crate::theme;
 
@@ -327,6 +328,20 @@ pub struct SavioApp {
     quality: Quality,
     /// Галочки «вшить метаданные / обложку / субтитры».
     options: DownloadOptions,
+    /// Границы фрагмента — как их набрал человек. Строки, а не числа: поле
+    /// ввода хранит текст, а разбирает его домен (`parse_section`).
+    ///
+    /// Между запусками намеренно не запоминаются, как и источник cookies:
+    /// границы относятся к конкретному ролику, и вчерашние «1:30 — 4:00»,
+    /// молча применённые к сегодняшней ссылке, дали бы не тот файл.
+    section_start: String,
+    section_end: String,
+    /// Разобранные границы. Пересобираются на правке поля, а не в кадре:
+    /// `ui()` зовут 60 раз в секунду, а меняется это от нажатия клавиши.
+    section: Section,
+    /// Чем именно плох набранный диапазон. `None` — всё в порядке (в том
+    /// числе когда оба поля пусты).
+    section_error: Option<SectionError>,
     /// Из какого браузера брать вход в аккаунт.
     ///
     /// Между запусками намеренно не запоминается, в отличие от формата,
@@ -430,6 +445,10 @@ impl SavioApp {
             format: saved.format,
             quality: saved.quality,
             options: DownloadOptions::default(),
+            section_start: String::new(),
+            section_end: String::new(),
+            section: Section::default(),
+            section_error: None,
             cookies: CookieSource::default(),
             ffmpeg_missing: false,
             out_dir_display: display_dir(out_dir.as_deref()),
@@ -566,6 +585,14 @@ impl SavioApp {
             && !self.url.trim().is_empty()
             && self.out_dir.is_some()
             && self.setup_error.is_none()
+            // Неразобранный диапазон кнопку **блокирует**, в отличие от
+            // непохожей на ссылку строки. Разница не в строгости, а в том,
+            // чья это проверка: список поддерживаемых сайтов принадлежит
+            // yt-dlp, и наша догадка о ссылке не повод запрещать попытку.
+            // А границы фрагмента — наши целиком, и промах в них yt-dlp
+            // ошибкой не считает: он молча отдаёт файл не с тем содержимым,
+            // и заметить подмену можно, только открыв его.
+            && self.section_error.is_none()
     }
 
     fn start(&mut self, ctx: &egui::Context) {
@@ -582,6 +609,7 @@ impl SavioApp {
             quality: self.quality,
             options: self.options,
             cookies: self.cookies,
+            section: self.section,
         };
 
         match engine::start(request, out_dir, tx, move || notify_ctx.request_repaint()) {
@@ -1158,6 +1186,10 @@ impl SavioApp {
                 self.quality_selector(ui);
 
                 ui.add_space(14.0);
+                field_label(ui, "Фрагмент");
+                self.section_row(ui);
+
+                ui.add_space(14.0);
                 field_label(ui, "Вшить в файл");
                 self.embed_options(ui);
 
@@ -1180,14 +1212,7 @@ impl SavioApp {
         let response = ui
             .scope(|ui| {
                 if invalid {
-                    // Ошибка валидации: красная рамка в покое, при наведении
-                    // и в фокусе (`selection.stroke` — это рамка фокуса).
-                    let v = ui.visuals_mut();
-                    let error = egui::Stroke::new(1.0, theme::STATE_ERROR);
-                    v.widgets.inactive.bg_stroke = error;
-                    v.widgets.hovered.bg_stroke = error;
-                    v.widgets.active.bg_stroke = error;
-                    v.selection.stroke = error;
+                    mark_invalid(ui);
                 }
 
                 ui.add_sized(
@@ -1287,6 +1312,93 @@ impl SavioApp {
         if !self.quality_note.is_empty() {
             ui.add_space(6.0);
             note(ui, &self.quality_note, theme::TEXT_SECONDARY);
+        }
+    }
+
+    /// Два поля «с» и «до»: какой кусок ролика нужен.
+    ///
+    /// Разбирает набранное домен (`parse_section`), и только по правке текста:
+    /// в кадре отрисовки здесь не считается ничего, включая сообщение об
+    /// ошибке — оно статическое и лежит в `SectionError`.
+    fn section_row(&mut self, ui: &mut egui::Ui) {
+        let error = self.section_error;
+        let mut changed = false;
+
+        ui.horizontal(|ui| {
+            // Ширину делим между двумя полями и тире между ними, а второму
+            // отдаём весь остаток, а не такую же половину: два округления до
+            // пиксельной сетки не дотянули бы ряд до правого края — та же
+            // причина, что и в `quality_selector`.
+            const DASH: f32 = 12.0;
+            let spacing = ui.spacing().item_spacing.x;
+            let width = ((ui.available_width() - DASH - spacing * 2.0) / 2.0).max(40.0);
+
+            changed |= time_field(
+                ui,
+                &mut self.section_start,
+                "с 0:00",
+                error.is_some_and(SectionError::at_start),
+                width,
+            );
+            ui.add_sized(
+                [DASH, theme::CONTROL_HEIGHT],
+                egui::Label::new(egui::RichText::new("—").color(theme::TEXT_MUTED)),
+            );
+            let rest = ui.available_width();
+            changed |= time_field(
+                ui,
+                &mut self.section_end,
+                "до конца",
+                error.is_some_and(SectionError::at_end),
+                rest,
+            );
+        });
+
+        if changed {
+            match parse_section(&self.section_start, &self.section_end) {
+                Ok(section) => {
+                    self.section = section;
+                    self.section_error = None;
+                }
+                Err(err) => {
+                    // Пока диапазон не разобран, не просим ничего. Кнопка всё
+                    // равно выключена (`can_start`), но оставить здесь прошлое
+                    // значение значило бы однажды вырезать не тот кусок.
+                    self.section = Section::default();
+                    self.section_error = Some(err);
+                }
+            }
+        }
+
+        // Оговорка есть всегда, как и у списка браузеров: у пустых полей она
+        // объясняет, что писать, у заполненных — чем обрезка отличается от
+        // обычной загрузки. Все строки статические.
+        ui.add_space(6.0);
+        if let Some(err) = self.section_error {
+            note(ui, err.message(), theme::STATE_ERROR);
+        } else if !self.section.any() {
+            note(
+                ui,
+                "Пусто — ролик скачается целиком. Время можно писать как «90», \
+                 «1:30» или «1:02:03».",
+                theme::TEXT_MUTED,
+            );
+        } else if self.ffmpeg_missing {
+            note(
+                ui,
+                "Вырезать нечем: ffmpeg не найден. Ролик скачается целиком.",
+                theme::STATE_WARNING,
+            );
+        } else {
+            note(
+                ui,
+                "Фрагмент вырезает ffmpeg прямо по ходу загрузки: она идёт \
+                 заметно медленнее обычной, а проценты и скорость при этом \
+                 не показываются. У MP4 начало сдвигается к ближайшему \
+                 ключевому кадру — файл может начаться на секунду-другую \
+                 раньше запрошенного.",
+                theme::TEXT_MUTED,
+            );
         }
     }
 
@@ -2338,6 +2450,51 @@ fn checkbox(
             egui::RichText::new(label).color(theme::TEXT_PRIMARY),
         ),
     )
+}
+
+/// Красная рамка у поля, в котором ошиблись: в покое, при наведении и в фокусе.
+///
+/// `selection.stroke` в списке не для полноты — это и есть рамка поля, когда
+/// в нём стоит курсор. Без неё поле краснеет ровно до того мгновения, когда
+/// человек начинает его исправлять.
+///
+/// Одна функция на все поля ввода: разъехавшись, две одинаковые по смыслу
+/// ошибки выглядели бы по-разному.
+fn mark_invalid(ui: &mut egui::Ui) {
+    let v = ui.visuals_mut();
+    let error = egui::Stroke::new(1.0, theme::STATE_ERROR);
+    v.widgets.inactive.bg_stroke = error;
+    v.widgets.hovered.bg_stroke = error;
+    v.widgets.active.bg_stroke = error;
+    v.selection.stroke = error;
+}
+
+/// Поле ввода времени: «1:30», «1:02:03» или число секунд.
+///
+/// Возвращает `true`, когда текст правили: разбирать строку в кадре отрисовки
+/// незачем, это работа обработчика изменения.
+fn time_field(
+    ui: &mut egui::Ui,
+    value: &mut String,
+    hint: &'static str,
+    invalid: bool,
+    width: f32,
+) -> bool {
+    ui.scope(|ui| {
+        if invalid {
+            mark_invalid(ui);
+        }
+
+        ui.add_sized(
+            [width, theme::CONTROL_HEIGHT],
+            egui::TextEdit::singleline(value)
+                .hint_text(hint)
+                .text_color(theme::TEXT_PRIMARY)
+                .margin(egui::Margin::symmetric(10, 6)),
+        )
+        .changed()
+    })
+    .inner
 }
 
 /// Мелкая оговорка под элементом управления.

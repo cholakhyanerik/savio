@@ -310,6 +310,157 @@ impl DownloadOptions {
     }
 }
 
+/// Фрагмент ролика: с какой секунды по какую его вырезать.
+///
+/// Обе границы независимы и обе необязательны: «с 1:30 и до конца» и «с начала
+/// по 4:00» — такие же законные просьбы, как полный диапазон. Обе пустые
+/// значат «скачать целиком» — ровно то, что Savio делал до появления обрезки,
+/// и потому это значение по умолчанию.
+///
+/// Секунды, а не набранные строки: разбор — работа домена, и до движка должно
+/// доезжать уже проверенное число. Строка «4:00» в аргументе `yt-dlp` была бы
+/// не ошибкой, а тихой бедой (см. `section_arg`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Section {
+    pub start: Option<u64>,
+    pub end: Option<u64>,
+}
+
+impl Section {
+    /// Просят ли вырезать фрагмент.
+    ///
+    /// Нужна по той же причине, что и `DownloadOptions::any()`: обрезка целиком
+    /// лежит на ffmpeg, и спросить «а есть ли он» надо один раз на обе границы.
+    pub fn any(self) -> bool {
+        self.start.is_some() || self.end.is_some()
+    }
+}
+
+/// Почему набранный фрагмент не годится.
+///
+/// Перечисление, а не готовая строка: под полями показывают текст, а красной
+/// рамкой — конкретное поле, и знать, какое именно, можно только отсюда.
+/// И оно `Copy`: значение живёт в поле экрана, а собирать `String` на каждое
+/// нажатие клавиши незачем.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SectionError {
+    /// Начало не разобралось.
+    Start,
+    /// Конец не разобрался.
+    End,
+    /// Конец не позже начала — вырезать нечего.
+    Order,
+}
+
+impl SectionError {
+    /// Что показать под полями.
+    pub fn message(self) -> &'static str {
+        match self {
+            SectionError::Start => {
+                "Начало не похоже на время. Нужно «1:30», «1:02:03» или число секунд."
+            }
+            SectionError::End => {
+                "Конец не похож на время. Нужно «4:00», «1:02:03» или число секунд."
+            }
+            SectionError::Order => "Конец должен быть позже начала.",
+        }
+    }
+
+    /// Подсвечивать ли поле начала.
+    pub fn at_start(self) -> bool {
+        matches!(self, SectionError::Start | SectionError::Order)
+    }
+
+    /// Подсвечивать ли поле конца. Перевёрнутый диапазон — беда обоих полей
+    /// сразу: какое из двух чисел человек имел в виду поправить, мы не знаем.
+    pub fn at_end(self) -> bool {
+        matches!(self, SectionError::End | SectionError::Order)
+    }
+}
+
+/// Разбирает «1:30», «1:02:03» или «90» в секунды — обратная к `human_duration`.
+///
+/// Принимает от одного до трёх полей через двоеточие: секунды, «минуты:секунды»
+/// и «часы:минуты:секунды». Всё остальное — `None`. Вытащить из строки первое
+/// попавшееся число было бы хуже честного отказа: человек получил бы не тот
+/// кусок ролика и узнал бы об этом, только открыв файл.
+///
+/// Поля после первого ограничены шестьюдесятью: «1:75» — это либо опечатка,
+/// либо «минута и 75 секунд», и угадывать, что имелось в виду, не наше дело.
+/// У первого поля потолка нет: «90» — законные полторы минуты, а «120:00» —
+/// два часа.
+pub fn parse_timecode(text: &str) -> Option<u64> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+
+    let mut secs: u64 = 0;
+    let mut fields = 0;
+    for field in text.split(':') {
+        fields += 1;
+        if fields > 3 {
+            return None;
+        }
+
+        // Проверяем цифры сами, а не полагаемся на `parse`: он принимает
+        // ведущий плюс, и «+5» стало бы законным временем.
+        let field = field.trim();
+        if field.is_empty() || !field.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let value: u64 = field.parse().ok()?;
+        if fields > 1 && value > 59 {
+            return None;
+        }
+
+        // `checked_*`, а не `*`: строка приходит из поля ввода, и «999999999999»
+        // в часах — это переполнение, то есть паника в отладочной сборке
+        // и тихо неверное число в выпускной.
+        secs = secs.checked_mul(60)?.checked_add(value)?;
+    }
+
+    Some(secs)
+}
+
+/// Собирает фрагмент из того, что человек набрал в двух полях.
+///
+/// Пустое поле — не ошибка, а «границы нет»: оба пустых дают `Section` по
+/// умолчанию, то есть загрузку целиком.
+///
+/// Проверка порядка живёт здесь, до запуска, и это не перестраховка:
+/// перевёрнутый диапазон yt-dlp ошибкой не считает — он выходит с кодом 0
+/// и отдаёт файл, в котором лежит не то, что просили.
+pub fn parse_section(start: &str, end: &str) -> Result<Section, SectionError> {
+    let start = parse_bound(start).ok_or(SectionError::Start)?;
+    let end = parse_bound(end).ok_or(SectionError::End)?;
+
+    // Пустое начало — это ноль, и сравнивать с ним надо тоже: «до 0:00» —
+    // такой же пустой фрагмент, как «с 4:00 по 1:30».
+    if let Some(end) = end
+        && end <= start.unwrap_or(0)
+    {
+        return Err(SectionError::Order);
+    }
+
+    // «0:00» в поле начала — это и есть начало ролика. Держать его отдельной
+    // границей незачем: с ней `any()` отвечал бы «фрагмент просят» на просьбу
+    // скачать всё, и целый ролик поехал бы медленным путём обрезки.
+    let start = start.filter(|&secs| secs > 0);
+
+    Ok(Section { start, end })
+}
+
+/// Одна граница: пусто — `Some(None)`, время — `Some(Some(секунды))`,
+/// мусор — `None`. Три исхода, и различать их обязательно: пустое поле
+/// и опечатка в нём значат противоположное.
+fn parse_bound(text: &str) -> Option<Option<u64>> {
+    if text.trim().is_empty() {
+        return Some(None);
+    }
+    parse_timecode(text).map(Some)
+}
+
 /// Что именно просят скачать.
 ///
 /// Отдельная структура, а не тройка параметров: формат и качество ходят
@@ -321,6 +472,14 @@ pub struct Request {
     pub format: Format,
     pub quality: Quality,
     pub options: DownloadOptions,
+    /// Какой кусок ролика нужен. Пустой `Section` — весь целиком.
+    ///
+    /// Поле запроса, а не флажок внутри `DownloadOptions`: там собрано то,
+    /// что вшивается в готовый файл, и на `any()` этой структуры держится
+    /// единственная проверка «нужен ли ffmpeg» для вшивания. Обрезке ffmpeg
+    /// нужен тоже, но по своей причине и с другим исходом при его нехватке,
+    /// так что и спрашивать про неё надо отдельно.
+    pub section: Section,
     /// Откуда взять вход в аккаунт. Поле запроса, а не четвёртый флажок внутри
     /// `DownloadOptions`: там собрано то, что вшивается в готовый файл, и
     /// держится на этом `any()` — единственная проверка «нужен ли ffmpeg».
@@ -640,6 +799,175 @@ mod tests {
         assert_eq!(human_duration(75), "1:15");
         assert_eq!(human_duration(3600), "1:00:00");
         assert_eq!(human_duration(3671), "1:01:11");
+    }
+
+    /// Парсер обязан понимать ровно то, что печатает `human_duration`:
+    /// человек читает длительность ролика в окне и оттуда же берёт границы.
+    #[test]
+    fn timecode_reads_back_what_duration_printed() {
+        for secs in [0, 9, 75, 600, 3600, 3671, 86_399, 359_999] {
+            assert_eq!(
+                parse_timecode(&human_duration(secs)),
+                Some(secs),
+                "{secs} с не прочитались обратно"
+            );
+        }
+    }
+
+    #[test]
+    fn timecode_takes_the_usual_ways_of_writing_it() {
+        // Голые секунды.
+        assert_eq!(parse_timecode("0"), Some(0));
+        assert_eq!(parse_timecode("90"), Some(90));
+        // Минуты и секунды.
+        assert_eq!(parse_timecode("1:30"), Some(90));
+        assert_eq!(parse_timecode("1:5"), Some(65), "односимвольные секунды");
+        assert_eq!(parse_timecode("01:30"), Some(90), "ведущий ноль");
+        // Часы.
+        assert_eq!(parse_timecode("1:02:03"), Some(3723));
+        assert_eq!(parse_timecode("0:00:07"), Some(7));
+        // У первого поля потолка нет: «120:00» — два часа, «90» — полторы минуты.
+        assert_eq!(parse_timecode("120:00"), Some(7200));
+        // Пробелы по краям — обычное дело при вставке из буфера.
+        assert_eq!(parse_timecode("  1:30  "), Some(90));
+    }
+
+    #[test]
+    fn timecode_rejects_everything_it_cannot_be_sure_about() {
+        for bad in [
+            "",
+            "   ",
+            ":",
+            "1:",
+            ":30",
+            "1::30",
+            "1:2:3:4", // полей больше трёх
+            "1:75",    // 75 секунд — либо опечатка, либо вовсе не время
+            "1:60:00", // то же в минутах
+            "-5",      // отрицательного времени не бывает
+            "+5",      // `parse` такое берёт, а мы не должны
+            "1.5",     // не наш разделитель
+            "1,5",
+            "1:30s",
+            "abc",
+            "полторы минуты",
+            "99999999999999999999999", // не влезает в u64
+        ] {
+            assert_eq!(parse_timecode(bad), None, "«{bad}» приняли за время");
+        }
+        // Переполнение при переводе часов в секунды: `checked_mul` обязан
+        // вернуть `None`, а не завернуть число по кругу.
+        assert_eq!(parse_timecode("99999999999999999999:00:00"), None);
+    }
+
+    #[test]
+    fn section_takes_both_bounds_and_either_alone() {
+        assert_eq!(
+            parse_section("1:30", "4:00"),
+            Ok(Section {
+                start: Some(90),
+                end: Some(240)
+            })
+        );
+        assert_eq!(
+            parse_section("1:30", ""),
+            Ok(Section {
+                start: Some(90),
+                end: None
+            })
+        );
+        assert_eq!(
+            parse_section("", "4:00"),
+            Ok(Section {
+                start: None,
+                end: Some(240)
+            })
+        );
+    }
+
+    /// Оба поля пустые — это «скачать целиком», а не ошибка и не пустой
+    /// фрагмент: до появления обрезки Savio вёл себя именно так.
+    #[test]
+    fn empty_fields_mean_the_whole_video() {
+        assert_eq!(parse_section("", ""), Ok(Section::default()));
+        assert_eq!(parse_section("  ", " "), Ok(Section::default()));
+        assert!(!Section::default().any());
+    }
+
+    /// «С 0:00» — это тоже «целиком». Останься ноль отдельной границей,
+    /// `any()` ответил бы «просят фрагмент», и весь ролик поехал бы медленным
+    /// путём обрезки через ffmpeg вместо обычной загрузки.
+    #[test]
+    fn zero_start_is_not_a_section() {
+        assert_eq!(parse_section("0", ""), Ok(Section::default()));
+        assert_eq!(parse_section("0:00", ""), Ok(Section::default()));
+        assert!(!parse_section("0:00", "").unwrap().any());
+        // А вот с концом ноль уже не пустяк: «с начала по 0:00» — пустой кусок.
+        assert_eq!(parse_section("", "0"), Err(SectionError::Order));
+    }
+
+    /// Перевёрнутый и вырожденный диапазон обязаны отсекаться здесь: yt-dlp
+    /// на них не ругается, а молча отдаёт файл не с тем содержимым.
+    #[test]
+    fn section_rejects_a_range_that_cuts_nothing() {
+        assert_eq!(parse_section("4:00", "1:30"), Err(SectionError::Order));
+        assert_eq!(parse_section("90", "90"), Err(SectionError::Order));
+        assert_eq!(parse_section("0", "0"), Err(SectionError::Order));
+    }
+
+    #[test]
+    fn section_says_which_field_to_highlight() {
+        assert_eq!(parse_section("абв", "4:00"), Err(SectionError::Start));
+        assert_eq!(parse_section("1:30", "абв"), Err(SectionError::End));
+        // Начало проверяется первым: когда врут оба поля, красить надо то,
+        // с которого человек начал набирать.
+        assert_eq!(parse_section("абв", "абв"), Err(SectionError::Start));
+
+        assert!(SectionError::Start.at_start() && !SectionError::Start.at_end());
+        assert!(SectionError::End.at_end() && !SectionError::End.at_start());
+        // Перевёрнутый диапазон — беда обоих полей сразу.
+        assert!(SectionError::Order.at_start() && SectionError::Order.at_end());
+    }
+
+    /// Сообщение показывают человеку вместо ввода: пустое или совпадающее
+    /// с соседним ничего ему не объяснит.
+    #[test]
+    fn section_errors_explain_themselves_distinctly() {
+        let mut seen: Vec<&str> = Vec::new();
+        for err in [SectionError::Start, SectionError::End, SectionError::Order] {
+            let message = err.message();
+            assert!(!message.trim().is_empty(), "{err:?}: пустое сообщение");
+            assert!(!seen.contains(&message), "{err:?}: сообщение повторяется");
+            seen.push(message);
+        }
+    }
+
+    /// Фрагмент по умолчанию не просят. Появись здесь граница — у всех, кто
+    /// эти поля не трогал, ролики начали бы приезжать обрезанными.
+    #[test]
+    fn nothing_is_trimmed_by_default() {
+        let section = Section::default();
+        assert_eq!(section.start, None);
+        assert_eq!(section.end, None);
+        assert!(!section.any());
+    }
+
+    #[test]
+    fn any_notices_each_bound_alone() {
+        assert!(
+            Section {
+                start: Some(90),
+                end: None
+            }
+            .any()
+        );
+        assert!(
+            Section {
+                start: None,
+                end: Some(240)
+            }
+            .any()
+        );
     }
 
     #[test]
