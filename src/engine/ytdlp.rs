@@ -274,6 +274,11 @@ pub fn parse_line(line: &str) -> Line {
         let speed = num("speed");
         let eta = num("eta");
         return Line::Progress(Progress {
+            // Чья это загрузка, знает только тот, кто её запустил: номер
+            // проставляет `engine::run` поверх разобранного. Здесь оставляем
+            // `NO_DOWNLOAD` из `Default` — разборщик строки про очередь
+            // не знает.
+            download_id: crate::model::NO_DOWNLOAD,
             downloaded: num("downloaded") as u64,
             total: num("total") as u64,
             speed_bps: (speed > 0.0).then_some(speed),

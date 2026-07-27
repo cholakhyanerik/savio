@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use super::binaries::{self, FFMPEG_NAME, FFPROBE_NAME, YTDLP_NAME};
 use super::sha256::{self, Sha256};
-use crate::model::{Event, Progress};
+use crate::model::{Event, NO_DOWNLOAD, Progress};
 
 // ---------------------------------------------------------------------------
 // Что и откуда качать
@@ -228,8 +228,14 @@ pub fn start(
             Ok(()) => {
                 let _ = tx.send(Event::Ready);
             }
+            // Установка — не элемент очереди, номера у неё нет и быть не
+            // может: её события ходят по своему приёмнику, и разводить там
+            // нечего. Тот же `NO_DOWNLOAD` стоит и у обновления движка ниже.
             Err(err) => {
-                let _ = tx.send(Event::Failed(err));
+                let _ = tx.send(Event::Failed {
+                    id: NO_DOWNLOAD,
+                    message: err,
+                });
             }
         }
         notify();
@@ -532,7 +538,10 @@ pub fn start_update(tx: Sender<Event>, notify: impl Fn() + Send + 'static) -> Ha
                 let _ = tx.send(Event::Ready);
             }
             Err(err) => {
-                let _ = tx.send(Event::Failed(err));
+                let _ = tx.send(Event::Failed {
+                    id: NO_DOWNLOAD,
+                    message: err,
+                });
             }
         }
         notify();
@@ -799,6 +808,7 @@ fn send_progress(tx: &Sender<Event>, notify: &impl Fn(), done: u64, total: u64, 
     };
 
     let _ = tx.send(Event::Progress(Progress {
+        download_id: NO_DOWNLOAD,
         downloaded: done,
         total,
         speed_bps: speed,

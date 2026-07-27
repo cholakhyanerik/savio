@@ -9,8 +9,8 @@ use crate::engine::settings;
 use crate::engine::setup;
 use crate::engine::{self, Handle, MetaTask, metadata};
 use crate::model::{
-    CookieSource, DownloadOptions, Event, Format, MediaInfo, Progress, Quality, Request, Section,
-    SectionError, Tag, human_bytes, human_duration, human_speed, looks_like_url, meta_kind,
+    CookieSource, DownloadId, DownloadOptions, Event, Format, MediaInfo, Progress, Quality, Request,
+    Section, SectionError, Tag, human_bytes, human_duration, human_speed, looks_like_url, meta_kind,
     parse_section,
 };
 use crate::theme;
@@ -57,6 +57,11 @@ const VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 
 enum State {
     Idle,
+    /// В очереди есть ссылки, но ничего не качается: их поставили и ещё не
+    /// запустили. Отдельно от `Idle`, потому что экран говорит разное:
+    /// «вставьте ссылку» и «нажмите „Скачать“ — очередь пойдёт» — это
+    /// два разных следующих шага.
+    Queued,
     Running,
     Done(PathBuf),
     Failed(String),
@@ -174,6 +179,337 @@ impl History {
         );
 
         self.entries.truncate(HISTORY_LIMIT);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Очередь загрузок
+// ---------------------------------------------------------------------------
+
+/// Сколько ссылок помещается в очередь.
+///
+/// Потолок обязателен по Правилу 1, как `LOG_LIMIT` у журнала и
+/// `HISTORY_LIMIT` у истории: без него список рос бы всё время работы окна.
+/// 50 — столько же, сколько помнит история, и заведомо больше, чем ставят
+/// в очередь за один заход.
+const QUEUE_LIMIT: usize = 50;
+
+/// Что происходит с элементом очереди.
+///
+/// `Failed` несёт текст причины, а не голый признак. Причина в сроке жизни:
+/// журнал очищается перед каждой следующей загрузкой, и к тому времени, как
+/// человек вернётся к ушедшей в ночь очереди, от объяснения не осталось бы
+/// ничего. А узнать, почему не скачалась третья ссылка из десяти, — ровно то,
+/// зачем в этот список потом смотрят.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum QueueStatus {
+    /// Ждёт своей очереди.
+    Waiting,
+    /// Качается прямо сейчас. Такой элемент в списке не больше одного —
+    /// это и есть правило «строго по одному» из `start_next`.
+    Running,
+    Done,
+    Failed(String),
+    /// Снята человеком: нажали «Отмена», пока она качалась. Не ошибка
+    /// (Правило 2), поэтому и слово, и цвет у неё спокойные.
+    Cancelled,
+}
+
+impl QueueStatus {
+    /// Отработал ли элемент — всё равно, чем кончилось.
+    ///
+    /// По этому признаку очередь освобождает место под новые ссылки:
+    /// выбрасывать можно только то, что уже отработало.
+    fn finished(&self) -> bool {
+        matches!(
+            self,
+            QueueStatus::Done | QueueStatus::Failed(_) | QueueStatus::Cancelled
+        )
+    }
+
+    /// Слово для строки списка. Статическое: в кадре отрисовки ничего
+    /// не собирается и не выделяется.
+    fn label(&self) -> &'static str {
+        match self {
+            QueueStatus::Waiting => "Ожидает",
+            QueueStatus::Running => "Качается",
+            QueueStatus::Done => "Готово",
+            QueueStatus::Failed(_) => "Ошибка",
+            QueueStatus::Cancelled => "Снято",
+        }
+    }
+
+    /// Цвет точки и подписи состояния.
+    ///
+    /// Все пары проверены на `BG_ELEVATED` (заливка строки списка) по
+    /// WCAG 2.1: `ACCENT` — 11.07:1, `STATE_SUCCESS` — 8.91:1,
+    /// `STATE_ERROR` — 5.61:1, `TEXT_SECONDARY` — 7.83:1,
+    /// `TEXT_MUTED` — 5.12:1. Порог 4.5:1 проходят все.
+    ///
+    /// Цветом одним состояние не передаётся: рядом с точкой всегда стоит
+    /// слово из `label()`.
+    fn color(&self) -> egui::Color32 {
+        match self {
+            QueueStatus::Waiting => theme::TEXT_MUTED,
+            QueueStatus::Running => theme::ACCENT,
+            QueueStatus::Done => theme::STATE_SUCCESS,
+            QueueStatus::Failed(_) => theme::STATE_ERROR,
+            QueueStatus::Cancelled => theme::TEXT_SECONDARY,
+        }
+    }
+}
+
+/// Одна ссылка в очереди.
+///
+/// Запрос и папку держим снимком, а не подсматриваем текущий выбор на экране:
+/// пока очередь идёт, человек волен переключить формат под следующую ссылку,
+/// и уже поставленное от этого меняться не должно. Иначе десяток ссылок,
+/// поставленных как MP3, доехал бы до диска как MP4 — и заметить это можно
+/// было бы, только открыв файлы.
+struct QueueItem {
+    id: DownloadId,
+    request: Request,
+    out_dir: PathBuf,
+    /// Первая строка списка: название ролика, а пока оно не приехало от
+    /// `probe` — сама ссылка.
+    title: String,
+    /// Вторая строка: «состояние · формат · качество». Собирается при смене
+    /// состояния, а не в кадре отрисовки (Правило 1).
+    detail: String,
+    /// Причина отказа, разложенная в одну строку. Пустая — отказа не было.
+    error_line: String,
+    status: QueueStatus,
+}
+
+impl QueueItem {
+    /// Пересобирает строки, зависящие от состояния. Зовётся при его смене —
+    /// в кадре отрисовки здесь не собирается ничего (Правило 1).
+    fn rebuild_strings(&mut self) {
+        let format = self.request.format;
+        self.detail.clear();
+        self.detail.push_str(self.status.label());
+        self.detail.push_str(" · ");
+        self.detail.push_str(format.short());
+        self.detail.push_str(" · ");
+        self.detail
+            .push_str(self.request.quality.label_with_unit(format));
+
+        // Причину раскладываем в одну строку, и это не косметика:
+        // `explain_failure` отдаёт текст с переносами, а метка с `truncate()`
+        // показывает ровно первую строку. Выходило «Ошибка (код 1):…» —
+        // подпись, которая не говорит ничего. Проверено глазами.
+        self.error_line.clear();
+        if let QueueStatus::Failed(message) = &self.status {
+            for (index, word) in message.split_whitespace().enumerate() {
+                if index > 0 {
+                    self.error_line.push(' ');
+                }
+                self.error_line.push_str(word);
+            }
+        }
+    }
+}
+
+/// Очередь загрузок за текущий запуск.
+///
+/// Отдельный тип, а не голый `Vec` в `SavioApp`, — по той же причине, что и
+/// у `History`: потолок и сводка обязаны пересчитываться в одном месте.
+/// Забыть про них в одной из точек изменения значило бы либо съесть память,
+/// либо показать вчерашние цифры — и ни того ни другого не увидят ни сборка,
+/// ни `clippy`.
+///
+/// Живёт только в памяти и только до закрытия окна, как и история.
+struct Queue {
+    /// Порядок здесь — порядок загрузки: сверху вниз, строго по одной.
+    items: Vec<QueueItem>,
+    /// Номер следующей загрузки. Растёт и никогда не переиспользуется:
+    /// на этом держится вся развязка событий (см. `model::DownloadId`).
+    next_id: DownloadId,
+    /// «Идёт: 1 · В очереди: 3 · Готово: 5» — собирается при изменении
+    /// очереди, а не в кадре отрисовки.
+    summary: String,
+    /// Мест больше нет, и освободить нечем. Считается там же, где сводка:
+    /// перебирать полсотни строк 60 раз в секунду ради одного `bool` незачем.
+    full: bool,
+}
+
+impl Queue {
+    fn new() -> Self {
+        Self {
+            items: Vec::new(),
+            // С единицы, а не с нуля: ноль занят под `NO_DOWNLOAD`.
+            next_id: 1,
+            summary: String::new(),
+            full: false,
+        }
+    }
+
+    /// Ставит ссылку в конец очереди и отдаёт её номер.
+    ///
+    /// `None` — места нет: все `QUEUE_LIMIT` ссылок ещё ждут своего часа.
+    fn push(&mut self, request: Request, out_dir: PathBuf) -> Option<DownloadId> {
+        if !self.make_room() {
+            return None;
+        }
+
+        let id = self.next_id;
+        // Четыре миллиарда ссылок за один запуск недостижимы, но `+= 1`
+        // в отладочной сборке паникует на переполнении, а `wrapping_add` нет.
+        // `max(1)` держит ноль занятым под `NO_DOWNLOAD`.
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+
+        let mut item = QueueItem {
+            id,
+            title: request.url.clone(),
+            detail: String::new(),
+            error_line: String::new(),
+            request,
+            out_dir,
+            status: QueueStatus::Waiting,
+        };
+        item.rebuild_strings();
+
+        self.items.push(item);
+        self.rebuild_summary();
+        Some(id)
+    }
+
+    /// Освобождает место под новую ссылку.
+    ///
+    /// Выбрасывает самую старую отработавшую строку, а не самую старую вообще:
+    /// ожидающая ссылка — это невыполненная просьба, и молча терять её нельзя.
+    /// Не нашлось ни одной отработавшей — очередь и правда полна, и сказать
+    /// об этом надо словами, а не молчаливым отказом.
+    fn make_room(&mut self) -> bool {
+        if self.items.len() < QUEUE_LIMIT {
+            return true;
+        }
+        match self.items.iter().position(|item| item.status.finished()) {
+            Some(index) => {
+                self.items.remove(index);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Что запускать следующим: номер, запрос и папка.
+    ///
+    /// Отдаёт копии, а не ссылки: `engine::start` забирает `Request` во
+    /// владение, а строка обязана остаться в списке — по ней рисуется
+    /// состояние, и в неё же приходит исход.
+    fn next_waiting(&self) -> Option<(DownloadId, Request, PathBuf)> {
+        let item = self
+            .items
+            .iter()
+            .find(|item| item.status == QueueStatus::Waiting)?;
+        Some((item.id, item.request.clone(), item.out_dir.clone()))
+    }
+
+    fn has_waiting(&self) -> bool {
+        self.items
+            .iter()
+            .any(|item| item.status == QueueStatus::Waiting)
+    }
+
+    /// Номер идущей загрузки. Такая в списке не больше одной.
+    fn running_id(&self) -> Option<DownloadId> {
+        self.items
+            .iter()
+            .find(|item| item.status == QueueStatus::Running)
+            .map(|item| item.id)
+    }
+
+    /// Идёт ли прямо сейчас загрузка с таким номером.
+    ///
+    /// Здесь и живёт вся развязка событий: у снятой секунду назад загрузки
+    /// процесс ещё дописывает свой вывод, и её `Failed` пометил бы ошибкой
+    /// уже следующий элемент очереди. Событию установки (`NO_DOWNLOAD`)
+    /// эта проверка отвечает «нет» — номера с нуля не начинаются.
+    fn is_running(&self, id: DownloadId) -> bool {
+        self.items
+            .iter()
+            .any(|item| item.id == id && item.status == QueueStatus::Running)
+    }
+
+    fn set_status(&mut self, id: DownloadId, status: QueueStatus) {
+        if let Some(item) = self.items.iter_mut().find(|item| item.id == id) {
+            item.status = status;
+            item.rebuild_strings();
+        }
+        self.rebuild_summary();
+    }
+
+    /// Заменяет ссылку в строке названием ролика.
+    ///
+    /// До `probe` названия нет, и в списке стоит сама ссылка. Как только оно
+    /// приезжает — меняем: десяток ссылок с одного сайта различается тремя
+    /// символами в конце, а названия — с первого взгляда.
+    fn set_title(&mut self, id: DownloadId, title: &str) {
+        if let Some(item) = self.items.iter_mut().find(|item| item.id == id) {
+            item.title.clear();
+            item.title.push_str(title);
+        }
+    }
+
+    /// Убирает строку из списка.
+    ///
+    /// Идущую загрузку не трогает: её процесс продолжил бы качать, а показать
+    /// исход стало бы негде. Кнопки «убрать» у неё и нет — это страховка на
+    /// случай, если она там однажды появится. Останавливают загрузку
+    /// «Отменой», и это другое действие.
+    fn remove(&mut self, id: DownloadId) {
+        self.items
+            .retain(|item| item.id != id || item.status == QueueStatus::Running);
+        self.rebuild_summary();
+    }
+
+    /// Убирает всё, кроме идущей загрузки, — по кнопке «Очистить».
+    fn clear(&mut self) {
+        self.items
+            .retain(|item| item.status == QueueStatus::Running);
+        self.rebuild_summary();
+    }
+
+    fn rebuild_summary(&mut self) {
+        use std::fmt::Write as _;
+
+        let (mut running, mut waiting, mut done, mut failed, mut cancelled) = (0, 0, 0, 0, 0);
+        for item in &self.items {
+            // Разбор по вариантам, а не `_`: появится состояние — компилятор
+            // потребует решить, куда его считать.
+            match &item.status {
+                QueueStatus::Running => running += 1,
+                QueueStatus::Waiting => waiting += 1,
+                QueueStatus::Done => done += 1,
+                QueueStatus::Failed(_) => failed += 1,
+                QueueStatus::Cancelled => cancelled += 1,
+            }
+        }
+
+        // Полна очередь ровно тогда, когда мест нет и освободить нечем:
+        // отработавшую строку `make_room` выбросит сам.
+        self.full = self.items.len() >= QUEUE_LIMIT && done + failed + cancelled == 0;
+
+        // Пары «слово: число», а не «3 ждут»: у русских числительных
+        // окончание зависит от последней цифры, и «1 ждут» с «2 готово»
+        // бросались бы в глаза. Двоеточие снимает вопрос вовсе.
+        self.summary.clear();
+        for (name, count) in [
+            ("Идёт", running),
+            ("В очереди", waiting),
+            ("Готово", done),
+            ("Ошибок", failed),
+            ("Снято", cancelled),
+        ] {
+            if count == 0 {
+                continue;
+            }
+            if !self.summary.is_empty() {
+                self.summary.push_str(" · ");
+            }
+            let _ = write!(self.summary, "{name}: {count}");
+        }
     }
 }
 
@@ -295,8 +631,10 @@ impl MetaPanel {
                     });
                     self.busy = false;
                 }
-                Event::Failed(err) => {
-                    self.outcome = Some((err, theme::STATE_ERROR));
+                // Номер загрузки здесь всегда `NO_DOWNLOAD` и никого
+                // не интересует: канал у метаданных свой, разводить нечего.
+                Event::Failed { message, .. } => {
+                    self.outcome = Some((message, theme::STATE_ERROR));
                     self.busy = false;
                 }
                 // Остальные варианты рождаются только загрузкой и установкой,
@@ -306,7 +644,7 @@ impl MetaPanel {
                 | Event::Thumbnail(_)
                 | Event::Progress(_)
                 | Event::Log(_)
-                | Event::Done(_)
+                | Event::Done { .. }
                 | Event::Ready
                 | Event::Warning(_)
                 | Event::Notice(_) => {}
@@ -410,6 +748,8 @@ pub struct SavioApp {
     meta: MetaPanel,
     /// Что скачано за этот запуск. Наполняется из `Event::Done`.
     history: History,
+    /// Ссылки, поставленные в очередь. Идут строго по одной, сверху вниз.
+    queue: Queue,
     /// Окно нужно развернуть на первом кадре.
     ///
     /// Одного `with_maximized(true)` в `main.rs` мало: вместе с
@@ -475,6 +815,7 @@ impl SavioApp {
             tab: Tab::Download,
             meta: MetaPanel::new(),
             history: History::default(),
+            queue: Queue::new(),
             maximize_pending: true,
             saver: settings::Saver::spawn(),
         };
@@ -580,9 +921,10 @@ fn display_dir(dir: Option<&Path>) -> String {
 }
 
 impl SavioApp {
-    fn can_start(&self) -> bool {
-        !matches!(self.state, State::Running)
-            && !self.url.trim().is_empty()
+    /// Проверки, общие для «Скачать» и «В очередь»: они относятся к ссылке
+    /// в поле, а не к тому, что с ней собираются делать.
+    fn url_is_ready(&self) -> bool {
+        !self.url.trim().is_empty()
             && self.out_dir.is_some()
             && self.setup_error.is_none()
             // Неразобранный диапазон кнопку **блокирует**, в отличие от
@@ -595,13 +937,38 @@ impl SavioApp {
             && self.section_error.is_none()
     }
 
-    fn start(&mut self, ctx: &egui::Context) {
-        let Some(out_dir) = self.out_dir.clone() else {
-            return;
-        };
+    /// Можно ли поставить ссылку из поля в конец очереди.
+    ///
+    /// В отличие от «Скачать», работает и во время загрузки: очередь затем
+    /// и нужна, чтобы докладывать ссылки, пока идёт первая.
+    fn can_enqueue(&self) -> bool {
+        self.url_is_ready() && !self.queue.full
+    }
 
-        let (tx, rx) = channel();
-        let notify_ctx = ctx.clone();
+    fn can_start(&self) -> bool {
+        if matches!(self.state, State::Running) || self.setup_error.is_some() {
+            return false;
+        }
+        // Ссылка в поле поедет в очередь первой — её проверки прежние.
+        // Поле пустое — запускать имеет смысл только то, что уже стоит
+        // в очереди: ровно так возвращаются к остатку после «Отмены».
+        if self.url.trim().is_empty() {
+            self.queue.has_waiting()
+        } else {
+            self.url_is_ready()
+        }
+    }
+
+    /// Ставит ссылку из поля в конец очереди.
+    ///
+    /// Возвращает `false`, если ставить было нечего или места не нашлось.
+    fn enqueue(&mut self) -> bool {
+        if !self.can_enqueue() {
+            return false;
+        }
+        let Some(out_dir) = self.out_dir.clone() else {
+            return false;
+        };
 
         let request = Request {
             url: self.url.trim().to_owned(),
@@ -612,8 +979,54 @@ impl SavioApp {
             section: self.section,
         };
 
-        match engine::start(request, out_dir, tx, move || notify_ctx.request_repaint()) {
+        if self.queue.push(request, out_dir).is_none() {
+            return false;
+        }
+
+        // Пока ничего не идёт, экран описывает не прошлую загрузку, а то,
+        // что человек только что попросил. Во время загрузки состояние
+        // не трогаем: там оно про неё.
+        if !matches!(self.state, State::Running) {
+            self.state = State::Queued;
+        }
+        true
+    }
+
+    /// Нажали «Скачать»: ссылка из поля уходит в конец очереди, и очередь
+    /// идёт сверху вниз.
+    ///
+    /// Пустое поле при непустой очереди — это «продолжить»: так возвращаются
+    /// к тому, что осталось после «Отмены». Поле при этом не очищается — до
+    /// появления очереди «Скачать» его тоже не трогал, и повторить ту же
+    /// ссылку по-прежнему можно вторым нажатием.
+    fn start(&mut self, ctx: &egui::Context) {
+        self.enqueue();
+        self.start_next(ctx);
+    }
+
+    /// Запускает следующую ожидающую ссылку.
+    ///
+    /// Строго по одной: пока идёт загрузка, второго потока не заводим —
+    /// десяток ссылок обернулся бы десятком yt-dlp разом, поделивших канал
+    /// и полосу на всех. Очередь кончилась — просто ничего не делаем:
+    /// на экране остаётся исход последней загрузки.
+    fn start_next(&mut self, ctx: &egui::Context) {
+        // `setup.busy()` в проверке не для полноты: установка занимает тот же
+        // единственный `rx`, и запуск загрузки поверх неё отобрал бы у модалки
+        // её же события.
+        if matches!(self.state, State::Running) || self.setup.busy() {
+            return;
+        }
+        let Some((id, request, out_dir)) = self.queue.next_waiting() else {
+            return;
+        };
+
+        let (tx, rx) = channel();
+        let notify_ctx = ctx.clone();
+
+        match engine::start(id, request, out_dir, tx, move || notify_ctx.request_repaint()) {
             Ok(handle) => {
+                self.queue.set_status(id, QueueStatus::Running);
                 self.rx = Some(rx);
                 self.handle = Some(handle);
                 self.state = State::Running;
@@ -633,6 +1046,10 @@ impl SavioApp {
                 self.rebuild_progress_line();
             }
             Err(err) => {
+                // Не нашёлся yt-dlp — дальше по очереди идти незачем:
+                // следующая ссылка споткнётся ровно о то же самое. Значит,
+                // останавливаемся и говорим об этом один раз, а не полсотни.
+                self.queue.set_status(id, QueueStatus::Failed(err.clone()));
                 self.setup_error = Some(err.clone());
                 self.state = State::Failed(err);
             }
@@ -644,7 +1061,18 @@ impl SavioApp {
             handle.cancel();
         }
         self.handle = None;
+        // Приёмник роняем сразу, и это не только уборка: у убитого процесса
+        // поток движка живёт ещё секунду-другую и досылает свой `Failed`.
+        // Закрытый канал глушит его, а заодно сообщает самому движку, что
+        // UI про эту загрузку забыл (см. проверку перед запуском в `run`).
         self.rx = None;
+        // Снятая — не проваленная: отмена показывается «Отменено», а не
+        // ошибкой (Правило 2). Остальные ссылки остаются ждать: «Отмена»
+        // останавливает очередь, а не стирает её, и «Скачать» продолжит
+        // с того же места.
+        if let Some(id) = self.queue.running_id() {
+            self.queue.set_status(id, QueueStatus::Cancelled);
+        }
         self.state = State::Cancelled;
         self.stage = "Отменено".into();
         self.progress_line.clear();
@@ -751,6 +1179,7 @@ impl SavioApp {
     fn status(&self) -> (&'static str, egui::Color32) {
         match self.state {
             State::Idle => ("Готов к работе", theme::TEXT_SECONDARY),
+            State::Queued => ("В очереди", theme::TEXT_SECONDARY),
             State::Running => ("Загрузка", theme::ACCENT),
             State::Done(_) => ("Готово", theme::STATE_SUCCESS),
             State::Failed(_) => ("Ошибка", theme::STATE_ERROR),
@@ -784,10 +1213,23 @@ impl SavioApp {
         // событии: прогресс приходит часто, а показать нужно только итог.
         let mut progress_dirty = false;
         let mut meta_dirty = false;
+        // Текущая загрузка доработала — пора брать следующую из очереди.
+        // Флагом, а не вызовом прямо из ветки: `start_next` подменяет `rx`,
+        // и делать это посреди разбора уже вычитанной пачки — значит гадать,
+        // к какой из двух загрузок относился её хвост.
+        let mut advance = false;
 
         for event in events {
             match event {
                 Event::Info(info) => {
+                    // Название ролика — единственное, по чему строку очереди
+                    // узнают глазами: десяток ссылок с одного сайта
+                    // различается тремя символами в конце.
+                    if let Some(title) = &info.title
+                        && let Some(id) = self.queue.running_id()
+                    {
+                        self.queue.set_title(id, title);
+                    }
                     self.info = Some(info);
                     meta_dirty = true;
                 }
@@ -816,8 +1258,16 @@ impl SavioApp {
                     progress_dirty = true;
                 }
                 Event::Progress(p) => {
-                    self.progress = p;
-                    progress_dirty = true;
+                    // Чужой прогресс — это прогресс уже снятой загрузки:
+                    // её процесс досылает строки и после `kill`. Показать
+                    // его на месте текущей значило бы дёрнуть полосу назад.
+                    //
+                    // Во время установки номера нет вовсе (`NO_DOWNLOAD`),
+                    // и разводить там нечего: канал занят ею одной.
+                    if self.setup.busy() || self.queue.is_running(p.download_id) {
+                        self.progress = p;
+                        progress_dirty = true;
+                    }
                 }
                 Event::Log(line) => {
                     self.log.push(line);
@@ -825,28 +1275,43 @@ impl SavioApp {
                         self.log.drain(..self.log.len() - LOG_LIMIT);
                     }
                 }
-                Event::Done(path) => {
-                    self.stage = "Готово".into();
-                    self.done_path_display = path.display().to_string();
-                    // Единственное место, где пополняется история: другого
-                    // признака «файл готов и лежит вот здесь» у UI нет.
-                    // Успех без пути (`Event::Stage("Готово (файл уже
-                    // существовал)")`) сюда не попадает — записывать нечего.
-                    self.history.remember(&path);
-                    self.state = State::Done(path);
-                    self.handle = None;
-                    progress_dirty = true;
-                }
-                Event::Failed(err) => {
-                    // Один и тот же вариант обслуживает обе задачи, поэтому
-                    // разводим их по текущему режиму: во время установки это
-                    // сбой установки, а не сорвавшаяся загрузка ролика.
-                    if self.setup.busy() {
-                        self.finish_setup(Setup::Failed(err));
-                    } else {
-                        self.stage = "Ошибка".into();
-                        self.state = State::Failed(err);
+                Event::Done { id, path } => {
+                    // Сверка номера обязательна: пока событие шло по каналу,
+                    // загрузку могли снять, и «Готово» встало бы рядом
+                    // с чужим путём.
+                    if self.queue.is_running(id) {
+                        self.stage = "Готово".into();
+                        self.done_path_display = path.display().to_string();
+                        // Единственное место, где пополняется история: другого
+                        // признака «файл готов и лежит вот здесь» у UI нет.
+                        // Успех без пути (`Event::Stage("Готово (файл уже
+                        // существовал)")`) сюда не попадает — записывать нечего.
+                        self.history.remember(&path);
+                        self.queue.set_status(id, QueueStatus::Done);
+                        self.state = State::Done(path);
                         self.handle = None;
+                        advance = true;
+                        progress_dirty = true;
+                    }
+                }
+                Event::Failed { id, message } => {
+                    // Один и тот же вариант обслуживает три задачи, поэтому
+                    // разводим их по режиму и по номеру: во время установки
+                    // это сбой установки, а не сорвавшаяся загрузка ролика.
+                    if self.setup.busy() {
+                        self.finish_setup(Setup::Failed(message));
+                    } else if self.queue.is_running(id) {
+                        self.stage = "Ошибка".into();
+                        self.queue
+                            .set_status(id, QueueStatus::Failed(message.clone()));
+                        self.state = State::Failed(message);
+                        self.handle = None;
+                        // Одна мёртвая ссылка — не повод бросать девять живых:
+                        // очередь идёт дальше. Ради этого её и ставят, уходя.
+                        // Причина никуда не денется: она лежит в самой строке
+                        // очереди, а не только в журнале, который вот-вот
+                        // очистится под следующую загрузку.
+                        advance = true;
                         progress_dirty = true;
                     }
                 }
@@ -877,9 +1342,25 @@ impl SavioApp {
 
         if disconnected {
             self.rx = None;
+            // Поток движка кончился, не сказав ни `Done`, ни `Failed`. Так
+            // выглядит успех без пути: файл уже лежал на диске, и стадию
+            // `after_move` yt-dlp пропустил — по Правилу 2 это НЕ ошибка.
+            // Отметить его обязательно: иначе строка навсегда осталась бы
+            // «качается», а вся очередь встала бы на ровном месте.
+            if let Some(id) = self.queue.running_id() {
+                self.queue.set_status(id, QueueStatus::Done);
+                advance = true;
+            }
             if matches!(self.state, State::Running) {
                 self.state = State::Idle;
             }
+        }
+
+        // Строго после разбора пачки и после разрыва канала: `start_next`
+        // заводит новый `rx`, и сделай мы это раньше — обрыв старого канала
+        // обнулил бы только что заведённый.
+        if advance {
+            self.start_next(ctx);
         }
     }
 }
@@ -1026,6 +1507,10 @@ impl SavioApp {
         self.controls_card(ui);
         ui.add_space(16.0);
         self.status_section(ui);
+        // Очередь идёт под состоянием и над обслуживанием: она про текущую
+        // работу, а «Обновить движок» — про то, за чем идут, когда работа
+        // не пошла.
+        self.queue_section(ui);
         self.maintenance_row(ui);
         self.log_section(ui);
     }
@@ -1578,65 +2063,147 @@ impl SavioApp {
         });
     }
 
+    /// Ряд действий: «В очередь» слева, «Скачать» (или «Отмена») справа.
+    ///
+    /// Две кнопки в строку, а не одна во всю ширину, как было до очереди:
+    /// докладывать ссылки нужно и во время загрузки, а второй ряд удлинил бы
+    /// и без того длинную карточку. Ширины неравные — главное действие экрана
+    /// остаётся заметно крупнее.
     fn action_button(&mut self, ui: &mut egui::Ui) {
-        if matches!(self.state, State::Running) {
-            let cancel = ui.add_sized(
-                [ui.available_width(), theme::CTA_HEIGHT],
-                egui::Button::new("Отмена"),
-            );
-            if cancel.clicked() {
+        // Подсказку выключенной кнопки выбираем по первой же причине, а не
+        // по всем сразу: человеку нужно знать, что сделать сейчас.
+        let add_hint = if self.queue.full {
+            "Очередь заполнена: дождитесь, пока что-нибудь скачается."
+        } else if self.url.trim().is_empty() {
+            "Вставьте ссылку — она встанет в конец очереди."
+        } else if self.section_error.is_some() {
+            "Поправьте границы фрагмента."
+        } else if self.out_dir.is_none() {
+            "Сначала выберите папку сохранения."
+        } else {
+            "Сначала нужен yt-dlp."
+        };
+        let can_enqueue = self.can_enqueue();
+
+        let mut enqueue_clicked = false;
+        let mut primary_clicked = false;
+
+        ui.horizontal(|ui| {
+            const GAP: f32 = 10.0;
+            ui.spacing_mut().item_spacing.x = GAP;
+            // Треть — «В очередь», остаток — главному действию. Остаток,
+            // а не вторая доля от деления: два округления до пиксельной
+            // сетки не дотянули бы ряд до правого края.
+            let secondary = ((ui.available_width() - GAP) / 3.0).max(90.0);
+
+            enqueue_clicked = ui
+                .add_enabled(
+                    can_enqueue,
+                    egui::Button::new("В очередь")
+                        .min_size(egui::vec2(secondary, theme::CTA_HEIGHT)),
+                )
+                .on_hover_text(
+                    "Ссылка встанет в конец очереди, а поле освободится под \
+                     следующую. Качаются они по одной, сверху вниз.",
+                )
+                .on_disabled_hover_text(add_hint)
+                .clicked();
+
+            primary_clicked = self.primary_button(ui, ui.available_width());
+        });
+
+        if enqueue_clicked && self.enqueue() {
+            // Поле освобождаем сразу: «В очередь» затем и нажимают, чтобы
+            // вставить следующую ссылку. У «Скачать» этого нет — там поле
+            // остаётся, как оно оставалось и до появления очереди.
+            self.url.clear();
+            self.url_invalid = false;
+        }
+        if primary_clicked {
+            let ctx = ui.ctx().clone();
+            if matches!(self.state, State::Running) {
                 self.cancel();
+            } else {
+                self.start(&ctx);
             }
-            return;
+        }
+
+        if self.queue.full {
+            ui.add_space(6.0);
+            note(
+                ui,
+                "В очереди больше некуда: полсотни ссылок ещё ждут. Как только \
+                 хоть одна скачается, место освободится само.",
+                theme::STATE_WARNING,
+            );
+        }
+    }
+
+    /// Главная кнопка ряда: «Отмена» во время загрузки, «Скачать» в остальное
+    /// время. Возвращает `true`, когда её нажали.
+    fn primary_button(&mut self, ui: &mut egui::Ui, width: f32) -> bool {
+        if matches!(self.state, State::Running) {
+            return ui
+                .add_sized([width, theme::CTA_HEIGHT], egui::Button::new("Отмена"))
+                .on_hover_text(
+                    "Остановит идущую загрузку. Остальные ссылки останутся \
+                     в очереди — «Скачать» продолжит с того же места.",
+                )
+                .clicked();
         }
 
         let enabled = self.can_start();
-        let clicked = ui
-            .scope(|ui| {
-                let v = ui.visuals_mut();
-                // `ui.disable()` не переключает виджет на `noninteractive`,
-                // а только глушит прозрачность. Поэтому выключенный вид
-                // задаём сами: все три состояния красим приглушённым жёлтым,
-                // навести на выключенную кнопку всё равно нельзя.
-                let (rest, hover, press) = if enabled {
-                    (theme::ACCENT, theme::ACCENT_HOVER, theme::ACCENT_ACTIVE)
-                } else {
-                    (
-                        theme::ACCENT_DISABLED,
-                        theme::ACCENT_DISABLED,
-                        theme::ACCENT_DISABLED,
-                    )
-                };
+        // Подсказка выключенной кнопке нужна не меньше, чем соседней: до
+        // очереди она молча гасла, и понять почему было неоткуда.
+        let hint = if self.setup_error.is_some() {
+            "Сначала нужен yt-dlp."
+        } else if self.section_error.is_some() {
+            "Поправьте границы фрагмента."
+        } else if self.out_dir.is_none() {
+            "Сначала выберите папку сохранения."
+        } else {
+            "Вставьте ссылку или поставьте что-нибудь в очередь."
+        };
 
-                for (state, fill) in [
-                    (&mut v.widgets.inactive, rest),
-                    (&mut v.widgets.hovered, hover),
-                    (&mut v.widgets.active, press),
-                ] {
-                    state.weak_bg_fill = fill;
-                    state.bg_stroke = egui::Stroke::NONE;
-                    state.fg_stroke = egui::Stroke::new(1.0, theme::TEXT_ON_ACCENT);
-                    state.corner_radius = egui::CornerRadius::same(theme::RADIUS);
-                }
-                // Двойное ослабление не нужно: приглушённый жёлтый уже задан
-                // явно, а поверх него прозрачность съела бы кнопку целиком.
-                v.disabled_alpha = 1.0;
+        ui.scope(|ui| {
+            let v = ui.visuals_mut();
+            // `ui.disable()` не переключает виджет на `noninteractive`,
+            // а только глушит прозрачность. Поэтому выключенный вид
+            // задаём сами: все три состояния красим приглушённым жёлтым,
+            // навести на выключенную кнопку всё равно нельзя.
+            let (rest, hover, press) = if enabled {
+                (theme::ACCENT, theme::ACCENT_HOVER, theme::ACCENT_ACTIVE)
+            } else {
+                (
+                    theme::ACCENT_DISABLED,
+                    theme::ACCENT_DISABLED,
+                    theme::ACCENT_DISABLED,
+                )
+            };
 
-                ui.add_enabled_ui(enabled, |ui| {
-                    ui.add_sized(
-                        [ui.available_width(), theme::CTA_HEIGHT],
-                        egui::Button::new(egui::RichText::new("Скачать").strong()),
-                    )
-                    .clicked()
-                })
-                .inner
-            })
-            .inner;
+            for (state, fill) in [
+                (&mut v.widgets.inactive, rest),
+                (&mut v.widgets.hovered, hover),
+                (&mut v.widgets.active, press),
+            ] {
+                state.weak_bg_fill = fill;
+                state.bg_stroke = egui::Stroke::NONE;
+                state.fg_stroke = egui::Stroke::new(1.0, theme::TEXT_ON_ACCENT);
+                state.corner_radius = egui::CornerRadius::same(theme::RADIUS);
+            }
+            // Двойное ослабление не нужно: приглушённый жёлтый уже задан
+            // явно, а поверх него прозрачность съела бы кнопку целиком.
+            v.disabled_alpha = 1.0;
 
-        if clicked {
-            let ctx = ui.ctx().clone();
-            self.start(&ctx);
-        }
+            ui.add_enabled(
+                enabled,
+                egui::Button::new(egui::RichText::new("Скачать").strong())
+                    .min_size(egui::vec2(width, theme::CTA_HEIGHT)),
+            )
+            .on_disabled_hover_text(hint)
+            .clicked()
+        })
+        .inner
     }
 
     fn status_section(&mut self, ui: &mut egui::Ui) {
@@ -1751,6 +2318,16 @@ impl SavioApp {
                         .color(theme::TEXT_SECONDARY),
                 );
             }
+            State::Queued => {
+                ui.label(
+                    egui::RichText::new(
+                        "Ссылки ждут в очереди. Нажмите «Скачать» — они пойдут \
+                         по одной, сверху вниз.",
+                    )
+                    .small()
+                    .color(theme::TEXT_SECONDARY),
+                );
+            }
             State::Idle => {
                 ui.label(
                     egui::RichText::new("Вставьте ссылку и нажмите «Скачать».")
@@ -1758,6 +2335,127 @@ impl SavioApp {
                         .color(theme::TEXT_SECONDARY),
                 );
             }
+        }
+    }
+
+    /// Список того, что стоит в очереди.
+    ///
+    /// Показывается, только когда очередь непуста: пустая карточка на экране
+    /// человека, который очередью не пользуется, отнимала бы место у главного
+    /// и объясняла бы то, о чём он не спрашивал.
+    fn queue_section(&mut self, ui: &mut egui::Ui) {
+        if self.queue.items.is_empty() {
+            return;
+        }
+
+        // Что нажали, решаем после отрисовки: менять список, пока по нему
+        // идёт цикл, нельзя, а откладывать решение до следующего кадра —
+        // значит терять его при быстром щелчке.
+        let mut remove: Option<DownloadId> = None;
+        let mut clear = false;
+
+        ui.add_space(16.0);
+        egui::Frame::new()
+            .fill(theme::BG_SURFACE)
+            .stroke(egui::Stroke::new(1.0, theme::BORDER_SUBTLE))
+            .corner_radius(egui::CornerRadius::same(12))
+            .inner_margin(egui::Margin::same(18))
+            .show(ui, |ui| {
+                // Без этого карточка сжалась бы по ширине самой длинной
+                // строки списка — то же, что и у карточки истории.
+                ui.set_width(ui.available_width());
+
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Очередь")
+                            .small()
+                            .color(theme::TEXT_SECONDARY),
+                    );
+
+                    // Кнопка прижата к правому краю, сводка — к ней:
+                    // в окне шириной 520 сводка обрежется, а кнопка нет.
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        clear = ui
+                            .add(
+                                egui::Button::new("Очистить")
+                                    .min_size(egui::vec2(0.0, theme::CONTROL_HEIGHT)),
+                            )
+                            .on_hover_text(
+                                "Список опустеет: уйдут и скачанные, и те, что ещё \
+                                 ждут. Идущая загрузка не прервётся — её \
+                                 останавливает «Отмена».",
+                            )
+                            .clicked();
+
+                        // Подсказку с полной сводкой вешает сама обрезанная
+                        // метка (`show_tooltip_when_elided`) — свой
+                        // `on_hover_text` рядом дал бы вторую коробку
+                        // с тем же текстом.
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&self.queue.summary)
+                                    .small()
+                                    .color(theme::TEXT_MUTED),
+                            )
+                            .truncate(),
+                        );
+                    });
+                });
+
+                ui.add_space(10.0);
+
+                // Строки лежат прямо в общей прокрутке, своей у списка нет —
+                // ровно как у вкладки «История», и по той же причине: полоса
+                // рядом с полосой только мешает. Здесь у этого есть и вторая,
+                // более жёсткая причина. Вложенная вертикальная прокрутка
+                // берёт высоту из `available_rect_before_wrap()`, а внутри
+                // другой прокрутки это не «сколько влезет в окно», а «сколько
+                // осталось от её видимой части». Карточка очереди лежит низко,
+                // остаток к ней нулевой — и список схлопывается до
+                // `min_scrolled_size`, то есть до 64 точек (scroll_area.rs:774).
+                // Выходит окошко в одну строку с обрезанной подписью, и
+                // `max_height` тут ни при чём. Проверено глазами; ни сборка,
+                // ни `clippy`, ни тесты этого не видят.
+                //
+                // Плата — длинная страница при длинной очереди. Она честная:
+                // человек, поставивший полсотни ссылок, их и хочет видеть,
+                // а потолок в `QUEUE_LIMIT` держит длину конечной.
+                for (index, item) in self.queue.items.iter().enumerate() {
+                    if index > 0 {
+                        ui.add_space(6.0);
+                    }
+                    if queue_row(ui, item) {
+                        remove = Some(item.id);
+                    }
+                }
+
+                ui.add_space(10.0);
+                note(
+                    ui,
+                    "Ссылки качаются по одной, сверху вниз. Сорвавшаяся не \
+                     останавливает остальные. На диск список не пишется и при \
+                     закрытии Savio исчезает.",
+                    theme::TEXT_MUTED,
+                );
+            });
+
+        let emptied = remove.is_some() || clear;
+        if let Some(id) = remove {
+            self.queue.remove(id);
+        }
+        if clear {
+            self.queue.clear();
+        }
+
+        // Экран не должен пережить очередь. Убрали последнее ожидающее — и
+        // «В очереди» на плашке становится враньём, а совет под ней («нажмите
+        // „Скачать“ — они пойдут по одной») указывает на кнопку, которую
+        // `can_start()` к этому моменту уже погасил: ждать-то нечего. Сам
+        // список при этом с экрана исчезает, так что человек читает про
+        // очередь, которой не видит. Ни сборка, ни `clippy`, ни тесты этого
+        // не ловят — только глаза.
+        if emptied && matches!(self.state, State::Queued) && !self.queue.has_waiting() {
+            self.state = State::Idle;
         }
     }
 
@@ -2432,6 +3130,120 @@ fn segment_button(ui: &mut egui::Ui, label: &str, selected: bool, width: f32) ->
     .inner
 }
 
+/// Одна строка очереди. Возвращает `true`, если нажали «убрать».
+///
+/// Свободная функция, а не метод: строке нужен только сам элемент, и от
+/// заимствования всего `SavioApp` внутри цикла по списку это избавляет.
+fn queue_row(ui: &mut egui::Ui, item: &QueueItem) -> bool {
+    let mut remove = false;
+
+    egui::Frame::new()
+        .fill(theme::BG_ELEVATED)
+        .corner_radius(egui::CornerRadius::same(theme::RADIUS_SMALL))
+        .inner_margin(egui::Margin::symmetric(12, 10))
+        .show(ui, |ui| {
+            // Иначе строка сжалась бы по ширине своего названия: у короткого
+            // получилась бы узкая полоска посреди списка.
+            ui.set_width(ui.available_width());
+
+            ui.horizontal(|ui| {
+                const GAP: f32 = 8.0;
+                const BUTTON: f32 = 24.0;
+                ui.spacing_mut().item_spacing.x = GAP;
+
+                // Точка — подсказка глазу, а не носитель смысла: то же
+                // состояние сказано словом строкой ниже.
+                let (dot, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                ui.painter()
+                    .circle_filled(dot.center(), 4.0, item.status.color());
+
+                // Убрать можно только то, что ещё не началось: у идущей
+                // загрузки для этого есть «Отмена», а у отработавшей строка —
+                // единственный след того, чем всё кончилось.
+                let removable = item.status == QueueStatus::Waiting;
+
+                // Место под кнопку отмеряем сами, а не кладём её первой
+                // в раскладке справа налево: там короткое название прижалось
+                // бы к правому краю, а начинаться строка обязана слева.
+                // Отдать же название под `truncate()` без запаса нельзя —
+                // оно займёт всю ширину и выдавит кнопку за кромку.
+                let trailing = if removable { BUTTON + GAP } else { 0.0 };
+                let width = (ui.available_width() - trailing).max(40.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(width, BUTTON),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        // `set_min_width` тут обязателен, хотя ширина уже
+                        // запрошена выше: `allocate_ui_with_layout` двигает
+                        // курсор не на запрошенный размер, а на тот, что занял
+                        // потомок. Без него у короткого названия кнопка
+                        // прилипала бы к нему вплотную посреди строки вместо
+                        // правого края. Проверено глазами.
+                        ui.set_min_width(width);
+                        // Подсказку с полным названием вешает сама обрезанная
+                        // метка — свой `on_hover_text` рядом её не заменил бы,
+                        // а добавил вторую коробку с тем же текстом.
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&item.title).color(theme::TEXT_PRIMARY),
+                            )
+                            .truncate(),
+                        );
+                    },
+                );
+
+                if removable {
+                    remove = ui
+                        .scope(|ui| {
+                            // Поля кнопке урезаем, и это не косметика.
+                            // `min_size` — только нижняя граница, а желаемую
+                            // ширину `Button` считает как «текст плюс
+                            // `button_padding.x` с двух сторон». При штатных
+                            // 14 точках (theme.rs) крестик выходит 36.5 вместо
+                            // отведённых ему 24, вылезает за `max_rect` строки
+                            // и расширяет его — а следующая строка стартует уже
+                            // от расширенной кромки и переполняет её снова.
+                            // Перекос копится вниз по списку: к десятой строке
+                            // это уже сотня точек за кромкой окна. Замерено на
+                            // egui 0.35; ни сборка, ни `clippy`, ни тесты
+                            // этого не видят.
+                            ui.spacing_mut().button_padding.x = 6.0;
+                            ui.add(egui::Button::new("×").min_size(egui::vec2(BUTTON, BUTTON)))
+                                .on_hover_text("Убрать из очереди")
+                                .clicked()
+                        })
+                        .inner;
+                }
+            });
+
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new(&item.detail)
+                    .small()
+                    .color(item.status.color()),
+            );
+
+            // Причина отказа — то, ради чего в этот список потом смотрят:
+            // журнал к тому времени очищен следующей загрузкой. Обрезаем,
+            // а не переносим: объяснения длинные, и десяток абзацев подряд
+            // превратил бы список в стену текста. Полный текст показывает
+            // та же штатная подсказка обрезанной метки.
+            if !item.error_line.is_empty() {
+                ui.add_space(2.0);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(&item.error_line)
+                            .small()
+                            .color(theme::STATE_ERROR),
+                    )
+                    .truncate(),
+                );
+            }
+        });
+
+    remove
+}
+
 /// Одна галочка «вшить в файл».
 ///
 /// Цвет подписи задаём явно и не полагаемся на стиль: egui красит текст
@@ -2569,6 +3381,273 @@ fn open_dir(dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::NO_DOWNLOAD;
+
+    fn request(url: &str, format: Format, quality: Quality) -> Request {
+        Request {
+            url: url.to_owned(),
+            format,
+            quality,
+            options: DownloadOptions::default(),
+            section: Section::default(),
+            cookies: CookieSource::default(),
+        }
+    }
+
+    /// Очередь из `count` одинаковых ожидающих ссылок.
+    fn queue_with(count: usize) -> Queue {
+        let mut queue = Queue::new();
+        for i in 0..count {
+            let url = format!("https://site/{i}");
+            assert!(
+                queue
+                    .push(
+                        request(&url, Format::Mp4, Quality::Best),
+                        PathBuf::from("/dl")
+                    )
+                    .is_some(),
+                "{url} не влезла в очередь"
+            );
+        }
+        queue
+    }
+
+    fn ids(queue: &Queue) -> Vec<DownloadId> {
+        queue.items.iter().map(|item| item.id).collect()
+    }
+
+    /// Ноль занят под `NO_DOWNLOAD` — событие установки или разбора
+    /// метаданных. Выдай очередь этот номер ссылке, и чужой `Failed`
+    /// пометил бы её ошибкой.
+    #[test]
+    fn numbering_never_hands_out_the_reserved_zero() {
+        let mut queue = Queue::new();
+        assert_ne!(queue.next_id, NO_DOWNLOAD);
+
+        // Четыре миллиарда ссылок за запуск недостижимы, но проверить обход
+        // нуля дёшево, а `+= 1` на этом месте ещё и паникует в отладке.
+        queue.next_id = u32::MAX;
+        let last = queue
+            .push(
+                request("https://site/a", Format::Mp4, Quality::Best),
+                PathBuf::from("/dl"),
+            )
+            .unwrap();
+        let wrapped = queue
+            .push(
+                request("https://site/b", Format::Mp4, Quality::Best),
+                PathBuf::from("/dl"),
+            )
+            .unwrap();
+
+        assert_eq!(last, u32::MAX);
+        assert_eq!(wrapped, 1, "после переполнения нумерация обходит ноль");
+    }
+
+    /// Потолок обязателен по Правилу 1, как и у журнала с историей. Но
+    /// выбрасывать можно только отработавшее: ожидающая ссылка — это
+    /// невыполненная просьба, и потерять её молча нельзя.
+    #[test]
+    fn queue_stays_bounded_by_dropping_what_already_finished() {
+        let mut queue = queue_with(QUEUE_LIMIT);
+        assert_eq!(queue.items.len(), QUEUE_LIMIT);
+        assert!(queue.full, "мест нет и освободить нечем");
+
+        let extra = request("https://site/extra", Format::Mp4, Quality::Best);
+        assert_eq!(queue.push(extra.clone(), PathBuf::from("/dl")), None);
+        assert_eq!(queue.items.len(), QUEUE_LIMIT, "ожидающую не выбросили");
+
+        // Первая скачалась — место освободилось, и уходит именно она.
+        let oldest = queue.items[0].id;
+        queue.set_status(oldest, QueueStatus::Done);
+        assert!(!queue.full);
+
+        assert!(queue.push(extra, PathBuf::from("/dl")).is_some());
+        assert_eq!(queue.items.len(), QUEUE_LIMIT);
+        assert!(
+            queue.items.iter().all(|item| item.id != oldest),
+            "место обязана освободить отработавшая строка"
+        );
+    }
+
+    /// Очередь идёт сверху вниз и не выдаёт дважды одно и то же: выдай она
+    /// идущую ссылку второй раз — и тот же ролик качался бы в два потока.
+    #[test]
+    fn the_queue_goes_top_down_and_skips_what_already_ran() {
+        let mut queue = queue_with(3);
+        let id = ids(&queue);
+        let next = |q: &Queue| q.next_waiting().map(|(id, ..)| id);
+
+        assert_eq!(next(&queue), Some(id[0]));
+        queue.set_status(id[0], QueueStatus::Done);
+        assert_eq!(next(&queue), Some(id[1]));
+        queue.set_status(id[1], QueueStatus::Running);
+        assert_eq!(next(&queue), Some(id[2]));
+
+        queue.set_status(id[2], QueueStatus::Failed("нет такой страницы".into()));
+        assert_eq!(next(&queue), None);
+        assert!(!queue.has_waiting());
+    }
+
+    /// Тот самый случай, ради которого номера и заведены: у снятой загрузки
+    /// поток движка живёт ещё секунду и досылает свой исход. Достанься он
+    /// следующему элементу — исправная загрузка показалась бы сорванной.
+    #[test]
+    fn a_late_event_of_a_dropped_download_belongs_to_no_one() {
+        let mut queue = queue_with(2);
+        let id = ids(&queue);
+
+        queue.set_status(id[0], QueueStatus::Running);
+        assert!(queue.is_running(id[0]));
+        assert!(!queue.is_running(id[1]), "ожидающая ещё не идёт");
+
+        queue.set_status(id[0], QueueStatus::Cancelled);
+        queue.set_status(id[1], QueueStatus::Running);
+
+        assert!(!queue.is_running(id[0]), "запоздалое событие снятой загрузки");
+        assert!(queue.is_running(id[1]));
+        // Установка и метаданные ходят без номера — их события в очередь
+        // не попадают вовсе.
+        assert!(!queue.is_running(NO_DOWNLOAD));
+        assert_eq!(queue.running_id(), Some(id[1]));
+    }
+
+    /// Строка списка обязана говорить, что именно уедет на диск: настройки
+    /// снимаются в момент постановки, и переключатели на экране к ней уже
+    /// отношения не имеют.
+    #[test]
+    fn a_row_says_what_it_will_download_and_in_what_state() {
+        let mut queue = Queue::new();
+        let id = queue
+            .push(
+                request("https://site/a", Format::Mp3, Quality::P1080),
+                PathBuf::from("/dl"),
+            )
+            .unwrap();
+
+        let detail = queue.items[0].detail.clone();
+        assert!(detail.starts_with("Ожидает"), "{detail}");
+        // Единица обязательна: «MP3 · 192» читается как загадка.
+        assert!(detail.contains("MP3 · 192 кбит/с"), "{detail}");
+
+        queue.set_status(id, QueueStatus::Running);
+        let detail = &queue.items[0].detail;
+        assert!(detail.starts_with("Качается"), "{detail}");
+        assert!(detail.contains("MP3 · 192 кбит/с"), "{detail}");
+    }
+
+    /// `explain_failure` отдаёт объяснение с переносами строк, а метка
+    /// с `truncate()` показывает ровно первую из них: в списке выходило
+    /// «Ошибка (код 1):…» — подпись, не говорящая ничего.
+    #[test]
+    fn the_reason_for_failure_is_flattened_into_one_line() {
+        let mut queue = queue_with(1);
+        let id = queue.items[0].id;
+        assert!(queue.items[0].error_line.is_empty(), "отказа ещё не было");
+
+        queue.set_status(
+            id,
+            QueueStatus::Failed("Ошибка (код 1):\nERROR: Unsupported URL:\n  https://site".into()),
+        );
+
+        let line = &queue.items[0].error_line;
+        assert!(!line.contains('\n'), "перенос остался: {line}");
+        assert_eq!(
+            line,
+            "Ошибка (код 1): ERROR: Unsupported URL: https://site"
+        );
+
+        // Ушёл отказ — ушла и строка: причина позапрошлой беды рядом
+        // с готовым файлом читается как новая.
+        queue.set_status(id, QueueStatus::Done);
+        assert!(queue.items[0].error_line.is_empty());
+    }
+
+    /// До `probe` названия нет, и в строке стоит сама ссылка: пустая строка
+    /// выглядела бы поломкой, а десяток ссылок с одного сайта различается
+    /// тремя символами в конце.
+    #[test]
+    fn the_link_gives_way_to_the_title_when_it_arrives() {
+        let mut queue = Queue::new();
+        let id = queue
+            .push(
+                request("https://site/watch?v=abc", Format::Mp4, Quality::Best),
+                PathBuf::from("/dl"),
+            )
+            .unwrap();
+
+        assert_eq!(queue.items[0].title, "https://site/watch?v=abc");
+        queue.set_title(id, "Ролик про кота");
+        assert_eq!(queue.items[0].title, "Ролик про кота");
+    }
+
+    #[test]
+    fn summary_counts_every_state_a_row_can_be_in() {
+        let mut queue = queue_with(5);
+        let id = ids(&queue);
+        queue.set_status(id[0], QueueStatus::Running);
+        queue.set_status(id[1], QueueStatus::Done);
+        queue.set_status(id[2], QueueStatus::Failed("не вышло".into()));
+        queue.set_status(id[3], QueueStatus::Cancelled);
+
+        assert_eq!(
+            queue.summary,
+            "Идёт: 1 · В очереди: 1 · Готово: 1 · Ошибок: 1 · Снято: 1"
+        );
+
+        // Пустых пар в сводке быть не должно: «Ошибок: 0» рядом с готовым
+        // выглядит как доклад о беде, которой не было.
+        let empty = Queue::new();
+        assert!(empty.summary.is_empty());
+    }
+
+    /// Идущую загрузку не выбрасывает ни «убрать», ни «Очистить»: процесс
+    /// продолжил бы качать, а показать его исход стало бы негде.
+    #[test]
+    fn neither_removing_nor_clearing_drops_the_running_download() {
+        let mut queue = queue_with(3);
+        let id = ids(&queue);
+        queue.set_status(id[1], QueueStatus::Running);
+
+        queue.remove(id[1]);
+        assert!(queue.items.iter().any(|item| item.id == id[1]));
+
+        queue.remove(id[0]);
+        assert!(queue.items.iter().all(|item| item.id != id[0]));
+
+        queue.clear();
+        assert_eq!(queue.items.len(), 1);
+        assert_eq!(queue.items[0].id, id[1]);
+        assert_eq!(queue.summary, "Идёт: 1");
+    }
+
+    /// Слова состояний человек читает в списке глазами: одинаковые или
+    /// пустые превратили бы очередь в набор одинаковых строк.
+    #[test]
+    fn queue_states_explain_themselves_distinctly() {
+        let all = [
+            QueueStatus::Waiting,
+            QueueStatus::Running,
+            QueueStatus::Done,
+            QueueStatus::Failed(String::new()),
+            QueueStatus::Cancelled,
+        ];
+
+        let mut seen: Vec<&str> = Vec::new();
+        for status in &all {
+            let label = status.label();
+            assert!(!label.trim().is_empty(), "{status:?}: пустая подпись");
+            assert!(!seen.contains(&label), "{label}: подпись повторяется");
+            seen.push(label);
+        }
+
+        // Освобождать место можно только за счёт отработавших.
+        assert!(!QueueStatus::Waiting.finished());
+        assert!(!QueueStatus::Running.finished());
+        assert!(QueueStatus::Done.finished());
+        assert!(QueueStatus::Failed(String::new()).finished());
+        assert!(QueueStatus::Cancelled.finished());
+    }
 
     /// Потолок обязателен: по одной ссылке-плейлисту `Event::Done` приходит
     /// столько раз, сколько в нём роликов, и без обрезки список рос бы вместе

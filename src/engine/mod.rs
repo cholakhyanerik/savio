@@ -17,7 +17,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
-use crate::model::{Event, Request, human_duration};
+use crate::model::{DownloadId, Event, NO_DOWNLOAD, Request, human_duration};
 
 pub use binaries::{Tools, discover};
 
@@ -50,7 +50,12 @@ impl Handle {
 /// Запускает загрузку в отдельном потоке.
 ///
 /// `notify` вызывается после каждого события — UI на нём делает repaint.
+///
+/// `id` движок не выдумывает, а получает снаружи и только проставляет в
+/// события: очередь ведёт UI, и знать о ней движку незачем. Одиночной
+/// загрузке (CLI, тест) годится любое ненулевое число.
 pub fn start(
+    id: DownloadId,
     request: Request,
     out_dir: PathBuf,
     tx: Sender<Event>,
@@ -102,9 +107,9 @@ pub fn start(
     };
 
     std::thread::spawn(move || {
-        let result = run(&request, &out_dir, &tools, &tx, &notify, &child_slot);
+        let result = run(id, &request, &out_dir, &tools, &tx, &notify, &child_slot);
         if let Err(err) = result {
-            let _ = tx.send(Event::Failed(err));
+            let _ = tx.send(Event::Failed { id, message: err });
             notify();
         }
     });
@@ -113,6 +118,7 @@ pub fn start(
 }
 
 fn run(
+    id: DownloadId,
     request: &Request,
     out_dir: &Path,
     tools: &Tools,
@@ -185,7 +191,23 @@ fn run(
     }
 
     let args = ytdlp::download_args(request, out_dir, tools);
-    let _ = tx.send(Event::Log(format!("yt-dlp {}", args.join(" "))));
+
+    // Последняя точка, где можно уйти, ничего не запустив, — и уходить тут
+    // обязательно. Всё, что было выше (`probe`, обложка), идёт до появления
+    // процесса, а `Handle::cancel()` умеет ровно одно: убить процесс из слота.
+    // Пока слот пуст, отмена не отменяет ничего (дефект 14), и для очереди это
+    // опаснее, чем для одиночной загрузки: следующий её элемент уже запущен,
+    // и мы получили бы два yt-dlp разом — вопреки правилу «строго по одному».
+    // Закрытый приёмник и есть признак того, что UI про нас забыл: он
+    // закрывает канал в `cancel()`. Своего события для этого не нужно —
+    // достаточно посмотреть на исход отправки той строки, что и так уходит
+    // в журнал.
+    if tx
+        .send(Event::Log(format!("yt-dlp {}", args.join(" "))))
+        .is_err()
+    {
+        return Ok(());
+    }
 
     let mut cmd = Command::new(&tools.ytdlp);
     cmd.args(&args)
@@ -234,7 +256,11 @@ fn run(
 
     for line in BufReader::new(stdout).lines().map_while(Result::ok) {
         match ytdlp::parse_line(&line) {
-            ytdlp::Line::Progress(p) => {
+            // Номер загрузки ставим здесь, а не в `parse_line`: тот разбирает
+            // одну строку вывода и про очередь ничего не знает — тем он и
+            // остаётся чистой функцией, которую легко покрыть тестами.
+            ytdlp::Line::Progress(mut p) => {
+                p.download_id = id;
                 let _ = tx.send(Event::Progress(p));
             }
             ytdlp::Line::Stage(stage) => {
@@ -269,7 +295,7 @@ fn run(
     if status.success() {
         match final_path {
             Some(path) => {
-                let _ = tx.send(Event::Done(path));
+                let _ = tx.send(Event::Done { id, path });
                 notify();
                 Ok(())
             }
@@ -343,7 +369,14 @@ pub fn start_metadata(
             }
         };
 
-        let _ = tx.send(result.unwrap_or_else(Event::Failed));
+        // Номер здесь `NO_DOWNLOAD`: к очереди метаданные отношения не имеют,
+        // да и приёмник у них свой. Раскрывать это замыканием, а не коротким
+        // `unwrap_or_else(Event::Failed)`, приходится потому, что вариант
+        // с именованными полями конструктором-функцией не бывает.
+        let _ = tx.send(result.unwrap_or_else(|message| Event::Failed {
+            id: NO_DOWNLOAD,
+            message,
+        }));
         notify();
     });
 }
