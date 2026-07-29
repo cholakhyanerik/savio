@@ -76,10 +76,12 @@ enum Setup {
     /// Всё на месте — обычный случай при любом запуске, кроме первого.
     Ready,
     Installing,
-    /// Обновление движка по кнопке. Отдельно от `Installing` только ради
+    /// Обновление одного инструмента по кнопке. Отдельно от `Installing` ради
     /// подписи в модалке: «Установка зависимостей» при обновлении сбивала бы
-    /// с толку — пользователь ничего не устанавливал.
-    Updating,
+    /// с толку — пользователь ничего не устанавливал. И с указанием, чего
+    /// именно: тексты у обновления yt-dlp и ffmpeg разные не для красоты —
+    /// одно занимает секунды, другое качает больше сотни мегабайт.
+    Updating(setup::Component),
     /// Установка не удалась. Приложение всё равно открывается: без `yt-dlp`
     /// пользователь увидит привычную подсказку, что делать дальше.
     Failed(String),
@@ -89,7 +91,7 @@ impl Setup {
     /// Идёт ли работа с внешними инструментами прямо сейчас. Пока идёт,
     /// показана модалка и занят единственный канал событий.
     fn busy(&self) -> bool {
-        matches!(self, Setup::Installing | Setup::Updating)
+        matches!(self, Setup::Installing | Setup::Updating(_))
     }
 }
 
@@ -647,7 +649,8 @@ impl MetaPanel {
                 | Event::Done { .. }
                 | Event::Ready
                 | Event::Warning(_)
-                | Event::Notice(_) => {}
+                | Event::Notice(_)
+                | Event::Versions(_) => {}
             }
         }
 
@@ -722,6 +725,12 @@ pub struct SavioApp {
     notice: Option<String>,
     /// Ручка установки — нужна, чтобы её можно было прервать.
     setup_handle: Option<setup::Handle>,
+    /// Приёмник ответа о версиях инструментов.
+    ///
+    /// Отдельный от `rx`: опрос версий идёт при запуске, когда общий канал ещё
+    /// может быть занят установкой недостающего, — попади ответ туда, его
+    /// разбирали бы вместе с событиями установки.
+    versions_rx: Option<Receiver<Event>>,
 
     // Строки ниже пересобираются только при изменении состояния, а не в кадре.
     // `ui()` вызывается 60 раз в секунду: `format!` и `join` здесь стоили бы
@@ -737,6 +746,14 @@ pub struct SavioApp {
     /// Оговорка под переключателем качества: источник не отдаёт столько,
     /// сколько запросили. Пустая строка — оговорки нет.
     quality_note: String,
+    /// Готовые строки версий для строки обслуживания — по одной на инструмент.
+    ///
+    /// Две, а не одна общая: длинная версия ffmpeg
+    /// (`N-125365-g9a01c1cb6a-20260630`) в окне минимальной ширины не влезает,
+    /// и в склеенной строке она вытеснила бы за кромку версию yt-dlp — то есть
+    /// более нужную из двух. Каждая обрезается сама за себя.
+    ytdlp_version_line: String,
+    ffmpeg_version_line: String,
     /// Ссылка не похожа на ссылку. Только подсветка поля — кнопку не блокирует.
     url_invalid: bool,
     /// Когда журнал скопировали, по часам egui. Нужно только для подписи
@@ -806,10 +823,16 @@ impl SavioApp {
             warning: None,
             notice: None,
             setup_handle: None,
+            versions_rx: None,
             meta_line: String::new(),
             progress_line: String::new(),
             done_path_display: String::new(),
             quality_note: String::new(),
+            // Пустые до первого ответа: строка обслуживания просто не показывает
+            // версий, пока их не спросили, — «неизвестно» там было бы враньём
+            // на те доли секунды, что идёт опрос.
+            ytdlp_version_line: String::new(),
+            ffmpeg_version_line: String::new(),
             url_invalid: false,
             log_copied_at: None,
             tab: Tab::Download,
@@ -835,12 +858,17 @@ impl SavioApp {
             app.setup_error = engine::discover().err();
         }
 
+        // Версии спрашиваем сразу — но в отдельном потоке: это запуск двух
+        // чужих программ, и в конструкторе окна ему не место. До ответа строка
+        // обслуживания просто без версий, и открытию окна опрос не мешает.
+        app.refresh_versions(ctx);
+
         app
     }
 
     /// Вызывается, когда установка закончилась — успехом или нет.
     /// Инструменты после неё нужно искать заново: до установки их не было.
-    fn finish_setup(&mut self, outcome: Setup) {
+    fn finish_setup(&mut self, outcome: Setup, ctx: &egui::Context) {
         self.setup = outcome;
         self.setup_handle = None;
         self.rx = None;
@@ -851,39 +879,67 @@ impl SavioApp {
         self.stage.clear();
         self.progress = Progress::default();
         self.progress_line.clear();
+        // Версии после установки или обновления другие — показанные устарели
+        // ровно в этот момент. Спросить заново обязательно: иначе кнопка
+        // «Обновить» отчитывалась бы об успехе, а строка над ней продолжала бы
+        // показывать прежний номер, и обновление выглядело бы несработавшим.
+        self.refresh_versions(ctx);
     }
 
-    fn cancel_setup(&mut self) {
+    fn cancel_setup(&mut self, ctx: &egui::Context) {
         if let Some(handle) = &self.setup_handle {
             handle.cancel();
         }
-        self.finish_setup(Setup::Ready);
+        self.finish_setup(Setup::Ready, ctx);
     }
 
-    /// Обновление движка по кнопке.
+    /// Обновление инструмента по кнопке.
     ///
     /// Идёт по тому же каналу и в ту же модалку, что и установка при первом
     /// запуске: задача та же — скачать бинарник и показать прогресс, поэтому
     /// заводить второй механизм незачем.
-    fn start_update(&mut self, ctx: &egui::Context) {
+    fn start_update(&mut self, what: setup::Component, ctx: &egui::Context) {
         let (tx, rx) = channel();
         let notify_ctx = ctx.clone();
 
         // Прошлый исход убираем: иначе рядом со свежим результатом висела бы
         // причина позапрошлой неудачи и было бы не понять, к чему она.
         self.notice = None;
+        self.warning = None;
         if matches!(self.setup, Setup::Failed(_)) {
             self.setup = Setup::Ready;
         }
 
-        self.setup_handle = Some(setup::start_update(tx, move || {
+        self.setup_handle = Some(setup::start_update(what, tx, move || {
             notify_ctx.request_repaint()
         }));
         self.rx = Some(rx);
-        self.setup = Setup::Updating;
+        self.setup = Setup::Updating(what);
         self.progress = Progress::default();
-        self.stage = "Проверяю версию…".into();
+        // Первая стадия у двух веток разная: у yt-dlp следом идёт запрос
+        // выпуска, у ffmpeg — сразу загрузка, и «Проверяю версию…» висела бы
+        // над полосой, которая на самом деле качает архив.
+        self.stage = match what {
+            setup::Component::Ytdlp => "Проверяю версию…",
+            setup::Component::Ffmpeg => "Готовлюсь скачивать…",
+        }
+        .into();
         self.rebuild_progress_line();
+    }
+
+    /// Спрашивает версии установленных инструментов заново.
+    ///
+    /// Свой приёмник, а не общий `rx`: тот занят загрузкой или установкой, и
+    /// ответ о версиях, пришедший в него, разбирался бы вместе с их событиями.
+    /// Так же устроена вкладка метаданных — образец готовый.
+    ///
+    /// Зовётся при запуске и после каждой установки или обновления: ровно
+    /// тогда версии и меняются. В кадре отрисовки — никогда.
+    fn refresh_versions(&mut self, ctx: &egui::Context) {
+        let (tx, rx) = channel();
+        let notify_ctx = ctx.clone();
+        setup::start_versions(tx, move || notify_ctx.request_repaint());
+        self.versions_rx = Some(rx);
     }
 
     /// Отдаёт текущий выбор писателю настроек.
@@ -1299,7 +1355,7 @@ impl SavioApp {
                     // разводим их по режиму и по номеру: во время установки
                     // это сбой установки, а не сорвавшаяся загрузка ролика.
                     if self.setup.busy() {
-                        self.finish_setup(Setup::Failed(message));
+                        self.finish_setup(Setup::Failed(message), ctx);
                     } else if self.queue.is_running(id) {
                         self.stage = "Ошибка".into();
                         self.queue
@@ -1316,7 +1372,7 @@ impl SavioApp {
                     }
                 }
                 Event::Ready => {
-                    self.finish_setup(Setup::Ready);
+                    self.finish_setup(Setup::Ready, ctx);
                 }
                 Event::Warning(text) => {
                     self.warning = Some(text);
@@ -1324,11 +1380,11 @@ impl SavioApp {
                 Event::Notice(text) => {
                     self.notice = Some(text);
                 }
-                // Метаданные ходят по своему каналу — сюда эти события
-                // попасть не могут. Ветка выписана явно, а не через `_`,
-                // чтобы компилятор и дальше требовал разбирать новые
-                // варианты `Event` в обоих приёмниках.
-                Event::Tags(_) | Event::Cleaned(_) => {}
+                // Метаданные и версии ходят по своим каналам — сюда эти
+                // события попасть не могут. Ветка выписана явно, а не через
+                // `_`, чтобы компилятор и дальше требовал разбирать новые
+                // варианты `Event` во всех приёмниках.
+                Event::Tags(_) | Event::Cleaned(_) | Event::Versions(_) => {}
             }
         }
 
@@ -1363,6 +1419,52 @@ impl SavioApp {
             self.start_next(ctx);
         }
     }
+
+    /// Забирает ответ о версиях инструментов, если он подъехал.
+    ///
+    /// Приёмник бросаем сразу: ответ приходит ровно один, и держать канал
+    /// дальше значило бы каждый кадр опрашивать заведомо мёртвую очередь.
+    fn drain_versions(&mut self) {
+        let Some(rx) = &self.versions_rx else {
+            return;
+        };
+
+        let received = match rx.try_recv() {
+            Ok(Event::Versions(versions)) => Some(versions),
+            // Прочие варианты по этому каналу не ходят: отправитель один и
+            // шлёт ровно `Versions`. Разбирать их незачем, а `_` вместо
+            // явного `Ok(_)` спрятал бы от компилятора смену этого уговора.
+            Ok(_) => None,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => None,
+        };
+
+        self.versions_rx = None;
+        let Some(versions) = received else {
+            return;
+        };
+
+        // Строки собираем здесь, на приёме события, а не в кадре отрисовки:
+        // меняются они дважды за запуск, а `ui()` зовут 60 раз в секунду.
+        self.ytdlp_version_line = version_line("yt-dlp", &versions.ytdlp);
+        self.ffmpeg_version_line = version_line("ffmpeg", &versions.ffmpeg);
+    }
+}
+
+/// Строка «инструмент — версия» для строки обслуживания.
+///
+/// «Не найден» и «версию узнать не вышло» говорят разное, и путать их нельзя:
+/// в первом случае программы на машине нет и её надо ставить, во втором она
+/// работает, просто печатает версию не так, как мы ожидали (см.
+/// `setup::parse_version_line`). Сказать «не найден» про рабочую копию —
+/// значит отправить человека решать несуществующую беду.
+fn version_line(name: &str, version: &crate::model::ToolVersion) -> String {
+    use crate::model::ToolVersion;
+    match version {
+        ToolVersion::Known(version) => format!("{name} — {version}"),
+        ToolVersion::Unknown => format!("{name} — версия неизвестна"),
+        ToolVersion::Missing => format!("{name} — не найден"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1396,6 +1498,7 @@ impl eframe::App for SavioApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_events(ui.ctx());
         self.meta.drain();
+        self.drain_versions();
 
         if self.maximize_pending {
             self.maximize_pending = false;
@@ -1527,17 +1630,23 @@ impl SavioApp {
     fn install_modal(&mut self, ctx: &egui::Context) {
         // Строки статические и выбираются по режиму — в кадре ничего
         // не собирается и не выделяется.
-        let (title, subtitle) = if matches!(self.setup, Setup::Updating) {
-            (
+        let (title, subtitle) = match self.setup {
+            Setup::Updating(setup::Component::Ytdlp) => (
                 "Обновление движка",
                 "Savio скачивает свежий yt-dlp. Это занимает несколько секунд.",
-            )
-        } else {
-            (
+            ),
+            // Про объём говорим прямо: ffmpeg весит больше сотни мегабайт, и
+            // молчаливое ожидание на медленном канале выглядит зависанием.
+            Setup::Updating(setup::Component::Ffmpeg) => (
+                "Обновление ffmpeg",
+                "Savio скачивает свежую сборку ffmpeg целиком — это больше сотни \
+                 мегабайт, на медленном интернете надолго.",
+            ),
+            _ => (
                 "Установка зависимостей",
                 "Savio догружает недостающие программы. \
                  Это нужно только при первом запуске — пожалуйста, подождите.",
-            )
+            ),
         };
 
         let cancelled = egui::Modal::new(egui::Id::new("savio-setup"))
@@ -1599,7 +1708,7 @@ impl SavioApp {
             .inner;
 
         if cancelled {
-            self.cancel_setup();
+            self.cancel_setup(ctx);
         }
     }
 
@@ -2459,15 +2568,15 @@ impl SavioApp {
         }
     }
 
-    /// Обслуживание: обновление движка.
+    /// Обслуживание: версии инструментов и их обновление.
     ///
     /// Стоит внизу, рядом с журналом, а не у кнопки «Скачать», и намеренно:
     /// это то, за чем идут, когда что-то перестало работать, — соседство
     /// с журналом и версией в шапке тут уместнее, чем спор за внимание
     /// с главным действием экрана.
     ///
-    /// Подпись на отдельной строке под кнопкой, а не сбоку: в окне минимальной
-    /// ширины (520) строка рядом с кнопкой не поместилась бы.
+    /// Подписи на отдельных строках под кнопками, а не сбоку: в окне
+    /// минимальной ширины (520) строка рядом с кнопкой не поместилась бы.
     fn maintenance_row(&mut self, ui: &mut egui::Ui) {
         ui.add_space(16.0);
         ui.separator();
@@ -2479,27 +2588,69 @@ impl SavioApp {
 
         let clicked = ui
             .add_enabled_ui(enabled, |ui| {
-                ui.add(
-                    egui::Button::new("Обновить движок")
-                        .min_size(egui::vec2(0.0, theme::CONTROL_HEIGHT)),
-                )
-                .clicked()
+                ui.horizontal(|ui| {
+                    let ytdlp = ui
+                        .add(
+                            egui::Button::new("Обновить движок")
+                                .min_size(egui::vec2(0.0, theme::CONTROL_HEIGHT)),
+                        )
+                        .clicked();
+                    let ffmpeg = ui
+                        .add(
+                            egui::Button::new("Обновить ffmpeg")
+                                .min_size(egui::vec2(0.0, theme::CONTROL_HEIGHT)),
+                        )
+                        .clicked();
+                    match (ytdlp, ffmpeg) {
+                        (true, _) => Some(setup::Component::Ytdlp),
+                        (_, true) => Some(setup::Component::Ffmpeg),
+                        _ => None,
+                    }
+                })
+                .inner
             })
             .inner;
 
+        // Версии под кнопками, а не в шапке: там уже стоит версия самого Savio,
+        // и три номера подряд в одной строке не различить глазами. Пусто до
+        // первого ответа — опрос идёт в отдельном потоке и занимает мгновение.
+        if !self.ytdlp_version_line.is_empty() {
+            ui.add_space(8.0);
+            for line in [&self.ytdlp_version_line, &self.ffmpeg_version_line] {
+                // `truncate()`, а не перенос: версия ffmpeg у git-сборки — это
+                // `N-125365-g9a01c1cb6a-20260630`, и в узком окне она заняла бы
+                // две строки, растащив пару подписей по высоте. Обрезанную
+                // метку egui сам показывает целиком по наведению, поэтому
+                // своей подсказки здесь нет — вторая была бы дублем (Правило 4).
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(line).small().color(theme::TEXT_SECONDARY),
+                    )
+                    .truncate(),
+                );
+            }
+        }
+
         ui.add_space(6.0);
-        ui.label(
-            egui::RichText::new(
-                "Сайты меняются, и старый yt-dlp перестаёт их скачивать. \
-                 Если ссылка вдруг не работает — обновите движок.",
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(
+                    "Сайты меняются, и старый yt-dlp перестаёт их скачивать. \
+                     Если ссылка вдруг не работает — обновите движок. \
+                     ffmpeg обновляют редко, и стоит это дороже: свежая сборка \
+                     качается целиком, больше сотни мегабайт.",
+                )
+                .small()
+                .color(theme::TEXT_MUTED),
             )
-            .small()
-            .color(theme::TEXT_MUTED),
+            // Без явного переноса длинный абзац в узком окне уходит за кромку:
+            // `ui.label` берёт там режим `Extend` и кладёт его в одну строку.
+            .wrap(),
         );
 
-        if clicked {
+        if let Some(what) = clicked {
             let ctx = ui.ctx().clone();
-            self.start_update(&ctx);
+            self.start_update(what, &ctx);
         }
     }
 

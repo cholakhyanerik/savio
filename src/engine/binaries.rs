@@ -103,6 +103,16 @@ pub struct Tools {
     /// без него не склеить видео+аудио и не извлечь MP3. Отсутствие — это
     /// предупреждение в UI, а не отказ запускаться.
     pub ffmpeg: Option<PathBuf>,
+    /// ffprobe ищется отдельно от ffmpeg, хотя качаются они всегда парой.
+    ///
+    /// Пара может разъехаться по разным папкам, и это не выдуманный случай:
+    /// у пользователя в PATH лежит один ffmpeg без ffprobe, `missing()`
+    /// считает такую установку неполной и докачивает пару к себе, а порядок
+    /// поиска оставляет в деле системный ffmpeg и наш ffprobe. Знать об этом
+    /// нужно потому, что yt-dlp ищет ffprobe **сам** — рядом с тем ffmpeg,
+    /// что назван в `--ffmpeg-location`, — и в такой раскладке не находит
+    /// (см. `engine::start`).
+    pub ffprobe: Option<PathBuf>,
 }
 
 /// Откуда взялся найденный бинарник.
@@ -167,6 +177,7 @@ pub fn discover() -> Result<Tools, String> {
     Ok(Tools {
         ytdlp,
         ffmpeg: locate(FFMPEG_NAME),
+        ffprobe: locate(FFPROBE_NAME),
     })
 }
 

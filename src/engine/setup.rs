@@ -20,9 +20,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
-use super::binaries::{self, FFMPEG_NAME, FFPROBE_NAME, YTDLP_NAME};
+use super::binaries::{self, FFMPEG_NAME, FFPROBE_NAME, Origin, YTDLP_NAME};
 use super::sha256::{self, Sha256};
-use crate::model::{Event, NO_DOWNLOAD, Progress};
+use crate::model::{Event, NO_DOWNLOAD, Progress, ToolVersion, ToolVersions};
 
 // ---------------------------------------------------------------------------
 // Что и откуда качать
@@ -59,13 +59,36 @@ const YTDLP_ASSET: &str = "yt-dlp_macos";
 #[allow(dead_code)]
 enum FfmpegSource {
     /// Один архив, внутри — `<корень>/bin/ffmpeg` и `<корень>/bin/ffprobe`.
-    Bundle(&'static str),
+    ///
+    /// `sums` — файл контрольных сумм того же выпуска. Есть он не у всех
+    /// источников, поэтому лежит здесь, а не общей константой.
+    Bundle {
+        url: &'static str,
+        sums: &'static str,
+    },
     /// Два плоских архива, по одному на программу.
+    ///
+    /// Контрольных сумм у этих источников нет: evermeet.cx выкладывает только
+    /// отделённую GPG-подпись (проверять её нечем — нужен `gpg` и ключ автора,
+    /// а зависимость ради этого противоречит минимальному набору), а у
+    /// martin-riedl.de файл `<архив>.sha256` лежит рядом с настоящим архивом,
+    /// но не с адресом `redirect/latest/…`, которым мы качаем: путь к нему
+    /// известен только из заголовка `Location`. Проверено вживую: по
+    /// `redirect/`-адресу сумма отдаёт 404 пять попыток подряд.
     Split {
         ffmpeg: &'static str,
         ffprobe: &'static str,
     },
 }
+
+/// Контрольные суммы сборок BtbN — один файл на весь выпуск, формат `sha256sum`.
+///
+/// Тег `latest` подвижный: BtbN перезаливает ассеты каждый день, поэтому сумму
+/// нельзя зашить в код — через сутки константа стала бы ложным отказом. Берём
+/// её из того же выпуска, что и архив.
+#[cfg(any(windows, target_os = "linux"))]
+const BTBN_SUMS: &str =
+    "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/checksums.sha256";
 
 /// Источники ffmpeg по порядку предпочтения: первый рабочий выигрывает.
 ///
@@ -79,21 +102,25 @@ enum FfmpegSource {
 // Windows и Linux — сборки BtbN, там оба бинарника лежат в одном архиве.
 // Windows получает .zip, Linux — .tar.xz: см. `extract`.
 #[cfg(all(windows, target_arch = "x86_64"))]
-const FFMPEG_SOURCES: &[FfmpegSource] = &[FfmpegSource::Bundle(
-    "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip",
-)];
+const FFMPEG_SOURCES: &[FfmpegSource] = &[FfmpegSource::Bundle {
+    url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip",
+    sums: BTBN_SUMS,
+}];
 #[cfg(all(windows, target_arch = "aarch64"))]
-const FFMPEG_SOURCES: &[FfmpegSource] = &[FfmpegSource::Bundle(
-    "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-winarm64-gpl.zip",
-)];
+const FFMPEG_SOURCES: &[FfmpegSource] = &[FfmpegSource::Bundle {
+    url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-winarm64-gpl.zip",
+    sums: BTBN_SUMS,
+}];
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-const FFMPEG_SOURCES: &[FfmpegSource] = &[FfmpegSource::Bundle(
-    "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz",
-)];
+const FFMPEG_SOURCES: &[FfmpegSource] = &[FfmpegSource::Bundle {
+    url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz",
+    sums: BTBN_SUMS,
+}];
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-const FFMPEG_SOURCES: &[FfmpegSource] = &[FfmpegSource::Bundle(
-    "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linuxarm64-gpl.tar.xz",
-)];
+const FFMPEG_SOURCES: &[FfmpegSource] = &[FfmpegSource::Bundle {
+    url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linuxarm64-gpl.tar.xz",
+    sums: BTBN_SUMS,
+}];
 // Под macOS готовых сборок «всё в одном» нет: BtbN её не собирает, а у
 // оставшихся источников ffmpeg и ffprobe разложены по отдельным архивам.
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
@@ -409,6 +436,46 @@ fn install_ffmpeg(
     })
 }
 
+/// Ожидаемая сумма архива, если её удалось получить.
+///
+/// `None` здесь означает «сверять не с чем», и это **не** повод отказаться от
+/// установки. Причина в асимметрии последствий: на Windows и Linux источник
+/// ffmpeg ровно один, и превращение недоступного списка сумм в ошибку лишало
+/// бы человека ffmpeg целиком из-за того, что у чужого сервера переименовался
+/// служебный файл. Распакованное всё равно проверяется существованием файлов
+/// (`tar` возвращает 0 и на пустой распаковке), а про пропущенную сверку
+/// говорит журнал. Настоящее несовпадение суммы — совсем другое дело: оно
+/// означает битый или подменённый архив, и вот оно источник отвергает.
+fn expected_sum(
+    agent: &ureq::Agent,
+    sums: &str,
+    url: &str,
+    tx: &Sender<Event>,
+) -> Option<String> {
+    let asset = url.rsplit('/').next().unwrap_or_default();
+
+    let list = match fetch_text(agent, sums) {
+        Ok(list) => list,
+        Err(err) => {
+            let _ = tx.send(Event::Log(format!(
+                "Список контрольных сумм ffmpeg недоступен ({err}) — ставлю без сверки."
+            )));
+            return None;
+        }
+    };
+
+    // Имя ищем целиком, а не подстрокой: в том же списке лежит
+    // `…-win64-gpl-shared.zip`, и поиск «по вхождению» брал бы сумму от него.
+    // `find_sum` сравнивает имена на равенство — на это и опираемся.
+    let found = sha256::find_sum(&list, asset).map(str::to_owned);
+    if found.is_none() {
+        let _ = tx.send(Event::Log(format!(
+            "В списке контрольных сумм ffmpeg нет строки для {asset} — ставлю без сверки."
+        )));
+    }
+    found
+}
+
 fn install_ffmpeg_from(
     source: &FfmpegSource,
     agent: &ureq::Agent,
@@ -420,9 +487,24 @@ fn install_ffmpeg_from(
     stage(tx, notify, "Скачиваю ffmpeg…");
 
     match *source {
-        FfmpegSource::Bundle(url) => {
+        FfmpegSource::Bundle { url, sums } => {
+            // Сумму спрашиваем до загрузки: качать сто с лишним мегабайт,
+            // чтобы потом выяснить, что сверять их не с чем, незачем.
+            let expected = expected_sum(agent, sums, url, tx);
+
             let name = archive_tmp_name(url);
-            download(agent, url, &dir.join(&name), tx, notify, cancelled)?;
+            let digest = download(agent, url, &dir.join(&name), tx, notify, cancelled)?;
+
+            // Несовпадение — отказ этого источника, а не всей установки:
+            // выше по стеку `install_ffmpeg` возьмётся за следующий.
+            if let Some(expected) = expected
+                && sha256::hex(&digest) != expected
+            {
+                let _ = fs::remove_file(dir.join(&name));
+                return Err(
+                    "скачанный архив ffmpeg повреждён: контрольная сумма не совпала".into(),
+                );
+            }
 
             stage(tx, notify, "Распаковываю ffmpeg…");
             // Внутри архива путь вида `ffmpeg-master-latest-win64-gpl/bin/ffmpeg`,
@@ -469,7 +551,106 @@ fn install_ffmpeg_from(
 }
 
 // ---------------------------------------------------------------------------
-// Обновление yt-dlp
+// Версии установленного
+// ---------------------------------------------------------------------------
+
+/// Спрашивает версии установленных инструментов в отдельном потоке.
+///
+/// Отдельный поток обязателен: `yt-dlp --version` — это запуск замороженной
+/// PyInstaller-сборки, и отвечает она не мгновенно (десятые доли секунды, а на
+/// холодном диске и с антивирусом — заметно дольше). В кадре отрисовки такому
+/// места нет (Правило 1).
+///
+/// Ручки, как у установки, здесь нет: обе программы просто печатают строку и
+/// выходят, отменять нечего. Ошибок наружу тоже не отдаём — их место в самом
+/// `ToolVersions`: «не найдена» и «версию узнать не вышло» это не сбой, а
+/// то, что надо показать.
+pub fn start_versions(tx: Sender<Event>, notify: impl Fn() + Send + 'static) {
+    std::thread::spawn(move || {
+        let versions = ToolVersions {
+            ytdlp: describe(binaries::locate(YTDLP_NAME).as_deref(), ytdlp_version),
+            ffmpeg: describe(binaries::locate(FFMPEG_NAME).as_deref(), ffmpeg_version),
+        };
+        let _ = tx.send(Event::Versions(versions));
+        notify();
+    });
+}
+
+fn describe(path: Option<&Path>, read: impl Fn(&Path) -> Option<String>) -> ToolVersion {
+    match path {
+        None => ToolVersion::Missing,
+        Some(path) => match read(path) {
+            Some(version) => ToolVersion::Known(version),
+            None => ToolVersion::Unknown,
+        },
+    }
+}
+
+/// Версия установленного ffmpeg — то, что он печатает первой строкой
+/// `ffmpeg -version`.
+///
+/// `None` — «спросить не удалось»: не запустился, вышел с ошибкой или напечатал
+/// что-то, в чём версии не видно. Отказом это не считается нигде: ffmpeg при
+/// этом исправен, а не узнанная строка стоит подписи «версия неизвестна», но
+/// никак не блокировки кнопки (Правило 2).
+fn ffmpeg_version(path: &Path) -> Option<String> {
+    let mut cmd = Command::new(path);
+    cmd.arg("-version")
+        .stdout(Stdio::piped())
+        // stderr, в отличие от `ytdlp_version`, забираем: `-version` печатает
+        // в stdout у всех проверенных сборок, но ffmpeg вообще-то шлёт свой
+        // баннер в stderr, и сборок его в мире несколько десятков. Проверить
+        // каждую нельзя, а запасной поток стоит одной строки.
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null());
+    crate::engine::ytdlp::hide_console(&mut cmd);
+
+    let output = cmd.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    [stdout.as_ref(), stderr.as_ref()]
+        .into_iter()
+        .find_map(|text| parse_version_line(text.lines().next().unwrap_or_default()))
+        .map(str::to_owned)
+}
+
+/// Сколько символов версии считаем правдоподобными.
+///
+/// Строку печатает чужая программа, и её вывод — не наш контракт: увидев
+/// вместо версии абзац текста, показывать его в окне не нужно. Самая длинная
+/// настоящая версия из встреченных — `N-125365-g9a01c1cb6a-20260630`, 29 знаков.
+const VERSION_LIMIT: usize = 64;
+
+/// Вырезает версию из первой строки вывода `-version`.
+///
+/// Приметой служит **слово `version`, за которым идёт токен**:
+/// ```text
+/// ffmpeg  version 8.1.2-full_build-www.gyan.dev  Copyright (c) 2000-2026 …
+/// ffprobe version N-125365-g9a01c1cb6a-20260630  Copyright (c) 2007-2026 …
+/// ```
+/// Всё остальное, что напрашивается, проверено вживую и промахивается:
+///
+/// - `starts_with("ffmpeg version")` — у ffprobe первое слово другое, и та же
+///   функция на нём молча вернула бы `None`;
+/// - опора на `Copyright (c) 2000-` — у ffprobe там 2007, общее только слово;
+/// - шаблон `X.Y.Z` — git-сборка печатает `N-125365-g9a01c1cb6a-20260630`,
+///   точечного номера в ней нет вовсе, а ставится она обычным `winget`;
+/// - обрезка токена по первому дефису «ради красоты» — `8.1.2-full_build…`
+///   она укоротила бы до `8.1.2`, а `N-125365-…` до одинокой буквы `N`.
+///
+/// Поэтому токен берётся целиком и как есть, а укорачивается только на экране.
+fn parse_version_line(line: &str) -> Option<&str> {
+    let mut words = line.split_whitespace();
+    words.by_ref().find(|word| *word == "version")?;
+    words.next().filter(|version| version.len() <= VERSION_LIMIT)
+}
+
+// ---------------------------------------------------------------------------
+// Обновление
 // ---------------------------------------------------------------------------
 
 /// Версия установленного yt-dlp — то, что он сам печатает по `--version`.
@@ -500,13 +681,41 @@ fn ytdlp_version(path: &Path) -> Option<String> {
 /// Чем пользователю обновлять чужую копию. У каждой ОС свой менеджер, и
 /// совет «обновите пакет» без имени команды бесполезен.
 #[cfg(windows)]
-const SYSTEM_UPDATE_HINT: &str = "winget upgrade yt-dlp";
+const YTDLP_SYSTEM_HINT: &str = "winget upgrade yt-dlp";
 #[cfg(target_os = "macos")]
-const SYSTEM_UPDATE_HINT: &str = "brew upgrade yt-dlp";
+const YTDLP_SYSTEM_HINT: &str = "brew upgrade yt-dlp";
 #[cfg(all(unix, not(target_os = "macos")))]
-const SYSTEM_UPDATE_HINT: &str = "менеджером пакетов вашей системы";
+const YTDLP_SYSTEM_HINT: &str = "менеджером пакетов вашей системы";
 
-/// Запускает обновление yt-dlp в отдельном потоке.
+#[cfg(windows)]
+const FFMPEG_SYSTEM_HINT: &str = "winget upgrade ffmpeg";
+#[cfg(target_os = "macos")]
+const FFMPEG_SYSTEM_HINT: &str = "brew upgrade ffmpeg";
+#[cfg(all(unix, not(target_os = "macos")))]
+const FFMPEG_SYSTEM_HINT: &str = "менеджером пакетов вашей системы";
+
+/// Что обновляем по кнопке.
+///
+/// Одно перечисление на две кнопки, а не две отдельные функции, потому что
+/// различаются они только адресами и текстами: поток, ручка отмены, канал
+/// событий и разбор исхода у них общие до последней строки.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Component {
+    Ytdlp,
+    Ffmpeg,
+}
+
+impl Component {
+    /// Имя для сообщений — ровно то, которым программу зовут в жизни.
+    fn name(self) -> &'static str {
+        match self {
+            Component::Ytdlp => "yt-dlp",
+            Component::Ffmpeg => "ffmpeg",
+        }
+    }
+}
+
+/// Запускает обновление выбранного инструмента в отдельном потоке.
 ///
 /// Заменяем **только свою** копию — ту, что Savio скачал в каталог данных.
 /// Копию из PATH или лежащую рядом с exe не трогаем: первая принадлежит
@@ -517,14 +726,18 @@ const SYSTEM_UPDATE_HINT: &str = "менеджером пакетов вашей
 /// Скачать свежую копию в каталог данных «про запас» тоже нельзя: каталог
 /// данных в порядке поиска последний, работать продолжила бы прежняя версия,
 /// и кнопка стала бы ровно той молчаливой пустышкой, ради которой её и завели.
-pub fn start_update(tx: Sender<Event>, notify: impl Fn() + Send + 'static) -> Handle {
+pub fn start_update(
+    what: Component,
+    tx: Sender<Event>,
+    notify: impl Fn() + Send + 'static,
+) -> Handle {
     let cancelled = Arc::new(AtomicBool::new(false));
     let handle = Handle {
         cancelled: Arc::clone(&cancelled),
     };
 
     std::thread::spawn(move || {
-        match run_update(&tx, &notify, &cancelled) {
+        match run_update(what, &tx, &notify, &cancelled) {
             Ok(Outcome::Updated(text)) => {
                 let _ = tx.send(Event::Notice(text));
                 let _ = tx.send(Event::Ready);
@@ -559,49 +772,152 @@ enum Outcome {
 }
 
 fn run_update(
+    what: Component,
     tx: &Sender<Event>,
     notify: &impl Fn(),
     cancelled: &AtomicBool,
 ) -> Result<Outcome, String> {
-    use super::binaries::Origin;
-
     let dir = binaries::data_dir()
         .ok_or("Не удалось определить папку для инструментов: не задана домашняя папка.")?;
 
-    let found = binaries::locate_with_origin(YTDLP_NAME);
+    // Смотрим на ту программу, которую и обновляем: у ffmpeg своё
+    // происхождение, и системный ffmpeg при своём yt-dlp — обычное дело.
+    let name = match what {
+        Component::Ytdlp => YTDLP_NAME,
+        Component::Ffmpeg => FFMPEG_NAME,
+    };
+    let found = binaries::locate_with_origin(name);
 
     // Чужую копию не трогаем — объясняем, откуда она и чем её обновить.
     if let Some((path, origin @ (Origin::System | Origin::Portable))) = &found {
-        let where_from = match origin {
-            Origin::System => format!(
-                "yt-dlp установлен в системе, а не Savio:\n{}\n\n\
-                 Обновите его так же, как ставили: {SYSTEM_UPDATE_HINT}. \
-                 Savio подменять чужой файл не станет — иначе он разойдётся \
-                 с пакетным менеджером.",
-                path.display()
-            ),
-            Origin::Portable => format!(
-                "yt-dlp лежит рядом с Savio:\n{}\n\n\
-                 Это портативная поставка — обновите её целиком или замените \
-                 этот файл вручную. Savio его не трогает, чтобы не сломать сборку.",
-                path.display()
-            ),
-            Origin::Owned => unreachable!("своя копия обрабатывается ниже"),
-        };
-        return Ok(Outcome::Declined(where_from));
+        return Ok(Outcome::Declined(declined(what, path, *origin)));
     }
 
     fs::create_dir_all(&dir)
         .map_err(|e| format!("Не удалось создать папку {}: {e}", dir.display()))?;
 
     let agent = agent();
+    let installed = found.as_ref().map(|(path, _)| path.as_path());
 
+    match what {
+        Component::Ytdlp => update_ytdlp(&agent, &dir, installed, tx, notify, cancelled),
+        Component::Ffmpeg => update_ffmpeg(&agent, &dir, installed, tx, notify, cancelled),
+    }
+}
+
+/// Текст отказа трогать чужую копию.
+///
+/// Общий на оба инструмента: беда одна и та же, меняются только имя и совет.
+/// Путь в сообщении обязателен — без него «установлен в системе» проверить
+/// нечем, а человек как раз и хочет понять, какой именно файл у него работает.
+fn declined(what: Component, path: &Path, origin: Origin) -> String {
+    let name = what.name();
+    match origin {
+        Origin::System => {
+            let hint = match what {
+                Component::Ytdlp => YTDLP_SYSTEM_HINT,
+                Component::Ffmpeg => FFMPEG_SYSTEM_HINT,
+            };
+            format!(
+                "{name} установлен в системе, а не Savio:\n{}\n\n\
+                 Обновите его так же, как ставили: {hint}. \
+                 Savio подменять чужой файл не станет — иначе он разойдётся \
+                 с пакетным менеджером.",
+                path.display()
+            )
+        }
+        Origin::Portable => format!(
+            "{name} лежит рядом с Savio:\n{}\n\n\
+             Это портативная поставка — обновите её целиком или замените \
+             этот файл вручную. Savio его не трогает, чтобы не сломать сборку.",
+            path.display()
+        ),
+        Origin::Owned => unreachable!("своя копия обновляется, а не объясняется"),
+    }
+}
+
+/// Перекачивает ffmpeg поверх своей копии.
+///
+/// Проверки «а не стоит ли уже последняя» здесь нет, и это не упущение.
+/// Основной источник (сборки BtbN для Windows и Linux) выпускается тегом
+/// `latest`, и **узнать версию, не скачав архив, невозможно**: проверено по
+/// ответу GitHub API — `body` пуст, `label` у всех ассетов пуст, в имени файла
+/// стоит слово `master`, а не номер, и внутри архива корневая папка тоже
+/// называется `ffmpeg-master-latest-…`. Запоминать сборку с прошлого раза
+/// нельзя по той же причине, по которой версия yt-dlp спрашивается у самого
+/// бинарника: запомненное разъезжается с настоящим, если файл подменили снаружи.
+///
+/// Поэтому кнопка честно перекачивает архив целиком (около 160 МБ), а
+/// сравнение версий происходит уже после — по нему и различаются сообщения
+/// «обновлён» и «на сервере та же сборка». Говорить об этом заранее — дело UI.
+fn update_ffmpeg(
+    agent: &ureq::Agent,
+    dir: &Path,
+    installed: Option<&Path>,
+    tx: &Sender<Event>,
+    notify: &impl Fn(),
+    cancelled: &AtomicBool,
+) -> Result<Outcome, String> {
+    // Версию спрашиваем до перекачки: после неё файл уже другой.
+    let current = installed.and_then(ffmpeg_version);
+
+    // Стадию «Скачиваю ffmpeg…» ставит сам `install_ffmpeg`.
+    install_ffmpeg(agent, dir, tx, notify, cancelled)
+        .map_err(|err| format!("Не удалось обновить ffmpeg: {err}."))?;
+
+    let fresh = ffmpeg_version(&dir.join(FFMPEG_NAME));
+
+    Ok(Outcome::Updated(match fresh {
+        Some(fresh) => update_summary(
+            "ffmpeg",
+            current.as_deref(),
+            &fresh,
+            // После перекачки сотни мегабайт одно «уже последней версии»
+            // читается как «мы проверили и качать не стали» — а качали.
+            " На сервере лежит та же сборка.",
+        ),
+        // Версию не прочитали — но файлы на месте: `install_ffmpeg` проверяет
+        // это существованием, а не кодом возврата. Обещать номер, которого мы
+        // не знаем, нельзя, а промолчать после нажатия кнопки — тем более.
+        None => "ffmpeg скачан заново. Версию узнать не вышло.".to_owned(),
+    }))
+}
+
+/// Итог обновления словами.
+///
+/// **Стрелки `→` здесь нет намеренно, и вернуть её нельзя.** Шрифты, которые
+/// eframe кладёт в сборку по умолчанию, знака U+2192 не содержат, и вместо
+/// него в окне рисуется пустой прямоугольник: «обновлён: 8.1.2 □ N-125829».
+/// Проверено глазами на Windows 11 — ни сборка, ни `clippy`, ни тесты этого
+/// не видят, а показывается это только после удачного обновления, то есть
+/// в сценарии, который вручную повторяют редко. Стрелка тут напрашивается
+/// сама, поэтому и предупреждение, и тест ниже.
+fn update_summary(name: &str, current: Option<&str>, fresh: &str, unchanged: &str) -> String {
+    match current {
+        Some(current) if current == fresh => {
+            format!("{name} уже последней версии ({fresh}).{unchanged}")
+        }
+        Some(current) => format!("{name} обновлён: было {current}, стало {fresh}."),
+        // Версии до обновления не было — значит, это первая установка своей
+        // копии, а не обновление. Обещать «обновлено с …» здесь нечестно.
+        None => format!("{name} установлен, версия {fresh}."),
+    }
+}
+
+fn update_ytdlp(
+    agent: &ureq::Agent,
+    dir: &Path,
+    installed: Option<&Path>,
+    tx: &Sender<Event>,
+    notify: &impl Fn(),
+    cancelled: &AtomicBool,
+) -> Result<Outcome, String> {
     stage(tx, notify, "Ищу свежий выпуск yt-dlp…");
-    let tag = latest_ytdlp_tag(&agent)?;
+    let tag = latest_ytdlp_tag(agent)?;
 
     // Версию спрашиваем у самого бинарника, а не запоминаем при установке:
     // запомненная разъехалась бы с настоящей, если файл подменили снаружи.
-    let current = found.as_ref().and_then(|(path, _)| ytdlp_version(path));
+    let current = installed.and_then(ytdlp_version);
 
     // Сравниваем строки, а не числа. Nightly-сборка (`2026.07.14.233956`)
     // со стабильным тегом никогда не совпадёт, и такую копию мы заменим
@@ -611,22 +927,27 @@ fn run_update(
     if let Some(current) = &current
         && current == &tag
     {
-        return Ok(Outcome::Updated(format!(
-            "yt-dlp уже последней версии ({current})."
+        // Оговорки «на сервере та же сборка» здесь нет и не нужно: у yt-dlp
+        // версия узнаётся до загрузки, и мы честно ничего не качали.
+        return Ok(Outcome::Updated(update_summary(
+            "yt-dlp",
+            Some(current),
+            &tag,
+            "",
         )));
     }
 
     // Стадию «Скачиваю yt-dlp…» ставит сам `install_ytdlp_tag` — здесь её
     // дублировать не надо.
     let _ = tx.send(Event::Log(format!("yt-dlp: выпуск {tag}")));
-    install_ytdlp_tag(&agent, &dir, &tag, tx, notify, cancelled)?;
+    install_ytdlp_tag(agent, dir, &tag, tx, notify, cancelled)?;
 
-    Ok(Outcome::Updated(match current {
-        Some(current) => format!("yt-dlp обновлён: {current} → {tag}."),
-        // Версии до обновления не было — значит, это первая установка своей
-        // копии, а не обновление. Обещать «обновлено с …» здесь нечестно.
-        None => format!("yt-dlp установлен, версия {tag}."),
-    }))
+    Ok(Outcome::Updated(update_summary(
+        "yt-dlp",
+        current.as_deref(),
+        &tag,
+        "",
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -1164,9 +1485,9 @@ mod tests {
     /// Настоящая загрузка и распаковка ffmpeg.
     ///
     /// Проверяет то, что нельзя проверить синтетикой: что архив по ссылке
-    /// действительно того формата, который распаковщик этой ОС понимает, и что
-    /// внутри него ожидаемая раскладка. Тянет больше сотни мегабайт, поэтому
-    /// тоже под `#[ignore]`.
+    /// действительно того формата, который распаковщик этой ОС понимает, что
+    /// внутри него ожидаемая раскладка и что сумму архива вообще есть с чем
+    /// сверить. Тянет больше сотни мегабайт, поэтому тоже под `#[ignore]`.
     #[test]
     #[ignore = "требует доступа в сеть и качает >100 МБ"]
     fn real_ffmpeg_download_and_extract() {
@@ -1179,13 +1500,33 @@ mod tests {
 
         let result = install_ffmpeg(&agent(), &dir, &tx, &|| {}, &cancelled);
         drop(tx);
+        let mut log = Vec::new();
         for event in rx.iter() {
             if let Event::Log(line) = event {
                 println!("log: {line}");
+                log.push(line);
             }
         }
 
         result.expect("установка ffmpeg обязана пройти");
+
+        // Сверка суммы обязана была состояться, а не быть пропущенной.
+        //
+        // Пропуск здесь — молчаливый (`expected_sum` возвращает `None`, и
+        // установка идёт дальше как ни в чём не бывало), и он ровно тот
+        // случай, ради которого написано Правило 6: переименуй BtbN свой
+        // `checksums.sha256` — и мы перестанем проверять архив вообще, не
+        // получив ни ошибки сборки, ни падения теста. Ловится это только
+        // здесь, на живом источнике.
+        //
+        // На macOS сверять нечем в принципе (см. `FfmpegSource::Split`),
+        // поэтому спрашиваем только там, где сумма обещана.
+        #[cfg(any(windows, target_os = "linux"))]
+        assert!(
+            !log.iter().any(|line| line.contains("без сверки")),
+            "архив ffmpeg поставился без сверки контрольной суммы: {log:?}"
+        );
+
         for name in [FFMPEG_NAME, FFPROBE_NAME] {
             let path = dir.join(name);
             assert!(path.is_file(), "{name} не распакован");
@@ -1203,6 +1544,151 @@ mod tests {
         assert!(leftovers.is_empty(), "остался мусор: {leftovers:?}");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Разбор версии на дословных первых строках настоящих сборок.
+    ///
+    /// Строки сняты с живых бинарников, а не выдуманы: точечная версия
+    /// (`8.1.2-…`) и git-сборка (`N-125365-…`) устроены по-разному, и правило
+    /// обязано брать обе. Промах здесь ничего не ломает при сборке и не виден
+    /// в тестах остального — просто версия перестаёт показываться.
+    #[test]
+    fn version_is_taken_from_real_banner_lines() {
+        let cases = [
+            (
+                "ffmpeg version 8.1.2-full_build-www.gyan.dev Copyright (c) 2000-2026 the FFmpeg developers",
+                "8.1.2-full_build-www.gyan.dev",
+            ),
+            // ffprobe — не ffmpeg: привязка к первому слову промахнулась бы.
+            (
+                "ffprobe version 8.1.2-full_build-www.gyan.dev Copyright (c) 2007-2026 the FFmpeg developers",
+                "8.1.2-full_build-www.gyan.dev",
+            ),
+            // Git-сборка: точечного номера нет вовсе, а ставит её обычный winget.
+            (
+                "ffmpeg version N-125365-g9a01c1cb6a-20260630 Copyright (c) 2000-2026 the FFmpeg developers",
+                "N-125365-g9a01c1cb6a-20260630",
+            ),
+            // Сборка martin-riedl — та, что качается на macOS ARM.
+            (
+                "ffmpeg version 8.1.2-https://www.martin-riedl.de Copyright (c) 2000-2026 the FFmpeg developers",
+                "8.1.2-https://www.martin-riedl.de",
+            ),
+            // Дистрибутивная сборка Debian/Ubuntu: после версии идёт ещё и
+            // название пакета, но версия по-прежнему сразу за словом.
+            (
+                "ffmpeg version 7.1.1-1ubuntu1 Copyright (c) 2000-2025 the FFmpeg developers",
+                "7.1.1-1ubuntu1",
+            ),
+        ];
+
+        for (line, expected) in cases {
+            assert_eq!(parse_version_line(line), Some(expected), "строка: {line}");
+        }
+    }
+
+    /// Неузнанный вывод обязан давать `None`, а не мусор в окне.
+    ///
+    /// Формат печатает чужая программа, и промах разбора рано или поздно
+    /// случится. Показать вместо версии кусок чужого текста хуже, чем честное
+    /// «версия неизвестна», — и втрое хуже, если этот текст ещё и длинный.
+    #[test]
+    fn unrecognised_output_gives_no_version() {
+        // Слова `version` нет вовсе.
+        assert_eq!(parse_version_line("ffmpeg 8.1.2"), None);
+        // Слово есть, но за ним ничего.
+        assert_eq!(parse_version_line("ffmpeg version"), None);
+        assert_eq!(parse_version_line(""), None);
+        // Подстрокой слово не считается: `versioning` — не `version`.
+        assert_eq!(parse_version_line("ffmpeg versioning info 8.1"), None);
+        // Неправдоподобно длинный токен — не версия, а чужой текст.
+        let long = format!("ffmpeg version {}", "x".repeat(VERSION_LIMIT + 1));
+        assert_eq!(parse_version_line(&long), None);
+    }
+
+    /// Отказ трогать чужую копию обязан называть **ту** программу, которую
+    /// нажали, и советовать команду для неё же.
+    ///
+    /// Совет не про ту программу — та же беда, о которой предупреждает
+    /// `explain_failure`: человек уходит чинить не своё. Перепутать здесь легко
+    /// (текст один на два инструмента), а компилятор этого не поймает.
+    #[test]
+    fn decline_names_the_right_tool() {
+        let path = Path::new("/usr/bin/tool");
+
+        let ytdlp = declined(Component::Ytdlp, path, Origin::System);
+        assert!(ytdlp.contains("yt-dlp"), "не назван yt-dlp: {ytdlp}");
+        assert!(!ytdlp.contains("ffmpeg"), "совет про чужую программу: {ytdlp}");
+        assert!(ytdlp.contains(YTDLP_SYSTEM_HINT), "нет команды обновления");
+
+        let ffmpeg = declined(Component::Ffmpeg, path, Origin::System);
+        assert!(ffmpeg.contains("ffmpeg"), "не назван ffmpeg: {ffmpeg}");
+        assert!(
+            !ffmpeg.contains("yt-dlp"),
+            "совет про чужую программу: {ffmpeg}"
+        );
+        assert!(ffmpeg.contains(FFMPEG_SYSTEM_HINT), "нет команды обновления");
+
+        // Путь обязателен в обоих случаях: без него «установлен в системе»
+        // проверить нечем.
+        for text in [
+            declined(Component::Ytdlp, path, Origin::Portable),
+            declined(Component::Ffmpeg, path, Origin::Portable),
+        ] {
+            assert!(text.contains("tool"), "потерян путь к файлу: {text}");
+        }
+    }
+
+    /// Итог обновления обязан называть обе версии и **не содержать стрелки**.
+    ///
+    /// Стрелка `→` в этой строке простояла один глазной прогон: шрифты eframe
+    /// знака U+2192 не содержат, и в окне на её месте пустой прямоугольник.
+    /// Компилятор такое пропускает, тесты остального — тоже, а увидеть можно
+    /// только после удачного обновления. Отсюда проверка машинно.
+    #[test]
+    fn update_summary_names_both_versions_without_an_arrow() {
+        let updated = update_summary("ffmpeg", Some("8.1.2"), "N-125829", "");
+        assert!(updated.contains("8.1.2"), "потеряна прежняя версия");
+        assert!(updated.contains("N-125829"), "потеряна новая версия");
+
+        let same = update_summary("ffmpeg", Some("N-125829"), "N-125829", " Оговорка.");
+        assert!(same.contains("уже последней"), "не сказано, что менять нечего");
+        assert!(same.contains("Оговорка."), "потеряна оговорка");
+
+        // Первая установка своей копии — обещать «обновлено с …» нечестно.
+        let first = update_summary("yt-dlp", None, "2026.07.04", "");
+        assert!(first.contains("установлен"), "первая установка названа обновлением");
+        assert!(first.contains("2026.07.04"), "потеряна версия");
+
+        for text in [&updated, &same, &first] {
+            assert!(
+                !text.chars().any(|c| c == '→' || c == '⟶' || c == '➜'),
+                "в окне вместо стрелки нарисуется пустой прямоугольник: {text}"
+            );
+        }
+    }
+
+    /// Имя ассета для поиска суммы обязано браться из самой ссылки.
+    ///
+    /// В списке BtbN рядом лежит `…-win64-gpl-shared.zip`, и сумма от него
+    /// подошла бы нашему архиву ровно никак: сверка провалилась бы на
+    /// исправном файле, а источник на Windows один — ffmpeg не поставился бы
+    /// вовсе. `find_sum` сравнивает имена целиком, здесь проверяем, что
+    /// сравнивать ему дают правильное.
+    #[test]
+    fn checksum_is_looked_up_by_exact_asset_name() {
+        let list = "\
+1111111111111111111111111111111111111111111111111111111111111111  ffmpeg-master-latest-win64-gpl-shared.zip
+2222222222222222222222222222222222222222222222222222222222222222  ffmpeg-master-latest-win64-gpl.zip
+";
+        let url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip";
+        let asset = url.rsplit('/').next().unwrap();
+
+        assert_eq!(asset, "ffmpeg-master-latest-win64-gpl.zip");
+        assert_eq!(
+            sha256::find_sum(list, asset),
+            Some("2222222222222222222222222222222222222222222222222222222222222222")
+        );
     }
 
     #[test]

@@ -994,6 +994,9 @@ mod tests {
         Tools {
             ytdlp: PathBuf::from("yt-dlp"),
             ffmpeg: ffmpeg.then(|| PathBuf::from("ffmpeg")),
+            // Пара всегда докачивается вместе, поэтому в заготовке они тоже
+            // появляются и исчезают вдвоём.
+            ffprobe: ffmpeg.then(|| PathBuf::from("ffprobe")),
         }
     }
 

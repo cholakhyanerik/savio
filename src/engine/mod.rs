@@ -101,6 +101,24 @@ pub fn start(
         }
     }
 
+    // ffprobe yt-dlp ищет **сам** — рядом с тем ffmpeg, что назван в
+    // `--ffmpeg-location`; отдельного ключа под него нет. Если пара разъехалась
+    // по разным папкам (системный ffmpeg в PATH, а докачанный нами ffprobe —
+    // в каталоге данных), yt-dlp наш ffprobe не увидит и HLS-поток не починит.
+    // Ошибки при этом не будет никакой: пропадёт лишь редкая ветка работы,
+    // ровно тот молчаливый отказ, о котором Правило 6. Сказать об этом может
+    // только журнал — на загрузку целиком это не влияет, и поднимать из-за
+    // этого баннер значило бы пугать там, где почти всегда всё в порядке.
+    if let (Some(ffmpeg), Some(ffprobe)) = (&tools.ffmpeg, &tools.ffprobe)
+        && ffmpeg.parent() != ffprobe.parent()
+    {
+        let _ = tx.send(Event::Log(format!(
+            "ffprobe лежит не рядом с ffmpeg ({} и {}) — yt-dlp его не увидит.",
+            ffmpeg.display(),
+            ffprobe.display()
+        )));
+    }
+
     let child_slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
     let handle = Handle {
         child: Arc::clone(&child_slot),
