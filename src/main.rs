@@ -35,7 +35,12 @@ fn main() -> eframe::Result {
             theme::apply(&cc.egui_ctx);
             // Контекст нужен приложению, чтобы поток установки мог будить
             // окно на перерисовку.
-            Ok(Box::new(app::SavioApp::new(&cc.egui_ctx)))
+            let app = app::SavioApp::new(&cc.egui_ctx);
+            // Без этого окно шире или выше 8192 точек убивает процесс вместе
+            // с идущей загрузкой, причём в релизе молча. Подробности — у
+            // `GpuErrors` в app.rs.
+            app.catch_gpu_errors(cc);
+            Ok(Box::new(app))
         }),
     )
 }

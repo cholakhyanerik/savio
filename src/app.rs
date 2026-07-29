@@ -1,7 +1,9 @@
 //! Состояние и отрисовка интерфейса.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
+use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 
@@ -16,6 +18,96 @@ use crate::model::{
 use crate::theme;
 
 const LOG_LIMIT: usize = 400;
+
+/// Сколько сообщений от wgpu держим до того, как их разберёт кадр.
+///
+/// Потолок обязателен по Правилу 1, как `LOG_LIMIT` у журнала: пока окно
+/// остаётся слишком большим, ошибка приходит на каждую попытку настроить
+/// поверхность, то есть много раз в секунду и без конца.
+const GPU_ERROR_LIMIT: usize = 4;
+
+/// Ошибки wgpu, пойманные вместо падения процесса.
+///
+/// Клиентская часть окна — это текстура, и egui-wgpu просит у устройства ровно
+/// 8192 пикселя по стороне жёстко зашитым числом, а поверхность настраивает
+/// сырым размером окна, ничем его не ограничивая. Окно больше этого предела —
+/// и `Surface::configure` отдаёт ошибку проверки, которую по умолчанию никто не
+/// ловит: wgpu роняет процесс паникой. Программный размер окна приходит откуда
+/// угодно — от оконного менеджера, удалённого рабочего стола, смены
+/// разрешения, — и предотвратить его приложение не может: `max_inner_size`
+/// система спрашивает только при перетаскивании рамки. Значит, остаётся
+/// пережить: с этим обработчиком процесс остаётся жив, старая цепочка кадров
+/// продолжает работать (wgpu-core выходит из `configure` до подмены
+/// поверхности), а когда размер снова становится законным, рисование
+/// восстанавливается само. Идущая загрузка при этом не теряется — ровно то,
+/// ради чего всё и делается.
+///
+/// Проверено вживую: без обработчика окно с клиентом 504×8193 убивает процесс,
+/// с ним — приложение живо и после возврата обычного размера рисует дальше.
+#[derive(Default)]
+struct GpuErrors {
+    /// Взводится обработчиком, гасится кадром. Нужен, чтобы в обычном кадре
+    /// (а ошибок не бывает почти никогда) дело не доходило до мьютекса:
+    /// `ui()` зовут 60 раз в секунду.
+    pending: AtomicBool,
+    messages: Mutex<Vec<String>>,
+}
+
+impl GpuErrors {
+    /// Зовётся из обработчика wgpu, то есть посреди чужого кода. Здесь нельзя
+    /// ни паниковать, ни трогать состояние приложения — только отложить.
+    fn push(&self, message: String) {
+        let Ok(mut messages) = self.messages.lock() else {
+            return;
+        };
+        // Пока окно остаётся большим, приходит одно и то же сообщение. Писать
+        // его в журнал десятками одинаковых строк — значит вытеснить оттуда
+        // всё остальное: у журнала свой предел, и он общий.
+        if messages.last().is_some_and(|last| *last == message) {
+            return;
+        }
+        if messages.len() < GPU_ERROR_LIMIT {
+            messages.push(message);
+            self.pending.store(true, Ordering::Release);
+        }
+    }
+
+    /// Забирает накопленное. Пусто в подавляющем большинстве кадров, и тогда
+    /// стоит одного атомарного чтения.
+    fn take(&self) -> Vec<String> {
+        if !self.pending.swap(false, Ordering::Acquire) {
+            return Vec::new();
+        }
+        match self.messages.lock() {
+            Ok(mut messages) => std::mem::take(&mut *messages),
+            Err(_) => Vec::new(),
+        }
+    }
+}
+
+/// Приметы, по которым ошибка wgpu опознаётся как «окно больше, чем умеет
+/// отрисовать видеокарта».
+///
+/// Подстроки английские и принадлежат wgpu — они могут смениться с новой
+/// версией, и промах не поймает ни компилятор, ни тест (Правило 6). Поэтому
+/// объяснение — не единственный исход: не узнали причину, значит показываем
+/// сырой текст, а не молчим.
+const GPU_TOO_LARGE_MARKS: [&str; 2] = [
+    "maximum supported texture size",
+    "max_texture_dimension_2d",
+];
+
+/// Строка для журнала по сообщению wgpu.
+fn gpu_error_line(message: &str) -> String {
+    if GPU_TOO_LARGE_MARKS.iter().any(|mark| message.contains(mark)) {
+        "Окно оказалось больше, чем может отрисовать видеокарта (предел — 8192 \
+         точки по стороне). Картинка временно не обновляется; уменьшите окно, \
+         и рисование восстановится. Загрузка при этом не прервана."
+            .to_owned()
+    } else {
+        format!("Ошибка отрисовки: {message}")
+    }
+}
 
 /// Ширина превью обложки в точках.
 ///
@@ -781,6 +873,10 @@ pub struct SavioApp {
     /// Пишет на своём потоке: сама запись — это ввод-вывод, а зовут её из
     /// обработчика щелчка, то есть из кадра отрисовки.
     saver: settings::Saver,
+
+    /// Сюда обработчик wgpu складывает то, из-за чего процесс раньше падал.
+    /// Разделяется с обработчиком, поэтому `Arc`, а не поле по значению.
+    gpu_errors: Arc<GpuErrors>,
 }
 
 impl SavioApp {
@@ -841,6 +937,7 @@ impl SavioApp {
             queue: Queue::new(),
             maximize_pending: true,
             saver: settings::Saver::spawn(),
+            gpu_errors: Arc::default(),
         };
 
         app.ffmpeg_missing = !engine::has_ffmpeg();
@@ -864,6 +961,47 @@ impl SavioApp {
         app.refresh_versions(ctx);
 
         app
+    }
+
+    /// Ставит перехват ошибок wgpu вместо падения процесса — см. [`GpuErrors`].
+    ///
+    /// Отдельным вызовом, а не внутри `new`: устройство появляется только у
+    /// рендерера wgpu, и его может не быть вовсе (сборка на glow). Тогда
+    /// перехватывать нечего, и это не ошибка — приложение работает как прежде.
+    pub fn catch_gpu_errors(&self, cc: &eframe::CreationContext<'_>) {
+        let Some(state) = &cc.wgpu_render_state else {
+            return;
+        };
+        let errors = Arc::clone(&self.gpu_errors);
+        let ctx = cc.egui_ctx.clone();
+        state.device.on_uncaptured_error(Arc::new(move |error| {
+            errors.push(error.to_string());
+            // Сообщение попадёт в журнал в ближайшем кадре, а сам кадр без
+            // этой строки может и не наступить: окно в этот момент как раз
+            // ничего не рисует.
+            ctx.request_repaint();
+        }));
+    }
+
+    /// Переносит пойманное в журнал. Зовётся из кадра, где это уже безопасно:
+    /// сам обработчик работает посреди чужого кода.
+    fn drain_gpu_errors(&mut self) {
+        for message in self.gpu_errors.take() {
+            let line = gpu_error_line(&message);
+            // Повтор гасится здесь, по готовой строке, а не по сообщению
+            // wgpu. Иначе в журнале двоится: про один и тот же предел
+            // приходят два РАЗНЫХ сообщения (про поверхность и про
+            // `set_viewport`), а человеку они говорят одно и то же. Заодно
+            // это гасит повтор между кадрами: пока окно остаётся большим,
+            // ошибка приходит заново в каждом.
+            if self.log.last().is_some_and(|last| *last == line) {
+                continue;
+            }
+            self.log.push(line);
+            if self.log.len() > LOG_LIMIT {
+                self.log.drain(..self.log.len() - LOG_LIMIT);
+            }
+        }
     }
 
     /// Вызывается, когда установка закончилась — успехом или нет.
@@ -1499,6 +1637,7 @@ impl eframe::App for SavioApp {
         self.drain_events(ui.ctx());
         self.meta.drain();
         self.drain_versions();
+        self.drain_gpu_errors();
 
         if self.maximize_pending {
             self.maximize_pending = false;
@@ -3869,5 +4008,67 @@ mod tests {
         assert_eq!(entry.name, "file.mp4");
         assert_eq!(entry.dir, None);
         assert!(entry.dir_display.is_empty());
+    }
+
+    /// Настоящее сообщение wgpu 29 — то самое, от которого раньше падал
+    /// процесс. Проверено вживую на окне с клиентом 504×8193.
+    const TOO_LARGE: &str = "Validation Error\n\nCaused by:\n  In Surface::configure\n    \
+         `Surface` width and height must be within the maximum supported texture size. \
+         Requested was (504, 8193), maximum extent for either dimension is 8192.";
+
+    #[test]
+    fn oversized_window_is_explained_in_russian() {
+        let line = gpu_error_line(TOO_LARGE);
+        assert!(line.contains("больше, чем может отрисовать"), "{line}");
+        // Английский текст wgpu пользователю не показываем: он про текстуру,
+        // а человек видит окно.
+        assert!(!line.contains("Surface"), "{line}");
+    }
+
+    /// Приметы принадлежат wgpu и могут смениться с новой версией. Промах не
+    /// поймает ни компилятор, ни сборка, поэтому запасной исход обязателен:
+    /// потерять подсказку терпимо, потерять сообщение целиком — нет.
+    #[test]
+    fn unknown_gpu_error_keeps_its_own_text() {
+        let line = gpu_error_line("Validation Error: something else entirely");
+        assert!(line.starts_with("Ошибка отрисовки: "), "{line}");
+        assert!(line.contains("something else entirely"), "{line}");
+    }
+
+    /// Пока окно остаётся большим, ошибка приходит без конца. Журнал у Savio
+    /// один и ограничен, так что повтор туда пускать нельзя.
+    #[test]
+    fn repeated_gpu_errors_are_collapsed_and_capped() {
+        let errors = GpuErrors::default();
+        for _ in 0..100 {
+            errors.push(TOO_LARGE.to_owned());
+        }
+        assert_eq!(errors.take().len(), 1);
+
+        for i in 0..100 {
+            errors.push(format!("ошибка {i}"));
+        }
+        assert_eq!(errors.take().len(), GPU_ERROR_LIMIT);
+    }
+
+    /// Про один и тот же предел wgpu присылает два РАЗНЫХ сообщения: про
+    /// поверхность и про `set_viewport`. Человеку они говорят одно и то же,
+    /// поэтому повторы в журнале гасятся по готовой строке, а не по тексту
+    /// wgpu. Без этого запись двоилась — видно только глазами, ни сборка,
+    /// ни clippy этого не ловят.
+    #[test]
+    fn different_wgpu_messages_about_one_limit_give_the_same_line() {
+        let viewport = "Validation Error\n\nCaused by:\n  In a CommandEncoder, label = 'encoder'\n    \
+             In a set_viewport command\n      Viewport size { w: 9984, h: 381 } greater than \
+             device's requested `max_texture_dimension_2d` limit 8192, or less than zero";
+        assert_eq!(gpu_error_line(TOO_LARGE), gpu_error_line(viewport));
+    }
+
+    /// Кадр без ошибок не должен ничего забирать: `ui()` зовут 60 раз
+    /// в секунду, и пустой разбор обязан оставаться пустым.
+    #[test]
+    fn quiet_frame_takes_nothing() {
+        let errors = GpuErrors::default();
+        assert!(errors.take().is_empty());
     }
 }
