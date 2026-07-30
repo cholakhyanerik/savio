@@ -14,6 +14,7 @@ pub mod ytdlp;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
@@ -31,16 +32,87 @@ pub fn has_ffmpeg() -> bool {
     binaries::locate(binaries::FFMPEG_NAME).is_some()
 }
 
+/// Чем «Отмена» останавливает загрузку. Общее у ручки и у потока движка.
+///
+/// Половины две, и обе обязательны. Убить процесс можно, только когда он есть,
+/// а первые секунды после «Скачать» его нет: идёт `probe`, потом обложка, потом
+/// сам запуск. Всё это время слот пуст, и одного слота хватало ровно на то,
+/// чтобы отмена не отменяла ничего: окно закрывалось, а файл спокойно
+/// докачивался. Флаг отвечает на другой вопрос — «просили ли отменить», —
+/// и потому виден движку до появления процесса. Приём тот же, что у установки
+/// инструментов (`setup::Handle`), там он проверен.
+#[derive(Clone, Default)]
+struct Control {
+    child: Arc<Mutex<Option<Child>>>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl Control {
+    /// Просили ли отменить.
+    fn cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Relaxed)
+    }
+
+    /// Отдаёт запущенный процесс под присмотр «Отмены».
+    ///
+    /// Возвращает `false`, если отменить успели, пока процесс запускался: тогда
+    /// он тут же и убит, а звать его снова незачем.
+    ///
+    /// Проверка флага и запись в слот идут под одним замком намеренно, и это
+    /// не перестраховка. Между проверкой перед запуском и этой строкой лежит
+    /// сам `spawn` — на Windows это десятки миллисекунд, и отмена, попавшая
+    /// ровно в них, не нашла бы в слоте ничего. Под общим замком третьего
+    /// исхода нет: либо `cancel()` видит в слоте процесс и убивает его, либо
+    /// мы видим её флаг и не начинаем.
+    fn adopt(&self, mut child: Child) -> Result<bool, String> {
+        match self.child.lock() {
+            Ok(mut slot) => {
+                if !self.cancelled() {
+                    *slot = Some(child);
+                    return Ok(true);
+                }
+            }
+            // Замок отравлен: в слот процесс не положить, а оставить его
+            // работать нельзя тем более — «Отмена» до него уже не доберётся.
+            Err(_) => {
+                kill_and_reap(&mut child);
+                return Err("Внутренняя ошибка синхронизации".into());
+            }
+        }
+        // Замок здесь уже отпущен: `wait()` под ним заставил бы `cancel()`
+        // ждать нас, а её задача — вернуть управление сразу.
+        kill_and_reap(&mut child);
+        Ok(false)
+    }
+}
+
+/// Убивает процесс и дожидается его конца.
+///
+/// Ждать обязательно: `Child::drop` этого не делает, и на Unix убитый, но
+/// не дождавшийся потомок остаётся зомби до конца жизни Savio.
+fn kill_and_reap(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// Ручка запущенной загрузки: позволяет её отменить.
 pub struct Handle {
-    child: Arc<Mutex<Option<Child>>>,
+    control: Control,
 }
 
 impl Handle {
-    /// Убивает процесс. Событие `Failed` при этом не шлётся —
-    /// отмену UI показывает сам, чтобы не выглядела как ошибка.
+    /// Просит движок остановиться и убивает процесс, если он уже есть.
+    /// Событие `Failed` при этом не шлётся — отмену UI показывает сам,
+    /// чтобы не выглядела как ошибка.
     pub fn cancel(&self) {
-        if let Ok(mut guard) = self.child.lock()
+        // Флаг ставится ДО замка, и порядок этих двух строк — не вкусовщина:
+        // под этим же замком движок решает, отдавать ли ему только что
+        // запущенный процесс (см. `Control::adopt`). Пока пометка идёт раньше
+        // захвата, промахнуться мимо друг друга мы не можем. Переставь строки
+        // местами — и вернётся ровно то окно, ради которого флаг заводился,
+        // причём не сломается при этом ни сборка, ни тесты.
+        self.control.cancelled.store(true, Ordering::Relaxed);
+        if let Ok(mut guard) = self.control.child.lock()
             && let Some(child) = guard.as_mut() {
                 let _ = child.kill();
             }
@@ -119,14 +191,24 @@ pub fn start(
         )));
     }
 
-    let child_slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
+    let control = Control::default();
     let handle = Handle {
-        child: Arc::clone(&child_slot),
+        control: control.clone(),
     };
 
     std::thread::spawn(move || {
-        let result = run(id, &request, &out_dir, &tools, &tx, &notify, &child_slot);
+        let result = run(id, &request, &out_dir, &tools, &tx, &notify, &control);
         if let Err(err) = result {
+            // Отменённая загрузка кончается ненулевым кодом убитого процесса,
+            // то есть выглядит отсюда точно как сорвавшаяся. Ошибкой она не
+            // является, и слать `Failed` нельзя: отмену UI показывает сам,
+            // словом «Отменено» (Правило 2). Раньше это спасал только UI —
+            // он роняет приёмник вместе с отменой, — но движок обязан
+            // оставаться пригодным для CLI и тестов без единой правки, а там
+            // ронять нечего, и запоздалое «Ошибка» досталось бы человеку.
+            if control.cancelled() {
+                return;
+            }
             let _ = tx.send(Event::Failed { id, message: err });
             notify();
         }
@@ -142,7 +224,7 @@ fn run(
     tools: &Tools,
     tx: &Sender<Event>,
     notify: &(impl Fn() + Send + 'static),
-    child_slot: &Arc<Mutex<Option<Child>>>,
+    control: &Control,
 ) -> Result<(), String> {
     let _ = tx.send(Event::Stage("Читаю ссылку…".into()));
     notify();
@@ -208,16 +290,26 @@ fn run(
         }
     }
 
+    // Отмена, нажатая в первые секунды. Всё, что было выше (`probe`, обложка),
+    // идёт до появления процесса, а убивать «Отмена» умеет только процесс —
+    // потому и спрашиваем флаг сами. Уходим молча, без `Failed`: UI обязан
+    // показать «Отменено», а не ошибку (Правило 2).
+    //
+    // Проверка стоит до запуска, а не после: yt-dlp, убитый через мгновение
+    // после старта, успевает оставить в папке `.part`-огрызок.
+    if control.cancelled() {
+        return Ok(());
+    }
+
     let args = ytdlp::download_args(request, out_dir, tools);
 
-    // Последняя точка, где можно уйти, ничего не запустив, — и уходить тут
-    // обязательно. Всё, что было выше (`probe`, обложка), идёт до появления
-    // процесса, а `Handle::cancel()` умеет ровно одно: убить процесс из слота.
-    // Пока слот пуст, отмена не отменяет ничего (дефект 14), и для очереди это
-    // опаснее, чем для одиночной загрузки: следующий её элемент уже запущен,
-    // и мы получили бы два yt-dlp разом — вопреки правилу «строго по одному».
-    // Закрытый приёмник и есть признак того, что UI про нас забыл: он
-    // закрывает канал в `cancel()`. Своего события для этого не нужно —
+    // Второй признак того, что UI про нас забыл, — закрытый приёмник, и он
+    // не заменяет флаг, а дополняет: флаг отвечает «просили ли отменить»,
+    // приёмник — «слушает ли кто-нибудь». Совпадают они не всегда: канал
+    // роняет и закрытие окна. Уйти по этому признаку так же важно: для
+    // очереди запуск после забвения опаснее, чем для одиночной загрузки —
+    // следующий её элемент уже пошёл, и мы получили бы два yt-dlp разом,
+    // вопреки правилу «строго по одному». Своего события не нужно —
     // достаточно посмотреть на исход отправки той строки, что и так уходит
     // в журнал.
     if tx
@@ -241,8 +333,10 @@ fn run(
     let stdout = child.stdout.take().ok_or("Нет stdout у yt-dlp")?;
     let stderr = child.stderr.take().ok_or("Нет stderr у yt-dlp")?;
 
-    if let Ok(mut guard) = child_slot.lock() {
-        *guard = Some(child);
+    // Отмена могла прийти, пока процесс запускался. Тогда он уже убит,
+    // и дальше идти незачем — снова молча, без `Failed`.
+    if !control.adopt(child)? {
+        return Ok(());
     }
 
     // stderr читаем отдельным потоком: под --quiet туда уходит прогресс
@@ -296,7 +390,8 @@ fn run(
     }
 
     let status = {
-        let mut guard = child_slot
+        let mut guard = control
+            .child
             .lock()
             .map_err(|_| "Внутренняя ошибка синхронизации".to_string())?;
         match guard.as_mut() {
@@ -306,7 +401,7 @@ fn run(
     };
     let _ = stderr_thread.join();
 
-    if let Ok(mut guard) = child_slot.lock() {
+    if let Ok(mut guard) = control.child.lock() {
         *guard = None;
     }
 
@@ -423,4 +518,155 @@ fn probe(request: &Request, tools: &Tools) -> Option<crate::model::MediaInfo> {
     }
     let json = String::from_utf8_lossy(&output.stdout);
     Some(ytdlp::parse_media_info(&json))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{CookieSource, DownloadOptions, Format, Quality, Section};
+    use std::sync::mpsc::channel;
+
+    /// Заведомо несуществующий бинарник: `probe` на нём отваливается мгновенно
+    /// (никакой сети и никакого процесса), а попытка запустить загрузку сразу
+    /// видна по ошибке. На этом и держатся оба теста ниже: до `spawn` дошли —
+    /// значит `Err`, не дошли — значит `Ok`.
+    fn tools() -> Tools {
+        Tools {
+            ytdlp: PathBuf::from("savio-заведомо-нет-такого-бинарника"),
+            ffmpeg: None,
+            ffprobe: None,
+        }
+    }
+
+    fn request() -> Request {
+        Request {
+            url: "https://example.invalid/watch?v=savio".into(),
+            format: Format::Mp4,
+            quality: Quality::default(),
+            options: DownloadOptions::default(),
+            section: Section::default(),
+            cookies: CookieSource::None,
+        }
+    }
+
+    /// Отмена, нажатая до запуска процесса, обязана остановить загрузку —
+    /// и остановить молча.
+    ///
+    /// Саму гонку тест поймать не может (она на то и гонка), но ловит её
+    /// причину: до появления флага `run` в этом месте не спрашивал ничего
+    /// и уходил запускать yt-dlp. Пара с тестом ниже: поодиночке любой из
+    /// них прошёл бы и на сломанном флаге.
+    #[test]
+    fn cancel_before_spawn_stops_download() {
+        let control = Control::default();
+        control.cancelled.store(true, Ordering::Relaxed);
+
+        let (tx, rx) = channel();
+        let result = run(
+            1,
+            &request(),
+            &std::env::temp_dir(),
+            &tools(),
+            &tx,
+            &|| {},
+            &control,
+        );
+
+        assert!(result.is_ok(), "отмена — не ошибка, а «Отменено»: {result:?}");
+        drop(tx);
+        assert!(
+            !rx.iter().any(|e| matches!(e, Event::Failed { .. })),
+            "при отмене UI показывает «Отменено», а не ошибку (Правило 2)"
+        );
+    }
+
+    /// Обратная половина: без отмены тот же вызов доходит до запуска yt-dlp.
+    #[test]
+    fn without_cancel_run_reaches_spawn() {
+        let control = Control::default();
+
+        // Приёмник держим живым до конца: закрытый канал — второй признак
+        // отмены, и на нём `run` вышел бы, не дойдя до запуска.
+        let (tx, rx) = channel();
+        let result = run(
+            1,
+            &request(),
+            &std::env::temp_dir(),
+            &tools(),
+            &tx,
+            &|| {},
+            &control,
+        );
+
+        let err = result.expect_err("без отмены дело обязано дойти до yt-dlp");
+        assert!(err.contains("yt-dlp"), "неожиданная ошибка: {err}");
+        drop(rx);
+    }
+
+    /// Настоящая загрузка, отменённая в первую секунду: в папке не должно
+    /// появиться ни файла, ни огрызка `.part`.
+    ///
+    /// Ровно тот сценарий, которым дефект 14 и нашли: окно показывало
+    /// «Отменено», а файл продолжал качаться. Отмена приходит через 300 мс,
+    /// то есть в середину `probe`, — в это окно процесса ещё нет, и убивать
+    /// «Отмене» нечего. Ни сборка, ни `clippy`, ни обычные тесты этого не
+    /// видят, проверяется только живьём.
+    ///
+    /// Приёмник тест держит живым намеренно, хотя UI его роняет вместе с
+    /// отменой: закрытый канал — второй, независимый признак остановки, и на
+    /// нём тест прошёл бы даже с выломанным флагом.
+    ///
+    /// В обычном прогоне отключён: нужны сеть и yt-dlp.
+    /// Запуск вручную: `cargo test -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "требует доступа в сеть и установленного yt-dlp"]
+    fn real_cancel_in_the_first_second_leaves_no_file() {
+        let dir = std::env::temp_dir().join("savio-cancel-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("создать временный каталог");
+
+        let mut request = request();
+        request.url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ".into();
+
+        let (tx, rx) = channel();
+        let handle = start(1, request, dir.clone(), tx, || {}).expect("yt-dlp обязан быть найден");
+
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        handle.cancel();
+
+        // Ждём дольше, чем длится probe и первые секунды загрузки: огрызок
+        // `.part` появляется почти сразу, и если он не появился за полминуты,
+        // значит yt-dlp не запускался вовсе.
+        std::thread::sleep(std::time::Duration::from_secs(30));
+
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .expect("читать временный каталог")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            left.is_empty(),
+            "после отмены в папке появились файлы: {left:?}"
+        );
+        assert!(
+            !rx.try_iter().any(|e| matches!(e, Event::Failed { .. })),
+            "отмена показывается «Отменено», а не ошибкой (Правило 2)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Отмена уже идущей загрузки: процесс из слота убит, а флаг стоит —
+    /// значит запускать что-то ещё после неё движок не станет.
+    #[test]
+    fn cancel_marks_the_flag() {
+        let control = Control::default();
+        let handle = Handle {
+            control: control.clone(),
+        };
+
+        assert!(!control.cancelled());
+        handle.cancel();
+        assert!(control.cancelled());
+    }
 }
