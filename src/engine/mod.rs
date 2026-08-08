@@ -11,14 +11,16 @@ pub mod sha256;
 pub mod thumbnail;
 pub mod ytdlp;
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
-use crate::model::{DownloadId, Event, NO_DOWNLOAD, Request, SubtitlePlan, human_duration};
+use crate::model::{
+    DownloadId, Event, MediaInfo, NO_DOWNLOAD, Request, SubtitlePlan, human_duration,
+};
 
 pub use binaries::{Tools, discover};
 
@@ -95,7 +97,11 @@ fn kill_and_reap(child: &mut Child) {
     let _ = child.wait();
 }
 
-/// Ручка запущенной загрузки: позволяет её отменить.
+/// Ручка запущенной работы: позволяет её остановить.
+///
+/// Одна на два дела — на загрузку и на фоновый запрос метаданных
+/// (`start_probe`). Останавливаются они одинаково: пометить флаг и убить
+/// процесс, — и отдельный тип отличался бы от этого только именем.
 pub struct Handle {
     control: Control,
 }
@@ -126,10 +132,19 @@ impl Handle {
 /// `id` движок не выдумывает, а получает снаружи и только проставляет в
 /// события: очередь ведёт UI, и знать о ней движку незачем. Одиночной
 /// загрузке (CLI, тест) годится любое ненулевое число.
+///
+/// `known` — ответ `probe`, который у вызывающего уже есть: UI спрашивает
+/// метаданные ещё при вставке ссылки (`start_probe`), и спрашивать их второй
+/// раз значило бы сходить на сайт дважды за одним и тем же — а лишние запросы
+/// на один ролик это прямая дорога к «Sign in to confirm you're not a bot».
+/// Вместе с ответом у него есть и обложка, поэтому при `Some` движок не тянет
+/// ни того ни другого. `None` — обычный путь (CLI, тесты, ссылка из очереди,
+/// о которой не спрашивали): движок спросит сам, как и раньше.
 pub fn start(
     id: DownloadId,
     request: Request,
     out_dir: PathBuf,
+    known: Option<MediaInfo>,
     tx: Sender<Event>,
     notify: impl Fn() + Send + 'static,
 ) -> Result<Handle, String> {
@@ -197,7 +212,13 @@ pub fn start(
     };
 
     std::thread::spawn(move || {
-        let result = run(id, &request, &out_dir, &tools, &tx, &notify, &control);
+        let job = Job {
+            id,
+            request: &request,
+            known,
+            out_dir: &out_dir,
+        };
+        let result = run(job, &tools, &tx, &notify, &control);
         if let Err(err) = result {
             // Отменённая загрузка кончается ненулевым кодом убитого процесса,
             // то есть выглядит отсюда точно как сорвавшаяся. Ошибкой она не
@@ -217,15 +238,33 @@ pub fn start(
     Ok(handle)
 }
 
-fn run(
+/// Что качаем: всё, что пришло снаружи, одной посылкой.
+///
+/// Собрано в структуру не для красоты. Восемь отдельных аргументов у `run`
+/// clippy уже не пропускает, а два соседних `&Path` в таком списке недолго
+/// и переставить местами — компилятор этого не заметит.
+struct Job<'a> {
     id: DownloadId,
-    request: &Request,
-    out_dir: &Path,
+    request: &'a Request,
+    /// Готовый ответ `probe` от вызывающего — см. `known` у [`start`].
+    known: Option<MediaInfo>,
+    out_dir: &'a Path,
+}
+
+fn run(
+    job: Job<'_>,
     tools: &Tools,
     tx: &Sender<Event>,
     notify: &(impl Fn() + Send + 'static),
     control: &Control,
 ) -> Result<(), String> {
+    let Job {
+        id,
+        request,
+        known,
+        out_dir,
+    } = job;
+
     let _ = tx.send(Event::Stage("Читаю ссылку…".into()));
     notify();
 
@@ -236,9 +275,14 @@ fn run(
     // окажется ровно тем, что было до появления выбора.
     let mut subs = SubtitlePlan::blind(request.options.auto_subs);
 
+    // Обложку тянем только тогда, когда спрашивали сами: с готовым ответом
+    // она у вызывающего уже есть (см. `known` в `start`), и второй заход за
+    // той же картинкой — это секунды задержки перед началом загрузки впустую.
+    let cover_wanted = known.is_none();
+
     // Метаданные тянем отдельным быстрым вызовом, чтобы показать название
     // ещё до старта загрузки. Если не вышло — не страшно, идём дальше.
-    if let Some(info) = probe(request, tools) {
+    if let Some(info) = known.or_else(|| probe(request, tools, control)) {
         // Адрес, длительность и план по субтитрам забираем до отправки:
         // `Info` уходит в UI вместе со структурой.
         let cover = info.thumbnail_url.clone();
@@ -280,21 +324,8 @@ fn run(
 
         // Обложку тянем после `Info`, а не вместо него: название должно
         // появиться сразу, не дожидаясь картинки.
-        //
-        // Любая неудача здесь — строка в журнале, и только. Ни `Failed`, ни
-        // даже `Warning`: превью — украшение, а баннер во весь экран из-за
-        // мёртвой ссылки на картинку выглядел бы поломкой загрузки, которой
-        // не произошло.
-        if listening && let Some(url) = cover {
-            match thumbnail::fetch(&url) {
-                Ok(cover) => {
-                    let _ = tx.send(Event::Thumbnail(cover));
-                    notify();
-                }
-                Err(err) => {
-                    let _ = tx.send(Event::Log(format!("Обложка не загрузилась: {err}")));
-                }
-            }
+        if cover_wanted && listening {
+            send_cover(cover, tx, notify);
         }
     }
 
@@ -502,6 +533,79 @@ pub fn start_metadata(
     });
 }
 
+/// Спрашивает метаданные ссылки, ни к какой загрузке не привязываясь.
+///
+/// Нужен предпросмотру: название и обложку человек должен увидеть, как только
+/// вставил ссылку, — то есть до нажатия «Скачать», а не после. Ответ уходит
+/// теми же `Info` и `Thumbnail`, что и у загрузки, так что разбирать его UI
+/// умеет с первого дня.
+///
+/// Отдельный канал `Event` на вызов, а не общий с загрузкой, — по той же
+/// причине, что и у метаданных файла: спрашивать про новую ссылку можно и
+/// во время скачивания, и события двух задач не должны попадать в один сток.
+///
+/// **Ни одна неудача здесь ничем не оборачивается**: ни `Failed`, ни строки
+/// в журнале. Предпросмотр — украшение, и отсутствие yt-dlp, незнакомый сайт
+/// или молчащий сервер значат ровно одно: карточка останется пустой, а
+/// «Скачать» по-прежнему можно нажать — вдруг сайт ответит ему.
+pub fn start_probe(
+    request: Request,
+    tx: Sender<Event>,
+    notify: impl Fn() + Send + 'static,
+) -> Handle {
+    let control = Control::default();
+    let handle = Handle {
+        control: control.clone(),
+    };
+
+    std::thread::spawn(move || {
+        let Ok(tools) = discover() else {
+            return;
+        };
+        let Some(info) = probe(&request, &tools, &control) else {
+            return;
+        };
+
+        let cover = info.thumbnail_url.clone();
+        // Закрытый приёмник означает, что спрашивают уже про другую ссылку:
+        // на смену цели UI роняет канал. Тянуть после этого ещё и картинку —
+        // несколько секунд чужого времени впустую, а показать её всё равно
+        // будет некому.
+        if tx.send(Event::Info(info)).is_err() {
+            return;
+        }
+        notify();
+
+        if control.cancelled() {
+            return;
+        }
+        send_cover(cover, &tx, &notify);
+    });
+
+    handle
+}
+
+/// Тянет обложку по адресу из ответа `probe` и отправляет её в канал.
+///
+/// Общее у загрузки и у предпросмотра — картинка и там и там одна и та же.
+/// Любая неудача здесь — строка в журнале, и только. Ни `Failed`, ни даже
+/// `Warning`: превью — украшение, а баннер во весь экран из-за мёртвой ссылки
+/// на картинку выглядел бы поломкой загрузки, которой не произошло.
+fn send_cover(url: Option<String>, tx: &Sender<Event>, notify: &impl Fn()) {
+    let Some(url) = url else {
+        return;
+    };
+    match thumbnail::fetch(&url) {
+        Ok(cover) => {
+            let _ = tx.send(Event::Thumbnail(cover));
+            notify();
+        }
+        Err(err) => {
+            let _ = tx.send(Event::Log(format!("Обложка не загрузилась: {err}")));
+        }
+    }
+}
+
 /// Быстрый запрос метаданных. Ошибки глушим: это украшение, а не необходимость.
 ///
 /// Разбор ответа (в том числе списка доступных высот) идёт здесь, на потоке
@@ -512,7 +616,13 @@ pub fn start_metadata(
 /// качаем, — вместе с cookies. Иначе у закрытого ролика этот вызов молча
 /// провалится, и человек будет смотреть на пустую карточку у загрузки,
 /// которая на самом деле идёт.
-fn probe(request: &Request, tools: &Tools) -> Option<crate::model::MediaInfo> {
+///
+/// Процесс запускаем и отдаём в слот, а не зовём короткий `Command::output()`:
+/// `-J` у медленного сайта идёт секундами, и всё это время бросить его было
+/// бы нечем. Для загрузки это то самое окно, в которое «Отмена» не отменяла
+/// ничего (дефект 14), а для предпросмотра — накопившиеся фоновые процессы
+/// по ссылкам, которых в поле давно нет.
+fn probe(request: &Request, tools: &Tools, control: &Control) -> Option<MediaInfo> {
     let mut cmd = Command::new(&tools.ytdlp);
     cmd.args(ytdlp::probe_args(&request.url, request.cookies))
         .stdout(Stdio::piped())
@@ -520,12 +630,40 @@ fn probe(request: &Request, tools: &Tools) -> Option<crate::model::MediaInfo> {
         .stdin(Stdio::null());
     ytdlp::hide_console(&mut cmd);
 
-    let output = cmd.output().ok()?;
-    if !output.status.success() {
+    let mut child = cmd.spawn().ok()?;
+    let stdout = child.stdout.take()?;
+
+    // Бросили, пока запускались, — `adopt` его уже убил, и ждать ответа
+    // не от кого.
+    if !control.adopt(child).ok()? {
         return None;
     }
-    let json = String::from_utf8_lossy(&output.stdout);
-    Some(ytdlp::parse_media_info(&json))
+
+    // Читаем байтами и разбираем `from_utf8_lossy`, а не `read_to_string`:
+    // ответ приходит от чужой программы, и один битый байт в названии ролика
+    // не повод остаться без карточки целиком.
+    let mut json = Vec::new();
+    let read = BufReader::new(stdout).read_to_end(&mut json);
+    let status = wait_and_release(control)?;
+
+    (read.is_ok() && status.success())
+        .then(|| ytdlp::parse_media_info(&String::from_utf8_lossy(&json)))
+}
+
+/// Дожидается процесса из слота и освобождает слот.
+///
+/// Ждать обязательно (иначе зомби на Unix), освобождать — тоже: после `probe`
+/// в тот же слот ложится сам yt-dlp, и оставленный там отработавший процесс
+/// сбивал бы с толку «Отмену».
+fn wait_and_release(control: &Control) -> Option<ExitStatus> {
+    let status = {
+        let mut guard = control.child.lock().ok()?;
+        guard.as_mut()?.wait().ok()?
+    };
+    if let Ok(mut guard) = control.child.lock() {
+        *guard = None;
+    }
+    Some(status)
 }
 
 #[cfg(test)]
@@ -543,6 +681,19 @@ mod tests {
             ytdlp: PathBuf::from("savio-заведомо-нет-такого-бинарника"),
             ffmpeg: None,
             ffprobe: None,
+        }
+    }
+
+    /// Загрузка, которую `run` получает на вход. Ссылка и папка живут в
+    /// статике, чтобы не разбираться со временем жизни ссылок в каждом тесте.
+    fn job(known: Option<MediaInfo>) -> Job<'static> {
+        static REQUEST: std::sync::OnceLock<Request> = std::sync::OnceLock::new();
+        static OUT_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        Job {
+            id: 1,
+            request: REQUEST.get_or_init(request),
+            known,
+            out_dir: OUT_DIR.get_or_init(std::env::temp_dir),
         }
     }
 
@@ -571,15 +722,7 @@ mod tests {
         control.cancelled.store(true, Ordering::Relaxed);
 
         let (tx, rx) = channel();
-        let result = run(
-            1,
-            &request(),
-            &std::env::temp_dir(),
-            &tools(),
-            &tx,
-            &|| {},
-            &control,
-        );
+        let result = run(job(None), &tools(), &tx, &|| {}, &control);
 
         assert!(result.is_ok(), "отмена — не ошибка, а «Отменено»: {result:?}");
         drop(tx);
@@ -597,19 +740,41 @@ mod tests {
         // Приёмник держим живым до конца: закрытый канал — второй признак
         // отмены, и на нём `run` вышел бы, не дойдя до запуска.
         let (tx, rx) = channel();
-        let result = run(
-            1,
-            &request(),
-            &std::env::temp_dir(),
-            &tools(),
-            &tx,
-            &|| {},
-            &control,
-        );
+        let result = run(job(None), &tools(), &tx, &|| {}, &control);
 
         let err = result.expect_err("без отмены дело обязано дойти до yt-dlp");
         assert!(err.contains("yt-dlp"), "неожиданная ошибка: {err}");
         drop(rx);
+    }
+
+    /// Готовый ответ вызывающего избавляет от второго похода на сайт.
+    ///
+    /// Проверяется от противного: бинарника нет, то есть сам `probe` ответить
+    /// не мог бы ничем, — а `Info` в канал всё равно уходит. Значит, взят он
+    /// из `known`, и `-J` второй раз не запускался. Ни сборка, ни `clippy`
+    /// такого не видят: лишний запрос ничего не ломает, он просто есть.
+    #[test]
+    fn a_known_answer_saves_the_second_trip_to_the_site() {
+        let known = MediaInfo {
+            title: Some("Название из предпросмотра".into()),
+            ..MediaInfo::default()
+        };
+
+        let (tx, rx) = channel();
+        let _ = run(
+            job(Some(known)),
+            &tools(),
+            &tx,
+            &|| {},
+            &Control::default(),
+        );
+        drop(tx);
+
+        let title = rx.iter().find_map(|event| match event {
+            Event::Info(info) => info.title,
+            _ => None,
+        });
+        assert_eq!(title.as_deref(), Some("Название из предпросмотра"));
     }
 
     /// Настоящая загрузка, отменённая в первую секунду: в папке не должно
@@ -638,7 +803,8 @@ mod tests {
         request.url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ".into();
 
         let (tx, rx) = channel();
-        let handle = start(1, request, dir.clone(), tx, || {}).expect("yt-dlp обязан быть найден");
+        let handle =
+            start(1, request, dir.clone(), None, tx, || {}).expect("yt-dlp обязан быть найден");
 
         std::thread::sleep(std::time::Duration::from_millis(300));
         handle.cancel();

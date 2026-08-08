@@ -12,8 +12,8 @@ use crate::engine::setup;
 use crate::engine::{self, Handle, MetaTask, metadata};
 use crate::model::{
     CookieSource, DownloadId, DownloadOptions, Event, Format, MediaInfo, Progress, Quality, Request,
-    Section, SectionError, SubLang, Tag, human_bytes, human_duration, human_speed, looks_like_url,
-    meta_kind, parse_section,
+    Section, SectionError, SubLang, Tag, Thumbnail, human_bytes, human_duration, human_speed,
+    looks_like_url, meta_kind, parse_section,
 };
 use crate::theme;
 
@@ -111,18 +111,30 @@ fn gpu_error_line(message: &str) -> String {
 
 /// Ширина превью обложки в точках.
 ///
-/// 240 — половина того, что остаётся от окна минимальной ширины (520 минус
-/// поля дают 480): картинка заметна, но не выдавливает прогресс и журнал
-/// за нижнюю кромку. Движок уменьшает обложку до 480 настоящих точек, так что
-/// на экране с двойной плотностью превью остаётся резким.
-const PREVIEW_WIDTH: f32 = 240.0;
+/// 128 — примерно четверть того, что остаётся от окна минимальной ширины
+/// (520 минус поля дают 480): рядом с картинкой обязано помещаться название,
+/// а сама она стоит теперь в карточке управления, между полем ссылки и
+/// переключателем формата, — то есть отнимает высоту у всего остального.
+/// Движок уменьшает обложку до 480 настоящих точек, так что на экране
+/// с двойной плотностью превью остаётся резким.
+const PREVIEW_WIDTH: f32 = 128.0;
 
 /// Потолок высоты превью.
 ///
-/// Нужен из-за вертикальных роликов: обложка 9:16 при ширине 240 заняла бы
-/// 427 точек — больше, чем всё окно минимальной высоты (420). С потолком такая
-/// картинка просто становится узкой, а не выдавливает содержимое в прокрутку.
-const PREVIEW_MAX_HEIGHT: f32 = 150.0;
+/// Нужен из-за вертикальных роликов: обложка 9:16 при ширине 128 заняла бы
+/// 227 точек — половину окна минимальной высоты (420) на одну картинку.
+/// С потолком такая просто становится узкой, а не выдавливает поля ввода
+/// в прокрутку. 72 — высота обычной обложки 16:9 при ширине 128.
+const PREVIEW_MAX_HEIGHT: f32 = 72.0;
+
+/// Сколько ждать после правки ссылки, прежде чем спрашивать сайт.
+///
+/// Окно ожидания обязательно. Без него запрос уходил бы на каждый набранный
+/// символ: вставка из буфера — это одно изменение, а ссылка, набранная руками
+/// или правленная по частям, — десятки, и сайт получил бы десятки запросов
+/// об одном ролике. Прямая дорога к «Sign in to confirm you're not a bot»,
+/// заработанная на ровном месте и ровно тем, что должно было помогать.
+const PREVIEW_DEBOUNCE: f64 = 0.8;
 
 /// Потолок высоты раскрытого списка браузеров.
 ///
@@ -390,6 +402,13 @@ struct QueueItem {
     /// Причина отказа, разложенная в одну строку. Пустая — отказа не было.
     error_line: String,
     status: QueueStatus,
+    /// Ответ `probe`, если предпросмотр успел его получить до того, как ссылку
+    /// поставили в очередь.
+    ///
+    /// Едет вместе со ссылкой, а не берётся из предпросмотра в момент запуска,
+    /// по той же причине, по какой снимком держится сам запрос: пока очередь
+    /// идёт, в поле давно другая ссылка, и ответ там про неё.
+    known: Option<MediaInfo>,
 }
 
 impl QueueItem {
@@ -458,7 +477,17 @@ impl Queue {
     /// Ставит ссылку в конец очереди и отдаёт её номер.
     ///
     /// `None` — места нет: все `QUEUE_LIMIT` ссылок ещё ждут своего часа.
-    fn push(&mut self, request: Request, out_dir: PathBuf) -> Option<DownloadId> {
+    ///
+    /// `known` — ответ предпросмотра по этой ссылке, если он есть. С ним
+    /// строка списка сразу называется роликом, а не адресом: до появления
+    /// предпросмотра название приезжало только с началом загрузки, то есть
+    /// у девятой ссылки — через час после того, как её поставили.
+    fn push(
+        &mut self,
+        request: Request,
+        out_dir: PathBuf,
+        known: Option<MediaInfo>,
+    ) -> Option<DownloadId> {
         if !self.make_room() {
             return None;
         }
@@ -471,12 +500,16 @@ impl Queue {
 
         let mut item = QueueItem {
             id,
-            title: request.url.clone(),
+            title: known
+                .as_ref()
+                .and_then(|info| info.title.clone())
+                .unwrap_or_else(|| request.url.clone()),
             detail: String::new(),
             error_line: String::new(),
             request,
             out_dir,
             status: QueueStatus::Waiting,
+            known,
         };
         item.rebuild_strings();
 
@@ -504,17 +537,22 @@ impl Queue {
         }
     }
 
-    /// Что запускать следующим: номер, запрос и папка.
+    /// Что запускать следующим: номер, запрос, папка и готовый ответ `probe`.
     ///
     /// Отдаёт копии, а не ссылки: `engine::start` забирает `Request` во
     /// владение, а строка обязана остаться в списке — по ней рисуется
     /// состояние, и в неё же приходит исход.
-    fn next_waiting(&self) -> Option<(DownloadId, Request, PathBuf)> {
+    fn next_waiting(&self) -> Option<(DownloadId, Request, PathBuf, Option<MediaInfo>)> {
         let item = self
             .items
             .iter()
             .find(|item| item.status == QueueStatus::Waiting)?;
-        Some((item.id, item.request.clone(), item.out_dir.clone()))
+        Some((
+            item.id,
+            item.request.clone(),
+            item.out_dir.clone(),
+            item.known.clone(),
+        ))
     }
 
     fn has_waiting(&self) -> bool {
@@ -529,6 +567,15 @@ impl Queue {
             .iter()
             .find(|item| item.status == QueueStatus::Running)
             .map(|item| item.id)
+    }
+
+    /// Запрос идущей загрузки. Нужен, чтобы понять, про ту ли ссылку приехали
+    /// её метаданные, — см. `Preview::is_about`.
+    fn running_request(&self) -> Option<&Request> {
+        self.items
+            .iter()
+            .find(|item| item.status == QueueStatus::Running)
+            .map(|item| &item.request)
     }
 
     /// Идёт ли прямо сейчас загрузка с таким номером.
@@ -770,6 +817,193 @@ impl MetaPanel {
     }
 }
 
+/// Что показывать под полем ссылки.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum PreviewState {
+    /// Спрашивать не о чем: поле пустое или в нём не ссылка.
+    #[default]
+    Idle,
+    /// Ждём — окна дебаунса или самого ответа.
+    Asking,
+    /// Ответ пришёл.
+    Ready,
+    /// Спросили, а ответа не будет.
+    Failed,
+}
+
+/// Сведения о ссылке из поля, полученные до нажатия «Скачать».
+///
+/// Ради этого превью и задумывалось: убедиться, что в буфере оказалась та
+/// самая ссылка, надо **до** загрузки, а не посреди неё. Заодно до неё же
+/// становятся известны доступные высоты кадра и список языков субтитров —
+/// то, из чего человек выбирает прямо здесь, в карточке управления.
+///
+/// Свой приёмник и своя ручка, отдельно от загрузки: спрашивать про новую
+/// ссылку можно и во время скачивания (`MetaPanel` устроен так же), и события
+/// двух задач не должны попадать в один сток.
+#[derive(Default)]
+struct Preview {
+    /// Ссылка, о которой спрашиваем или уже спросили. Пусто — спрашивать
+    /// нечего.
+    url: String,
+    /// Cookies, которыми спрашивали. Часть цели, а не мелочь: тот же адрес
+    /// с cookies и без них отдаёт разные ответы (у YouTube — вплоть до
+    /// пустого списка дорожек), и смена браузера в списке обязана запрос
+    /// перезапустить.
+    cookies: CookieSource,
+    /// Когда истекает окно дебаунса, по часам egui. `None` — ждать нечего:
+    /// либо уже спросили, либо спрашивать не о чем.
+    due: Option<f64>,
+    /// Приёмник ответа. Свой на каждый запуск, и в этом вся развязка
+    /// поколений: бросив его вместе со сменой цели, мы разом перестаём
+    /// слышать устаревший запрос. Без этого ответ по прежней ссылке,
+    /// вернувшийся позже нового, положил бы в окно чужое название — беда
+    /// тихая, её не видят ни компилятор, ни сборка.
+    rx: Option<Receiver<Event>>,
+    /// Чем бросить сам процесс. Без него `-J` по забытой ссылке дочитывает
+    /// медленный сайт до конца, и на десятке правок подряд таких процессов
+    /// накапливается десяток.
+    handle: Option<Handle>,
+    /// Что ответили. Отдаётся загрузке (см. `Queue::push`), чтобы та
+    /// не ходила на сайт за тем же самым второй раз.
+    info: Option<MediaInfo>,
+    /// Обложка ролика, уже залитая в текстуру egui.
+    ///
+    /// Именно текстура, а не байты: заводится она один раз, на приёме
+    /// `Event::Thumbnail`, и в кадре отрисовки остаётся только нарисовать.
+    /// Освобождает текстуру egui сам, когда ручку заменяют или бросают.
+    thumbnail: Option<egui::TextureHandle>,
+    state: PreviewState,
+}
+
+impl Preview {
+    /// Нацеливает предпросмотр на ссылку из поля.
+    ///
+    /// Возвращает `true`, если цель сменилась: прежний ответ больше не про то,
+    /// что в поле, и всё, что из него собрано (название, оговорка про высоту,
+    /// список языков), показывать уже нельзя.
+    fn retarget(&mut self, url: &str, cookies: CookieSource, now: f64) -> bool {
+        if self.url == url && self.cookies == cookies {
+            return false;
+        }
+
+        self.stop();
+        self.cookies = cookies;
+        // Мусор из буфера обмена в yt-dlp не отправляем. Список поддерживаемых
+        // сайтов принадлежит ему, и кнопку «непохожая» ссылка не блокирует, —
+        // но каждый такой запуск это процесс и поход в сеть, а обрывок текста
+        // из буфера не стоит ни того ни другого.
+        if looks_like_url(url) {
+            self.url.push_str(url);
+            self.due = Some(now + PREVIEW_DEBOUNCE);
+            self.state = PreviewState::Asking;
+        }
+        true
+    }
+
+    /// Спрашивает заново про ту же ссылку — когда изменилось не то, что
+    /// в поле, а то, чем спрашивают.
+    fn retry(&mut self, now: f64) {
+        if self.url.is_empty() {
+            return;
+        }
+        self.due = Some(now + PREVIEW_DEBOUNCE);
+        self.state = PreviewState::Asking;
+    }
+
+    /// Бросает начатое и забывает ответ.
+    fn stop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.cancel();
+        }
+        self.rx = None;
+        self.url.clear();
+        self.due = None;
+        self.info = None;
+        self.thumbnail = None;
+        self.state = PreviewState::Idle;
+    }
+
+    /// Запоминает запущенный запрос.
+    fn asked(&mut self, rx: Receiver<Event>, handle: Handle) {
+        self.due = None;
+        self.rx = Some(rx);
+        self.handle = Some(handle);
+    }
+
+    /// Забирает то, что успел ответить движок.
+    ///
+    /// Сначала собираем, потом применяем — как в `drain_events`: заимствование
+    /// приёмника иначе живёт во время правки остального состояния.
+    fn take_events(&mut self) -> Vec<Event> {
+        let mut events = Vec::new();
+        let Some(rx) = &self.rx else {
+            return events;
+        };
+
+        loop {
+            match rx.try_recv() {
+                Ok(event) => events.push(event),
+                Err(TryRecvError::Empty) => return events,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+
+        // Поток кончился — слушать больше нечего. Ответа при этом могло и не
+        // быть вовсе: про отсутствие yt-dlp, незнакомый сайт и молчащий сервер
+        // предпросмотр не говорит ничего (см. `engine::start_probe`), так что
+        // единственный признак неудачи — закрытый канал без `Info`.
+        self.rx = None;
+        self.handle = None;
+        if self.state == PreviewState::Asking
+            && self.info.is_none()
+            && !events.iter().any(|event| matches!(event, Event::Info(_)))
+        {
+            self.state = PreviewState::Failed;
+        }
+        events
+    }
+
+    /// Заводит текстуру под приехавшую обложку.
+    ///
+    /// Единственная заливка текстуры за весь запрос — и она здесь, на приёме
+    /// события, а не в кадре. Разбор картинки уже сделал движок: сюда
+    /// приезжает готовый RGBA.
+    ///
+    /// Размеры проверяем, хотя движок это уже сделал: между ним и нами канал,
+    /// а `ColorImage` на несовпадении не возвращает ошибку, а паникует.
+    /// Уронить окно из-за украшения нельзя, поэтому проверка на обеих сторонах.
+    fn set_cover(&mut self, cover: &Thumbnail, ctx: &egui::Context) {
+        if !cover.is_valid() {
+            return;
+        }
+        self.thumbnail = Some(ctx.load_texture(
+            "savio-cover",
+            egui::ColorImage::from_rgba_unmultiplied([cover.width, cover.height], &cover.rgba),
+            egui::TextureOptions::LINEAR,
+        ));
+    }
+
+    /// Про ту же ли ссылку этот запрос.
+    ///
+    /// Сверяем и адрес, и cookies: ответ на один и тот же адрес с чужим входом
+    /// в аккаунт — это другой ответ.
+    fn is_about(&self, request: Option<&Request>) -> bool {
+        request.is_some_and(|request| request.url == self.url && request.cookies == self.cookies)
+    }
+
+    /// Ответ, годный для этой загрузки, — чтобы та не спрашивала сайт второй
+    /// раз о том же самом.
+    ///
+    /// Копия, а не перенос: ссылку из поля после «В очередь» обычно не стирают,
+    /// и карточка под ним обязана остаться на месте.
+    fn answer_for(&self, request: &Request) -> Option<MediaInfo> {
+        self.is_about(Some(request))
+            .then(|| self.info.clone())
+            .flatten()
+    }
+}
+
 pub struct SavioApp {
     url: String,
     format: Format,
@@ -815,14 +1049,9 @@ pub struct SavioApp {
     state: State,
     progress: Progress,
     stage: String,
-    info: Option<MediaInfo>,
-    /// Обложка ролика, уже залитая в текстуру egui.
-    ///
-    /// Именно текстура, а не байты: заводится она один раз, на приёме
-    /// `Event::Thumbnail`, и в кадре отрисовки остаётся только нарисовать.
-    /// Живёт до старта следующей загрузки — освобождает текстуру egui сам,
-    /// когда ручку заменяют или бросают.
-    thumbnail: Option<egui::TextureHandle>,
+    /// Что за ролик лежит по ссылке из поля. Наполняется фоновым запросом
+    /// по вставке ссылки, а не загрузкой: см. [`Preview`].
+    preview: Preview,
     log: Vec<String>,
     rx: Option<Receiver<Event>>,
     handle: Option<Handle>,
@@ -941,8 +1170,7 @@ impl SavioApp {
             state: State::Idle,
             progress: Progress::default(),
             stage: String::new(),
-            info: None,
-            thumbnail: None,
+            preview: Preview::default(),
             log: Vec::new(),
             rx: None,
             handle: None,
@@ -1051,6 +1279,15 @@ impl SavioApp {
         self.stage.clear();
         self.progress = Progress::default();
         self.progress_line.clear();
+        // Предпросмотр мог споткнуться ровно о то, чего до этой минуты не было:
+        // без yt-dlp спрашивать сайт нечем, а молчит он об этом одинаково — и
+        // про отсутствие инструмента, и про незнакомый сайт. Раз инструменты
+        // появились, пробуем ещё раз: иначе ссылка, лежащая в поле с прошлой
+        // попытки, останется без карточки до следующей правки текста.
+        if self.preview.state == PreviewState::Failed {
+            self.preview.retry(ctx.input(|i| i.time));
+        }
+
         // Версии после установки или обновления другие — показанные устарели
         // ровно в этот момент. Спросить заново обязательно: иначе кнопка
         // «Обновить» отчитывалась бы об успехе, а строка над ней продолжала бы
@@ -1208,7 +1445,11 @@ impl SavioApp {
             sub_lang: self.sub_lang.clone(),
         };
 
-        if self.queue.push(request, out_dir).is_none() {
+        // Ответ предпросмотра уезжает вместе со ссылкой: спрашивать сайт
+        // второй раз о том же самом незачем — ни ради названия в списке,
+        // ни ради обложки, которая и так уже показана.
+        let known = self.preview.answer_for(&request);
+        if self.queue.push(request, out_dir, known).is_none() {
             return false;
         }
 
@@ -1246,36 +1487,31 @@ impl SavioApp {
         if matches!(self.state, State::Running) || self.setup.busy() {
             return;
         }
-        let Some((id, request, out_dir)) = self.queue.next_waiting() else {
+        let Some((id, request, out_dir, known)) = self.queue.next_waiting() else {
             return;
         };
 
         let (tx, rx) = channel();
         let notify_ctx = ctx.clone();
 
-        match engine::start(id, request, out_dir, tx, move || notify_ctx.request_repaint()) {
+        match engine::start(id, request, out_dir, known, tx, move || {
+            notify_ctx.request_repaint()
+        }) {
             Ok(handle) => {
                 self.queue.set_status(id, QueueStatus::Running);
                 self.rx = Some(rx);
                 self.handle = Some(handle);
                 self.state = State::Running;
                 self.progress = Progress::default();
-                self.info = None;
-                // Обложка относилась к прошлой ссылке. Оставить её рядом
-                // с новой — прямой повод перепутать ролики, а ровно от этого
-                // превью и должно спасать.
-                self.thumbnail = None;
                 self.stage = "Запуск…".into();
                 self.log.clear();
-                self.meta_line.clear();
                 self.done_path_display.clear();
-                // Оговорки относились к прошлой ссылке: новые высоты и
-                // дорожки субтитров приедут вместе с `Event::Info`, а до тех
-                // пор говорить нечего. Выбранный язык при этом остаётся:
-                // это выбор человека, а не свойство ролика.
-                self.quality_note.clear();
-                self.rebuild_subtitles();
                 self.rebuild_progress_line();
+                // Карточку под полем ссылки здесь не трогаем, и это не
+                // упущение: она описывает то, что лежит в поле, а не то, что
+                // качается. Запуск ссылки из середины очереди поля не меняет —
+                // и стирать по нему название с обложкой значило бы гасить
+                // сведения о совсем другом ролике.
             }
             Err(err) => {
                 // Не нашёлся yt-dlp — дальше по очереди идти незачем:
@@ -1353,7 +1589,7 @@ impl SavioApp {
         use std::fmt::Write as _;
 
         self.meta_line.clear();
-        let Some(info) = &self.info else {
+        let Some(info) = &self.preview.info else {
             return;
         };
         if let Some(uploader) = &info.uploader {
@@ -1394,7 +1630,7 @@ impl SavioApp {
         }
         let (Some(want), Some(have)) = (
             self.quality.max_height(),
-            self.info.as_ref().and_then(MediaInfo::max_height),
+            self.preview.info.as_ref().and_then(MediaInfo::max_height),
         ) else {
             return;
         };
@@ -1424,6 +1660,7 @@ impl SavioApp {
                 // а у нынешней такого языка нет. Показываем тогда сам код —
                 // он и уедет в `--sub-langs`.
                 let label = self
+                    .preview
                     .info
                     .as_ref()
                     .and_then(|info| info.subtitle_label(code))
@@ -1439,7 +1676,7 @@ impl SavioApp {
         if self.format != Format::Mp4 || !self.options.embed_subs {
             return;
         }
-        let Some(info) = &self.info else {
+        let Some(info) = &self.preview.info else {
             return;
         };
         if let Some(note) = info.subtitle_note(&self.sub_lang, self.options.auto_subs) {
@@ -1503,27 +1740,31 @@ impl SavioApp {
                     {
                         self.queue.set_title(id, title);
                     }
-                    self.info = Some(info);
-                    meta_dirty = true;
+                    // Карточка под полем ссылки — не про эту загрузку, и
+                    // класть в неё что попало нельзя: качается обычно уже не
+                    // то, что набрано в поле. Но если ссылка та же, а
+                    // предпросмотр по ней ничего не добился (не было yt-dlp,
+                    // сайт промолчал), то показать ответ загрузки — ровно то,
+                    // что сделал бы он сам, повезло бы ему чуть больше.
+                    // Обычно этой ветки не бывает вовсе: при живом
+                    // предпросмотре движок и не спрашивает (см. `known`
+                    // в `engine::start`).
+                    if self.preview.info.is_none()
+                        && self.preview.is_about(self.queue.running_request())
+                    {
+                        self.preview.info = Some(info);
+                        self.preview.state = PreviewState::Ready;
+                        meta_dirty = true;
+                    }
                 }
                 Event::Thumbnail(cover) => {
-                    // Единственная заливка текстуры за всю загрузку — и она
-                    // здесь, на приёме события, а не в кадре. Разбор картинки
-                    // уже сделал движок: сюда приезжает готовый RGBA.
-                    //
-                    // Размеры проверяем, хотя движок это уже сделал: между ним
-                    // и нами канал, а `ColorImage` на несовпадении не возвращает
-                    // ошибку, а паникует. Уронить окно из-за украшения нельзя,
-                    // поэтому проверка на обеих сторонах.
-                    if cover.is_valid() {
-                        self.thumbnail = Some(ctx.load_texture(
-                            "savio-cover",
-                            egui::ColorImage::from_rgba_unmultiplied(
-                                [cover.width, cover.height],
-                                &cover.rgba,
-                            ),
-                            egui::TextureOptions::LINEAR,
-                        ));
+                    // Та же оговорка, что и у `Info`: чужую обложку под полем
+                    // ссылки показывать нельзя — ровно от этого превью
+                    // и должно спасать.
+                    if self.preview.thumbnail.is_none()
+                        && self.preview.is_about(self.queue.running_request())
+                    {
+                        self.preview.set_cover(&cover, ctx);
                     }
                 }
                 Event::Stage(stage) => {
@@ -1542,12 +1783,7 @@ impl SavioApp {
                         progress_dirty = true;
                     }
                 }
-                Event::Log(line) => {
-                    self.log.push(line);
-                    if self.log.len() > LOG_LIMIT {
-                        self.log.drain(..self.log.len() - LOG_LIMIT);
-                    }
-                }
+                Event::Log(line) => self.push_log(line),
                 Event::Done { id, path } => {
                     // Сверка номера обязательна: пока событие шло по каналу,
                     // загрузку могли снять, и «Готово» встало бы рядом
@@ -1640,6 +1876,114 @@ impl SavioApp {
         }
     }
 
+    /// Ведёт фоновый запрос по ссылке из поля: забирает ответ и, когда
+    /// истекло окно дебаунса, заводит следующий.
+    ///
+    /// Зовётся каждый кадр, но работы в обычном кадре здесь нет: пустой
+    /// приёмник и сравнение двух чисел.
+    fn tick_preview(&mut self, ctx: &egui::Context) {
+        // Ответ разбираем первым: он мог приехать, пока шло окно дебаунса
+        // следующего запроса.
+        let mut ready = false;
+        for event in self.preview.take_events() {
+            match event {
+                Event::Info(info) => {
+                    self.preview.info = Some(info);
+                    self.preview.state = PreviewState::Ready;
+                    ready = true;
+                }
+                Event::Thumbnail(cover) => self.preview.set_cover(&cover, ctx),
+                // Сюда попадает разве что «обложка не загрузилась»: больше
+                // предпросмотр в журнал ничего не пишет, и молчит он даже
+                // о собственной неудаче (см. `engine::start_probe`).
+                Event::Log(line) => self.push_log(line),
+                // Остальное по этому каналу не ходит. Ветка выписана явно,
+                // а не через `_`, чтобы компилятор и дальше требовал
+                // разбирать новые варианты `Event` во всех приёмниках.
+                Event::Stage(_)
+                | Event::Progress(_)
+                | Event::Done { .. }
+                | Event::Failed { .. }
+                | Event::Ready
+                | Event::Warning(_)
+                | Event::Notice(_)
+                | Event::Tags(_)
+                | Event::Cleaned(_)
+                | Event::Versions(_) => {}
+            }
+        }
+
+        if ready {
+            self.rebuild_meta_line();
+            self.rebuild_quality_note();
+            // Дорожки субтитров приезжают тем же `Event::Info`: до него
+            // список языков пуст, а сказать «вшивать нечего» нечем.
+            self.rebuild_subtitles();
+        }
+
+        let Some(due) = self.preview.due else {
+            return;
+        };
+        let now = ctx.input(|i| i.time);
+        if now < due {
+            // Кадр к сроку приходится просить: без ввода egui окно не
+            // перерисовывает, и запрос ушёл бы не через `PREVIEW_DEBOUNCE`,
+            // а при первом движении мыши — то есть, если ссылку вставили
+            // и убрали руки, не ушёл бы вовсе.
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(due - now));
+            return;
+        }
+
+        self.start_preview(ctx);
+    }
+
+    /// Спрашивает сайт о ссылке из поля.
+    fn start_preview(&mut self, ctx: &egui::Context) {
+        let request = Request {
+            url: self.preview.url.clone(),
+            cookies: self.preview.cookies,
+            // Остальное `probe` не спрашивает (см. `ytdlp::probe_args`), но
+            // запрос — это запрос целиком, и половины его не бывает. Заодно
+            // ровно эти поля уедут в загрузку, если нажмут «Скачать».
+            format: self.format,
+            quality: self.quality,
+            options: self.options,
+            section: self.section,
+            sub_lang: self.sub_lang.clone(),
+        };
+
+        let (tx, rx) = channel();
+        let notify_ctx = ctx.clone();
+        let handle = engine::start_probe(request, tx, move || notify_ctx.request_repaint());
+        self.preview.asked(rx, handle);
+    }
+
+    /// Ссылку в поле правили — предпросмотр обязан догнать.
+    ///
+    /// Зовётся из обработчиков (правка поля, смена браузера в списке), а не
+    /// из кадра: сравнивать строки шестьдесят раз в секунду незачем.
+    fn retarget_preview(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|i| i.time);
+        if !self.preview.retarget(self.url.trim(), self.cookies, now) {
+            return;
+        }
+
+        // Всё, что было собрано из прошлого ответа, теперь про другую ссылку.
+        // Молча оставить это на экране — худший исход: «Выше 720p этот ролик
+        // не отдают» под чужой ссылкой выглядит фактом о ней.
+        self.meta_line.clear();
+        self.quality_note.clear();
+        self.rebuild_subtitles();
+    }
+
+    /// Добавляет строку в журнал, соблюдая его потолок.
+    fn push_log(&mut self, line: String) {
+        self.log.push(line);
+        if self.log.len() > LOG_LIMIT {
+            self.log.drain(..self.log.len() - LOG_LIMIT);
+        }
+    }
+
     /// Забирает ответ о версиях инструментов, если он подъехал.
     ///
     /// Приёмник бросаем сразу: ответ приходит ровно один, и держать канал
@@ -1717,6 +2061,7 @@ impl eframe::App for SavioApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_events(ui.ctx());
+        self.tick_preview(ui.ctx());
         self.meta.drain();
         self.drain_versions();
         self.drain_gpu_errors();
@@ -1989,6 +2334,12 @@ impl SavioApp {
             .show(ui, |ui| {
                 field_label(ui, "Ссылка");
                 self.url_field(ui);
+                // Превью идёт сразу под полем, а не в карточке состояния
+                // ниже: оно про то, что собираются скачать, а не про то, что
+                // качается. К моменту, когда очередь дойдёт до третьей ссылки,
+                // в поле давно лежит пятая, и одна карточка на двоих врала бы
+                // про обеих.
+                self.preview_row(ui);
 
                 ui.add_space(14.0);
                 field_label(ui, "Формат");
@@ -2044,6 +2395,7 @@ impl SavioApp {
         if response.changed() {
             let url = self.url.trim();
             self.url_invalid = !url.is_empty() && !looks_like_url(url);
+            self.retarget_preview(ui.ctx());
         }
 
         if invalid {
@@ -2054,6 +2406,86 @@ impl SavioApp {
                     .color(theme::STATE_WARNING),
             );
         }
+    }
+
+    /// Что за ролик лежит по ссылке из поля.
+    ///
+    /// Всё готово заранее: название и обложка приехали событием, строка
+    /// «автор · длительность» собрана в `rebuild_meta_line`. В кадре здесь
+    /// не считается и не выделяется ничего.
+    fn preview_row(&mut self, ui: &mut egui::Ui) {
+        match self.preview.state {
+            PreviewState::Idle => return,
+            // Про ожидание говорим словами: пустое место под ссылкой человек
+            // читает как «Savio ничего про неё не понял», а не как «идёт
+            // запрос», и ждать перестаёт.
+            PreviewState::Asking => {
+                ui.add_space(8.0);
+                note(ui, "Смотрю, что это за ролик…", theme::TEXT_MUTED);
+                return;
+            }
+            // Не ошибка и баннера не заслуживает: сведения — украшение,
+            // и «Скачать» после этого работает как ни в чём не бывало.
+            PreviewState::Failed => {
+                ui.add_space(8.0);
+                note(
+                    ui,
+                    "Что это за ролик, выяснить не вышло: сайт не ответил или \
+                     он незнаком yt-dlp. Скачать всё равно можно — попробуйте.",
+                    theme::TEXT_MUTED,
+                );
+                return;
+            }
+            PreviewState::Ready => {}
+        }
+
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            if let Some(cover) = &self.preview.thumbnail {
+                ui.add(
+                    egui::Image::new(cover)
+                        // `max_size`, а не `max_width`: у вертикальных роликов
+                        // ограничивать надо высоту (см. `PREVIEW_MAX_HEIGHT`),
+                        // а пропорцию egui сохраняет сам.
+                        .max_size(egui::vec2(PREVIEW_WIDTH, PREVIEW_MAX_HEIGHT))
+                        .corner_radius(egui::CornerRadius::same(theme::RADIUS_SMALL)),
+                );
+                ui.add_space(4.0);
+            }
+
+            // Текст кладём в свою вертикальную раскладку: в горизонтальной
+            // egui берёт для подписей режим `Extend` и вытягивает строку любой
+            // длины за кромку окна, а `truncate()` там ограничивать нечем.
+            ui.vertical(|ui| {
+                if let Some(title) = self
+                    .preview
+                    .info
+                    .as_ref()
+                    .and_then(|info| info.title.as_deref())
+                {
+                    // Своей подсказки нет намеренно: у обрезанной метки egui
+                    // вешает её сам, и вторая встала бы под первой (Правило 4).
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(title)
+                                .strong()
+                                .color(theme::TEXT_PRIMARY),
+                        )
+                        .truncate(),
+                    );
+                }
+                if !self.meta_line.is_empty() {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&self.meta_line)
+                                .small()
+                                .color(theme::TEXT_SECONDARY),
+                        )
+                        .truncate(),
+                    );
+                }
+            });
+        });
     }
 
     fn format_selector(&mut self, ui: &mut egui::Ui) {
@@ -2321,11 +2753,10 @@ impl SavioApp {
     /// Возвращает `true`, когда выбор поменяли: пересобирать подпись и
     /// оговорку — работа обработчика, а не кадра отрисовки.
     ///
-    /// Пункты берутся из ответа `probe` и потому появляются только со второй
-    /// попытки: `probe` идёт уже внутри загрузки, и до неё Savio про дорожки
-    /// ролика не знает ничего. Пустого списка при этом не бывает — «Язык
-    /// ролика» есть всегда, и он же значение по умолчанию, так что первая
-    /// загрузка ничего не теряет.
+    /// Пункты берутся из ответа `probe`, то есть появляются через секунду
+    /// после того, как в поле вставили ссылку (см. [`Preview`]). Пустого
+    /// списка при этом не бывает — «Язык ролика» есть всегда, и он же
+    /// значение по умолчанию, так что и до ответа выбор осмыслен.
     fn sub_lang_selector(&mut self, ui: &mut egui::Ui) -> bool {
         // Ширину берём до `ComboBox`, как и у списка браузеров: внутри он
         // заводит свою горизонтальную раскладку.
@@ -2344,7 +2775,7 @@ impl SavioApp {
 
             // Поля берём по отдельности: внутри замыкания `sub_lang` нужен
             // изменяемым, а `info` — нет, и целиком `self` там занять нельзя.
-            let info = self.info.as_ref();
+            let info = self.preview.info.as_ref();
             let lang = &mut self.sub_lang;
 
             egui::ComboBox::from_id_salt("savio-sub-lang")
@@ -2423,9 +2854,8 @@ impl SavioApp {
             note(
                 ui,
                 "Свои субтитры выкладывает автор ролика, и они точные — но \
-                 есть далеко не у всех. Список языков заполняется после \
-                 первой загрузки этой ссылки: до неё Savio про дорожки \
-                 ролика ничего не знает.",
+                 есть далеко не у всех. Список языков заполняется сам, \
+                 через секунду после того, как вы вставите ссылку.",
                 theme::TEXT_MUTED,
             );
         }
@@ -2445,6 +2875,10 @@ impl SavioApp {
         // Ширину берём до `ComboBox`: внутри он заводит свою горизонтальную
         // раскладку, и `available_width` там уже другая.
         let width = ui.available_width();
+        // С каким входом спрашивали — часть вопроса: у YouTube ответ с cookies
+        // и без них отличается вплоть до пустого списка дорожек. Сменили
+        // браузер — прежнее превью уже не про этот запрос.
+        let before = self.cookies;
 
         ui.scope(|ui| {
             let v = ui.visuals_mut();
@@ -2483,6 +2917,10 @@ impl SavioApp {
                     }
                 });
         });
+
+        if self.cookies != before {
+            self.retarget_preview(ui.ctx());
+        }
 
         ui.add_space(6.0);
         if self.cookies.browser().is_some() {
@@ -2678,52 +3116,11 @@ impl SavioApp {
     fn status_section(&mut self, ui: &mut egui::Ui) {
         let (label, color) = self.status();
 
-        ui.horizontal(|ui| {
-            status_pill(ui, label, color);
-
-            if let Some(info) = &self.info
-                && let Some(title) = &info.title
-            {
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(title)
-                            .strong()
-                            .color(theme::TEXT_PRIMARY),
-                    )
-                    .truncate(),
-                )
-                .on_hover_text(title);
-            }
-        });
-
-        if !self.meta_line.is_empty() {
-            ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new(&self.meta_line)
-                    .small()
-                    .color(theme::TEXT_SECONDARY),
-            );
-        }
-
-        // Обложка идёт под названием, а не над плашкой состояния: плашка
-        // с названием — это заголовок блока, и картинка над ним оторвала бы
-        // его от того, к чему он относится.
-        //
-        // В кадре здесь ничего не считается и не выделяется: текстура готова,
-        // а `Image` — это две пары чисел.
-        if let Some(cover) = &self.thumbnail {
-            ui.add_space(10.0);
-            ui.add(
-                egui::Image::new(cover)
-                    // `max_size`, а не `max_width`: у вертикальных роликов
-                    // ограничивать надо высоту (см. `PREVIEW_MAX_HEIGHT`),
-                    // а пропорцию egui сохраняет сам. Ширину окна учитывать
-                    // отдельно не нужно — по умолчанию картинка вписывается
-                    // в доступное место и лишь потом упирается в этот потолок.
-                    .max_size(egui::vec2(PREVIEW_WIDTH, PREVIEW_MAX_HEIGHT))
-                    .corner_radius(egui::CornerRadius::same(theme::RADIUS_SMALL)),
-            );
-        }
+        // Название с обложкой отсюда переехали под поле ссылки: они про то,
+        // что собираются скачать, и известны ещё до нажатия «Скачать».
+        // Здесь остаётся только ход самой работы, а какой ролик качается —
+        // видно в строке очереди, где название и так стоит и подсвечено.
+        status_pill(ui, label, color);
 
         ui.add_space(10.0);
 
@@ -3915,7 +4312,8 @@ mod tests {
                 queue
                     .push(
                         request(&url, Format::Mp4, Quality::Best),
-                        PathBuf::from("/dl")
+                        PathBuf::from("/dl"),
+                        None
                     )
                     .is_some(),
                 "{url} не влезла в очередь"
@@ -3926,6 +4324,151 @@ mod tests {
 
     fn ids(queue: &Queue) -> Vec<DownloadId> {
         queue.items.iter().map(|item| item.id).collect()
+    }
+
+    fn info(title: &str) -> MediaInfo {
+        MediaInfo {
+            title: Some(title.to_owned()),
+            ..MediaInfo::default()
+        }
+    }
+
+    /// Предпросмотр, уже спросивший про эту ссылку.
+    ///
+    /// Ручку движка тест завести не может — её отдаёт только
+    /// `engine::start_probe`, — но для развязки поколений она и не нужна:
+    /// всё решает приёмник, а ручка лишь убивает процесс.
+    fn asking(url: &str) -> (Preview, std::sync::mpsc::Sender<Event>) {
+        let mut preview = Preview::default();
+        assert!(preview.retarget(url, CookieSource::None, 0.0), "{url}");
+
+        let (tx, rx) = channel();
+        preview.due = None;
+        preview.rx = Some(rx);
+        (preview, tx)
+    }
+
+    /// Ответ по прежней ссылке не должен попасть в окно.
+    ///
+    /// Это и есть та тихая беда, ради которой запрос живёт на своём канале:
+    /// медленный сайт отвечает про первую ссылку позже, чем быстрый про
+    /// вторую, и в карточке оказывается чужое название. Ни компилятор, ни
+    /// сборка, ни глазной прогон такого не ловят — воспроизводится оно только
+    /// на разной скорости ответов.
+    #[test]
+    fn an_answer_about_the_previous_link_never_reaches_the_screen() {
+        let (mut preview, slow) = asking("https://site.ru/a");
+        // Ответ по первой ссылке уже в пути, а в поле за это время оказалась
+        // вторая.
+        slow.send(Event::Info(info("Ролик по прежней ссылке")))
+            .expect("канал ещё жив");
+        assert!(preview.retarget("https://site.ru/b", CookieSource::None, 0.0));
+
+        assert!(
+            preview.take_events().is_empty(),
+            "ответ по прежней ссылке обязан пропасть вместе с приёмником"
+        );
+        assert!(preview.info.is_none(), "и ничего после себя не оставить");
+    }
+
+    /// Обратная половина: ответ по той ссылке, что в поле, доезжает.
+    /// Поодиночке любой из двух тестов прошёл бы и на предпросмотре,
+    /// который не работает вовсе.
+    #[test]
+    fn an_answer_about_the_link_in_the_field_reaches_the_screen() {
+        let (mut preview, tx) = asking("https://site.ru/a");
+        tx.send(Event::Info(info("Тот самый ролик")))
+            .expect("канал ещё жив");
+
+        let events = preview.take_events();
+        assert_eq!(events.len(), 1, "ответ обязан доехать: {events:?}");
+    }
+
+    /// Молчание — законный исход: про отсутствие yt-dlp и незнакомый сайт
+    /// предпросмотр не говорит ничего, и единственный его признак —
+    /// закрытый канал без `Info`. Спутать одно с другим нельзя: в первом
+    /// случае под ссылкой надо объясниться, во втором — показать ролик.
+    #[test]
+    fn silence_and_an_answer_are_told_apart() {
+        let (mut preview, tx) = asking("https://site.ru/a");
+        drop(tx);
+        assert!(preview.take_events().is_empty());
+        assert_eq!(preview.state, PreviewState::Failed);
+
+        let (mut preview, tx) = asking("https://site.ru/a");
+        tx.send(Event::Info(info("Ролик"))).expect("канал ещё жив");
+        drop(tx);
+        assert_eq!(preview.take_events().len(), 1);
+        assert_ne!(
+            preview.state,
+            PreviewState::Failed,
+            "ответ пришёл — жаловаться не на что"
+        );
+    }
+
+    /// Окно ожидания отсчитывается от последней правки, а не от первой:
+    /// иначе ссылка, набранная руками, ушла бы в сеть недописанной.
+    #[test]
+    fn the_site_is_asked_only_after_a_pause() {
+        let mut preview = Preview::default();
+
+        assert!(preview.retarget("https://site.ru/a", CookieSource::None, 10.0));
+        assert_eq!(preview.due, Some(10.0 + PREVIEW_DEBOUNCE));
+
+        assert!(preview.retarget("https://site.ru/ab", CookieSource::None, 10.4));
+        assert_eq!(preview.due, Some(10.4 + PREVIEW_DEBOUNCE));
+
+        // Та же ссылка и тот же вход — спрашивать заново нечего: срок
+        // не сдвигается, а начатое не бросается.
+        assert!(!preview.retarget("https://site.ru/ab", CookieSource::None, 10.9));
+        assert_eq!(preview.due, Some(10.4 + PREVIEW_DEBOUNCE));
+    }
+
+    /// Обрывок текста из буфера обмена в yt-dlp не отправляем: кнопку такая
+    /// строка не блокирует, но процесс и поход в сеть стоят дороже догадки.
+    #[test]
+    fn junk_from_the_clipboard_is_not_worth_a_request() {
+        let mut preview = Preview::default();
+        for text in ["", "   ", "просто текст", "site.com/watch?v=a", "https://"] {
+            preview.retarget(text, CookieSource::None, 0.0);
+            assert_eq!(preview.due, None, "спросили про {text:?}");
+            assert_eq!(preview.state, PreviewState::Idle, "на {text:?}");
+        }
+    }
+
+    /// Готовый ответ переиспользуется загрузкой — но только тот же самый.
+    /// Тот же адрес, спрошенный с чужим входом в аккаунт, у YouTube отдаёт
+    /// другое вплоть до пустого списка дорожек.
+    #[test]
+    fn the_answer_is_reused_only_for_the_very_same_request() {
+        let mut preview = Preview::default();
+        preview.retarget("https://site.ru/a", CookieSource::None, 0.0);
+        preview.info = Some(info("Ролик"));
+
+        let mut same = request("https://site.ru/a", Format::Mp4, Quality::Best);
+        assert!(preview.answer_for(&same).is_some());
+
+        let other = request("https://site.ru/b", Format::Mp4, Quality::Best);
+        assert!(preview.answer_for(&other).is_none(), "чужая ссылка");
+
+        same.cookies = CookieSource::Firefox;
+        assert!(preview.answer_for(&same).is_none(), "чужой вход в аккаунт");
+    }
+
+    /// Строка очереди называется роликом сразу, а не через час, когда до неё
+    /// дойдёт очередь: название уже спрошено предпросмотром.
+    #[test]
+    fn a_queued_row_is_named_by_the_preview_right_away() {
+        let mut queue = Queue::new();
+        queue
+            .push(
+                request("https://site/watch?v=abc", Format::Mp4, Quality::Best),
+                PathBuf::from("/dl"),
+                Some(info("Ролик про кота")),
+            )
+            .expect("место в пустой очереди есть");
+
+        assert_eq!(queue.items[0].title, "Ролик про кота");
     }
 
     /// Ноль занят под `NO_DOWNLOAD` — событие установки или разбора
@@ -3943,12 +4486,14 @@ mod tests {
             .push(
                 request("https://site/a", Format::Mp4, Quality::Best),
                 PathBuf::from("/dl"),
+                None,
             )
             .unwrap();
         let wrapped = queue
             .push(
                 request("https://site/b", Format::Mp4, Quality::Best),
                 PathBuf::from("/dl"),
+                None,
             )
             .unwrap();
 
@@ -3966,7 +4511,7 @@ mod tests {
         assert!(queue.full, "мест нет и освободить нечем");
 
         let extra = request("https://site/extra", Format::Mp4, Quality::Best);
-        assert_eq!(queue.push(extra.clone(), PathBuf::from("/dl")), None);
+        assert_eq!(queue.push(extra.clone(), PathBuf::from("/dl"), None), None);
         assert_eq!(queue.items.len(), QUEUE_LIMIT, "ожидающую не выбросили");
 
         // Первая скачалась — место освободилось, и уходит именно она.
@@ -3974,7 +4519,7 @@ mod tests {
         queue.set_status(oldest, QueueStatus::Done);
         assert!(!queue.full);
 
-        assert!(queue.push(extra, PathBuf::from("/dl")).is_some());
+        assert!(queue.push(extra, PathBuf::from("/dl"), None).is_some());
         assert_eq!(queue.items.len(), QUEUE_LIMIT);
         assert!(
             queue.items.iter().all(|item| item.id != oldest),
@@ -4034,6 +4579,7 @@ mod tests {
             .push(
                 request("https://site/a", Format::Mp3, Quality::P1080),
                 PathBuf::from("/dl"),
+                None,
             )
             .unwrap();
 
@@ -4085,6 +4631,7 @@ mod tests {
             .push(
                 request("https://site/watch?v=abc", Format::Mp4, Quality::Best),
                 PathBuf::from("/dl"),
+                None,
             )
             .unwrap();
 

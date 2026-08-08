@@ -265,7 +265,10 @@ mod tests {
             section: crate::model::Section::default(),
             sub_lang: crate::model::SubLang::default(),
         };
-        let info = super::super::probe(&request, &tools).expect("метаданные обязаны прийти");
+        // Ручка отмены своя и никем не тронутая: отменять тесту нечего,
+        // а `probe` без неё запуститься не может — он отдаёт ей процесс.
+        let info = super::super::probe(&request, &tools, &super::super::Control::default())
+            .expect("метаданные обязаны прийти");
         let url = info
             .thumbnail_url
             .expect("у ролика с YouTube обложка есть всегда");
