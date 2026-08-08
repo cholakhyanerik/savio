@@ -12,8 +12,8 @@ use crate::engine::setup;
 use crate::engine::{self, Handle, MetaTask, metadata};
 use crate::model::{
     CookieSource, DownloadId, DownloadOptions, Event, Format, MediaInfo, Progress, Quality, Request,
-    Section, SectionError, Tag, human_bytes, human_duration, human_speed, looks_like_url, meta_kind,
-    parse_section,
+    Section, SectionError, SubLang, Tag, human_bytes, human_duration, human_speed, looks_like_url,
+    meta_kind, parse_section,
 };
 use crate::theme;
 
@@ -131,6 +131,23 @@ const PREVIEW_MAX_HEIGHT: f32 = 150.0;
 /// уехал в прокрутку. 28 — строка списка (26 точек) плюс промежуток (2),
 /// 12 — поля рамки меню сверху и снизу.
 const COOKIE_LIST_HEIGHT: f32 = CookieSource::ALL.len() as f32 * 28.0 + 12.0;
+
+/// Потолок высоты раскрытого списка языков субтитров.
+///
+/// Здесь, в отличие от списка браузеров, вместить всё нельзя и пытаться:
+/// список приходит от источника, и у YouTube в автоматических субтитрах
+/// полторы сотни языков (проверено на живом ответе `-J`). Значение выбрано
+/// от окна, а не от числа пунктов: 240 точек — чуть больше половины окна
+/// минимальной высоты (420), так что раскрытый список не накрывает экран
+/// целиком и остаётся видно, к чему он относится.
+const SUBLANG_LIST_HEIGHT: f32 = 240.0;
+
+/// Отступ подчинённой галочки «Можно автоматические» от левого края.
+///
+/// Ровно настолько, чтобы она встала под подписью «Субтитров», а не под их
+/// коробкой: подчинённость должна читаться глазами, иначе флажок выглядит
+/// четвёртым равноправным, а он без «Субтитров» не значит ничего.
+const SUBOPTION_INDENT: f32 = 24.0;
 
 /// Сколько секунд висит подпись «Скопировано» после нажатия.
 ///
@@ -761,6 +778,13 @@ pub struct SavioApp {
     quality: Quality,
     /// Галочки «вшить метаданные / обложку / субтитры».
     options: DownloadOptions,
+    /// На каком языке нужны субтитры.
+    ///
+    /// Отдельно от `options` по той же причине, что и `cookies`: там всё
+    /// `Copy`, а язык — строка. Между запусками не запоминается: язык
+    /// относится к конкретному ролику, и вчерашний «немецкий», молча
+    /// применённый к сегодняшней ссылке, дал бы не те субтитры.
+    sub_lang: SubLang,
     /// Границы фрагмента — как их набрал человек. Строки, а не числа: поле
     /// ввода хранит текст, а разбирает его домен (`parse_section`).
     ///
@@ -838,6 +862,13 @@ pub struct SavioApp {
     /// Оговорка под переключателем качества: источник не отдаёт столько,
     /// сколько запросили. Пустая строка — оговорки нет.
     quality_note: String,
+    /// Подпись выбранного языка субтитров — то, что написано на закрытом
+    /// списке. Готовой строкой, а не поиском по дорожкам в кадре: их
+    /// у YouTube полторы сотни.
+    sub_lang_label: String,
+    /// Оговорка под списком языков: субтитров, которые просят, у ролика нет.
+    /// Пустая строка — всё в порядке или сказать пока нечего.
+    subs_note: String,
     /// Готовые строки версий для строки обслуживания — по одной на инструмент.
     ///
     /// Две, а не одна общая: длинная версия ffmpeg
@@ -898,6 +929,7 @@ impl SavioApp {
             format: saved.format,
             quality: saved.quality,
             options: DownloadOptions::default(),
+            sub_lang: SubLang::default(),
             section_start: String::new(),
             section_end: String::new(),
             section: Section::default(),
@@ -924,6 +956,8 @@ impl SavioApp {
             progress_line: String::new(),
             done_path_display: String::new(),
             quality_note: String::new(),
+            sub_lang_label: SubLang::ORIGINAL_LABEL.to_owned(),
+            subs_note: String::new(),
             // Пустые до первого ответа: строка обслуживания просто не показывает
             // версий, пока их не спросили, — «неизвестно» там было бы враньём
             // на те доли секунды, что идёт опрос.
@@ -1171,6 +1205,7 @@ impl SavioApp {
             options: self.options,
             cookies: self.cookies,
             section: self.section,
+            sub_lang: self.sub_lang.clone(),
         };
 
         if self.queue.push(request, out_dir).is_none() {
@@ -1234,9 +1269,12 @@ impl SavioApp {
                 self.log.clear();
                 self.meta_line.clear();
                 self.done_path_display.clear();
-                // Оговорка относилась к прошлой ссылке: новые высоты приедут
-                // вместе с `Event::Info`, а до тех пор говорить нечего.
+                // Оговорки относились к прошлой ссылке: новые высоты и
+                // дорожки субтитров приедут вместе с `Event::Info`, а до тех
+                // пор говорить нечего. Выбранный язык при этом остаётся:
+                // это выбор человека, а не свойство ролика.
                 self.quality_note.clear();
+                self.rebuild_subtitles();
                 self.rebuild_progress_line();
             }
             Err(err) => {
@@ -1365,6 +1403,47 @@ impl SavioApp {
                 self.quality_note,
                 "Выше {have}p этот ролик не отдают — скачается {have}p."
             );
+        }
+    }
+
+    /// Подпись выбранного языка субтитров и оговорка под списком.
+    ///
+    /// Обе строки собираются вместе намеренно: зависят они от одного и того
+    /// же — от выбора человека и от ответа `probe`. Разъедься вызовы, и на
+    /// списке был бы написан один язык, а оговорка говорила бы про другой.
+    ///
+    /// Зовётся только из обработчиков: смены формата, щелчка по галочке,
+    /// выбора в списке и приезда `Event::Info`. В кадре отрисовки здесь
+    /// собирать нечего — обе строки уже готовы.
+    fn rebuild_subtitles(&mut self) {
+        self.sub_lang_label.clear();
+        match &self.sub_lang {
+            SubLang::Original => self.sub_lang_label.push_str(SubLang::ORIGINAL_LABEL),
+            SubLang::Code(code) => {
+                // Подписи может не быть: список остался от прошлой ссылки,
+                // а у нынешней такого языка нет. Показываем тогда сам код —
+                // он и уедет в `--sub-langs`.
+                let label = self
+                    .info
+                    .as_ref()
+                    .and_then(|info| info.subtitle_label(code))
+                    .unwrap_or(code);
+                self.sub_lang_label.push_str(label);
+            }
+        }
+
+        self.subs_note.clear();
+        // Говорим только тогда, когда знаем наверняка: субтитры просят,
+        // положить их есть куда, и `probe` уже ответил. Молчание честнее
+        // догадки.
+        if self.format != Format::Mp4 || !self.options.embed_subs {
+            return;
+        }
+        let Some(info) = &self.info else {
+            return;
+        };
+        if let Some(note) = info.subtitle_note(&self.sub_lang, self.options.auto_subs) {
+            self.subs_note = note;
         }
     }
 
@@ -1532,6 +1611,9 @@ impl SavioApp {
         if meta_dirty {
             self.rebuild_meta_line();
             self.rebuild_quality_note();
+            // Дорожки субтитров приезжают тем же `Event::Info`: до него
+            // список языков пуст, а сказать «вшивать нечего» нечем.
+            self.rebuild_subtitles();
         }
 
         if disconnected {
@@ -1995,9 +2077,12 @@ impl SavioApp {
     fn segment(&mut self, ui: &mut egui::Ui, format: Format, width: f32) {
         if segment_button(ui, format.label(), self.format == format, width) {
             self.format = format;
-            // Подписи сегментов качества и оговорка под ними зависят от
+            // Подписи сегментов качества и оговорки под ними зависят от
             // формата — пересобрать их надо здесь, а не в кадре отрисовки.
+            // Субтитры в том же списке: в MP3 их класть некуда, и оговорка
+            // про них при переключении на звук обязана исчезнуть.
             self.rebuild_quality_note();
+            self.rebuild_subtitles();
             self.remember();
         }
     }
@@ -2135,7 +2220,7 @@ impl SavioApp {
         }
     }
 
-    /// Три галочки «вшить в файл».
+    /// Галочки «вшить в файл» и всё, что относится к субтитрам.
     ///
     /// Столбиком, а не в строку: подписи русские и длинные, а в горизонтальной
     /// раскладке egui берёт для текста режим `Extend` — три штуки подряд в окне
@@ -2145,8 +2230,11 @@ impl SavioApp {
         // гасим, но причину говорим по наведению — молча выключенный элемент
         // выглядит поломкой, а не запретом.
         let subs_enabled = self.format == Format::Mp4;
+        // Пересобрать подпись списка и оговорку надо на любое изменение
+        // здесь, но **после** отрисовки: `self` до конца замыкания занят.
+        let mut changed = false;
 
-        ui.scope(|ui| {
+        let subs_on = ui.scope(|ui| {
             // Штатная строка виджета — 32 точки (высота поля ввода). Для галочки
             // это много: три подряд съели бы четверть окна минимальной высоты.
             ui.spacing_mut().interact_size.y = 24.0;
@@ -2181,11 +2269,32 @@ impl SavioApp {
                 true,
             );
             checkbox(ui, &mut self.options.embed_thumbnail, "Обложку ролика", true);
-            checkbox(ui, &mut self.options.embed_subs, "Субтитры", subs_enabled)
-                .on_disabled_hover_text("Субтитры бывают только у видео — выберите MP4.");
-        });
+            changed |= checkbox(ui, &mut self.options.embed_subs, "Субтитры", subs_enabled)
+                .on_disabled_hover_text("Субтитры бывают только у видео — выберите MP4.")
+                .changed();
 
-        // Обе оговорки ниже — статические строки: в кадре ничего не собирается.
+            // Подчинённая галочка появляется вместе с субтитрами, а не висит
+            // выключенной рядом: без «Субтитров» она не значит ничего, а
+            // карточка и так длинная — в окне минимальной высоты каждый
+            // лишний постоянный ряд виден сразу.
+            let subs_on = subs_enabled && self.options.embed_subs;
+            if subs_on {
+                ui.horizontal(|ui| {
+                    ui.add_space(SUBOPTION_INDENT);
+                    changed |= checkbox(
+                        ui,
+                        &mut self.options.auto_subs,
+                        "Можно автоматические",
+                        true,
+                    )
+                    .changed();
+                });
+            }
+            subs_on
+        })
+        .inner;
+
+        // Оговорка про ffmpeg — статическая строка: в кадре ничего не собирается.
         if self.ffmpeg_missing && self.options.any() {
             ui.add_space(6.0);
             note(
@@ -2196,20 +2305,132 @@ impl SavioApp {
             );
         }
 
-        // Говорим только тогда, когда знаем наверняка: `probe` уже ответил,
-        // и собственных субтитров у ролика нет. Молчание здесь честнее догадки.
-        if self.options.embed_subs
-            && subs_enabled
-            && self.info.as_ref().is_some_and(|info| !info.has_subtitles)
-        {
+        if subs_on {
+            ui.add_space(12.0);
+            field_label(ui, "Язык субтитров");
+            changed |= self.sub_lang_selector(ui);
+        }
+
+        if changed {
+            self.rebuild_subtitles();
+        }
+    }
+
+    /// Выпадающий список языков субтитров.
+    ///
+    /// Возвращает `true`, когда выбор поменяли: пересобирать подпись и
+    /// оговорку — работа обработчика, а не кадра отрисовки.
+    ///
+    /// Пункты берутся из ответа `probe` и потому появляются только со второй
+    /// попытки: `probe` идёт уже внутри загрузки, и до неё Savio про дорожки
+    /// ролика не знает ничего. Пустого списка при этом не бывает — «Язык
+    /// ролика» есть всегда, и он же значение по умолчанию, так что первая
+    /// загрузка ничего не теряет.
+    fn sub_lang_selector(&mut self, ui: &mut egui::Ui) -> bool {
+        // Ширину берём до `ComboBox`, как и у списка браузеров: внутри он
+        // заводит свою горизонтальную раскладку.
+        let width = ui.available_width();
+        let allow_auto = self.options.auto_subs;
+        let mut changed = false;
+
+        ui.scope(|ui| {
+            let v = ui.visuals_mut();
+            // То же оформление, что у списка браузеров: это такое же поле
+            // ввода, и разъехаться им нельзя.
+            for state in [&mut v.widgets.inactive, &mut v.widgets.open] {
+                state.weak_bg_fill = theme::BG_INPUT;
+            }
+            v.widgets.hovered.weak_bg_fill = theme::BG_ELEVATED;
+
+            // Поля берём по отдельности: внутри замыкания `sub_lang` нужен
+            // изменяемым, а `info` — нет, и целиком `self` там занять нельзя.
+            let info = self.info.as_ref();
+            let lang = &mut self.sub_lang;
+
+            egui::ComboBox::from_id_salt("savio-sub-lang")
+                .selected_text(self.sub_lang_label.as_str())
+                .width(width)
+                .height(SUBLANG_LIST_HEIGHT)
+                .show_ui(ui, |ui| {
+                    let spacing = ui.spacing_mut();
+                    spacing.interact_size.y = 26.0;
+                    spacing.button_padding.y = 3.0;
+                    spacing.item_spacing.y = 2.0;
+
+                    // Первым — то, что нужно почти всегда, и единственный
+                    // пункт, который есть до первого `probe`.
+                    let selected = matches!(lang, SubLang::Original);
+                    if ui
+                        .selectable_label(selected, SubLang::ORIGINAL_LABEL)
+                        .clicked()
+                        && !selected
+                    {
+                        *lang = SubLang::Original;
+                        changed = true;
+                    }
+
+                    // Заголовок раздела ставим на смене вида дорожек.
+                    // Список приходит уже разделённым: сначала авторские,
+                    // потом автоматические, — так что перелом ровно один.
+                    let mut group: Option<bool> = None;
+                    let tracks = info.map(|info| info.subtitle_tracks(allow_auto));
+                    for track in tracks.into_iter().flatten() {
+                        if group != Some(track.auto) {
+                            group = Some(track.auto);
+                            ui.label(
+                                egui::RichText::new(if track.auto {
+                                    "Автоматические"
+                                } else {
+                                    "Свои"
+                                })
+                                .small()
+                                .color(theme::TEXT_MUTED),
+                            );
+                        }
+
+                        // `selectable_label`, а не `selectable_value`:
+                        // последний берёт значение по значению, то есть
+                        // требовал бы копии кода на каждый пункт в каждом
+                        // кадре — а пунктов у YouTube полторы сотни.
+                        let selected = matches!(lang, SubLang::Code(code) if *code == track.code);
+                        if ui.selectable_label(selected, track.label.as_str()).clicked()
+                            && !selected
+                        {
+                            *lang = SubLang::Code(track.code.clone());
+                            changed = true;
+                        }
+                    }
+                });
+        });
+
+        ui.add_space(6.0);
+        if !self.subs_note.is_empty() {
+            note(ui, &self.subs_note, theme::STATE_WARNING);
             ui.add_space(6.0);
+        }
+        // Обе строки статические, и обе нужны: про качество робота человек
+        // должен узнать здесь, а не по готовому файлу.
+        if allow_auto {
             note(
                 ui,
-                "У этого ролика нет своих субтитров — вшивать нечего. \
-                 Автоматические Savio не берёт: их пишет робот, и в них ошибки.",
-                theme::TEXT_SECONDARY,
+                "Автоматические субтитры распознаёт робот: опечатки, слипшиеся \
+                 слова и пропущенные знаки препинания там обычное дело. \
+                 «Язык ролика» берёт распознанный оригинал, любой другой \
+                 язык — машинный перевод с него, и он ещё хуже.",
+                theme::TEXT_MUTED,
+            );
+        } else {
+            note(
+                ui,
+                "Свои субтитры выкладывает автор ролика, и они точные — но \
+                 есть далеко не у всех. Список языков заполняется после \
+                 первой загрузки этой ссылки: до неё Savio про дорожки \
+                 ролика ничего не знает.",
+                theme::TEXT_MUTED,
             );
         }
+
+        changed
     }
 
     /// Выпадающий список «взять вход из браузера».
@@ -3681,6 +3902,7 @@ mod tests {
             options: DownloadOptions::default(),
             section: Section::default(),
             cookies: CookieSource::default(),
+            sub_lang: SubLang::default(),
         }
     }
 

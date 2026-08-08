@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
-use crate::model::{DownloadId, Event, NO_DOWNLOAD, Request, human_duration};
+use crate::model::{DownloadId, Event, NO_DOWNLOAD, Request, SubtitlePlan, human_duration};
 
 pub use binaries::{Tools, discover};
 
@@ -229,13 +229,21 @@ fn run(
     let _ = tx.send(Event::Stage("Читаю ссылку…".into()));
     notify();
 
+    // Что просить по субтитрам: до `probe` этого знать неоткуда — ни языка
+    // ролика, ни того, выложил ли автор свои субтитры, — а после уже поздно
+    // спрашивать человека. Поэтому решаем сами (см. `SubtitlePlan`). Провал
+    // `probe` оставляет слепой план: ключа языка не будет, и поведение
+    // окажется ровно тем, что было до появления выбора.
+    let mut subs = SubtitlePlan::blind(request.options.auto_subs);
+
     // Метаданные тянем отдельным быстрым вызовом, чтобы показать название
     // ещё до старта загрузки. Если не вышло — не страшно, идём дальше.
     if let Some(info) = probe(request, tools) {
-        // Адрес и длительность забираем до отправки: `Info` уходит в UI
-        // вместе со структурой.
+        // Адрес, длительность и план по субтитрам забираем до отправки:
+        // `Info` уходит в UI вместе со структурой.
         let cover = info.thumbnail_url.clone();
         let duration = info.duration_secs;
+        subs = info.subtitle_plan(&request.sub_lang, request.options.auto_subs);
         // Провал отправки означает, что приёмник закрыт, то есть загрузку уже
         // отменили. Проверяем это именно здесь и именно ради обложки: запрос
         // за ней стоит **перед** запуском yt-dlp и занимает до нескольких
@@ -301,7 +309,7 @@ fn run(
         return Ok(());
     }
 
-    let args = ytdlp::download_args(request, out_dir, tools);
+    let args = ytdlp::download_args(request, out_dir, tools, &subs);
 
     // Второй признак того, что UI про нас забыл, — закрытый приёмник, и он
     // не заменяет флаг, а дополняет: флаг отвечает «просили ли отменить»,
@@ -546,6 +554,7 @@ mod tests {
             options: DownloadOptions::default(),
             section: Section::default(),
             cookies: CookieSource::None,
+            sub_lang: crate::model::SubLang::default(),
         }
     }
 

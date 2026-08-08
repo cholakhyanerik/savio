@@ -326,19 +326,34 @@ impl CookieSource {
 
 /// Что дополнительно вшить в готовый файл.
 ///
-/// Плоская структура из трёх флажков, а не варианты перечисления: галочки
+/// Плоская структура из флажков, а не варианты перечисления: галочки
 /// независимы, и любая их комбинация осмысленна. Значение по умолчанию —
 /// все выключены, то есть ровно то, что Savio делал до появления опций.
 ///
 /// Вшивание целиком лежит на `ffmpeg`, и это не деталь реализации, а свойство,
 /// от которого зависит поведение: без него запрошенное вшивание не просто
 /// не сработает, а **уронит всю загрузку** (подробности — в `download_args`).
-/// Отсюда `any()`: спрашивать про ffmpeg надо один раз на все три флажка.
+/// Отсюда `any()`: спрашивать про ffmpeg надо один раз на все флажки.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct DownloadOptions {
     pub embed_metadata: bool,
     pub embed_thumbnail: bool,
     pub embed_subs: bool,
+    /// Годятся ли автоматические субтитры — распознавание речи и машинный
+    /// перевод с него.
+    ///
+    /// Не самостоятельная просьба, а уточнение к `embed_subs`: без неё
+    /// вшивать нечего, и в командной строке ключ появляется только рядом
+    /// с `--embed-subs`. Отсюда же то, что `any()` этот флажок **не**
+    /// считает: `any()` отвечает на вопрос «нужен ли ffmpeg», и одинокая
+    /// галочка «можно автоматические» ответила бы на него «да» там, где
+    /// вшивать не просят вовсе, — человек получил бы предупреждение
+    /// про ненайденный ffmpeg на пустом месте.
+    ///
+    /// Отдельная галочка, а не молчаливое расширение `embed_subs`, потому
+    /// что качество у распознанных субтитров заметно хуже авторских:
+    /// включать такое за человека нельзя.
+    pub auto_subs: bool,
 }
 
 impl DownloadOptions {
@@ -346,6 +361,95 @@ impl DownloadOptions {
     pub fn any(self) -> bool {
         self.embed_metadata || self.embed_thumbnail || self.embed_subs
     }
+}
+
+/// На каком языке нужны субтитры.
+///
+/// Перечисление с кодом внутри, а не голая строка: «язык ролика» — это не
+/// код, а просьба определить его по ответу `probe`, и представить её пустой
+/// строкой значило бы смешать «не выбрано» с «выбрано ничего».
+///
+/// Значение по умолчанию — `Original`, и это не вкусовщина. Без явного
+/// `--sub-langs` yt-dlp берёт `en`, а YouTube кладёт в автоматические
+/// субтитры машинный перевод на сотню языков, и `en` среди них есть почти
+/// всегда: в русский ролик вшился бы английский перевод русского же
+/// распознавания. Проверено вживую (yt-dlp 2026.07.04) — см. `download_args`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum SubLang {
+    /// Тот язык, на котором ролик снят. Определяется по ответу `probe`
+    /// (`MediaInfo::subtitle_code`), а не угадывается в UI.
+    #[default]
+    Original,
+    /// Выбранный человеком код языка — ровно в том виде, в каком его
+    /// понимает `--sub-langs`.
+    Code(String),
+}
+
+impl SubLang {
+    /// Подпись первого пункта списка. Здесь же, а не в UI, потому что
+    /// её называет и объяснение про недоступный язык.
+    pub const ORIGINAL_LABEL: &'static str = "Язык ролика";
+}
+
+/// Что решено про субтитры этой загрузки.
+///
+/// Собирается после `probe` (`MediaInfo::subtitle_plan`) и уезжает прямо
+/// в аргументы: до ответа сайта ни языка, ни выбора между автором и роботом
+/// не существует.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SubtitlePlan {
+    /// Код языка для `--sub-langs`. `None` — определить не вышло, и ключа
+    /// в командной строке не будет вовсе.
+    pub lang: Option<String>,
+    /// Просить ли у yt-dlp автоматические субтитры.
+    ///
+    /// Это **не** галочка «Можно автоматические», и разница не косметическая.
+    /// Проверено вживую (yt-dlp 2026.07.04) на ролике, у которого есть и
+    /// авторские субтитры, и распознанные: с `--embed-subs --write-auto-subs
+    /// --sub-langs en` в файл уехали **распознанные**, хотя авторские на том
+    /// же языке лежали рядом. Ни ошибки, ни предупреждения — код возврата 0,
+    /// подмену видно только по тексту субтитров («[Music]» вместо «[♪♪♪]»).
+    /// Убери `--write-auto-subs` — вшиваются авторские.
+    ///
+    /// Поэтому приоритет держит Savio, а не yt-dlp: робота зовём только туда,
+    /// где автора нет. Галочка при этом значит ровно то, что на ней написано:
+    /// «можно и робота», а не «robotа вместо автора».
+    pub auto: bool,
+}
+
+impl SubtitlePlan {
+    /// План на случай, когда про ролик не известно ничего: `probe` не прошёл.
+    ///
+    /// Языка нет — ключа не будет, и yt-dlp возьмёт своё умолчание, ровно
+    /// как до появления выбора языка. Галочку при этом уважаем: «нет данных,
+    /// значит и не пытаемся» молча выключило бы возможность.
+    pub fn blind(allow_auto: bool) -> Self {
+        Self {
+            lang: None,
+            auto: allow_auto,
+        }
+    }
+}
+
+/// Одна дорожка субтитров, которую предлагает источник.
+///
+/// `label` собран заранее, в движке: список у YouTube доходит до полутора
+/// сотен языков, и склеивать подписи в кадре отрисовки нельзя (Правило 1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubtitleTrack {
+    /// Код языка в том виде, в каком его понимает `--sub-langs`: «ru»,
+    /// «pt-BR», а иногда и «en-nP7-2PuUl7o» — YouTube так называет вторую
+    /// английскую дорожку одного ролика.
+    pub code: String,
+    /// Что показать в списке: имя языка от источника плюс сам код.
+    pub label: String,
+    /// Автоматические: распознавание речи или машинный перевод с него.
+    ///
+    /// Разделять обязательно. Авторские субтитры выкладывает человек, и
+    /// они точные; автоматические пишет робот, и вшивать их без спроса
+    /// нельзя. Плюс на этом держится приоритет: при одинаковом коде
+    /// в списке остаётся авторская дорожка.
+    pub auto: bool,
 }
 
 /// Фрагмент ролика: с какой секунды по какую его вырезать.
@@ -525,6 +629,10 @@ pub struct Request {
     /// первый же, кто честно допишет их в `any()`, начнёт ругаться на
     /// отсутствие ffmpeg там, где он не нужен.
     pub cookies: CookieSource,
+    /// Язык субтитров. Поле запроса, а не флажок внутри `DownloadOptions`:
+    /// там всё `Copy`, а язык — строка, и одна её строчка лишила бы
+    /// `Copy` структуру, которую копируют в каждом кадре.
+    pub sub_lang: SubLang,
 }
 
 /// Метаданные ролика, полученные до начала загрузки.
@@ -541,12 +649,21 @@ pub struct MediaInfo {
     /// отдельным событием: `-J` отдаёт только ссылку, а тянуть по ней байты —
     /// это ещё один запрос в сеть.
     pub thumbnail_url: Option<String>,
-    /// Есть ли у ролика собственные субтитры — те, что выложил автор.
+    /// Язык самого ролика, как его назвал экстрактор: «ru», «en». `None` —
+    /// не назвал, и это обычное дело: из четырёх проверенных вживую роликов
+    /// YouTube поле заполнил у двух.
     ///
-    /// Нужно ровно для одного: сказать человеку, что вшивать нечего. `false`
-    /// значит «мы точно знаем, что их нет»; когда `probe` не прошёл вовсе,
-    /// `MediaInfo` до UI не доезжает, и молчать — правильно.
-    pub has_subtitles: bool,
+    /// Нужен ровно для одного — понять, какой язык считать «языком ролика»
+    /// при выборе субтитров. Угадать его иначе нечем: в автоматических
+    /// субтитрах YouTube распознанный язык лежит вперемешку с машинным
+    /// переводом на полторы сотни других.
+    pub language: Option<String>,
+    /// Дорожки субтитров, которые предлагает источник: сначала авторские,
+    /// потом автоматические. Пусто — субтитров нет вовсе.
+    ///
+    /// Готовый список, а не голое «есть/нет», потому что язык надо выбирать:
+    /// без явного `--sub-langs` yt-dlp берёт `en` (см. [`SubLang`]).
+    pub subtitles: Vec<SubtitleTrack>,
 }
 
 impl MediaInfo {
@@ -556,6 +673,144 @@ impl MediaInfo {
     /// первый элемент, потому что вызывается это из кадра отрисовки.
     pub fn max_height(&self) -> Option<u32> {
         self.heights.first().copied()
+    }
+
+    /// Дорожки, из которых человеку дают выбирать.
+    ///
+    /// `allow_auto` — состояние галочки «можно автоматические». Показывать
+    /// их, когда галочка снята, нельзя: выбранный язык просто не приехал бы,
+    /// и yt-dlp сообщил бы об этом в `[info]`, который глушит `--quiet`.
+    pub fn subtitle_tracks(&self, allow_auto: bool) -> impl Iterator<Item = &SubtitleTrack> {
+        self.subtitles
+            .iter()
+            .filter(move |track| allow_auto || !track.auto)
+    }
+
+    /// Найдётся ли дорожка на этом языке среди разрешённых.
+    pub fn has_subtitle(&self, code: &str, allow_auto: bool) -> bool {
+        self.subtitle_tracks(allow_auto)
+            .any(|track| track.code == code)
+    }
+
+    /// Подпись дорожки по коду. `None` — такой дорожки у ролика нет.
+    pub fn subtitle_label(&self, code: &str) -> Option<&str> {
+        self.subtitles
+            .iter()
+            .find(|track| track.code == code)
+            .map(|track| track.label.as_str())
+    }
+
+    /// Какой код языка уедет в `--sub-langs`. `None` — определить не вышло,
+    /// и тогда ключа в командной строке не будет вовсе: yt-dlp возьмёт своё
+    /// умолчание, ровно как до появления выбора языка.
+    ///
+    /// Правила перебираются сверху вниз, и каждое проверено на живом ответе
+    /// `-J`, а не выведено из документации:
+    ///
+    /// 1. **Язык, названный экстрактором, если такая дорожка есть.** Самый
+    ///    надёжный признак: у русского ролика это `language: "ru"`, и
+    ///    дорожка `ru` в автоматических — та самая распознанная (в её
+    ///    адресе нет `tlang`, в отличие от переводов).
+    /// 2. **Единственная авторская дорожка** — даже когда язык назван, но
+    ///    дорожки на нём нет. Тот же выбор, что у хвостового `/b` в `-f`:
+    ///    отдать доступное лучше, чем отказать. У ролика с `language: "ru"`
+    ///    и единственными английскими субтитрами автора до появления выбора
+    ///    языка вшивались именно они, и отнимать это — поломка старого
+    ///    (Правило 2), а не строгость.
+    /// 3. **Язык экстрактора, даже если дорожки на нём нет.** Так честнее
+    ///    молчания: человек получит объяснение «субтитров на этом языке
+    ///    нет», а не файл без субтитров без единого слова.
+    ///
+    /// Авторских дорожек несколько и языка экстрактор не назвал — выбрать
+    /// не из чего, и выдумывать нельзя: `None`.
+    pub fn subtitle_code<'a>(&'a self, want: &'a SubLang) -> Option<&'a str> {
+        if let SubLang::Code(code) = want {
+            return Some(code);
+        }
+
+        let language = self
+            .language
+            .as_deref()
+            .filter(|language| !language.is_empty());
+
+        if let Some(language) = language
+            && self.subtitles.iter().any(|track| track.code == language)
+        {
+            return Some(language);
+        }
+
+        let mut own = self.subtitles.iter().filter(|track| !track.auto);
+        if let (Some(only), None) = (own.next(), own.next()) {
+            return Some(&only.code);
+        }
+
+        language
+    }
+
+    /// Что просить у yt-dlp: язык и нужен ли робот.
+    ///
+    /// `allow_auto` — состояние галочки «Можно автоматические». Робота
+    /// зовём только туда, где авторской дорожки нет: при обоих ключах сразу
+    /// yt-dlp вшивает именно робота, даже когда автор выложил субтитры на том
+    /// же языке (проверено вживую, подробности — у [`SubtitlePlan::auto`]).
+    pub fn subtitle_plan(&self, want: &SubLang, allow_auto: bool) -> SubtitlePlan {
+        let lang = self.subtitle_code(want).map(str::to_owned);
+
+        let authored = match lang.as_deref() {
+            Some(code) => self
+                .subtitles
+                .iter()
+                .any(|track| !track.auto && track.code == code),
+            // Язык не определился — просим «что дадите». Авторские дорожки
+            // в таком ролике есть, и отдать надо их, а не робота.
+            None => self.subtitles.iter().any(|track| !track.auto),
+        };
+
+        SubtitlePlan {
+            lang,
+            auto: allow_auto && !authored,
+        }
+    }
+
+    /// Почему запрошенных субтитров не будет — или `None`, если всё в порядке.
+    ///
+    /// Сказать об этом можем только мы, и в этом всё дело. Запрошенного
+    /// языка у ролика нет — yt-dlp выходит **с кодом 0**, без файла
+    /// субтитров и без единого слова: сообщение уходит в `[info]`, который
+    /// глушит `--quiet`. Проверено вживую (yt-dlp 2026.07.04): `--sub-langs zz`
+    /// не напечатал ничего. То есть галочка молча не срабатывает, и человек
+    /// узнаёт об этом, только открыв готовый файл.
+    ///
+    /// Собирает строку, поэтому зовётся не из кадра отрисовки, а из
+    /// обработчиков (`rebuild_subs_note`) — как и всё остальное в UI.
+    pub fn subtitle_note(&self, want: &SubLang, allow_auto: bool) -> Option<String> {
+        // Подходящих дорожек нет вовсе — язык тут ни при чём.
+        if self.subtitle_tracks(allow_auto).next().is_none() {
+            return Some(if self.subtitles.is_empty() {
+                "Субтитров у этого ролика нет вовсе — ни своих, ни \
+                 автоматических. Вшивать нечего."
+                    .to_owned()
+            } else {
+                "Своих субтитров у этого ролика нет, зато есть автоматические. \
+                 Поставьте «Можно автоматические» — только учтите, что их \
+                 пишет робот и ошибки в них обычное дело."
+                    .to_owned()
+            });
+        }
+
+        // Язык не определился: ключа в командной строке не будет, yt-dlp
+        // возьмёт своё умолчание. Что именно он возьмёт, мы не знаем, —
+        // значит и говорить нечего.
+        let code = self.subtitle_code(want)?;
+        if self.has_subtitle(code, allow_auto) {
+            return None;
+        }
+
+        let name = self.subtitle_label(code).unwrap_or(code);
+        Some(format!(
+            "Субтитров на этом языке ({name}) у ролика нет — файл сохранится \
+             без них. Выберите другой язык из списка."
+        ))
     }
 }
 
@@ -1140,7 +1395,231 @@ mod tests {
         assert!(!options.embed_metadata);
         assert!(!options.embed_thumbnail);
         assert!(!options.embed_subs);
+        assert!(!options.auto_subs);
         assert!(!options.any());
+    }
+
+    /// «Можно автоматические» — уточнение к «Субтитрам», а не самостоятельная
+    /// просьба, и `any()` его считать не должен. Иначе одинокая галочка
+    /// подняла бы предупреждение «ffmpeg не найден, вшить не выйдет» там, где
+    /// вшивать не просят вовсе.
+    #[test]
+    fn auto_subs_alone_do_not_ask_for_ffmpeg() {
+        let options = DownloadOptions {
+            auto_subs: true,
+            ..DownloadOptions::default()
+        };
+        assert!(!options.any());
+
+        // А вместе с «Субтитрами» ffmpeg, конечно, нужен.
+        let options = DownloadOptions {
+            embed_subs: true,
+            auto_subs: true,
+            ..DownloadOptions::default()
+        };
+        assert!(options.any());
+    }
+
+    /// Заготовка ответа `probe`: авторские дорожки и автоматические.
+    fn info_with(language: Option<&str>, own: &[&str], auto: &[&str]) -> MediaInfo {
+        let track = |code: &str, auto: bool| SubtitleTrack {
+            code: code.to_owned(),
+            label: format!("Имя · {code}"),
+            auto,
+        };
+        MediaInfo {
+            language: language.map(str::to_owned),
+            subtitles: own
+                .iter()
+                .map(|code| track(code, false))
+                .chain(auto.iter().map(|code| track(code, true)))
+                .collect(),
+            ..MediaInfo::default()
+        }
+    }
+
+    /// Главная ловушка задачи в доменной её половине: «язык ролика» обязан
+    /// разрешаться в настоящий язык ролика. Ошибись здесь — и в русский
+    /// ролик уедет английский машинный перевод, причём при коде возврата 0.
+    #[test]
+    fn original_language_comes_from_the_extractor() {
+        // Ровно то, что вернул живой `-J` на русском ролике: язык назван,
+        // авторских дорожек нет, автоматических полторы сотни.
+        let info = info_with(Some("ru"), &[], &["en", "de", "ru", "fr"]);
+        assert_eq!(info.subtitle_code(&SubLang::Original), Some("ru"));
+
+        // Выбранный руками язык сильнее любого угадывания: человек мог
+        // захотеть именно перевод.
+        let chosen = SubLang::Code("de".to_owned());
+        assert_eq!(info.subtitle_code(&chosen), Some("de"));
+    }
+
+    #[test]
+    fn original_language_falls_back_to_the_only_authored_track() {
+        // Языка экстрактор не назвал — так бывает у половины роликов.
+        let info = info_with(None, &["ja"], &[]);
+        assert_eq!(info.subtitle_code(&SubLang::Original), Some("ja"));
+
+        // Авторских несколько, языка нет — выбирать не из чего, и выдумывать
+        // нельзя: без ключа yt-dlp возьмёт своё умолчание, как и раньше.
+        let info = info_with(None, &["en", "de"], &[]);
+        assert_eq!(info.subtitle_code(&SubLang::Original), None);
+
+        // Совсем пустой ответ — тоже молчание.
+        assert_eq!(MediaInfo::default().subtitle_code(&SubLang::Original), None);
+    }
+
+    /// Язык назван, дорожки на нём нет, зато есть единственная авторская.
+    ///
+    /// Берём её — тот же выбор, что у хвостового `/b` в `-f`: отдать
+    /// доступное лучше, чем отказать. До появления выбора языка у такого
+    /// ролика вшивались именно эти субтитры (умолчание yt-dlp — `en`),
+    /// и отнять их значило бы сломать работавшее.
+    #[test]
+    fn the_only_authored_track_beats_a_language_without_one() {
+        let info = info_with(Some("ru"), &["en"], &[]);
+        assert_eq!(info.subtitle_code(&SubLang::Original), Some("en"));
+        assert_eq!(info.subtitle_note(&SubLang::Original, false), None);
+    }
+
+    /// А вот когда отдавать нечего — ни дорожки на названном языке, ни
+    /// единственной авторской, — просим всё-таки названный язык: тогда
+    /// объяснение («субтитров на этом языке нет») сойдётся с тем, что ушло
+    /// в командную строку.
+    #[test]
+    fn named_language_is_asked_for_when_there_is_nothing_to_fall_back_to() {
+        // Авторских две — выбрать «единственную» не выйдет.
+        let info = info_with(Some("ru"), &["en", "de"], &[]);
+        assert_eq!(info.subtitle_code(&SubLang::Original), Some("ru"));
+        assert!(info.subtitle_note(&SubLang::Original, false).is_some());
+
+        // Только автоматические, и русского среди них нет.
+        let info = info_with(Some("ru"), &[], &["en", "de"]);
+        assert_eq!(info.subtitle_code(&SubLang::Original), Some("ru"));
+    }
+
+    /// Автоматические дорожки не должны считаться доступными, пока галочка
+    /// снята: yt-dlp на такую просьбу молча ничего не скачает.
+    #[test]
+    fn automatic_tracks_are_hidden_until_allowed() {
+        let info = info_with(Some("ru"), &["en"], &["ru"]);
+
+        assert!(info.has_subtitle("ru", true));
+        assert!(!info.has_subtitle("ru", false), "робот сошёл за автора");
+        assert!(info.has_subtitle("en", false));
+        assert_eq!(info.subtitle_tracks(false).count(), 1);
+        assert_eq!(info.subtitle_tracks(true).count(), 2);
+        // Ролик с одним роботом выглядит для галочки «Субтитры» как ролик
+        // вовсе без субтитров — на этом и держится вторая галочка.
+        assert_eq!(info_with(None, &[], &["ru"]).subtitle_tracks(false).count(), 0);
+    }
+
+    /// Оговорка появляется ровно тогда, когда вшивать нечего, и объясняет
+    /// разные беды по-разному: «включите автоматические» и «выберите другой
+    /// язык» — советы противоположные.
+    #[test]
+    fn subtitle_note_tells_the_two_troubles_apart() {
+        // Всё в порядке — молчим.
+        let good = info_with(Some("ru"), &[], &["ru"]);
+        assert_eq!(good.subtitle_note(&SubLang::Original, true), None);
+
+        // Есть автоматические, но галочка снята.
+        let note = good
+            .subtitle_note(&SubLang::Original, false)
+            .expect("нет оговорки про выключенные автоматические");
+        assert!(note.contains("Можно автоматические"), "{note}");
+
+        // Субтитров нет вовсе.
+        let note = MediaInfo::default()
+            .subtitle_note(&SubLang::Original, true)
+            .expect("нет оговорки про полное отсутствие субтитров");
+        assert!(note.contains("нет вовсе"), "{note}");
+        assert!(!note.contains("Можно автоматические"), "{note}");
+
+        // Выбран язык, которого у ролика нет: так бывает, когда список
+        // остался от прошлой ссылки.
+        let note = good
+            .subtitle_note(&SubLang::Code("de".to_owned()), true)
+            .expect("нет оговорки про недоступный язык");
+        assert!(note.contains("de"), "{note}");
+        assert!(note.contains("другой язык"), "{note}");
+    }
+
+    /// Язык не определился — сказать нечего: что возьмёт yt-dlp своим
+    /// умолчанием, мы не знаем, а уверенная догадка хуже молчания.
+    #[test]
+    fn subtitle_note_stays_quiet_when_the_language_is_unknown() {
+        let info = info_with(None, &["en", "de"], &[]);
+        assert_eq!(info.subtitle_note(&SubLang::Original, true), None);
+    }
+
+    /// Робота зовём только туда, где автора нет.
+    ///
+    /// Проверено вживую (yt-dlp 2026.07.04): `--embed-subs` вместе с
+    /// `--write-auto-subs` вшивает **распознанную** дорожку, даже когда
+    /// авторская на том же языке лежит рядом. Ни ошибки, ни предупреждения —
+    /// подмену видно только по тексту субтитров. Значит, приоритет держим
+    /// сами, и проверить это может только такой тест: сборка, clippy и живой
+    /// код возврата тут слепы.
+    #[test]
+    fn the_robot_is_only_called_where_the_author_is_missing() {
+        // У ролика есть и авторская `en`, и распознанная `en`.
+        let both = info_with(Some("en"), &["en"], &["en", "ru"]);
+        let plan = both.subtitle_plan(&SubLang::Original, true);
+        assert_eq!(plan.lang.as_deref(), Some("en"));
+        assert!(!plan.auto, "робот вытеснил бы авторские субтитры");
+
+        // А на язык, которого автор не выкладывал, робот нужен.
+        let plan = both.subtitle_plan(&SubLang::Code("ru".to_owned()), true);
+        assert_eq!(plan.lang.as_deref(), Some("ru"));
+        assert!(plan.auto);
+
+        // Авторских нет вовсе — робот тем более.
+        let auto_only = info_with(Some("ru"), &[], &["ru"]);
+        assert!(auto_only.subtitle_plan(&SubLang::Original, true).auto);
+    }
+
+    /// Галочка снята — робота не зовём ни при каких раскладах.
+    #[test]
+    fn the_robot_stays_home_until_allowed() {
+        let info = info_with(Some("ru"), &[], &["ru"]);
+        let plan = info.subtitle_plan(&SubLang::Original, false);
+        assert_eq!(plan.lang.as_deref(), Some("ru"));
+        assert!(!plan.auto);
+    }
+
+    /// Язык не определился, но авторские дорожки у ролика есть: просим
+    /// «что дадите» — и без робота, иначе он вытеснит автора.
+    #[test]
+    fn an_unknown_language_still_leaves_the_author_in_charge() {
+        let info = info_with(None, &["en", "de"], &["en", "ru"]);
+        let plan = info.subtitle_plan(&SubLang::Original, true);
+        assert_eq!(plan.lang, None);
+        assert!(!plan.auto, "робот вытеснил бы авторские субтитры");
+    }
+
+    /// `probe` не прошёл — про ролик не известно ничего. Язык не называем,
+    /// а галочку уважаем: молча выключить возможность нельзя.
+    #[test]
+    fn a_blind_plan_keeps_the_checkbox() {
+        assert_eq!(
+            SubtitlePlan::blind(true),
+            SubtitlePlan {
+                lang: None,
+                auto: true
+            }
+        );
+        assert!(!SubtitlePlan::blind(false).auto);
+        assert_eq!(SubtitlePlan::default(), SubtitlePlan::blind(false));
+    }
+
+    /// Язык субтитров по умолчанию — язык ролика. Переедь `#[default]` на
+    /// конкретный код, и у всех, кто списка не открывал, в ролики начал бы
+    /// вшиваться машинный перевод.
+    #[test]
+    fn subtitles_default_to_the_video_language() {
+        assert_eq!(SubLang::default(), SubLang::Original);
+        assert!(!SubLang::ORIGINAL_LABEL.trim().is_empty());
     }
 
     /// `any()` обязан замечать каждый флажок по отдельности: на нём держится

@@ -9,7 +9,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::binaries::Tools;
-use crate::model::{CookieSource, Format, MediaInfo, Progress, Quality, Request, Section};
+use crate::model::{
+    CookieSource, Format, MediaInfo, Progress, Quality, Request, Section, SubtitlePlan,
+    SubtitleTrack,
+};
 
 /// Каждое поле, способное прийти пустым, обязано иметь `|default`.
 /// Иначе yt-dlp подставит голое `NA` без кавычек и сломает JSON —
@@ -110,7 +113,19 @@ fn section_arg(section: Section) -> Option<String> {
     })
 }
 
-pub fn download_args(request: &Request, out_dir: &Path, tools: &Tools) -> Vec<String> {
+/// Собирает командную строку загрузки.
+///
+/// `subs` — что решено про субтитры по ответу `probe`
+/// (`MediaInfo::subtitle_plan`). Отдельным параметром, а не полем `Request`,
+/// потому что взяться ему неоткуда до запроса метаданных: в запросе лежит
+/// просьба человека («язык ролика», «можно робота»), а здесь нужен уже
+/// разобранный ответ сайта.
+pub fn download_args(
+    request: &Request,
+    out_dir: &Path,
+    tools: &Tools,
+    subs: &SubtitlePlan,
+) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "--newline".into(),
         // --quiet глушит обычный вывод, --progress возвращает обратно
@@ -183,6 +198,38 @@ pub fn download_args(request: &Request, out_dir: &Path, tools: &Tools) -> Vec<St
         // после вшивания не убирает. Просили вшить, а не положить рядом.
         if options.embed_subs && request.format == Format::Mp4 {
             args.push("--embed-subs".into());
+
+            // Автоматические субтитры — распознавание речи и машинный перевод
+            // с него.
+            //
+            // Спрашиваем не галочку, а план: при `--embed-subs` вместе с
+            // `--write-auto-subs` yt-dlp вшивает **робота**, даже когда автор
+            // выложил субтитры на том же языке. Проверено вживую (2026.07.04):
+            // у ролика с обеими дорожками в файл уехало «[Music]» вместо
+            // авторского «[♪♪♪]», при коде возврата 0 и без предупреждений.
+            // Поэтому ключ добавляется только там, где авторской дорожки нет
+            // (`MediaInfo::subtitle_plan`), — иначе новая галочка молча
+            // ухудшила бы то, что и так работало.
+            if subs.auto {
+                args.push("--write-auto-subs".into());
+            }
+
+            // **Явный язык обязателен.** Без `--sub-langs` yt-dlp берёт `en`,
+            // и это не догадка: проверено вживую (yt-dlp 2026.07.04) на
+            // русском ролике — `[info] Downloading subtitles: en`. А `en`
+            // у YouTube есть почти всегда, потому что в автоматические
+            // субтитры кладётся машинный перевод на полторы сотни языков:
+            // в русский ролик уехал бы английский перевод русского же
+            // распознавания. Ошибки при этом нет ни в сборке, ни в коде
+            // возврата — субтитры появятся, просто не те.
+            //
+            // `None` бывает, когда язык определить нечем (см.
+            // `MediaInfo::subtitle_code`). Тогда ключа нет, и поведение
+            // остаётся ровно тем, что было до появления выбора языка.
+            if let Some(lang) = &subs.lang {
+                args.push("--sub-langs".into());
+                args.push(lang.clone());
+            }
         }
 
         // Обрезка лежит на ffmpeg целиком, и без него она не «просто не
@@ -501,29 +548,93 @@ pub fn parse_media_info(json: &str) -> MediaInfo {
         duration_secs: v.get("duration").and_then(|x| x.as_f64()),
         heights: parse_heights(v.get("formats")),
         thumbnail_url: parse_thumbnail_url(&v),
-        has_subtitles: parse_has_subtitles(&v),
+        language: text("language").filter(|language| !language.is_empty()),
+        subtitles: parse_subtitles(&v),
     }
 }
 
-/// Есть ли у ролика собственные субтитры.
+/// Запись чата прошедшей трансляции. YouTube кладёт её в `subtitles` рядом
+/// с настоящими дорожками, и по форме ответа она от них неотличима. Без
+/// этой проверки у любой записи стрима «субтитры есть» — то есть подсказка
+/// соврала бы ровно там, где нужна.
+const LIVE_CHAT: &str = "live_chat";
+
+/// Хвост, которым YouTube помечает распознанную дорожку.
 ///
-/// Смотрим только `subtitles` — то, что выложил автор, — и намеренно не
-/// заглядываем в `automatic_captions`: `--embed-subs` без `--write-auto-subs`
-/// берёт ровно этот список, и посчитать автоматические значило бы обещать
-/// субтитры, которых не будет.
+/// Она лежит в ответе **дважды**: под кодом языка (`ru`) и под `ru-orig`
+/// с именем «Russian (Original)» — адрес у обеих один и тот же, `tlang`
+/// в нём нет. Проверено на живом ответе `-J`. В списке языков это выглядело
+/// бы как два разных пункта, ведущих к одному файлу, поэтому дубль убираем.
+const ORIG_SUFFIX: &str = "-orig";
+
+/// Собирает список дорожек субтитров из ответа `-J`.
 ///
-/// `live_chat` из счёта выбрасываем: YouTube кладёт в `subtitles` запись чата
-/// прошедшей трансляции, и по формату ответа она неотличима от дорожки
-/// субтитров. Без этой проверки у любой записи стрима «субтитры есть» —
-/// подсказка соврала бы ровно там, где нужна.
-fn parse_has_subtitles(v: &serde_json::Value) -> bool {
-    let Some(tracks) = v.get("subtitles").and_then(|x| x.as_object()) else {
-        return false;
+/// Авторские идут первыми, и это не косметика: при совпадении кода языка
+/// в списке остаётся первая, то есть авторская. Так же поступает и сам
+/// yt-dlp, когда `--embed-subs` и `--write-auto-subs` включены вместе.
+fn parse_subtitles(v: &serde_json::Value) -> Vec<SubtitleTrack> {
+    let mut tracks = Vec::new();
+    collect_subtitles(v.get("subtitles"), false, &mut tracks);
+    collect_subtitles(v.get("automatic_captions"), true, &mut tracks);
+
+    // Убираем `<код>-orig` там, где рядом лежит сам `<код>`: это одна и та
+    // же дорожка под двумя именами. Коды берём отдельным списком, потому что
+    // `retain` не даёт заглянуть в остальной вектор изнутри.
+    let codes: Vec<String> = tracks.iter().map(|track| track.code.clone()).collect();
+    tracks.retain(|track| {
+        track
+            .code
+            .strip_suffix(ORIG_SUFFIX)
+            .is_none_or(|base| !codes.iter().any(|code| code == base))
+    });
+
+    tracks
+}
+
+/// Перекладывает один раздел ответа (`subtitles` или `automatic_captions`)
+/// в общий список.
+///
+/// Пустой список файлов у языка — не дорожка: экстракторы иногда оставляют
+/// такие заготовки, и обещать по ним субтитры нельзя.
+fn collect_subtitles(node: Option<&serde_json::Value>, auto: bool, out: &mut Vec<SubtitleTrack>) {
+    let Some(languages) = node.and_then(|x| x.as_object()) else {
+        return;
     };
 
-    tracks.iter().any(|(lang, files)| {
-        lang != "live_chat" && files.as_array().is_some_and(|files| !files.is_empty())
-    })
+    for (code, files) in languages {
+        if code == LIVE_CHAT {
+            continue;
+        }
+        let Some(files) = files.as_array().filter(|files| !files.is_empty()) else {
+            continue;
+        };
+        // Первым победил — то есть авторская дорожка выигрывает у
+        // автоматической с тем же кодом. Разделы обходятся именно в этом
+        // порядке (см. `parse_subtitles`).
+        if out.iter().any(|track| track.code == *code) {
+            continue;
+        }
+
+        // Имя языка даёт сам источник («Russian», «Portuguese (Brazil)»).
+        // Переводить его нам нечем: языков полторы сотни, и своя таблица
+        // из двух десятков дала бы список наполовину по-русски. Код рядом
+        // обязателен: у одного ролика бывает три английские дорожки, и
+        // различаются они только кодом (`en`, `en-nP7-2PuUl7o`).
+        let name = files
+            .iter()
+            .find_map(|file| file.get("name").and_then(|x| x.as_str()))
+            .filter(|name| !name.is_empty());
+        let label = match name {
+            Some(name) => format!("{name} · {code}"),
+            None => code.clone(),
+        };
+
+        out.push(SubtitleTrack {
+            code: code.clone(),
+            label,
+            auto,
+        });
+    }
 }
 
 /// Ширина обложки, которой нам достаточно. Превью в окне — около 240 точек.
@@ -657,7 +768,7 @@ fn parse_heights(formats: Option<&serde_json::Value>) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{CookieSource, DownloadOptions};
+    use crate::model::{CookieSource, DownloadOptions, SubLang};
 
     const COOKIE_FLAG: &str = "--cookies-from-browser";
 
@@ -1036,8 +1147,38 @@ mod tests {
             options,
             cookies,
             section: Section::default(),
+            sub_lang: SubLang::default(),
         };
-        download_args(&request, &PathBuf::from("out"), &fake_tools(ffmpeg))
+        download_args(
+            &request,
+            &PathBuf::from("out"),
+            &fake_tools(ffmpeg),
+            &SubtitlePlan::default(),
+        )
+    }
+
+    /// Аргументы загрузки с субтитрами: план уже собран по ответу `probe`,
+    /// как это делает `engine::run`.
+    fn args_subs(format: Format, options: DownloadOptions, plan: &SubtitlePlan) -> Vec<String> {
+        let request = Request {
+            url: "https://example.com/video".to_owned(),
+            format,
+            quality: Quality::Best,
+            options,
+            cookies: CookieSource::None,
+            section: Section::default(),
+            sub_lang: SubLang::default(),
+        };
+        download_args(&request, &PathBuf::from("out"), &fake_tools(true), plan)
+    }
+
+    /// План «язык такой-то, робот такой-то» — то, что отдаёт
+    /// `MediaInfo::subtitle_plan`.
+    fn plan(lang: Option<&str>, auto: bool) -> SubtitlePlan {
+        SubtitlePlan {
+            lang: lang.map(str::to_owned),
+            auto,
+        }
     }
 
     /// Аргументы загрузки с запрошенным фрагментом.
@@ -1049,8 +1190,14 @@ mod tests {
             options: DownloadOptions::default(),
             cookies: CookieSource::None,
             section,
+            sub_lang: SubLang::default(),
         };
-        download_args(&request, &PathBuf::from("out"), &fake_tools(ffmpeg))
+        download_args(
+            &request,
+            &PathBuf::from("out"),
+            &fake_tools(ffmpeg),
+            &SubtitlePlan::default(),
+        )
     }
 
     const SECTION_FLAG: &str = "--download-sections";
@@ -1060,12 +1207,15 @@ mod tests {
         args_with(format, quality, DownloadOptions::default(), true)
     }
 
-    /// Все три флажка сразу — самый ходовой случай «поставил галочки и забыл».
+    /// Все три галочки вшивания сразу — самый ходовой случай «поставил
+    /// и забыл». Без «можно автоматические»: тесты ниже про вшивание,
+    /// а робот — отдельная просьба со своими проверками.
     fn all_options() -> DownloadOptions {
         DownloadOptions {
             embed_metadata: true,
             embed_thumbnail: true,
             embed_subs: true,
+            auto_subs: false,
         }
     }
 
@@ -1324,11 +1474,11 @@ mod tests {
         assert!(!has(&args, "--write-auto-subs"));
     }
 
-    /// Субтитры в ответе `-J` — те, что выложил автор. `live_chat` там же:
-    /// это запись чата трансляции, и по форме она от дорожки субтитров
+    /// Свои субтитры в ответе `-J` — те, что выложил автор. `live_chat` там
+    /// же: это запись чата трансляции, и по форме она от дорожки субтитров
     /// не отличается.
     #[test]
-    fn subtitles_are_detected_from_the_probe() {
+    fn own_subtitles_are_detected_from_the_probe() {
         let cases = [
             (r#"{"subtitles":{"en":[{"ext":"vtt","url":"https://x/en"}]}}"#, true),
             (
@@ -1339,8 +1489,8 @@ mod tests {
                 r#"{"subtitles":{"live_chat":[{"ext":"json"}],"ru":[{"ext":"vtt"}]}}"#,
                 true,
             ),
-            // Автоматических субтитров мало: `--embed-subs` их не берёт,
-            // и обещать их пользователю нельзя.
+            // Автоматические своими не считаются: их пишет робот, и без
+            // отдельной галочки yt-dlp их не берёт.
             (r#"{"automatic_captions":{"en":[{"ext":"vtt"}]}}"#, false),
             (r#"{"subtitles":{}}"#, false),
             (r#"{"subtitles":{"en":[]}}"#, false),
@@ -1351,11 +1501,230 @@ mod tests {
 
         for (json, expected) in cases {
             assert_eq!(
-                parse_media_info(json).has_subtitles,
+                parse_media_info(json).subtitle_tracks(false).next().is_some(),
                 expected,
                 "вход: {json}"
             );
         }
+    }
+
+    /// Ответ `-J` в том виде, в каком его отдаёт YouTube на русском ролике:
+    /// авторских дорожек нет, распознанная лежит **дважды** (`ru` и
+    /// `ru-orig` с одним и тем же адресом), а рядом — машинный перевод на
+    /// другие языки. Выдумать такой образец нельзя, он снят с живого ответа
+    /// (yt-dlp 2026.07.04); сокращены только 157 языков до трёх.
+    const REAL_AUTO_CAPTIONS: &str = r#"{
+        "title":"Ролик",
+        "language":"ru",
+        "subtitles":{},
+        "automatic_captions":{
+            "af":[{"ext":"vtt","name":"Afrikaans","url":"https://x/af?tlang=af"}],
+            "en":[{"ext":"vtt","name":"English","url":"https://x/en?tlang=en"}],
+            "ru":[{"ext":"vtt","name":"Russian","url":"https://x/ru"}],
+            "ru-orig":[{"ext":"vtt","name":"Russian (Original)","url":"https://x/ru"}],
+            "live_chat":[{"ext":"json","name":"Live chat","url":"https://x/chat"}]
+        }
+    }"#;
+
+    /// Главная ловушка задачи в разборе: «язык ролика» обязан находиться.
+    /// Промахнись он — и в русский ролик уехал бы `en`, то есть английский
+    /// машинный перевод русского же распознавания, при коде возврата 0.
+    #[test]
+    fn video_language_and_auto_tracks_come_from_the_probe() {
+        let info = parse_media_info(REAL_AUTO_CAPTIONS);
+
+        assert_eq!(info.language.as_deref(), Some("ru"));
+        assert_eq!(
+            info.subtitle_tracks(false).count(),
+            0,
+            "у ролика нет авторских дорожек"
+        );
+        assert_eq!(info.subtitle_code(&SubLang::Original), Some("ru"));
+
+        // `ru-orig` — та же дорожка под вторым именем (адрес совпадает),
+        // и в списке ей делать нечего.
+        let codes: Vec<&str> = info
+            .subtitles
+            .iter()
+            .map(|track| track.code.as_str())
+            .collect();
+        assert_eq!(codes, vec!["af", "en", "ru"], "список поехал: {codes:?}");
+
+        // Запись чата — не субтитры.
+        assert!(!codes.contains(&"live_chat"));
+
+        // Подпись собрана заранее и несёт код: у одного ролика бывает
+        // несколько дорожек одного языка, и различаются они только кодом.
+        assert_eq!(info.subtitle_label("ru"), Some("Russian · ru"));
+        assert!(info.subtitles.iter().all(|track| track.auto));
+    }
+
+    /// Авторская дорожка обязана вытеснить автоматическую с тем же кодом:
+    /// человек выкладывал субтитры сам, и они точнее робота. Так же ведёт
+    /// себя и yt-dlp, когда оба ключа включены вместе.
+    #[test]
+    fn authored_tracks_win_over_automatic_ones() {
+        let json = r#"{
+            "language":"en",
+            "subtitles":{"en":[{"ext":"vtt","name":"English"}]},
+            "automatic_captions":{
+                "en":[{"ext":"vtt","name":"English"}],
+                "ru":[{"ext":"vtt","name":"Russian"}]
+            }
+        }"#;
+        let info = parse_media_info(json);
+
+        let en = info
+            .subtitles
+            .iter()
+            .find(|track| track.code == "en")
+            .expect("нет английской дорожки");
+        assert!(!en.auto, "авторскую дорожку затёрла автоматическая");
+
+        // Авторские идут первыми: на этом держится и приоритет, и заголовки
+        // разделов в списке.
+        assert_eq!(info.subtitles.first().map(|t| t.code.as_str()), Some("en"));
+        assert_eq!(info.subtitle_tracks(false).count(), 1);
+        assert_eq!(info.subtitle_tracks(true).count(), 2);
+    }
+
+    #[test]
+    fn broken_subtitles_do_not_break_the_probe() {
+        for json in [
+            "{}",
+            "не json",
+            r#"{"subtitles":"нет","automatic_captions":42}"#,
+            r#"{"subtitles":{"en":[]}}"#,
+            r#"{"automatic_captions":{"ru":"нет"}}"#,
+            // Язык пустой строкой — то же, что отсутствие поля.
+            r#"{"language":""}"#,
+        ] {
+            let info = parse_media_info(json);
+            assert!(info.subtitles.is_empty(), "вход: {json}");
+            assert_eq!(info.language, None, "вход: {json}");
+        }
+
+        // Имени у дорожки может не быть — тогда подписью служит сам код.
+        let info = parse_media_info(r#"{"subtitles":{"cs":[{"ext":"vtt"}]}}"#);
+        assert_eq!(info.subtitle_label("cs"), Some("cs"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Автоматические субтитры и их язык
+    // -----------------------------------------------------------------------
+
+    const AUTO_FLAG: &str = "--write-auto-subs";
+    const LANGS_FLAG: &str = "--sub-langs";
+
+    /// Галочки субтитров: «вшить» и, по желанию, «можно автоматические».
+    fn subs_options(auto: bool) -> DownloadOptions {
+        DownloadOptions {
+            embed_subs: true,
+            auto_subs: auto,
+            ..DownloadOptions::default()
+        }
+    }
+
+    /// Главная ловушка задачи: `--write-auto-subs` без явного языка молча
+    /// даёт **не те** субтитры. Проверено вживую (yt-dlp 2026.07.04) на
+    /// русском ролике: без `--sub-langs` в журнале «Downloading subtitles:
+    /// en», и в файл уехал бы английский машинный перевод. Ни сборка, ни код
+    /// возврата этого не видят.
+    #[test]
+    fn automatic_subtitles_never_go_without_a_language() {
+        let args = args_subs(Format::Mp4, subs_options(true), &plan(Some("ru"), true));
+        assert!(has(&args, AUTO_FLAG), "нет {AUTO_FLAG}");
+        assert_eq!(value_of(&args, LANGS_FLAG), Some("ru"), "язык не доехал");
+
+        // Язык определить не вышло — ключа нет вовсе, и yt-dlp ведёт себя
+        // ровно как до появления выбора языка. Врать про язык нельзя.
+        let args = args_subs(Format::Mp4, subs_options(true), &plan(None, true));
+        assert!(has(&args, AUTO_FLAG));
+        assert!(!has(&args, LANGS_FLAG), "язык взялся из ниоткуда");
+    }
+
+    /// Вторая ловушка, и она обратна ожиданию: `--write-auto-subs` рядом
+    /// с `--embed-subs` **вытесняет** авторские субтитры, а не дополняет их.
+    /// Поэтому решает не галочка, а план — и когда план говорит «автор есть»,
+    /// ключа робота в строке быть не должно.
+    #[test]
+    fn the_robot_is_not_called_where_the_author_wrote() {
+        let args = args_subs(Format::Mp4, subs_options(true), &plan(Some("en"), false));
+        assert!(has(&args, "--embed-subs"), "потерялись субтитры целиком");
+        assert!(
+            !has(&args, AUTO_FLAG),
+            "робот вытеснит авторские субтитры — проверено вживую"
+        );
+        assert_eq!(value_of(&args, LANGS_FLAG), Some("en"));
+        // Рядом с роликом по-прежнему ничего не остаётся.
+        assert!(!has(&args, "--write-subs"), "рядом останется .vtt");
+    }
+
+    /// Пока «можно автоматические» не поставили, командной строке меняться
+    /// не с чего — кроме языка, который теперь называется всегда.
+    #[test]
+    fn automatic_subtitles_are_not_taken_until_asked() {
+        let args = args_subs(Format::Mp4, subs_options(false), &plan(Some("ru"), false));
+        assert!(has(&args, "--embed-subs"));
+        assert!(!has(&args, AUTO_FLAG), "непрошеный робот");
+        assert_eq!(value_of(&args, LANGS_FLAG), Some("ru"));
+
+        // Субтитров не просят вовсе — ни одного ключа из этой тройки.
+        let args = args_subs(
+            Format::Mp4,
+            DownloadOptions::default(),
+            &plan(Some("ru"), true),
+        );
+        for flag in ["--embed-subs", AUTO_FLAG, LANGS_FLAG] {
+            assert!(!has(&args, flag), "непрошеный {flag}");
+        }
+    }
+
+    /// В MP3 субтитры класть некуда, и вся тройка ключей туда не едет —
+    /// включая язык: без `--embed-subs` он лишний.
+    #[test]
+    fn audio_takes_no_subtitle_flags_at_all() {
+        let args = args_subs(Format::Mp3, subs_options(true), &plan(Some("ru"), true));
+        for flag in ["--embed-subs", AUTO_FLAG, LANGS_FLAG] {
+            assert!(!has(&args, flag), "у MP3 оказался {flag}");
+        }
+    }
+
+    /// Без ffmpeg вшивать нечем, и ключи субтитров пропускаются целиком:
+    /// иначе удавшаяся загрузка обернулась бы ошибкой на постобработке.
+    #[test]
+    fn subtitle_flags_are_skipped_without_ffmpeg() {
+        let request = Request {
+            url: "https://example.com/video".to_owned(),
+            format: Format::Mp4,
+            quality: Quality::Best,
+            options: subs_options(true),
+            cookies: CookieSource::None,
+            section: Section::default(),
+            sub_lang: SubLang::default(),
+        };
+        let args = download_args(
+            &request,
+            &PathBuf::from("out"),
+            &fake_tools(false),
+            &plan(Some("ru"), true),
+        );
+        for flag in ["--embed-subs", AUTO_FLAG, LANGS_FLAG] {
+            assert!(!has(&args, flag), "{flag} без ffmpeg сорвёт загрузку");
+        }
+        assert!(has(&args, "https://example.com/video"), "потеряна ссылка");
+    }
+
+    /// Ссылка обязана остаться последней: `--sub-langs` берёт следующее
+    /// слово как своё значение, и вклинься он между ключом и ссылкой —
+    /// качать стали бы язык.
+    #[test]
+    fn the_url_stays_last_with_subtitle_flags() {
+        let args = args_subs(Format::Mp4, subs_options(true), &plan(Some("ru"), true));
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("https://example.com/video")
+        );
     }
 
     // -----------------------------------------------------------------------
