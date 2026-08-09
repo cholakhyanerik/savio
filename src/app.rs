@@ -11,9 +11,9 @@ use crate::engine::settings;
 use crate::engine::setup;
 use crate::engine::{self, Handle, MetaTask, metadata};
 use crate::model::{
-    CookieSource, DownloadId, DownloadOptions, Event, Format, MediaInfo, Progress, Quality, Request,
-    Section, SectionError, SubLang, Tag, Thumbnail, human_bytes, human_duration, human_speed,
-    looks_like_url, meta_kind, parse_section,
+    CheckStatus, CookieSource, DownloadId, DownloadOptions, Event, Format, GpuInfo, MediaInfo,
+    Progress, Quality, Request, Section, SectionError, SubLang, SystemReport, Tag, Thumbnail,
+    human_bytes, human_duration, human_speed, looks_like_url, meta_kind, parse_section,
 };
 use crate::theme;
 
@@ -225,6 +225,7 @@ enum Tab {
     Download,
     Metadata,
     History,
+    System,
 }
 
 /// Сколько загрузок помним.
@@ -806,6 +807,107 @@ impl MetaPanel {
                 | Event::Ready
                 | Event::Warning(_)
                 | Event::Notice(_)
+                | Event::Versions(_)
+                | Event::SystemReport(_) => {}
+            }
+        }
+
+        if disconnected {
+            self.rx = None;
+            self.busy = false;
+        }
+    }
+}
+
+/// Состояние вкладки «Система».
+///
+/// Устроена как `MetaPanel`: свой приёмник на каждый запуск, работа в потоке,
+/// готовый результат приезжает событием. Общего канала с загрузкой здесь быть
+/// не может — опрашивать железо можно и посреди скачивания.
+struct SystemPanel {
+    /// Готовый снимок. `None` — ещё не спрашивали или спрашиваем прямо сейчас.
+    report: Option<SystemReport>,
+    busy: bool,
+    /// Чем занят движок прямо сейчас.
+    stage: String,
+    /// Спрашивали ли хоть раз. Нужно, чтобы опрос пошёл сам при первом
+    /// открытии вкладки: пустой экран с одной кнопкой «Проверить» — лишний
+    /// шаг там, где ответ всё равно нужен всегда.
+    asked: bool,
+    /// Итог последнего сохранения отчёта в файл.
+    saved: Option<(String, egui::Color32)>,
+    rx: Option<Receiver<Event>>,
+}
+
+impl SystemPanel {
+    fn new() -> Self {
+        Self {
+            report: None,
+            busy: false,
+            stage: String::new(),
+            asked: false,
+            saved: None,
+            rx: None,
+        }
+    }
+
+    fn start(&mut self, gpu: Option<GpuInfo>, ctx: &egui::Context) {
+        let (tx, rx) = channel();
+        let notify_ctx = ctx.clone();
+        engine::hardware::start(gpu, tx, move || notify_ctx.request_repaint());
+
+        self.rx = Some(rx);
+        self.busy = true;
+        self.asked = true;
+        self.stage = "Запуск…".to_owned();
+        // Прошлый снимок убираем сразу: показывать вчерашние числа рядом
+        // с надписью «опрашиваю» — прямой повод их перепутать.
+        self.report = None;
+        self.saved = None;
+    }
+
+    fn drain(&mut self) {
+        let mut events = Vec::new();
+        let mut disconnected = false;
+
+        if let Some(rx) = &self.rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(event) => events.push(event),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        for event in events {
+            match event {
+                Event::Stage(stage) => self.stage = stage,
+                Event::SystemReport(report) => {
+                    self.report = Some(report);
+                    self.busy = false;
+                }
+                // Опрос железа отказать целиком не умеет: не ответивший
+                // источник приезжает пунктом со статусом «нет данных», а не
+                // ошибкой на весь отчёт. Ветка всё равно выписана — на случай,
+                // если это когда-нибудь изменится.
+                Event::Failed { .. } => self.busy = false,
+                // Остальное ходит по чужим каналам. Перечислено явно, а не
+                // через `_`, чтобы компилятор и дальше требовал разбирать
+                // новые варианты `Event` во всех приёмниках.
+                Event::Info(_)
+                | Event::Thumbnail(_)
+                | Event::Progress(_)
+                | Event::Log(_)
+                | Event::Done { .. }
+                | Event::Ready
+                | Event::Warning(_)
+                | Event::Notice(_)
+                | Event::Tags(_)
+                | Event::Cleaned(_)
                 | Event::Versions(_) => {}
             }
         }
@@ -1115,6 +1217,16 @@ pub struct SavioApp {
     tab: Tab,
     /// Состояние вкладки «Метаданные».
     meta: MetaPanel,
+    /// Состояние вкладки «Система».
+    system: SystemPanel,
+    /// Чем eframe рисует это окно.
+    ///
+    /// Снимается один раз при создании приложения с того же адаптера, что уже
+    /// открыт для отрисовки, — второй открывать незачем, и стоит это ноль.
+    /// `get_info()` собирает четыре строки, так что в кадре его звать нельзя
+    /// (Правило 1); здесь он вызван ровно один раз за запуск. `None` —
+    /// сборка без wgpu: не ошибка, просто пункта про видеокарту не будет.
+    gpu: Option<GpuInfo>,
     /// Что скачано за этот запуск. Наполняется из `Event::Done`.
     history: History,
     /// Ссылки, поставленные в очередь. Идут строго по одной, сверху вниз.
@@ -1195,6 +1307,8 @@ impl SavioApp {
             log_copied_at: None,
             tab: Tab::Download,
             meta: MetaPanel::new(),
+            system: SystemPanel::new(),
+            gpu: None,
             history: History::default(),
             queue: Queue::new(),
             maximize_pending: true,
@@ -1243,6 +1357,62 @@ impl SavioApp {
             // ничего не рисует.
             ctx.request_repaint();
         }));
+    }
+
+    /// Забирает сведения о видеокарте с адаптера, которым рисуется окно.
+    ///
+    /// Зовётся один раз при создании приложения, из того же места, что и
+    /// `catch_gpu_errors`, и по той же причине: `RenderState` виден только
+    /// здесь. Второй адаптер не открываем — этот уже готов, и данные с него
+    /// стоят ноль. Отдельным методом, а не внутри `catch_gpu_errors`: тот
+    /// про выживание процесса, этот про содержимое вкладки, и смешивать
+    /// два несвязанных дела в одном имени незачем.
+    ///
+    /// Обновлять нечего: адаптер у окна один на всю жизнь процесса.
+    pub fn read_gpu_info(&mut self, cc: &eframe::CreationContext<'_>) {
+        // `None` — сборка на glow либо wgpu не поднялся. Не ошибка: пункта
+        // про видеокарту в отчёте просто не будет.
+        let Some(state) = &cc.wgpu_render_state else {
+            return;
+        };
+        let info = state.adapter.get_info();
+
+        // Пустые строки у `AdapterInfo` — обычное дело: `driver` и
+        // `driver_info` приходят пустыми на Metal и на GL через ANGLE, и это
+        // штатно. Пустоту превращаем в `None` здесь, у самого источника,
+        // чтобы дальше по коду «нет данных» имело один-единственный вид.
+        let text = |s: String| (!s.trim().is_empty()).then_some(s);
+
+        self.gpu = text(info.name.clone()).map(|name| GpuInfo {
+            name,
+            kind: match info.device_type {
+                eframe::wgpu::DeviceType::DiscreteGpu => "дискретная",
+                eframe::wgpu::DeviceType::IntegratedGpu => "встроенная",
+                eframe::wgpu::DeviceType::VirtualGpu => "виртуальная",
+                // Программный растеризатор: карты нет вовсе или её драйвер
+                // не подошёл. Сказать об этом стоит — рисование в этом
+                // случае заметно медленнее.
+                eframe::wgpu::DeviceType::Cpu => "программная отрисовка",
+                eframe::wgpu::DeviceType::Other => "тип неизвестен",
+            },
+            // Ноль здесь — «идентификатор неизвестен», и звать по нему
+            // разбор вендора незачем: он ответил бы «Unknown».
+            vendor: (info.vendor != 0)
+                .then(|| eframe::egui_wgpu::parse_vendor_id(info.vendor))
+                .filter(|name| *name != "Unknown")
+                .map(str::to_owned),
+            // Имя драйвера и его версия лежат в разных полях, и порознь
+            // каждое бесполезно: «NVIDIA» без числа не отличает свежий
+            // драйвер от трёхлетнего. Склеиваем, но только непустые — на
+            // Metal и на GL через ANGLE оба поля приходят пустыми, и это
+            // штатно.
+            driver: match (text(info.driver.clone()), text(info.driver_info.clone())) {
+                (Some(name), Some(version)) => Some(format!("{name} {version}")),
+                (Some(one), None) | (None, Some(one)) => Some(one),
+                (None, None) => None,
+            },
+            backend: info.backend.to_string(),
+        });
     }
 
     /// Переносит пойманное в журнал. Зовётся из кадра, где это уже безопасно:
@@ -1837,7 +2007,10 @@ impl SavioApp {
                 // события попасть не могут. Ветка выписана явно, а не через
                 // `_`, чтобы компилятор и дальше требовал разбирать новые
                 // варианты `Event` во всех приёмниках.
-                Event::Tags(_) | Event::Cleaned(_) | Event::Versions(_) => {}
+                Event::Tags(_)
+                | Event::Cleaned(_)
+                | Event::Versions(_)
+                | Event::SystemReport(_) => {}
             }
         }
 
@@ -1909,7 +2082,8 @@ impl SavioApp {
                 | Event::Notice(_)
                 | Event::Tags(_)
                 | Event::Cleaned(_)
-                | Event::Versions(_) => {}
+                | Event::Versions(_)
+                | Event::SystemReport(_) => {}
             }
         }
 
@@ -2063,6 +2237,7 @@ impl eframe::App for SavioApp {
         self.drain_events(ui.ctx());
         self.tick_preview(ui.ctx());
         self.meta.drain();
+        self.system.drain();
         self.drain_versions();
         self.drain_gpu_errors();
 
@@ -2092,6 +2267,7 @@ impl eframe::App for SavioApp {
                                     Tab::Download => self.download_tab(ui),
                                     Tab::Metadata => self.metadata_tab(ui),
                                     Tab::History => self.history_tab(ui),
+                                    Tab::System => self.system_tab(ui),
                                 }
                             });
                     });
@@ -2123,10 +2299,17 @@ impl SavioApp {
         // Порядок здесь — порядок на экране. Новая вкладка добавляется строкой
         // сюда: ширину сегментов пересчитает цикл, делённого пополам числа
         // в коде больше нет.
-        const TABS: [(Tab, &str); 3] = [
+        // Подписи короткие не из вкусовщины. `segment_button` берёт
+        // переданную ширину как **минимум**, а не как потолок: egui кнопку
+        // под доступное место не сжимает, а раздвигает раскладку. При
+        // четырёх вкладках в окне шириной 520 на сегмент приходится около
+        // 118 точек, и «Проверка состояния системы» вытолкнула бы дорожку
+        // за кромку окна. Отсюда «Система» — то же самое одним словом.
+        const TABS: [(Tab, &str); 4] = [
             (Tab::Download, "Загрузка"),
             (Tab::Metadata, "Метаданные"),
             (Tab::History, "История"),
+            (Tab::System, "Система"),
         ];
 
         egui::Frame::new()
@@ -3906,6 +4089,146 @@ impl SavioApp {
         }
     }
 
+    /// Вкладка «Система»: что за машина и в каком она состоянии.
+    ///
+    /// Опрос запускается сам при первом открытии вкладки. Кнопка с пустым
+    /// экраном была бы лишним шагом: сюда заходят ровно за ответом, и
+    /// нажимать «Проверить», чтобы его увидеть, незачем.
+    fn system_tab(&mut self, ui: &mut egui::Ui) {
+        if !self.system.asked {
+            let ctx = ui.ctx().clone();
+            let gpu = self.gpu.clone();
+            self.system.start(gpu, &ctx);
+        }
+
+        self.system_header(ui);
+        ui.add_space(16.0);
+
+        if self.system.busy {
+            note(ui, &self.system.stage, theme::TEXT_SECONDARY);
+            return;
+        }
+
+        let Some(report) = &self.system.report else {
+            // Приёмник умер, а отчёт не приехал: поток сорвался, не отправив
+            // ничего. Показать «в порядке» тут нельзя — мы ничего не узнали.
+            note(
+                ui,
+                "Опрос не дал ответа. Попробуйте «Проверить снова».",
+                theme::TEXT_MUTED,
+            );
+            return;
+        };
+
+        for check in &report.checks {
+            check_card(ui, check);
+            ui.add_space(8.0);
+        }
+    }
+
+    /// Шапка вкладки: общий итог и две кнопки.
+    fn system_header(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::new()
+            .fill(theme::BG_SURFACE)
+            .stroke(egui::Stroke::new(1.0, theme::BORDER_SUBTLE))
+            .corner_radius(egui::CornerRadius::same(12))
+            .inner_margin(egui::Margin::same(18))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+
+                // Итог — обычной строкой с переносом: он длинный, а в
+                // горизонтальной раскладке egui положил бы его в одну строку
+                // любой длины и срезал кромкой окна.
+                let headline = match &self.system.report {
+                    Some(report) => report.headline(),
+                    None => "Сведения о железе этой машины.".to_owned(),
+                };
+                note(ui, &headline, theme::TEXT_SECONDARY);
+
+                ui.add_space(6.0);
+                // Оговорка про то, чего в отчёте нет. Без неё «нет данных»
+                // у половины пунктов выглядит поломкой Savio, а не отказом
+                // системы: человеку неоткуда узнать, что температуры и SMART
+                // без прав администратора недоступны в принципе.
+                note(
+                    ui,
+                    "Показано то, что система отдаёт без прав администратора. \
+                     Температуры, обороты вентиляторов и SMART накопителей \
+                     сюда не входят: без элевации их нельзя прочитать честно, \
+                     а показывать выдуманные значения хуже, чем не показывать \
+                     ничего.",
+                    theme::TEXT_MUTED,
+                );
+
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    const GAP: f32 = 10.0;
+                    ui.spacing_mut().item_spacing.x = GAP;
+                    let width = (ui.available_width() - GAP) / 2.0;
+
+                    let again = ui.add_enabled(
+                        !self.system.busy,
+                        egui::Button::new("Проверить снова")
+                            .min_size(egui::vec2(width, theme::CONTROL_HEIGHT)),
+                    );
+                    if again.clicked() {
+                        let ctx = ui.ctx().clone();
+                        let gpu = self.gpu.clone();
+                        self.system.start(gpu, &ctx);
+                    }
+
+                    let can_save = !self.system.busy && self.system.report.is_some();
+                    let save = ui
+                        .add_enabled(
+                            can_save,
+                            egui::Button::new("Сохранить отчёт…")
+                                .min_size(egui::vec2(width, theme::CONTROL_HEIGHT)),
+                        )
+                        .on_disabled_hover_text("Сначала дождитесь опроса.");
+                    if save.clicked() {
+                        self.save_report();
+                    }
+                });
+
+                if let Some((text, color)) = &self.system.saved {
+                    ui.add_space(10.0);
+                    note(ui, text, *color);
+                }
+            });
+    }
+
+    /// Кладёт отчёт в файл.
+    ///
+    /// Запись идёт прямо здесь, в кадре, и это тот редкий случай, когда так
+    /// можно: диалог выбора файла всё равно останавливает всё окно на время
+    /// своего показа, а сам отчёт — несколько килобайт текста. Заводить ради
+    /// него поток значило бы усложнить код там, где выигрыша нет.
+    fn save_report(&mut self) {
+        let Some(report) = &self.system.report else {
+            return;
+        };
+
+        let Some(path) = rfd::FileDialog::new()
+            .set_file_name("savio-система.txt")
+            .add_filter("Текстовый файл", &["txt"])
+            .save_file()
+        else {
+            // Диалог закрыли — это не отказ и не ошибка, говорить не о чем.
+            return;
+        };
+
+        self.system.saved = Some(match std::fs::write(&path, report.to_text()) {
+            Ok(()) => (
+                format!("Отчёт сохранён: {}", path.display()),
+                theme::STATE_SUCCESS,
+            ),
+            Err(err) => (
+                format!("Не удалось сохранить отчёт: {err}"),
+                theme::STATE_ERROR,
+            ),
+        });
+    }
+
     /// Одна строка истории.
     ///
     /// Карточка на каждую запись, а не одна на весь список: строки отделяются
@@ -4223,6 +4546,138 @@ fn time_field(
 /// и растянула бы содержимое прокрутки — см. комментарий в `banner`.
 fn note(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
     ui.add(egui::Label::new(egui::RichText::new(text).small().color(color)).wrap());
+}
+
+/// Цвет плашки статуса пункта отчёта.
+///
+/// «Нет данных» намеренно не красный и не зелёный, а приглушённый: это не
+/// беда и не благополучие, а отсутствие сведений. Покрасить его зелёным
+/// значило бы сказать «в порядке» про то, чего не смотрели, красным —
+/// напугать штатным положением дел.
+fn check_color(status: CheckStatus) -> egui::Color32 {
+    match status {
+        CheckStatus::Ok => theme::STATE_SUCCESS,
+        CheckStatus::Warning => theme::STATE_WARNING,
+        CheckStatus::Failed => theme::STATE_ERROR,
+        CheckStatus::Unknown => theme::TEXT_MUTED,
+    }
+}
+
+/// Карточка одного пункта отчёта.
+fn check_card(ui: &mut egui::Ui, check: &crate::model::Check) {
+    egui::Frame::new()
+        .fill(theme::BG_SURFACE)
+        .stroke(egui::Stroke::new(1.0, theme::BORDER_SUBTLE))
+        .corner_radius(egui::CornerRadius::same(theme::RADIUS_SMALL))
+        .inner_margin(egui::Margin::symmetric(14, 12))
+        .show(ui, |ui| {
+            // Иначе карточка сожмётся по ширине самой длинной строки, и у
+            // короткого пункта получилась бы узкая полоска посреди окна.
+            ui.set_width(ui.available_width());
+
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(&check.name)
+                            .strong()
+                            .color(theme::TEXT_PRIMARY),
+                    )
+                    .truncate(),
+                );
+                // Плашка прижата к правому краю: так статусы всех карточек
+                // стоят в одну колонку и читаются сверху вниз, не завися
+                // от длины заголовка.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    status_pill(ui, check.status.label(), check_color(check.status));
+                });
+            });
+
+            ui.add_space(6.0);
+            note(ui, &check.summary, theme::TEXT_SECONDARY);
+
+            if !check.rows.is_empty() {
+                ui.add_space(10.0);
+                for row in &check.rows {
+                    check_row(ui, row);
+                }
+            }
+
+            if let Some(advice) = &check.advice {
+                ui.add_space(10.0);
+                banner(ui, advice, theme::STATE_WARNING);
+            }
+        });
+}
+
+/// Строка «подпись — значение» внутри карточки.
+fn check_row(ui: &mut egui::Ui, row: &crate::model::CheckRow) {
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+
+        // Подпись занимает фиксированную долю ширины, чтобы значения
+        // выстроились в колонку. Доля, а не число точек: в окне 520 и в
+        // развёрнутом на два монитора нужны разные ширины, а колонка нужна
+        // в обеих.
+        let label_width = (ui.available_width() * 0.42).clamp(40.0, 200.0);
+        ui.allocate_ui_with_layout(
+            egui::vec2(label_width, 0.0),
+            egui::Layout::left_to_right(egui::Align::Min),
+            |ui| {
+                // `set_min_width` тут обязателен, хотя ширина уже запрошена
+                // выше, и это ровно та же грабля, что в `queue_row`:
+                // `allocate_ui_with_layout` двигает курсор не на запрошенный
+                // размер, а на тот, что реально занял потомок. Без него
+                // значения начинаются сразу за подписью, каждое на своём
+                // месте, и обещанной колонки не получается — у «Ядро»
+                // значение уезжает к левому краю, у «Точка монтирования»
+                // почти к середине. Ни сборка, ни тесты этого не видят.
+                ui.set_min_width(label_width);
+                // Подсказку с полным текстом обрезанная метка вешает сама
+                // (`show_tooltip_when_elided` включён по умолчанию). Свой
+                // `on_hover_text` здесь добавил бы вторую коробку с тем же
+                // текстом — это дефект 22, он уже случался.
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(&row.label)
+                            .small()
+                            .color(theme::TEXT_MUTED),
+                    )
+                    .truncate(),
+                );
+            },
+        );
+
+        match &row.value {
+            // `wrap()` обязателен: в горизонтальной раскладке egui берёт
+            // режим `Extend` и кладёт значение в одну строку любой длины —
+            // длинное имя USB-устройства ушло бы за кромку окна.
+            Some(value) => {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(value)
+                            .small()
+                            .color(theme::TEXT_SECONDARY),
+                    )
+                    .wrap(),
+                );
+            }
+            // Вот ради чего значение — `Option`. Прочерк, а не ноль и не
+            // пустое место: пустая строка выглядит недорисованной, а ноль
+            // читается как измеренная величина. Тон приглушённый — «нет
+            // данных» не должно спорить за внимание с настоящими числами.
+            None => {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new("—")
+                            .small()
+                            .color(theme::TEXT_MUTED),
+                    )
+                    .wrap(),
+                )
+                .on_hover_text("Система не сообщила это значение.");
+            }
+        }
+    });
 }
 
 fn field_label(ui: &mut egui::Ui, text: &'static str) {
