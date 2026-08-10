@@ -10,10 +10,12 @@ use eframe::egui;
 use crate::engine::settings;
 use crate::engine::setup;
 use crate::engine::{self, Handle, MetaTask, metadata};
+use crate::engine::monitor;
 use crate::model::{
     CheckStatus, CookieSource, DownloadId, DownloadOptions, Event, Format, GpuInfo, MediaInfo,
-    Progress, Quality, Request, Section, SectionError, SubLang, SystemReport, Tag, Thumbnail,
-    human_bytes, human_duration, human_speed, looks_like_url, meta_kind, parse_section,
+    Metric, PerfSample, Progress, Quality, Request, Section, SectionError, SubLang, SystemReport,
+    TRACE_LIMIT, Tag, Thumbnail, Trace, human_bytes, human_duration, human_speed, looks_like_url,
+    meta_kind, parse_section,
 };
 use crate::theme;
 
@@ -226,6 +228,7 @@ enum Tab {
     Metadata,
     History,
     System,
+    Monitor,
 }
 
 /// Сколько загрузок помним.
@@ -808,7 +811,8 @@ impl MetaPanel {
                 | Event::Warning(_)
                 | Event::Notice(_)
                 | Event::Versions(_)
-                | Event::SystemReport(_) => {}
+                | Event::SystemReport(_)
+                | Event::Perf(_) => {}
             }
         }
 
@@ -908,7 +912,8 @@ impl SystemPanel {
                 | Event::Notice(_)
                 | Event::Tags(_)
                 | Event::Cleaned(_)
-                | Event::Versions(_) => {}
+                | Event::Versions(_)
+                | Event::Perf(_) => {}
             }
         }
 
@@ -916,6 +921,249 @@ impl SystemPanel {
             self.rx = None;
             self.busy = false;
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Монитор производительности
+// ---------------------------------------------------------------------------
+
+/// Размер окна оверлея.
+///
+/// Фиксированный, и окно неизменяемое: содержимое у него — четыре строки
+/// известной длины, и растягивать его некуда. Заодно это снимает целый класс
+/// бед из дефекта 13: у окна, которому нельзя менять размер, не бывает
+/// клиентской части шире 8192 пикселей.
+///
+/// Ширина подобрана по самой длинной строке — «Приём 1.2 МБ/с · Отдача
+/// 128.0 КБ/с». На 230 точках она обрезалась многоточием, то есть оверлей
+/// показывал половину того, ради чего его открыли. Высота — под четыре
+/// строки и заголовок ровно с теми отступами, что заданы в `overlay_ui`:
+/// со штатными отступами темы (строка виджета 32 точки) четвёртая строка
+/// не влезала и молча пропадала.
+const OVERLAY_SIZE: [f32; 2] = [300.0, 122.0];
+
+/// Состояние вкладки «Монитор».
+///
+/// Устроена как `SystemPanel`: свой приёмник, работа в потоке, готовый
+/// результат приезжает событием. Отличие одно, и оно определяет всё
+/// остальное: снимок системы спрашивают однажды, а монитор — каждую секунду,
+/// пока на него смотрят. Отсюда и ручка опроса, и явный останов.
+struct MonitorPanel {
+    /// Последний замер. `None` — опрос только начался, первого замера ещё нет.
+    sample: Option<PerfSample>,
+    /// История загрузки процессора и памяти — для графиков.
+    cpu_trace: Trace,
+    mem_trace: Trace,
+    rx: Option<Receiver<Event>>,
+    /// Чем остановить опрос. `Some` — поток работает.
+    handle: Option<monitor::Handle>,
+
+    /// Показывать ли окно поверх остальных.
+    overlay: bool,
+    /// Пропускать ли щелчки мыши сквозь оверлей.
+    ///
+    /// Отдельная галочка, а не всегда включённый режим: с пропуском оверлей
+    /// нельзя ни передвинуть, ни закрыть его же кнопкой — щелчок уходит
+    /// в окно под ним. Поэтому по умолчанию выключен, а сказано об этом
+    /// рядом с галочкой.
+    passthrough: bool,
+    /// Оверлей попросили закрыть из него самого.
+    ///
+    /// Через общий флаг, а не напрямую: рисует оверлей замыкание, которому
+    /// до полей панели не дотянуться (`show_viewport_deferred` требует
+    /// `Send + Sync + 'static`).
+    overlay_closing: Arc<AtomicBool>,
+    /// То, что рисует оверлей. По той же причине — через общую ячейку.
+    overlay_sample: Arc<Mutex<Option<PerfSample>>>,
+    /// Кто такой оверлей для egui.
+    ///
+    /// Считается один раз и хранится полем, а не пересчитывается по имени
+    /// в каждом обращении: `ViewportId::from_hash_of` — это хеш строки, а
+    /// зовут его несколько раз за кадр. Константой его не сделать: функция
+    /// не `const`, а `ViewportId(Id::NULL)`, которым это тянет записать, —
+    /// это `ViewportId::ROOT`, то есть само главное окно.
+    overlay_id: egui::ViewportId,
+}
+
+impl MonitorPanel {
+    fn new() -> Self {
+        Self {
+            sample: None,
+            cpu_trace: Trace::default(),
+            mem_trace: Trace::default(),
+            rx: None,
+            handle: None,
+            overlay: false,
+            passthrough: false,
+            overlay_closing: Arc::new(AtomicBool::new(false)),
+            overlay_sample: Arc::new(Mutex::new(None)),
+            overlay_id: egui::ViewportId::from_hash_of("savio-overlay"),
+        }
+    }
+
+    /// Идёт ли опрос прямо сейчас.
+    fn running(&self) -> bool {
+        self.handle.is_some()
+    }
+
+    /// Включает и выключает опрос по тому, смотрят ли на него.
+    ///
+    /// Это и есть ответ на главный риск задачи: Savio в покое не тратит ни
+    /// кадра, а секундный опрос будит окно раз в секунду до конца дня. Пока
+    /// открыта вкладка или включён оверлей — есть кому смотреть; во всех
+    /// прочих случаях поток обязан остановиться, иначе загрузчик греет
+    /// ноутбук в фоне.
+    fn set_running(&mut self, wanted: bool, ctx: &egui::Context) {
+        if wanted == self.running() {
+            return;
+        }
+        if wanted {
+            self.start(ctx);
+        } else {
+            self.stop();
+        }
+    }
+
+    fn start(&mut self, ctx: &egui::Context) {
+        let (tx, rx) = channel();
+        let notify_ctx = ctx.clone();
+        self.handle = Some(monitor::start(tx, move || notify_ctx.request_repaint()));
+        self.rx = Some(rx);
+
+        // Прошлые числа и графики убираем: между двумя включениями монитора
+        // проходит сколько угодно времени, и склеенный с сегодняшним вчерашний
+        // график показал бы провал, которого не было.
+        self.sample = None;
+        self.cpu_trace.clear();
+        self.mem_trace.clear();
+    }
+
+    fn stop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.stop();
+        }
+        // Приёмник бросаем вместе с ручкой — как это делает `Preview::stop`.
+        // Замер, снятый в последний миг перед остановкой, уже не про то,
+        // что показано, и лечь в окно он не должен.
+        self.rx = None;
+    }
+
+    /// Забирает замеры, приехавшие с прошлого кадра.
+    fn drain(&mut self, ctx: &egui::Context) {
+        let mut events = Vec::new();
+        let mut disconnected = false;
+
+        if let Some(rx) = &self.rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(event) => events.push(event),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        for event in events {
+            match event {
+                Event::Perf(sample) => self.accept(sample, ctx),
+                // Остальное ходит по чужим каналам. Перечислено явно, а не
+                // через `_`, чтобы компилятор и дальше требовал разбирать
+                // новые варианты `Event` во всех приёмниках.
+                Event::Info(_)
+                | Event::Thumbnail(_)
+                | Event::Stage(_)
+                | Event::Progress(_)
+                | Event::Log(_)
+                | Event::Done { .. }
+                | Event::Failed { .. }
+                | Event::Ready
+                | Event::Warning(_)
+                | Event::Notice(_)
+                | Event::Tags(_)
+                | Event::Cleaned(_)
+                | Event::Versions(_)
+                | Event::SystemReport(_) => {}
+            }
+        }
+
+        if disconnected {
+            // Поток кончился сам — например, приёмник умер раньше ручки.
+            // Держать мёртвый канал и мёртвую ручку незачем: следующий кадр
+            // заведёт опрос заново, если на него всё ещё смотрят.
+            self.rx = None;
+            self.handle = None;
+        }
+    }
+
+    /// Принимает свежий замер.
+    fn accept(&mut self, sample: PerfSample, ctx: &egui::Context) {
+        // В график кладём только то, что система вправду сказала: `None`
+        // здесь означает «показания нет», и подставить на его месте ноль
+        // значило бы нарисовать провал загрузки, которого не было.
+        if let Some(cpu) = sample.cpu.percent {
+            self.cpu_trace.push(cpu);
+        }
+        if let Some(mem) = sample.mem.percent {
+            self.mem_trace.push(mem);
+        }
+
+        if let Ok(mut slot) = self.overlay_sample.lock() {
+            *slot = Some(sample.clone());
+        }
+        if self.overlay {
+            // Оверлею кадр надо просить отдельно: `request_repaint` из потока
+            // опроса будит главное окно, а дочернее окно egui само по себе
+            // за родителем не перерисовывается — числа в нём просто застыли
+            // бы до первого движения мышью над ним.
+            ctx.request_repaint_of(self.overlay_id);
+        }
+
+        self.sample = Some(sample);
+    }
+
+    /// Рисует оверлей, пока он включён.
+    ///
+    /// Зовётся каждый кадр: egui держит дочернее окно ровно до тех пор, пока
+    /// его просят на каждом проходе. Замыкание при этом собирается заново —
+    /// так требует API (`Fn + Send + Sync + 'static`), и дешевле этого здесь
+    /// ничего нет: сами данные лежат в общей ячейке и не копируются.
+    fn show_overlay(&mut self, ctx: &egui::Context) {
+        // Закрыли изнутри — гасим галочку и забываем просьбу: иначе окно,
+        // открытое заново, тут же закрылось бы старым флагом.
+        if self.overlay_closing.swap(false, Ordering::Relaxed) {
+            self.overlay = false;
+        }
+        if !self.overlay {
+            return;
+        }
+
+        let builder = egui::ViewportBuilder::default()
+            .with_title("Savio — монитор")
+            .with_inner_size(OVERLAY_SIZE)
+            // Оба предела равны размеру: окно без рамки всё равно нечем
+            // тянуть, а верхний предел заодно закрывает дорогу дефекту 13.
+            .with_min_inner_size(OVERLAY_SIZE)
+            .with_max_inner_size(OVERLAY_SIZE)
+            .with_resizable(false)
+            .with_decorations(false)
+            .with_always_on_top()
+            // В панели задач оверлею делать нечего: это не второе приложение,
+            // а полоска поверх игры.
+            .with_taskbar(false)
+            // Забирать фокус нельзя ни в коем случае: в игре это потеря
+            // управления, а в полноэкранной игре — ещё и сворачивание.
+            .with_active(false)
+            .with_mouse_passthrough(self.passthrough);
+
+        let sample = Arc::clone(&self.overlay_sample);
+        let closing = Arc::clone(&self.overlay_closing);
+        ctx.show_viewport_deferred(self.overlay_id, builder, move |ui, class| {
+            overlay_ui(ui, class, &sample, &closing);
+        });
     }
 }
 
@@ -1219,6 +1467,8 @@ pub struct SavioApp {
     meta: MetaPanel,
     /// Состояние вкладки «Система».
     system: SystemPanel,
+    /// Состояние вкладки «Монитор» и оверлея.
+    monitor: MonitorPanel,
     /// Чем eframe рисует это окно.
     ///
     /// Снимается один раз при создании приложения с того же адаптера, что уже
@@ -1308,6 +1558,7 @@ impl SavioApp {
             tab: Tab::Download,
             meta: MetaPanel::new(),
             system: SystemPanel::new(),
+            monitor: MonitorPanel::new(),
             gpu: None,
             history: History::default(),
             queue: Queue::new(),
@@ -2010,7 +2261,8 @@ impl SavioApp {
                 Event::Tags(_)
                 | Event::Cleaned(_)
                 | Event::Versions(_)
-                | Event::SystemReport(_) => {}
+                | Event::SystemReport(_)
+                | Event::Perf(_) => {}
             }
         }
 
@@ -2083,7 +2335,8 @@ impl SavioApp {
                 | Event::Tags(_)
                 | Event::Cleaned(_)
                 | Event::Versions(_)
-                | Event::SystemReport(_) => {}
+                | Event::SystemReport(_)
+                | Event::Perf(_) => {}
             }
         }
 
@@ -2238,8 +2491,16 @@ impl eframe::App for SavioApp {
         self.tick_preview(ui.ctx());
         self.meta.drain();
         self.system.drain();
+        self.monitor.drain(ui.ctx());
         self.drain_versions();
         self.drain_gpu_errors();
+
+        // Опрос железа стоит кадра в секунду — и стоит его, только пока есть
+        // кому смотреть. Решение принимается здесь, а не во вкладке: вкладка
+        // при закрытом мониторе не рисуется вовсе, и остановить опрос из неё
+        // было бы некому.
+        let watched = self.tab == Tab::Monitor || self.monitor.overlay;
+        self.monitor.set_running(watched, ui.ctx());
 
         if self.maximize_pending {
             self.maximize_pending = false;
@@ -2268,10 +2529,16 @@ impl eframe::App for SavioApp {
                                     Tab::Metadata => self.metadata_tab(ui),
                                     Tab::History => self.history_tab(ui),
                                     Tab::System => self.system_tab(ui),
+                                    Tab::Monitor => self.monitor_tab(ui),
                                 }
                             });
                     });
             });
+
+        // Оверлей — отдельное окно, и просить его надо на каждом проходе,
+        // иначе egui его закроет. Место здесь, а не во вкладке: оверлей живёт
+        // и при закрытой вкладке — ради этого он и нужен.
+        self.monitor.show_overlay(ui.ctx());
 
         // Модалки рисуются последними, поверх всего остального.
         let ctx = ui.ctx().clone();
@@ -2301,15 +2568,22 @@ impl SavioApp {
         // в коде больше нет.
         // Подписи короткие не из вкусовщины. `segment_button` берёт
         // переданную ширину как **минимум**, а не как потолок: egui кнопку
-        // под доступное место не сжимает, а раздвигает раскладку. При
-        // четырёх вкладках в окне шириной 520 на сегмент приходится около
-        // 118 точек, и «Проверка состояния системы» вытолкнула бы дорожку
-        // за кромку окна. Отсюда «Система» — то же самое одним словом.
-        const TABS: [(Tab, &str); 4] = [
+        // под доступное место не сжимает, а раздвигает раскладку. При пяти
+        // вкладках в окне шириной 520 на сегмент приходится около 92 точек,
+        // и «Проверка состояния системы» или «Монитор производительности»
+        // вытолкнули бы дорожку за кромку окна. Отсюда «Система» и
+        // «Монитор» — то же самое одним словом.
+        //
+        // Запас при этом кончился: самая длинная подпись здесь —
+        // «Метаданные», и на пятой вкладке она встала впритык. Шестая
+        // вкладка в дорожку уже не поместится, и добавлять её придётся
+        // не строкой сюда, а вместе с решением, что делать с шириной.
+        const TABS: [(Tab, &str); 5] = [
             (Tab::Download, "Загрузка"),
             (Tab::Metadata, "Метаданные"),
             (Tab::History, "История"),
             (Tab::System, "Система"),
+            (Tab::Monitor, "Монитор"),
         ];
 
         egui::Frame::new()
@@ -2849,65 +3123,34 @@ impl SavioApp {
         // здесь, но **после** отрисовки: `self` до конца замыкания занят.
         let mut changed = false;
 
-        let subs_on = ui.scope(|ui| {
-            // Штатная строка виджета — 32 точки (высота поля ввода). Для галочки
-            // это много: три подряд съели бы четверть окна минимальной высоты.
-            ui.spacing_mut().interact_size.y = 24.0;
+        checkbox(
+            ui,
+            &mut self.options.embed_metadata,
+            "Метаданные: название, автор, дата",
+            true,
+        );
+        checkbox(ui, &mut self.options.embed_thumbnail, "Обложку ролика", true);
+        changed |= checkbox(ui, &mut self.options.embed_subs, "Субтитры", subs_enabled)
+            .on_disabled_hover_text("Субтитры бывают только у видео — выберите MP4.")
+            .changed();
 
-            let v = ui.visuals_mut();
-            // `noninteractive` в списке не для полноты: выключенную галочку
-            // egui рисует именно им, и без него она осталась бы с чужим
-            // скруглением, то есть кружком-радиокнопкой.
-            for state in [
-                &mut v.widgets.noninteractive,
-                &mut v.widgets.inactive,
-                &mut v.widgets.hovered,
-                &mut v.widgets.active,
-            ] {
-                // Галочку egui рисует цветом `fg_stroke` — тем же, каким красит
-                // подпись рядом. Акцент нужен только самой галочке (в покое
-                // коробка пуста, и без цвета выбранное не отличить от
-                // невыбранного), поэтому подписям цвет задаётся отдельно,
-                // через `RichText`: он перебивает цвет по умолчанию.
-                state.fg_stroke = egui::Stroke::new(1.6, theme::ACCENT);
-                state.corner_radius = egui::CornerRadius::same(theme::RADIUS_TINY);
-                state.expansion = 0.0;
-            }
-            // Коробка «утоплена», как поле ввода и дорожка переключателя: на
-            // заливке карточки она иначе держится на одной тонкой рамке.
-            v.widgets.inactive.bg_fill = theme::BG_INPUT;
-
-            checkbox(
-                ui,
-                &mut self.options.embed_metadata,
-                "Метаданные: название, автор, дата",
-                true,
-            );
-            checkbox(ui, &mut self.options.embed_thumbnail, "Обложку ролика", true);
-            changed |= checkbox(ui, &mut self.options.embed_subs, "Субтитры", subs_enabled)
-                .on_disabled_hover_text("Субтитры бывают только у видео — выберите MP4.")
+        // Подчинённая галочка появляется вместе с субтитрами, а не висит
+        // выключенной рядом: без «Субтитров» она не значит ничего, а
+        // карточка и так длинная — в окне минимальной высоты каждый
+        // лишний постоянный ряд виден сразу.
+        let subs_on = subs_enabled && self.options.embed_subs;
+        if subs_on {
+            ui.horizontal(|ui| {
+                ui.add_space(SUBOPTION_INDENT);
+                changed |= checkbox(
+                    ui,
+                    &mut self.options.auto_subs,
+                    "Можно автоматические",
+                    true,
+                )
                 .changed();
-
-            // Подчинённая галочка появляется вместе с субтитрами, а не висит
-            // выключенной рядом: без «Субтитров» она не значит ничего, а
-            // карточка и так длинная — в окне минимальной высоты каждый
-            // лишний постоянный ряд виден сразу.
-            let subs_on = subs_enabled && self.options.embed_subs;
-            if subs_on {
-                ui.horizontal(|ui| {
-                    ui.add_space(SUBOPTION_INDENT);
-                    changed |= checkbox(
-                        ui,
-                        &mut self.options.auto_subs,
-                        "Можно автоматические",
-                        true,
-                    )
-                    .changed();
-                });
-            }
-            subs_on
-        })
-        .inner;
+            });
+        }
 
         // Оговорка про ffmpeg — статическая строка: в кадре ничего не собирается.
         if self.ffmpeg_missing && self.options.any() {
@@ -4229,6 +4472,106 @@ impl SavioApp {
         });
     }
 
+    /// Вкладка «Монитор»: что происходит с машиной прямо сейчас.
+    fn monitor_tab(&mut self, ui: &mut egui::Ui) {
+        self.monitor_header(ui);
+        ui.add_space(16.0);
+
+        let Some(sample) = &self.monitor.sample else {
+            note(
+                ui,
+                "Замеряю… Первые числа появятся через секунду: загрузка — это \
+                 разница между двумя замерами, и одной точки для неё мало.",
+                theme::TEXT_SECONDARY,
+            );
+            return;
+        };
+
+        metric_card(
+            ui,
+            "Процессор",
+            &sample.cpu,
+            &self.monitor.cpu_trace,
+            theme::ACCENT,
+        );
+        ui.add_space(8.0);
+
+        metric_card(
+            ui,
+            "Память",
+            &sample.mem,
+            &self.monitor.mem_trace,
+            theme::STATE_SUCCESS,
+        );
+        ui.add_space(8.0);
+
+        io_card(ui, sample, self.gpu.as_ref());
+        ui.add_space(8.0);
+
+        process_card(ui, &sample.procs);
+    }
+
+    /// Шапка вкладки: чем монитор занят и как включить оверлей.
+    fn monitor_header(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::new()
+            .fill(theme::BG_SURFACE)
+            .stroke(egui::Stroke::new(1.0, theme::BORDER_SUBTLE))
+            .corner_radius(egui::CornerRadius::same(12))
+            .inner_margin(egui::Margin::same(18))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+
+                note(
+                    ui,
+                    "Показания снимаются раз в секунду, пока открыта эта вкладка \
+                     или включён оверлей. В остальное время Savio ничего не \
+                     опрашивает и не тратит ни кадра.",
+                    theme::TEXT_SECONDARY,
+                );
+
+                ui.add_space(6.0);
+                // Та же оговорка, что и во вкладке «Система», и по той же
+                // причине: без неё отсутствие видеокарты в списке выглядит
+                // недоделкой Savio, а не отказом системы.
+                note(
+                    ui,
+                    "Загрузки видеокарты здесь нет: система отдаёт её только \
+                     через счётчики производительности, своих у каждой ОС и \
+                     у каждого производителя, — а показывать выдуманное число \
+                     хуже, чем не показывать ничего.",
+                    theme::TEXT_MUTED,
+                );
+
+                ui.add_space(14.0);
+                checkbox(
+                    ui,
+                    &mut self.monitor.overlay,
+                    "Оверлей поверх других окон",
+                    true,
+                );
+
+                ui.add_space(6.0);
+                let passthrough = checkbox(
+                    ui,
+                    &mut self.monitor.passthrough,
+                    "Пропускать щелчки мыши сквозь оверлей",
+                    self.monitor.overlay,
+                );
+                passthrough.on_disabled_hover_text("Сначала включите оверлей.");
+
+                ui.add_space(10.0);
+                note(
+                    ui,
+                    "Оверлей — обычное окно поверх остальных, и виден он только \
+                     в оконных и безрамочных играх. В полноэкранном режиме его \
+                     не будет: туда не пускают ни одно чужое окно. С пропуском \
+                     щелчков оверлей нельзя ни передвинуть, ни закрыть его же \
+                     кнопкой — только этой галочкой.",
+                    theme::TEXT_MUTED,
+                );
+            });
+    }
+
     /// Одна строка истории.
     ///
     /// Карточка на каждую запись, а не одна на весь список: строки отделяются
@@ -4475,24 +4818,58 @@ fn queue_row(ui: &mut egui::Ui, item: &QueueItem) -> bool {
     remove
 }
 
-/// Одна галочка «вшить в файл».
+/// Одна галочка.
 ///
-/// Цвет подписи задаём явно и не полагаемся на стиль: egui красит текст
-/// флажка тем же `fg_stroke`, которым рисует саму галочку, а он у нас
-/// акцентный — иначе весь список подписей стал бы жёлтым.
+/// Вид задан здесь, а не у места вызова, и это не вкусовщина. Коробка
+/// у флажка всего 16 точек в поперечнике, а общее скругление темы — 8:
+/// при нём она скругляется почти в кружок, то есть выглядит радиокнопкой —
+/// элементом с другим смыслом («одно из»), хотя галочки независимы. Пока
+/// эта настройка стояла у карточки «Вшить в файл», следующая галочка
+/// в другом месте окна получала именно кружок; ровно так и вышло с первой
+/// галочкой монитора. Ни сборка, ни `clippy`, ни тесты этого не видят.
 fn checkbox(
     ui: &mut egui::Ui,
     checked: &mut bool,
     label: &'static str,
     enabled: bool,
 ) -> egui::Response {
-    ui.add_enabled(
-        enabled,
-        egui::Checkbox::new(
-            checked,
-            egui::RichText::new(label).color(theme::TEXT_PRIMARY),
-        ),
-    )
+    ui.scope(|ui| {
+        // Штатная строка виджета — 32 точки (высота поля ввода). Для галочки
+        // это много: три подряд съели бы четверть окна минимальной высоты.
+        ui.spacing_mut().interact_size.y = 24.0;
+
+        let v = ui.visuals_mut();
+        // `noninteractive` в списке не для полноты: выключенную галочку
+        // egui рисует именно им, и без него она осталась бы с чужим
+        // скруглением, то есть тем самым кружком-радиокнопкой.
+        for state in [
+            &mut v.widgets.noninteractive,
+            &mut v.widgets.inactive,
+            &mut v.widgets.hovered,
+            &mut v.widgets.active,
+        ] {
+            // Галочку egui рисует цветом `fg_stroke` — тем же, каким красит
+            // подпись рядом. Акцент нужен только самой галочке (в покое
+            // коробка пуста, и без цвета выбранное не отличить от
+            // невыбранного), поэтому подписи цвет задаётся отдельно, через
+            // `RichText`: он перебивает цвет по умолчанию.
+            state.fg_stroke = egui::Stroke::new(1.6, theme::ACCENT);
+            state.corner_radius = egui::CornerRadius::same(theme::RADIUS_TINY);
+            state.expansion = 0.0;
+        }
+        // Коробка «утоплена», как поле ввода и дорожка переключателя: на
+        // заливке карточки она иначе держится на одной тонкой рамке.
+        v.widgets.inactive.bg_fill = theme::BG_INPUT;
+
+        ui.add_enabled(
+            enabled,
+            egui::Checkbox::new(
+                checked,
+                egui::RichText::new(label).color(theme::TEXT_PRIMARY),
+            ),
+        )
+    })
+    .inner
 }
 
 /// Красная рамка у поля, в котором ошиблись: в покое, при наведении и в фокусе.
@@ -4611,6 +4988,18 @@ fn check_card(ui: &mut egui::Ui, check: &crate::model::Check) {
 
 /// Строка «подпись — значение» внутри карточки.
 fn check_row(ui: &mut egui::Ui, row: &crate::model::CheckRow) {
+    stat_row(ui, &row.label, row.value.as_deref());
+}
+
+/// Строка «подпись — значение» в колонку.
+///
+/// Отделена от `check_row` ради монитора: у него значения приезжают готовыми
+/// строками внутри замера, и заворачивать их в `CheckRow` пришлось бы каждый
+/// кадр — то есть заводить по аллокации на строку шестьдесят раз в секунду
+/// ровно там, где Правило 1 этого и не велит. Вид у строк при этом обязан
+/// остаться общим: две одинаковые на вид таблицы, разъехавшиеся по вёрстке,
+/// выглядят небрежностью.
+fn stat_row(ui: &mut egui::Ui, label: &str, value: Option<&str>) {
     ui.horizontal_top(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
 
@@ -4638,7 +5027,7 @@ fn check_row(ui: &mut egui::Ui, row: &crate::model::CheckRow) {
                 // текстом — это дефект 22, он уже случался.
                 ui.add(
                     egui::Label::new(
-                        egui::RichText::new(&row.label)
+                        egui::RichText::new(label)
                             .small()
                             .color(theme::TEXT_MUTED),
                     )
@@ -4647,7 +5036,7 @@ fn check_row(ui: &mut egui::Ui, row: &crate::model::CheckRow) {
             },
         );
 
-        match &row.value {
+        match value {
             // `wrap()` обязателен: в горизонтальной раскладке egui берёт
             // режим `Extend` и кладёт значение в одну строку любой длины —
             // длинное имя USB-устройства ушло бы за кромку окна.
@@ -4704,6 +5093,410 @@ fn status_pill(ui: &mut egui::Ui, label: &str, color: egui::Color32) {
                 ui.label(egui::RichText::new(label).small().strong().color(color));
             });
         });
+}
+
+// ---------------------------------------------------------------------------
+// Монитор: карточки, графики, оверлей
+// ---------------------------------------------------------------------------
+
+/// Прочерк на месте отсутствующего значения.
+///
+/// Одной константой, а не литералом по месту: прочерк здесь — не украшение,
+/// а способ сказать «нет данных», и он обязан выглядеть одинаково везде.
+const DASH: &str = "—";
+
+/// Карточка показателя: крупное число, график и подпись.
+fn metric_card(
+    ui: &mut egui::Ui,
+    title: &str,
+    metric: &Metric,
+    trace: &Trace,
+    color: egui::Color32,
+) {
+    egui::Frame::new()
+        .fill(theme::BG_SURFACE)
+        .stroke(egui::Stroke::new(1.0, theme::BORDER_SUBTLE))
+        .corner_radius(egui::CornerRadius::same(theme::RADIUS_SMALL))
+        .inner_margin(egui::Margin::symmetric(14, 12))
+        .show(ui, |ui| {
+            // Иначе карточка сожмётся по ширине своего заголовка.
+            ui.set_width(ui.available_width());
+
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(title)
+                            .strong()
+                            .color(theme::TEXT_PRIMARY),
+                    )
+                    .truncate(),
+                );
+                // Число прижато к правому краю: так проценты всех карточек
+                // стоят в одну колонку и читаются сверху вниз.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let text = metric.percent_text.as_deref().unwrap_or(DASH);
+                    ui.label(egui::RichText::new(text).heading().color(color));
+                });
+            });
+
+            ui.add_space(8.0);
+            trace_plot(ui, trace, color);
+
+            if let Some(detail) = &metric.detail {
+                ui.add_space(6.0);
+                note(ui, detail, theme::TEXT_SECONDARY);
+            }
+        });
+}
+
+/// Полоска-график: последние замеры, слева самый старый.
+///
+/// Шкала жёстко от нуля до ста, а не «по максимуму в окне». Автомасштаб
+/// нарисовал бы у простаивающей машины ту же гору, что у загруженной, —
+/// график, который врёт ровно в ту сторону, в какую на него смотрят.
+fn trace_plot(ui: &mut egui::Ui, trace: &Trace, color: egui::Color32) {
+    const HEIGHT: f32 = 44.0;
+
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), HEIGHT),
+        egui::Sense::hover(),
+    );
+    let painter = ui.painter();
+    painter.rect_filled(
+        rect,
+        egui::CornerRadius::same(theme::RADIUS_TINY),
+        theme::BG_INPUT,
+    );
+    // Одна линия сетки, на половине шкалы. Пять линий на сорока четырёх
+    // точках высоты слились бы в серый прямоугольник.
+    painter.line_segment(
+        [
+            egui::pos2(rect.left(), rect.center().y),
+            egui::pos2(rect.right(), rect.center().y),
+        ],
+        egui::Stroke::new(1.0, theme::BORDER_SUBTLE),
+    );
+
+    // Одной точке рисовать нечего: линия начинается с отрезка.
+    let filled = trace.iter().len();
+    if filled < 2 {
+        return;
+    }
+
+    // Шаг считаем по потолку буфера, а не по числу набранных точек: иначе
+    // первые секунды график растягивался бы на всю ширину и «сжимался» по
+    // мере наполнения — движение, которого на самом деле не было.
+    let step = rect.width() / (TRACE_LIMIT - 1) as f32;
+    let newest = filled - 1;
+
+    // Одна ломаная, а не сто девятнадцать отрезков: `Shape::line` кладёт
+    // в список отрисовки один объект, отдельные `line_segment` — по одному
+    // на каждую пару точек.
+    let points: Vec<egui::Pos2> = trace
+        .iter()
+        .enumerate()
+        .map(|(i, value)| {
+            egui::pos2(
+                rect.right() - (newest - i) as f32 * step,
+                rect.bottom() - (value / 100.0).clamp(0.0, 1.0) * rect.height(),
+            )
+        })
+        .collect();
+    painter.add(egui::Shape::line(
+        points,
+        egui::Stroke::new(1.5, color),
+    ));
+}
+
+/// Карточка «Ввод-вывод»: сеть, диски и видеокарта.
+///
+/// Втроём в одной карточке, потому что у всех троих одна беда: показать
+/// про них можно строку, а не график. Своя карточка на строку превратила бы
+/// вкладку в лестницу из рамок.
+fn io_card(ui: &mut egui::Ui, sample: &PerfSample, gpu: Option<&GpuInfo>) {
+    egui::Frame::new()
+        .fill(theme::BG_SURFACE)
+        .stroke(egui::Stroke::new(1.0, theme::BORDER_SUBTLE))
+        .corner_radius(egui::CornerRadius::same(theme::RADIUS_SMALL))
+        .inner_margin(egui::Margin::symmetric(14, 12))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new("Ввод-вывод")
+                        .strong()
+                        .color(theme::TEXT_PRIMARY),
+                )
+                .truncate(),
+            );
+
+            ui.add_space(8.0);
+            stat_row(ui, "Сеть", sample.net.as_deref());
+            stat_row(ui, "Диски", sample.disk.as_deref());
+            stat_row(ui, "Подкачка", sample.swap.detail.as_deref());
+            // Видеокарта здесь только именем: загрузку у неё не спросить,
+            // а имя уже снято с адаптера, которым eframe рисует окно.
+            stat_row(ui, "Видеокарта", gpu.map(|gpu| gpu.name.as_str()));
+        });
+}
+
+/// Карточка со списком процессов.
+fn process_card(ui: &mut egui::Ui, procs: &[crate::model::ProcRow]) {
+    egui::Frame::new()
+        .fill(theme::BG_SURFACE)
+        .stroke(egui::Stroke::new(1.0, theme::BORDER_SUBTLE))
+        .corner_radius(egui::CornerRadius::same(theme::RADIUS_SMALL))
+        .inner_margin(egui::Margin::symmetric(14, 12))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new("Процессы")
+                        .strong()
+                        .color(theme::TEXT_PRIMARY),
+                )
+                .truncate(),
+            );
+
+            ui.add_space(4.0);
+            if procs.is_empty() {
+                note(
+                    ui,
+                    "Список процессов система не отдала.",
+                    theme::TEXT_MUTED,
+                );
+                return;
+            }
+
+            note(
+                ui,
+                "Сверху те, кто занимает процессор. Доля уже поделена на \
+                 число ядер, поэтому сумма по списку не превышает ста.",
+                theme::TEXT_MUTED,
+            );
+            ui.add_space(8.0);
+
+            // Своей прокрутки здесь нет: вкладка целиком лежит в общей, а
+            // вложенная полоса рядом с внешней схлопывает содержимое (это
+            // дефект 27, он уже случался с журналом). Список короткий —
+            // `PROC_LIMIT` строк, — и в общей прокрутке помещается весь.
+            for row in procs {
+                process_row(ui, row);
+            }
+        });
+}
+
+/// Одна строка списка процессов.
+fn process_row(ui: &mut egui::Ui, row: &crate::model::ProcRow) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        // Раскладка справа налево: числа кладутся первыми и занимают
+        // ровно себя, а имени достаётся остаток строки. Слева направо
+        // длинное имя процесса вытолкнуло бы за кромку окна как раз то,
+        // ради чего в список и смотрят.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(&row.mem_text)
+                        .small()
+                        .color(theme::TEXT_SECONDARY),
+                )
+                .truncate(),
+            );
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(&row.cpu_text)
+                        .small()
+                        .strong()
+                        .color(theme::TEXT_PRIMARY),
+                )
+                .truncate(),
+            );
+            // Имени достаётся весь остаток строки, и вложенная раскладка
+            // здесь обязательна: в `right_to_left` метка занимает ровно
+            // себя и прижимается к правому краю — без неё вся строка
+            // сползает вправо, а слева остаётся пустое поле во всю ширину
+            // окна. Проверено глазами: ни сборка, ни тесты этого не видят.
+            //
+            // Подсказку с полным именем обрезанная метка вешает сама —
+            // свой `on_hover_text` добавил бы вторую (дефект 22).
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(&row.name)
+                            .small()
+                            .color(theme::TEXT_SECONDARY),
+                    )
+                    .truncate(),
+                );
+            });
+        });
+    });
+
+    // Полоска под строкой: список читается глазами по ней, а не по числам.
+    let (bar, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), 3.0),
+        egui::Sense::hover(),
+    );
+    let radius = egui::CornerRadius::same(2);
+    let painter = ui.painter();
+    painter.rect_filled(bar, radius, theme::PROGRESS_TRACK);
+    let filled = egui::Rect::from_min_size(
+        bar.min,
+        egui::vec2(bar.width() * (row.cpu / 100.0).clamp(0.0, 1.0), bar.height()),
+    );
+    painter.rect_filled(filled, radius, theme::ACCENT);
+    ui.add_space(6.0);
+}
+
+/// Содержимое оверлея.
+///
+/// Свободная функция, а не метод: замыкание дочернего окна обязано быть
+/// `Send + Sync + 'static` (так требует `show_viewport_deferred`), то есть
+/// до полей `SavioApp` ему не дотянуться. Всё, что оно видит, приходит
+/// через `Arc`.
+///
+/// Прозрачным окно намеренно не сделано, хотя просится. Подробности —
+/// в CLAUDE.md, коротко: у wgpu прозрачность включается на весь `Painter`
+/// сразу и берётся из настроек **главного** окна, а поверхность обычного
+/// окна на Windows отдаёт единственный режим смешения — непрозрачный.
+/// Запрос прозрачности собрался бы, прошёл бы clippy и тесты — и уехал бы
+/// в `log::warn`, которого никто не увидит.
+fn overlay_ui(
+    ui: &mut egui::Ui,
+    class: egui::ViewportClass,
+    sample: &Mutex<Option<PerfSample>>,
+    closing: &AtomicBool,
+) {
+    // Окно закрыли системой — Alt+F4 или «Закрыть» из панели задач. Гасить
+    // галочку отсюда некому, поэтому передаём просьбу главному окну.
+    if ui.ctx().input(|i| i.viewport().close_requested()) {
+        closing.store(true, Ordering::Relaxed);
+    }
+
+    egui::CentralPanel::default()
+        .frame(
+            egui::Frame::new()
+                .fill(theme::BG_SURFACE)
+                .stroke(egui::Stroke::new(1.0, theme::BORDER_STRONG))
+                .inner_margin(egui::Margin::symmetric(12, 10)),
+        )
+        .show(ui, |ui| {
+            // Отступы темы рассчитаны на окно, а не на полоску в треть его
+            // ширины: штатная строка виджета — 32 точки, и четыре строки
+            // с заголовком не поместились бы в оверлей никакой разумной
+            // высоты. Правится здесь, а не в теме: там эти числа держат
+            // раскладку главного окна.
+            ui.spacing_mut().interact_size.y = 0.0;
+            ui.spacing_mut().item_spacing.y = 4.0;
+            ui.spacing_mut().button_padding = egui::vec2(8.0, 2.0);
+
+            // Выделение текста здесь выключено не ради вида, а ради
+            // перетаскивания. Подписи у egui по умолчанию выделяемые, то есть
+            // сами ловят нажатие и протаскивание, — и окно, схваченное за
+            // строку «ЦП 24%», не двигалось никуда. Проверено вживую: за пустое
+            // место оверлей тянулся, за любую надпись — нет, а надписи занимают
+            // почти всю его площадь. Ни сборка, ни `clippy`, ни тесты этого
+            // не видят: и там и там нажатие «сработало», просто на другом
+            // виджете. Выделять в оверлее всё равно нечего — числа меняются
+            // раз в секунду.
+            ui.style_mut().interaction.selectable_labels = false;
+
+            // Перетаскивание вешаем ПЕРВЫМ, до кнопки: у egui щелчок достаётся
+            // тому, кого положили позже. Наоборот — и кнопка «Закрыть»
+            // перестала бы нажиматься, а окно ездило бы по экрану от каждого
+            // тычка в неё.
+            //
+            // Своего заголовка у окна нет (`with_decorations(false)`), так что
+            // без этого оверлей нельзя было бы сдвинуть с того места, куда его
+            // поставила система. Во встроенном окне (`EmbeddedWindow`, сборка
+            // без поддержки нескольких окон) команда бессмысленна: там его
+            // таскает сам egui за свою рамку.
+            if class != egui::ViewportClass::EmbeddedWindow {
+                let drag = ui.interact(
+                    ui.max_rect(),
+                    ui.id().with("savio-overlay-drag"),
+                    egui::Sense::click_and_drag(),
+                );
+                // Спрашиваем «кнопка нажата на нас», а не `drag_started`, и это
+                // не придирка: как только команда ушла, окно уводит система —
+                // мышь захватывает её собственный цикл перетаскивания, и до
+                // egui события больше не доходят. Порога сдвига, по которому
+                // `drag_started` только и срабатывает, оно набрать не успевает,
+                // так что оверлей просто не двигался. Проверено вживую: с
+                // `drag_started` сдвиг ровно ноль. Так же устроен и штатный
+                // пример egui с окном без рамки.
+                if drag.is_pointer_button_down_on() {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
+            }
+
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new("Savio")
+                            .small()
+                            .strong()
+                            .color(theme::TEXT_MUTED),
+                    )
+                    .truncate(),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Словом, а не крестиком: своих шрифтов Savio не
+                    // подключает, а в тех, что кладёт eframe, знаки вроде
+                    // `✕` рисуются пустым прямоугольником — ровно так уже
+                    // вышло со стрелкой `→` (Правило 4).
+                    let close =
+                        ui.add(egui::Button::new(egui::RichText::new("Закрыть").small()));
+                    if close.clicked() {
+                        closing.store(true, Ordering::Relaxed);
+                    }
+                });
+            });
+
+            ui.add_space(6.0);
+
+            let Ok(slot) = sample.lock() else {
+                return;
+            };
+            let Some(sample) = slot.as_ref() else {
+                note(ui, "Замеряю…", theme::TEXT_MUTED);
+                return;
+            };
+
+            overlay_row(ui, "ЦП", sample.cpu.percent_text.as_deref());
+            overlay_row(ui, "ОЗУ", sample.mem.percent_text.as_deref());
+            overlay_row(ui, "Сеть", sample.net.as_deref());
+            overlay_row(ui, "Диск", sample.disk.as_deref());
+        });
+}
+
+/// Одна строка оверлея.
+///
+/// Своя, а не `stat_row`: там подпись занимает 42% ширины ради колонки из
+/// длинных названий, а здесь подписи в три буквы и места всего 230 точек —
+/// колонка съела бы половину окна.
+fn overlay_row(ui: &mut egui::Ui, label: &str, value: Option<&str>) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(label)
+                    .small()
+                    .color(theme::TEXT_MUTED),
+            )
+            .truncate(),
+        );
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(value.unwrap_or(DASH))
+                    .small()
+                    .strong()
+                    .color(theme::TEXT_PRIMARY),
+            )
+            .truncate(),
+        );
+    });
 }
 
 /// Сообщение об ошибке или предупреждение: цветная полоса слева, текст справа.
