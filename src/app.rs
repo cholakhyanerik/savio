@@ -11,11 +11,12 @@ use crate::engine::settings;
 use crate::engine::setup;
 use crate::engine::{self, Handle, MetaTask, metadata};
 use crate::engine::monitor;
+use crate::engine::power;
 use crate::model::{
-    CheckStatus, CookieSource, DownloadId, DownloadOptions, Event, Format, GpuInfo, MediaInfo,
-    Metric, PerfSample, Progress, Quality, Request, Section, SectionError, SubLang, SystemReport,
-    TRACE_LIMIT, Tag, Thumbnail, Trace, human_bytes, human_duration, human_speed, looks_like_url,
-    meta_kind, parse_section,
+    BALANCED_PLAN, CheckStatus, CookieSource, DownloadId, DownloadOptions, Event, Format, GpuInfo,
+    MediaInfo, Metric, PerfSample, PowerMode, PowerModes, PowerState, Progress, Quality, Request,
+    Section, SectionError, SubLang, SystemReport, TRACE_LIMIT, Tag, Thumbnail, Trace, human_bytes,
+    human_duration, human_speed, looks_like_url, meta_kind, parse_section,
 };
 use crate::theme;
 
@@ -830,6 +831,7 @@ impl MetaPanel {
                 | Event::Notice(_)
                 | Event::Versions(_)
                 | Event::SystemReport(_)
+                | Event::Power(_)
                 | Event::Perf(_) => {}
             }
         }
@@ -931,6 +933,7 @@ impl SystemPanel {
                 | Event::Tags(_)
                 | Event::Cleaned(_)
                 | Event::Versions(_)
+                | Event::Power(_)
                 | Event::Perf(_) => {}
             }
         }
@@ -940,6 +943,196 @@ impl SystemPanel {
             self.busy = false;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Питание
+// ---------------------------------------------------------------------------
+
+/// Состояние карточки «Питание».
+///
+/// Устроена как `SystemPanel`: свой приёмник на каждый запуск, работа в
+/// потоке, готовый ответ приезжает событием. Отличие в том, когда спрашивают.
+/// Снимок железа берут по кнопке, а питание перечитывается само — при каждом
+/// открытии половины «Сейчас» и после каждого переключения. Иначе кнопки
+/// показывали бы вчерашнее положение: схему и режим меняют и мимо Savio,
+/// из параметров Windows.
+struct PowerPanel {
+    state: PowerState,
+    /// Спрашивали ли хоть раз. До первого ответа кнопок нет вовсе — рисовать
+    /// переключатель, не зная его положения, значит выдумать положение.
+    asked: bool,
+    /// Идёт чтение или переключение: кнопки на это время выключены.
+    busy: bool,
+    /// Открыта ли половина «Сейчас». По изменению этого флага и идёт
+    /// перечитывание.
+    open: bool,
+    /// Итог последнего переключения: текст и цвет.
+    outcome: Option<(String, egui::Color32)>,
+    /// Оговорка под рядом режимов. Собирается на приёме события, а не в кадре
+    /// отрисовки: `format!` в `ui()` — это аллокация шестьдесят раз в секунду
+    /// ради строки, которая меняется раз в минуту (Правило 1).
+    hint: String,
+    rx: Option<Receiver<Event>>,
+}
+
+impl PowerPanel {
+    fn new() -> Self {
+        Self {
+            state: PowerState::default(),
+            asked: false,
+            busy: false,
+            open: false,
+            outcome: None,
+            hint: String::new(),
+            rx: None,
+        }
+    }
+
+    /// Перечитывает состояние, когда половину «Сейчас» открыли.
+    ///
+    /// Именно по открытию, а не каждую секунду вместе с замерами монитора:
+    /// чтение стоит запуска потока, а меняется питание раз в день. И не
+    /// однажды за весь запуск: половину открывают ровно тогда, когда хотят
+    /// увидеть, что с машиной сейчас.
+    fn watch(&mut self, open: bool, ctx: &egui::Context) {
+        if open && !self.open {
+            self.start(ctx);
+        }
+        self.open = open;
+    }
+
+    fn start(&mut self, ctx: &egui::Context) {
+        let (tx, rx) = channel();
+        let notify_ctx = ctx.clone();
+        engine::power::start(tx, move || notify_ctx.request_repaint());
+
+        self.rx = Some(rx);
+        self.busy = true;
+        self.asked = true;
+    }
+
+    /// Просит систему переключиться и перечитать состояние.
+    fn change(&mut self, change: power::Change, ctx: &egui::Context) {
+        let (tx, rx) = channel();
+        let notify_ctx = ctx.clone();
+        engine::power::start_change(change, tx, move || notify_ctx.request_repaint());
+
+        self.rx = Some(rx);
+        self.busy = true;
+        self.asked = true;
+        // Прошлый итог относился к прошлому нажатию: оставить его рядом
+        // с новым — прямой повод их перепутать.
+        self.outcome = None;
+    }
+
+    /// Принимает свежее состояние и пересобирает оговорку под ним.
+    fn accept(&mut self, state: PowerState) {
+        self.hint = power_hint(&state);
+        self.state = state;
+    }
+
+    fn drain(&mut self) {
+        let mut events = Vec::new();
+        let mut disconnected = false;
+
+        if let Some(rx) = &self.rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(event) => events.push(event),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        for event in events {
+            match event {
+                Event::Power(state) => {
+                    self.accept(state);
+                    self.busy = false;
+                }
+                // Переключилось и проверено перечитыванием.
+                Event::Notice(text) => self.outcome = Some((text, theme::STATE_SUCCESS)),
+                // Система приняла просьбу, но работает по-прежнему. Не ошибка
+                // и не успех — свой цвет (Правило 6).
+                Event::Warning(text) => self.outcome = Some((text, theme::STATE_WARNING)),
+                Event::Failed { message, .. } => {
+                    self.outcome = Some((message, theme::STATE_ERROR));
+                    self.busy = false;
+                }
+                // Остальное ходит по чужим каналам. Перечислено явно, а не
+                // через `_`, чтобы компилятор и дальше требовал разбирать
+                // новые варианты `Event` во всех приёмниках.
+                Event::Info(_)
+                | Event::Thumbnail(_)
+                | Event::Stage(_)
+                | Event::Progress(_)
+                | Event::Log(_)
+                | Event::Done { .. }
+                | Event::Ready
+                | Event::Tags(_)
+                | Event::Cleaned(_)
+                | Event::Versions(_)
+                | Event::SystemReport(_)
+                | Event::Perf(_) => {}
+            }
+        }
+
+        if disconnected {
+            self.rx = None;
+            self.busy = false;
+        }
+    }
+}
+
+/// Оговорка под рядом режимов питания: чего ждать от нажатия.
+///
+/// Свободная функция, а не метод панели, потому что она чистая: из состояния
+/// делается строка, и ничего больше. Так её и проверяют тесты — а проверять
+/// её надо, потому что это единственное место, где Savio предупреждает
+/// о молчаливом отказе Windows **до** нажатия, а не после.
+fn power_hint(state: &PowerState) -> String {
+    let PowerModes::Known { effective, ignored } = state.modes else {
+        return String::new();
+    };
+
+    // Название сбалансированной схемы берём из списка, а не пишем своё: на
+    // английской Windows она называется «Balanced», и подменять её название
+    // значило бы отправить человека искать в системе то, чего там нет.
+    let balanced = state
+        .plan_name(BALANCED_PLAN)
+        .unwrap_or("Сбалансированная");
+    // Как назвать активную схему: по имени, если система его дала, и
+    // обезличенно, если нет. Пустое место вместо названия читалось бы как
+    // недорисованная строка, а выдуманное имя — как чужая схема.
+    let active = match state.active_name() {
+        Some(name) => format!("«{name}»"),
+        None => "другая схема".to_owned(),
+    };
+
+    if let Some(stored) = ignored {
+        return format!(
+            "Windows запомнила режим «{}», но машина работает в другом: {}. \
+             Режим питания применяется только при схеме «{balanced}», \
+             а сейчас активна {active}.",
+            stored.label(),
+            effective.map_or("система его не назвала", PowerMode::label),
+        );
+    }
+
+    if state.active.is_some_and(|id| id != BALANCED_PLAN) {
+        return format!(
+            "Сейчас активна {active}, а режим питания Windows применяет только \
+             при «{balanced}»: выбор она запомнит, но машина будет работать \
+             по-прежнему."
+        );
+    }
+
+    String::new()
 }
 
 // ---------------------------------------------------------------------------
@@ -1104,6 +1297,7 @@ impl MonitorPanel {
                 | Event::Tags(_)
                 | Event::Cleaned(_)
                 | Event::Versions(_)
+                | Event::Power(_)
                 | Event::SystemReport(_) => {}
             }
         }
@@ -1508,6 +1702,8 @@ pub struct SavioApp {
     system: SystemPanel,
     /// Состояние вкладки «Монитор» и оверлея.
     monitor: MonitorPanel,
+    /// Состояние карточки «Питание» на половине «Сейчас».
+    power: PowerPanel,
     /// Чем eframe рисует это окно.
     ///
     /// Снимается один раз при создании приложения с того же адаптера, что уже
@@ -1609,6 +1805,7 @@ impl SavioApp {
             meta: MetaPanel::new(),
             system: SystemPanel::new(),
             monitor: MonitorPanel::new(),
+            power: PowerPanel::new(),
             gpu: None,
             history: History::default(),
             queue: Queue::new(),
@@ -2332,6 +2529,7 @@ impl SavioApp {
                 | Event::Cleaned(_)
                 | Event::Versions(_)
                 | Event::SystemReport(_)
+                | Event::Power(_)
                 | Event::Perf(_) => {}
             }
         }
@@ -2406,6 +2604,7 @@ impl SavioApp {
                 | Event::Cleaned(_)
                 | Event::Versions(_)
                 | Event::SystemReport(_)
+                | Event::Power(_)
                 | Event::Perf(_) => {}
             }
         }
@@ -2602,6 +2801,7 @@ impl eframe::App for SavioApp {
         self.meta.drain();
         self.system.drain();
         self.monitor.drain(ui.ctx());
+        self.power.drain();
         self.drain_versions();
         self.drain_gpu_errors();
 
@@ -2609,9 +2809,14 @@ impl eframe::App for SavioApp {
         // кому смотреть. Решение принимается здесь, а не во вкладке: вкладка
         // при закрытом мониторе не рисуется вовсе, и остановить опрос из неё
         // было бы некому.
-        let watched =
-            (self.tab == Tab::Machine && self.machine_tab == MachineTab::Now) || self.monitor.overlay;
+        let now_open = self.tab == Tab::Machine && self.machine_tab == MachineTab::Now;
+        let watched = now_open || self.monitor.overlay;
         self.monitor.set_running(watched, ui.ctx());
+        // Питание перечитывается по открытию половины, а не по кадру: оно
+        // меняется раз в день, но меняют его и мимо Savio. Место здесь, а не
+        // во вкладке, по той же причине, что и у опроса: закрытая половина
+        // не рисуется, и заметить её закрытие из неё самой некому.
+        self.power.watch(now_open, ui.ctx());
 
         if self.maximize_pending {
             self.maximize_pending = false;
@@ -4798,6 +5003,13 @@ impl SavioApp {
         self.monitor_header(ui);
         ui.add_space(14.0);
 
+        // Питание — до показаний, а не после: это единственный орган
+        // управления на всей половине, а показания под ним — ровно то, на
+        // что он влияет. И до ожидания первого замера тоже: ждать секунду,
+        // чтобы показать переключатель, незачем.
+        self.power_card(ui);
+        ui.add_space(14.0);
+
         let Some(sample) = &self.monitor.sample else {
             note(
                 ui,
@@ -4850,6 +5062,155 @@ impl SavioApp {
         ui.add_space(12.0);
 
         process_card(ui, &sample.procs);
+    }
+
+    /// Карточка «Питание»: чем машина питается сейчас и как это переключить.
+    ///
+    /// Нажатия не спрашивают подтверждения, и это решение: схема и режим
+    /// питания меняются мгновенно и обратимо одним нажатием соседней кнопки.
+    /// Переспрашивать Savio положено перед необратимым (так устроена чистка
+    /// метаданных), а лишний вопрос там, где отменить можно тут же, только
+    /// приучает жать «Да» не глядя.
+    fn power_card(&mut self, ui: &mut egui::Ui) {
+        let busy = self.power.busy;
+        let mut refresh = false;
+        let mut change = None;
+
+        theme::card(ui, |ui| {
+            // Ряду задаётся высота, и это не украшение вёрстки. `with_layout`
+            // отдаёт потомку всю оставшуюся высоту карточки, а `Align::Center`
+            // в горизонтальной раскладке «считает занятой» её целиком
+            // (`Placer::advance_after_rects`: expand_to_include_rect(frame_rect)
+            // «pretend we used whole frame»). Внутри прокрутки остаток — это
+            // почти весь экран, поэтому строка заголовка уезжает в середину
+            // карточки, а сама карточка вырастает во весь экран. Ровно так
+            // сейчас и выглядят соседние `check_card` и `metric_card` —
+            // это задача 42 реестра, и повторять её здесь незачем.
+            // `ui.horizontal` этой беды лишён именно тем, что задаёт высоту
+            // (`interact_size.y`).
+            //
+            // Кнопка при этом кладётся первой, справа налево: обрезаемый
+            // заголовок иначе занял бы всю ширину и кнопка налезла бы на него.
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), theme::CONTROL_HEIGHT),
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
+                    refresh = ui
+                        .add_enabled(!busy, pill("Обновить"))
+                        .on_disabled_hover_text("Сначала дождитесь ответа системы.")
+                        .clicked();
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new("Питание")
+                                    .font(theme::display(17.0))
+                                    .color(theme::TEXT_PRIMARY),
+                            )
+                            .truncate(),
+                        );
+                    });
+                },
+            );
+
+            if let Some(trouble) = &self.power.state.trouble {
+                ui.add_space(6.0);
+                note(ui, trouble, theme::TEXT_MUTED);
+            }
+
+            // Ответа ещё нет. Молчать здесь нельзя: пустая карточка с одним
+            // заголовком выглядит поломкой, а не ожиданием.
+            if self.power.state.is_blank() && self.power.state.trouble.is_none() {
+                ui.add_space(6.0);
+                note(ui, "Спрашиваю систему…", theme::TEXT_SECONDARY);
+            }
+
+            if !self.power.state.plans.is_empty() {
+                ui.add_space(14.0);
+                field_label(ui, "Схема электропитания");
+                // Раскладка с переносом, а не дорожка сегментов: названий
+                // бывает и шесть (вендорские схемы), длина у них любая, а
+                // в окне шириной 520 даже три не встают в строку.
+                //
+                // Выключается ряд целиком, снаружи: `add_enabled_ui` на
+                // каждой кнопке сломал бы перенос (см. `choice_pill`).
+                ui.add_enabled_ui(!busy, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+                        for plan in &self.power.state.plans {
+                            let on = self.power.state.active == Some(plan.id);
+                            // Нажатие на уже активную ничего не значит:
+                            // просить систему переключиться на то, что и так
+                            // работает, — бодрый отчёт о безделье.
+                            if choice_pill(ui, &plan.name, on).clicked() && !on {
+                                change = Some(power::Change::Plan(plan.id));
+                            }
+                        }
+                    });
+                });
+            }
+
+            if let PowerModes::Known { effective, .. } = self.power.state.modes {
+                ui.add_space(14.0);
+                field_label(ui, "Режим питания");
+                ui.add_enabled_ui(!busy, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+                        for mode in PowerMode::ALL {
+                            // Четвёртый режим (ползунок Windows 10) рисуем,
+                            // только если система в нём и есть: предложить
+                            // пункт, которого нет в параметрах Windows 11,
+                            // значит показать список, которого человек
+                            // у себя не видел, а скрыть действующий —
+                            // соврать о машине.
+                            let on = effective == Some(mode);
+                            if !mode.offered() && !on {
+                                continue;
+                            }
+                            if choice_pill(ui, mode.label(), on).clicked() && !on {
+                                change = Some(power::Change::Mode(mode));
+                            }
+                        }
+                    });
+                });
+
+                // Ни одна кнопка не выбрана — это надо объяснить, иначе ряд
+                // выглядит сломанным.
+                if effective.is_none() {
+                    ui.add_space(8.0);
+                    note(
+                        ui,
+                        "Машина работает в режиме, которого Savio не знает, — \
+                         поэтому ни одна кнопка не выбрана. Нажатие любой \
+                         переключит машину в неё.",
+                        theme::TEXT_MUTED,
+                    );
+                }
+
+                if !self.power.hint.is_empty() {
+                    ui.add_space(8.0);
+                    note(ui, &self.power.hint, theme::STATE_WARNING);
+                }
+            }
+
+            // Итог последнего нажатия — последней строкой карточки, у самых
+            // кнопок: сказанное про переключение должно стоять там, где
+            // переключали.
+            if let Some((text, color)) = &self.power.outcome {
+                ui.add_space(12.0);
+                note(ui, text, *color);
+            }
+        });
+
+        // Обе просьбы исполняем после карточки: внутри замыкания `self`
+        // одолжен на чтение, и завести оттуда поток не выйдет.
+        if refresh {
+            let ctx = ui.ctx().clone();
+            self.power.start(&ctx);
+        }
+        if let Some(change) = change {
+            let ctx = ui.ctx().clone();
+            self.power.change(change, &ctx);
+        }
     }
 
     /// Шапка половины: чем монитор занят и как включить оверлей.
@@ -5626,6 +5987,69 @@ fn time_field(
         .changed()
     })
     .inner
+}
+
+/// Кнопка выбора «одно из»: подпись в таблетке, выбранная — с акцентом.
+///
+/// Рисуется своими руками, и причина не в оформлении, а в переносе строки.
+/// Готовый [`toggle_pill`] заводит внутри `ui.scope`, а тот сообщает
+/// раскладке занятое место **задним числом**, минуя `next_space` — то есть
+/// мимо всей логики переноса. В `horizontal_wrapped` такая кнопка на новую
+/// строку не уезжает: она вылезает за кромку карточки и тянет карточку за
+/// собой. По той же причине выключать ряд надо целиком, снаружи, а не
+/// каждую кнопку через `add_enabled_ui`: это тот же `scope`.
+///
+/// Проверено глазами в окне 520×420: третья таблетка режима обрезалась
+/// кромкой окна, а подпись второй заворачивалась в две строки внутри самой
+/// таблетки. Ни сборка, ни `clippy`, ни тесты этого не видят.
+///
+/// Здесь ширина известна заранее, из разложенного текста, и место просится
+/// через `allocate_exact_size` — то есть через ту самую логику переноса
+/// (так же устроен `chip`).
+fn choice_pill(ui: &mut egui::Ui, label: &str, on: bool) -> egui::Response {
+    const PAD: f32 = 14.0;
+
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    // Раскладка текста у egui кэшируется по самой строке, так что повторный
+    // вызов с той же подписью считает только хеш.
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), font, egui::Color32::PLACEHOLDER);
+
+    let size = egui::vec2(PAD * 2.0 + galley.size().x, theme::CONTROL_HEIGHT);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+
+    // Выбранная сказана не одним цветом: у неё и заливка, и акцентная
+    // кромка, и подпись другого тона. Невыбранная в покое почти прозрачна
+    // и светлеет под курсором — это и есть отклик.
+    let (fill, stroke, text) = match (on, response.hovered()) {
+        (true, _) => (theme::ACCENT_SOFT, theme::ACCENT, theme::ACCENT_HOVER),
+        (false, true) => (theme::CARD_INNER, theme::BORDER_HOVER, theme::TEXT_PRIMARY),
+        (false, false) => (
+            egui::Color32::TRANSPARENT,
+            theme::BORDER_STRONG,
+            theme::TEXT_SECONDARY,
+        ),
+    };
+
+    let painter = ui.painter();
+    painter.rect(
+        rect,
+        egui::CornerRadius::same(theme::RADIUS_PILL),
+        fill,
+        egui::Stroke::new(1.0, stroke),
+        egui::StrokeKind::Inside,
+    );
+    painter.galley(
+        egui::pos2(rect.left() + PAD, rect.center().y - galley.size().y / 2.0),
+        galley,
+        text,
+    );
+
+    response
 }
 
 /// Мелкая оговорка под элементом управления.
@@ -6818,5 +7242,118 @@ mod tests {
     fn quiet_frame_takes_nothing() {
         let errors = GpuErrors::default();
         assert!(errors.take().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Питание
+    // -----------------------------------------------------------------------
+
+    fn plans() -> Vec<crate::model::PowerPlan> {
+        vec![
+            crate::model::PowerPlan {
+                id: BALANCED_PLAN,
+                name: "Сбалансированная".to_owned(),
+            },
+            crate::model::PowerPlan {
+                id: crate::model::PlanId::from_parts(
+                    0x8c5e_7fda,
+                    0xe8bf,
+                    0x4a96,
+                    [0x9a, 0x85, 0xa6, 0xe2, 0x3a, 0x8c, 0x63, 0x5c],
+                ),
+                name: "Высокая производительность".to_owned(),
+            },
+        ]
+    }
+
+    fn high_performance() -> crate::model::PlanId {
+        plans()[1].id
+    }
+
+    /// При сбалансированной схеме режим питания работает — предупреждать
+    /// не о чем, и лишняя жёлтая строка только пугала бы.
+    #[test]
+    fn the_power_hint_stays_quiet_when_the_mode_really_applies() {
+        let state = PowerState {
+            plans: plans(),
+            active: Some(BALANCED_PLAN),
+            modes: PowerModes::Known {
+                effective: Some(PowerMode::Max),
+                ignored: None,
+            },
+            trouble: None,
+        };
+        assert_eq!(power_hint(&state), "");
+    }
+
+    /// Оговорка обязана появиться ДО нажатия: это единственное место, где
+    /// Savio успевает предупредить о молчаливом отказе Windows.
+    #[test]
+    fn the_power_hint_warns_before_the_press_when_the_scheme_is_not_balanced() {
+        let state = PowerState {
+            plans: plans(),
+            active: Some(high_performance()),
+            modes: PowerModes::Known {
+                effective: Some(PowerMode::Balanced),
+                ignored: None,
+            },
+            trouble: None,
+        };
+
+        let hint = power_hint(&state);
+        // Названа и та схема, что мешает, и та, что нужна: без первой
+        // непонятно, что менять, без второй — на что.
+        assert!(hint.contains("Высокая производительность"), "{hint}");
+        assert!(hint.contains("Сбалансированная"), "{hint}");
+    }
+
+    /// Windows запомнила одно, а работает по-другому. Пока это не сказано
+    /// словами, окно показывает выбранным режим, которого нет.
+    #[test]
+    fn the_power_hint_names_both_modes_when_the_stored_one_is_ignored() {
+        let state = PowerState {
+            plans: plans(),
+            active: Some(high_performance()),
+            modes: PowerModes::Known {
+                effective: Some(PowerMode::Balanced),
+                ignored: Some(PowerMode::Max),
+            },
+            trouble: None,
+        };
+
+        let hint = power_hint(&state);
+        assert!(hint.contains(PowerMode::Max.label()), "{hint}");
+        assert!(hint.contains(PowerMode::Balanced.label()), "{hint}");
+    }
+
+    /// Схему система назвать может и не суметь. Выдуманного имени в оговорке
+    /// быть не должно — человек пойдёт искать его в параметрах Windows.
+    #[test]
+    fn the_power_hint_does_not_invent_a_scheme_name() {
+        let state = PowerState {
+            plans: Vec::new(),
+            active: Some(high_performance()),
+            modes: PowerModes::Known {
+                effective: Some(PowerMode::Balanced),
+                ignored: None,
+            },
+            trouble: None,
+        };
+
+        let hint = power_hint(&state);
+        assert!(!hint.is_empty(), "предупредить всё равно надо");
+        assert!(!hint.contains("Высокая производительность"), "{hint}");
+    }
+
+    /// Без режимов питания оговорка про них бессмысленна.
+    #[test]
+    fn the_power_hint_says_nothing_where_there_are_no_modes() {
+        let state = PowerState {
+            plans: plans(),
+            active: Some(high_performance()),
+            modes: PowerModes::Unsupported,
+            trouble: Some("режимов нет".to_owned()),
+        };
+        assert_eq!(power_hint(&state), "");
     }
 }

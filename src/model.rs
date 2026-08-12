@@ -1016,6 +1016,14 @@ pub enum Event {
     /// строки: собрать их шестьдесят раз в секунду ради одного изменения
     /// значило бы сделать пятьдесят девять лишних раз (Правило 1).
     Perf(PerfSample),
+    /// Схемы электропитания и режим питания — прочитанные заново.
+    ///
+    /// Приезжает и на открытие половины «Сейчас», и после каждого
+    /// переключения: по Правилу 6 применённым считается не то, что система
+    /// приняла с кодом успеха, а только то, что она же и подтвердила при
+    /// перечитывании. Поэтому событие с состоянием идёт **после** `Notice`
+    /// или `Warning` об исходе, а не вместо него.
+    Power(PowerState),
 }
 
 /// Похожа ли строка на ссылку, которую есть смысл отдавать yt-dlp.
@@ -1557,6 +1565,219 @@ pub struct PerfSample {
     pub disk: Option<String>,
     /// Верхние процессы по загрузке процессора, не длиннее `PROC_LIMIT`.
     pub procs: Vec<ProcRow>,
+}
+
+// ---------------------------------------------------------------------------
+// Питание
+// ---------------------------------------------------------------------------
+
+/// Идентификатор схемы электропитания или режима питания.
+///
+/// Шестнадцать байт ровно в том виде, в каком их отдаёт и принимает система, —
+/// то есть первые три поля GUID лежат младшим байтом вперёд. Домен об этом
+/// знать не обязан, но обязан уметь показать: разъехавшийся порядок байт
+/// превратил бы `381b4222-…` в `22421b38-…`, и «неизвестный режим» в отчёте
+/// назывался бы чужим именем. Держит это тест `plan_id_reads_like_windows`.
+///
+/// Строкой не хранится намеренно: сравнение идёт на каждый нарисованный
+/// переключатель, а шестнадцать байт сравниваются без единой аллокации.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub struct PlanId([u8; 16]);
+
+impl PlanId {
+    /// Собирает идентификатор из привычной записи GUID.
+    ///
+    /// Ровно для констант ниже: записать `ded574b5-45a0-…` цифрами в том
+    /// порядке, в каком его печатает Windows, и не переставлять байты руками.
+    pub const fn from_parts(a: u32, b: u16, c: u16, tail: [u8; 8]) -> Self {
+        let a = a.to_le_bytes();
+        let b = b.to_le_bytes();
+        let c = c.to_le_bytes();
+        Self([
+            a[0], a[1], a[2], a[3], b[0], b[1], c[0], c[1], tail[0], tail[1], tail[2], tail[3],
+            tail[4], tail[5], tail[6], tail[7],
+        ])
+    }
+
+    /// Байты как есть — для передачи обратно в систему.
+    pub const fn bytes(self) -> [u8; 16] {
+        self.0
+    }
+}
+
+impl std::fmt::Display for PlanId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let b = self.0;
+        write!(
+            f,
+            "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-",
+            b[3], b[2], b[1], b[0], b[5], b[4], b[7], b[6], b[8], b[9]
+        )?;
+        for byte in &b[10..] {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Схема «Сбалансированная» — та единственная, при которой Windows применяет
+/// режим питания.
+///
+/// Проверено вживую (Windows 11, 2026-08-12): при активных «Высокая
+/// производительность» и «Экономия энергии» переключение режима проходит
+/// с кодом успеха и запоминается, но действующим остаётся прежний. Число
+/// здесь нужно ровно затем, чтобы предупредить об этом **до** нажатия;
+/// после нажатия правду говорит перечитывание, а не эта константа.
+pub const BALANCED_PLAN: PlanId = PlanId::from_parts(
+    0x381b_4222,
+    0xf694,
+    0x41f0,
+    [0x96, 0x85, 0xff, 0x5b, 0xb2, 0x60, 0xdf, 0x2e],
+);
+
+/// Схема электропитания: то, что Windows показывает в «Электропитании».
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PowerPlan {
+    pub id: PlanId,
+    /// Название, как его дала сама система.
+    ///
+    /// Своего перевода у Savio здесь нет намеренно: на русской Windows имя
+    /// приезжает русским, на английской — английским, и в обоих случаях оно
+    /// совпадает с тем, что человек видит в панели управления. Подменять его
+    /// значило бы показать схему, которой он у себя не найдёт.
+    pub name: String,
+}
+
+/// Режим питания — то, что в параметрах Windows 11 названо «Режим питания».
+///
+/// Это не схема электропитания, а надстройка над ней (в терминах системы —
+/// overlay). Схем у машины три и они настраиваются, режимов ровно столько,
+/// сколько знает система, и настраивать в них нечего.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PowerMode {
+    /// «Наилучшая энергоэффективность».
+    Saver,
+    /// «Сбалансированный» — режима нет, работает сама схема.
+    Balanced,
+    /// «Высокая производительность»: третье положение ползунка Windows 10.
+    ///
+    /// В параметрах Windows 11 такого пункта нет, поэтому Savio его не
+    /// предлагает — но узнаёт и показывает, если система работает именно
+    /// в нём. Скрыть действующий режим значило бы соврать о состоянии
+    /// машины, а предложить пункт, которого нет в системных параметрах, —
+    /// показать список, которого человек у себя не видел.
+    High,
+    /// «Максимальная производительность».
+    Max,
+}
+
+impl PowerMode {
+    /// Все, какие Savio узнаёт в ответе системы.
+    pub const ALL: [PowerMode; 4] = [Self::Saver, Self::Balanced, Self::High, Self::Max];
+
+    /// Идентификатор режима.
+    ///
+    /// «Сбалансированный» — это нулевой GUID, и это не заглушка: система
+    /// именно им обозначает «надстройки нет».
+    pub const fn id(self) -> PlanId {
+        match self {
+            Self::Saver => PlanId::from_parts(
+                0x961c_c777,
+                0x2547,
+                0x4f9d,
+                [0x81, 0x74, 0x7d, 0x86, 0x18, 0x1b, 0x8a, 0x7a],
+            ),
+            Self::Balanced => PlanId::from_parts(0, 0, 0, [0; 8]),
+            Self::High => PlanId::from_parts(
+                0x3af9_b8d9,
+                0x7c97,
+                0x431d,
+                [0xad, 0x78, 0x34, 0xa8, 0xbf, 0xea, 0x43, 0x9f],
+            ),
+            Self::Max => PlanId::from_parts(
+                0xded5_74b5,
+                0x45a0,
+                0x4f42,
+                [0x87, 0x37, 0x46, 0x34, 0x5c, 0x09, 0xc2, 0x38],
+            ),
+        }
+    }
+
+    /// Чей это идентификатор. `None` — режим, которого Savio не знает.
+    pub fn from_id(id: PlanId) -> Option<Self> {
+        Self::ALL.into_iter().find(|mode| mode.id() == id)
+    }
+
+    /// Предлагаем ли его нажать. См. оговорку у [`PowerMode::High`].
+    pub const fn offered(self) -> bool {
+        !matches!(self, Self::High)
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Saver => "Наилучшая энергоэффективность",
+            Self::Balanced => "Сбалансированный",
+            Self::High => "Высокая производительность",
+            Self::Max => "Максимальная производительность",
+        }
+    }
+}
+
+/// Что известно про режимы питания.
+///
+/// `Copy` не для удобства: карточка разбирает это значение на каждом кадре,
+/// и без него пришлось бы либо клонировать, либо держать заимствование
+/// `self.power` живым на всю отрисовку — а внутри неё меняются поля.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PowerModes {
+    /// Система ими не управляет: не Windows или Windows старее 1803.
+    #[default]
+    Unsupported,
+    /// Управляет, и вот в каком она сейчас.
+    Known {
+        /// Действующий — тот, по которому машина работает прямо сейчас.
+        /// `None` — система назвала режим, которого Savio не знает.
+        effective: Option<PowerMode>,
+        /// Запомненный, но не применённый.
+        ///
+        /// `Some` только тогда, когда он отличается от действующего, — то
+        /// есть ровно в том случае, ради которого поле и заведено: без него
+        /// переключатель показывал бы «Сбалансированный» и молчал о том, что
+        /// на самом деле у системы записано другое.
+        ignored: Option<PowerMode>,
+    },
+}
+
+/// Всё, что Savio знает про питание машины.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PowerState {
+    /// Схемы электропитания. Пусто — спросить не вышло.
+    pub plans: Vec<PowerPlan>,
+    /// Активная схема. `None` — система её не назвала.
+    pub active: Option<PlanId>,
+    pub modes: PowerModes,
+    /// Чего Savio на этой машине не может и почему. `None` — может всё.
+    pub trouble: Option<String>,
+}
+
+impl PowerState {
+    /// Есть ли что показывать, кроме объяснения.
+    pub fn is_blank(&self) -> bool {
+        self.plans.is_empty() && self.modes == PowerModes::Unsupported
+    }
+
+    /// Название схемы по её идентификатору.
+    pub fn plan_name(&self, id: PlanId) -> Option<&str> {
+        self.plans
+            .iter()
+            .find(|plan| plan.id == id)
+            .map(|plan| plan.name.as_str())
+    }
+
+    /// Название активной схемы.
+    pub fn active_name(&self) -> Option<&str> {
+        self.active.and_then(|id| self.plan_name(id))
+    }
 }
 
 #[cfg(test)]
@@ -2365,5 +2586,139 @@ mod tests {
         let off = Metric::missing(Some("выключена".to_owned()));
         assert!(off.percent.is_none());
         assert_eq!(off.detail.as_deref(), Some("выключена"));
+    }
+
+    /// Идентификатор обязан читаться ровно так, как его пишет Windows.
+    ///
+    /// Проверять это надо числами из системы, а не самими собой: перепутанный
+    /// порядок байт даёт совершенно правдоподобный на вид GUID, и заметить
+    /// подмену можно только по сравнению с тем, что показывает `powercfg`.
+    /// Числа ниже сняты вживую (Windows 11, 2026-08-12).
+    #[test]
+    fn plan_id_reads_like_windows() {
+        assert_eq!(
+            BALANCED_PLAN.to_string(),
+            "381b4222-f694-41f0-9685-ff5bb260df2e"
+        );
+        assert_eq!(
+            PowerMode::Saver.id().to_string(),
+            "961cc777-2547-4f9d-8174-7d86181b8a7a"
+        );
+        assert_eq!(
+            PowerMode::High.id().to_string(),
+            "3af9b8d9-7c97-431d-ad78-34a8bfea439f"
+        );
+        assert_eq!(
+            PowerMode::Max.id().to_string(),
+            "ded574b5-45a0-4f42-8737-46345c09c238"
+        );
+        // «Сбалансированный» режим — это отсутствие надстройки, и система
+        // обозначает его нулём. Ноль здесь не заглушка, а значение.
+        assert_eq!(
+            PowerMode::Balanced.id().to_string(),
+            "00000000-0000-0000-0000-000000000000"
+        );
+    }
+
+    /// В памяти байты лежат так, как их отдаёт и принимает система: первые
+    /// три поля младшим байтом вперёд. Обратный порядок собрался бы и прошёл
+    /// бы все остальные тесты — а система получила бы чужой идентификатор.
+    #[test]
+    fn plan_id_keeps_the_byte_order_the_system_uses() {
+        let bytes = BALANCED_PLAN.bytes();
+        assert_eq!(&bytes[..4], &[0x22, 0x42, 0x1b, 0x38]);
+        assert_eq!(&bytes[4..6], &[0x94, 0xf6]);
+        assert_eq!(&bytes[6..8], &[0xf0, 0x41]);
+        // Хвост из восьми байт переворачивать не надо — он и в записи такой.
+        assert_eq!(&bytes[8..], &[0x96, 0x85, 0xff, 0x5b, 0xb2, 0x60, 0xdf, 0x2e]);
+    }
+
+    #[test]
+    fn every_power_mode_is_recognised_by_its_own_id() {
+        for mode in PowerMode::ALL {
+            assert_eq!(PowerMode::from_id(mode.id()), Some(mode));
+        }
+        // Схема — не режим. Спутав их, Savio показал бы «Сбалансированный»
+        // выбранным на машине, где режимов нет вовсе.
+        assert_eq!(PowerMode::from_id(BALANCED_PLAN), None);
+    }
+
+    /// Четвёртый режим Savio узнаёт, но не предлагает: в параметрах
+    /// Windows 11 такого пункта нет.
+    #[test]
+    fn the_fourth_mode_is_recognised_but_not_offered() {
+        assert!(!PowerMode::High.offered());
+        assert_eq!(
+            PowerMode::ALL.iter().filter(|mode| mode.offered()).count(),
+            3
+        );
+    }
+
+    /// Две кнопки с одинаковой подписью — это выбор вслепую.
+    #[test]
+    fn power_modes_name_themselves_distinctly() {
+        let mut seen: Vec<&str> = Vec::new();
+        for mode in PowerMode::ALL {
+            let label = mode.label();
+            assert!(!label.trim().is_empty(), "{mode:?}: пустая подпись");
+            assert!(!seen.contains(&label), "{mode:?}: подпись повторяется");
+            seen.push(label);
+        }
+    }
+
+    /// Пустое состояние обязано сознаваться, что оно пустое: карточка по
+    /// этому и решает, показывать переключатели или объяснение.
+    #[test]
+    fn a_blank_power_state_admits_it_knows_nothing() {
+        assert!(PowerState::default().is_blank());
+
+        let only_modes = PowerState {
+            modes: PowerModes::Known {
+                effective: Some(PowerMode::Balanced),
+                ignored: None,
+            },
+            ..PowerState::default()
+        };
+        assert!(!only_modes.is_blank(), "режимы есть — показывать есть что");
+
+        let only_plans = PowerState {
+            plans: vec![PowerPlan {
+                id: BALANCED_PLAN,
+                name: "Сбалансированная".to_owned(),
+            }],
+            ..PowerState::default()
+        };
+        assert!(!only_plans.is_blank(), "схемы есть — показывать есть что");
+    }
+
+    /// Название активной схемы ищется по идентификатору, а не по порядку
+    /// в списке: порядок задаёт система, и он не обещан.
+    #[test]
+    fn the_active_plan_is_named_only_when_it_is_in_the_list() {
+        let stranger = PlanId::from_parts(1, 2, 3, [4; 8]);
+        let state = PowerState {
+            plans: vec![
+                PowerPlan {
+                    id: BALANCED_PLAN,
+                    name: "Сбалансированная".to_owned(),
+                },
+                PowerPlan {
+                    id: PowerMode::Max.id(),
+                    name: "Высокая производительность".to_owned(),
+                },
+            ],
+            active: Some(PowerMode::Max.id()),
+            ..PowerState::default()
+        };
+        assert_eq!(state.active_name(), Some("Высокая производительность"));
+        assert_eq!(state.plan_name(stranger), None);
+
+        // Активной может не оказаться в списке — например, её удалили между
+        // двумя вызовами. Выдумывать имя нельзя.
+        let lost = PowerState {
+            active: Some(stranger),
+            ..state
+        };
+        assert_eq!(lost.active_name(), None);
     }
 }

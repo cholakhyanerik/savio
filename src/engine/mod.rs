@@ -7,6 +7,7 @@ pub mod binaries;
 pub mod hardware;
 pub mod metadata;
 pub mod monitor;
+pub mod power;
 pub mod settings;
 pub mod setup;
 pub mod sha256;
