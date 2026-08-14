@@ -1761,7 +1761,13 @@ impl SavioApp {
             url: String::new(),
             format: saved.format,
             quality: saved.quality,
-            options: DownloadOptions::default(),
+            // Галочки вшивания восстанавливаются как есть, **не** оглядываясь
+            // на то, нашёлся ли ffmpeg. Без него человек увидит под ними
+            // жёлтую оговорку «Вшивать нечем» — и это правда: он просил вшить,
+            // а вшить нечем. Погасить их было бы тише, но соврало бы дважды:
+            // сегодня — про то, чего он не отменял, а в тот день, когда ffmpeg
+            // доставится, — молчаливым отказом вшить то, что он выбрал.
+            options: saved.options,
             sub_lang: SubLang::default(),
             section_start: String::new(),
             section_end: String::new(),
@@ -2034,6 +2040,12 @@ impl SavioApp {
             format: self.format,
             quality: self.quality,
             out_dir: self.out_dir.clone(),
+            // Флажки уезжают такими, какие есть, даже когда их не видно:
+            // «Субтитры» при MP3 и «Можно автоматические» при снятых
+            // субтитрах спрятаны, но значения своего не теряли. Обнулять
+            // спрятанное нельзя — один запуск в режиме MP3 стёр бы настройку
+            // насовсем, хотя человек к ней не прикасался.
+            options: self.options,
         });
     }
 }
@@ -3594,25 +3606,31 @@ impl SavioApp {
         // гасим, но причину говорим по наведению — молча выключенный элемент
         // выглядит поломкой, а не запретом.
         let subs_enabled = self.format == Format::Mp4;
-        // Пересобрать подпись списка и оговорку надо на любое изменение
-        // здесь, но **после** отрисовки: `self` до конца замыкания занят.
-        let mut changed = false;
+        // Два флага, а не один, и разница не в экономии. `subs` пересобирает
+        // подписи, и трогать их от «Метаданных» незачем; `any` запоминает
+        // выбор, и вот его пропуск как раз ничем себя не выдаст — настройка
+        // просто перестанет переживать перезапуск. Оба применяются **после**
+        // отрисовки: `self` до конца замыкания занят.
+        let mut subs_changed = false;
+        let mut any_changed = false;
 
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
 
-            chip(ui, &mut self.options.embed_metadata, "Метаданные", true)
-                .on_hover_text("Название, автор и дата уедут в сам файл.");
-            chip(ui, &mut self.options.embed_thumbnail, "Обложку", true)
-                .on_hover_text("Картинка ролика станет обложкой файла.");
-            changed |= chip(ui, &mut self.options.embed_subs, "Субтитры", subs_enabled)
+            any_changed |= chip(ui, &mut self.options.embed_metadata, "Метаданные", true)
+                .on_hover_text("Название, автор и дата уедут в сам файл.")
+                .changed();
+            any_changed |= chip(ui, &mut self.options.embed_thumbnail, "Обложку", true)
+                .on_hover_text("Картинка ролика станет обложкой файла.")
+                .changed();
+            subs_changed |= chip(ui, &mut self.options.embed_subs, "Субтитры", subs_enabled)
                 .on_disabled_hover_text("Субтитры бывают только у видео — выберите MP4.")
                 .changed();
 
             // Подчинённый чип появляется вместе с субтитрами, а не висит
             // выключенным рядом: без «Субтитров» он не значит ничего.
             if subs_enabled && self.options.embed_subs {
-                changed |= chip(
+                subs_changed |= chip(
                     ui,
                     &mut self.options.auto_subs,
                     "Можно автоматические",
@@ -3637,11 +3655,15 @@ impl SavioApp {
             );
         }
 
-        if changed {
+        if subs_changed {
             self.rebuild_subtitles();
             // Язык субтитров показан в тонких настройках, и его строка
             // в их заголовке зависит от того, просят ли субтитры вообще.
             self.rebuild_advanced_summary();
+        }
+
+        if any_changed || subs_changed {
+            self.remember();
         }
     }
 

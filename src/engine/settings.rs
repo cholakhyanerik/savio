@@ -1,7 +1,8 @@
 //! Выбор пользователя, переживающий закрытие окна.
 //!
-//! Формат, ступень качества и папка сохранения выставляются один раз и дальше
-//! обычно не меняются: тот, кто качает только MP3 к себе в «Музыку», не должен
+//! Формат, ступень качества, папка сохранения и то, что вшивается в файл,
+//! выставляются один раз и дальше обычно не меняются: тот, кто качает только
+//! MP3 к себе в «Музыку» и всегда вшивает обложку с названием, не должен
 //! переключать это при каждом запуске.
 //!
 //! Живёт в слое движка, а не UI, по той же причине, что и всё остальное здесь:
@@ -20,7 +21,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use super::binaries;
-use crate::model::{Format, Quality};
+use crate::model::{DownloadOptions, Format, Quality};
 
 /// Имя файла в каталоге Savio.
 const FILE_NAME: &str = "settings.json";
@@ -54,6 +55,12 @@ pub struct Settings {
     /// `None` — папки в файле не было либо её больше нет на диске.
     /// Тогда UI берёт свой обычный каталог загрузок.
     pub out_dir: Option<PathBuf>,
+    /// Что вшивать в готовый файл — все четыре флажка разом.
+    ///
+    /// Доменный тип целиком, а не четыре `bool` рядом: флажки живут вместе,
+    /// и разложенные по отдельным полям они разъехались бы с
+    /// [`DownloadOptions`] при первом же добавлении пятого.
+    pub options: DownloadOptions,
 }
 
 /// Читает настройки прошлого запуска.
@@ -146,10 +153,17 @@ fn quality_from_token(token: &str) -> Option<Quality> {
 
 /// Содержимое файла для текущих настроек.
 fn to_json(settings: &Settings) -> String {
+    // Флажки пишем всегда, включая выключенные: снятая галочка — такой же
+    // выбор человека, как поставленная, а по отсутствию ключа отличить
+    // «выключил» от «версия ещё не умела это помнить» было бы нечем.
     let mut value = serde_json::json!({
         "version": SCHEMA,
         "format": format_token(settings.format),
         "quality": quality_token(settings.quality),
+        "embed_metadata": settings.options.embed_metadata,
+        "embed_thumbnail": settings.options.embed_thumbnail,
+        "embed_subs": settings.options.embed_subs,
+        "auto_subs": settings.options.auto_subs,
     });
 
     // Путь кладём только тогда, когда он выражается в UTF-8. Терять запомненную
@@ -202,7 +216,30 @@ fn parse(text: &str) -> Settings {
         settings.out_dir = Some(PathBuf::from(dir));
     }
 
+    // Флажки вшивания. Каждый по отдельности и с тем же правилом: нет ключа
+    // (файл от версии до 0.20) или в нём не `true`/`false` — остаётся
+    // выключенным, то есть ровно то, что Savio показывал раньше.
+    let options = &mut settings.options;
+    if let Some(on) = flag(&value, "embed_metadata") {
+        options.embed_metadata = on;
+    }
+    if let Some(on) = flag(&value, "embed_thumbnail") {
+        options.embed_thumbnail = on;
+    }
+    if let Some(on) = flag(&value, "embed_subs") {
+        options.embed_subs = on;
+    }
+    if let Some(on) = flag(&value, "auto_subs") {
+        options.auto_subs = on;
+    }
+
     settings
+}
+
+/// Флажок из файла. `None` — ключа нет или в нём лежит не логическое
+/// значение; и то и другое означает «оставить умолчание».
+fn flag(value: &serde_json::Value, key: &str) -> Option<bool> {
+    value.get(key).and_then(serde_json::Value::as_bool)
 }
 
 // ---------------------------------------------------------------------------
@@ -353,8 +390,36 @@ mod tests {
             // Обратные слэши в JSON экранируются — путь Windows проверяем
             // именно ради этого.
             out_dir: Some(PathBuf::from(r"C:\Users\Вася\Музыка")),
+            options: DownloadOptions {
+                embed_metadata: true,
+                embed_thumbnail: true,
+                embed_subs: false,
+                auto_subs: true,
+            },
         };
         assert_eq!(parse(&to_json(&settings)), settings);
+    }
+
+    #[test]
+    fn switched_off_flags_are_written_too() {
+        // Снятая галочка обязана пережить перезапуск так же, как
+        // поставленная: отсутствие ключа означало бы «этой версии Savio
+        // такая настройка ещё неизвестна», и файл врал бы о выборе.
+        let json = to_json(&Settings::default());
+        for key in ["embed_metadata", "embed_thumbnail", "embed_subs", "auto_subs"] {
+            assert!(json.contains(key), "в файле нет {key}");
+        }
+        assert_eq!(parse(&json), Settings::default());
+    }
+
+    #[test]
+    fn a_file_without_flags_leaves_them_off() {
+        // Файл от версии до 0.20: галочек в нём нет вовсе, и появиться
+        // взведёнными они не должны.
+        let text = r#"{"version": 1, "format": "mp3", "quality": "720"}"#;
+        let settings = parse(text);
+        assert_eq!(settings.format, Format::Mp3);
+        assert_eq!(settings.options, DownloadOptions::default());
     }
 
     #[test]
@@ -363,6 +428,7 @@ mod tests {
             format: Format::Mp4,
             quality: Quality::Best,
             out_dir: None,
+            options: DownloadOptions::default(),
         };
         let json = to_json(&settings);
         assert!(!json.contains("out_dir"), "пустого пути в файле быть не должно");
@@ -381,7 +447,8 @@ mod tests {
 
     #[test]
     fn wrong_types_fall_back_field_by_field() {
-        let text = r#"{"format": 4, "quality": ["1080"], "out_dir": true}"#;
+        let text = r#"{"format": 4, "quality": ["1080"], "out_dir": true,
+                       "embed_metadata": "да", "auto_subs": 1}"#;
         assert_eq!(parse(text), Settings::default());
     }
 
@@ -412,6 +479,10 @@ mod tests {
             format: Format::Mp3,
             quality: Quality::P1080,
             out_dir: Some(dir.clone()),
+            options: DownloadOptions {
+                embed_thumbnail: true,
+                ..DownloadOptions::default()
+            },
         };
 
         let mut saver = Saver::spawn_to(path.clone());
@@ -443,22 +514,29 @@ mod tests {
             format: Format::Mp4,
             quality: Quality::P480,
             out_dir: None,
+            options: DownloadOptions::default(),
         });
         saver.save(Settings {
             format: Format::Mp3,
             quality: Quality::P720,
             out_dir: Some(dir.clone()),
+            options: DownloadOptions::default(),
         });
         saver.save(Settings {
             format: Format::Mp3,
             quality: Quality::P2160,
             out_dir: Some(gone),
+            options: DownloadOptions {
+                embed_metadata: true,
+                ..DownloadOptions::default()
+            },
         });
         saver.flush();
 
         let loaded = load_from(&path);
         assert_eq!(loaded.format, Format::Mp3);
         assert_eq!(loaded.quality, Quality::P2160);
+        assert!(loaded.options.embed_metadata);
         // Папки на диске нет — UI должен получить `None` и взять свой обычный
         // каталог загрузок, а не пытаться сохранить в никуда.
         assert_eq!(loaded.out_dir, None);
