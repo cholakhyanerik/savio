@@ -22,7 +22,7 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
 use crate::model::{
-    DownloadId, Event, MediaInfo, NO_DOWNLOAD, Request, SubtitlePlan, human_duration,
+    CookieSource, DownloadId, Event, MediaInfo, NO_DOWNLOAD, Request, SubtitlePlan, human_duration,
 };
 
 pub use binaries::{Tools, discover};
@@ -152,6 +152,14 @@ pub fn start(
     notify: impl Fn() + Send + 'static,
 ) -> Result<Handle, String> {
     let tools = discover()?;
+
+    // Предупреждения копим, а шлём одним сообщением. Причина в UI:
+    // `Event::Warning` живёт там в единственном поле, и второе сообщение
+    // молча затёрло бы первое — то есть про одну из двух бед человек не
+    // узнал бы вовсе. Случаются они независимо: файл cookies мог пропасть
+    // и у того, у кого нет ffmpeg.
+    let mut warnings: Vec<String> = Vec::new();
+
     if tools.ffmpeg.is_none() {
         let _ = tx.send(Event::Log(
             "ffmpeg не найден — склейка видео со звуком и конвертация в MP3 работать не будут."
@@ -165,10 +173,8 @@ pub fn start(
         // `download_args`): вшивание сорвало бы загрузку на постобработке,
         // а обрезка оборвала бы её ещё до начала.
         //
-        // Предупреждение одно на оба случая, хотя случая два. Причина в UI:
-        // `Event::Warning` живёт там в единственном поле, и второе сообщение
-        // молча затёрло бы первое — то есть про потерянную обрезку человек
-        // не узнал бы вовсе.
+        // Предупреждение одно на оба случая, хотя случая два: перечислять
+        // потерянное списком не нужно, фраза покрывает обе беды разом.
         let warning = match (request.section.any(), request.options.any()) {
             (true, true) => Some(
                 "Без ffmpeg не выйдет ни вырезать фрагмент, ни вшить метаданные, \
@@ -184,11 +190,19 @@ pub fn start(
             (false, false) => None,
         };
         if let Some(warning) = warning {
-            let _ = tx.send(Event::Warning(format!(
+            warnings.push(format!(
                 "{warning} Перезапустите Savio: при старте он сам попробует \
                  скачать ffmpeg ещё раз."
-            )));
+            ));
         }
+    }
+
+    if let Some(warning) = cookie_file_trouble(request.cookies, request.cookie_file.as_deref()) {
+        warnings.push(warning);
+    }
+
+    if !warnings.is_empty() {
+        let _ = tx.send(Event::Warning(warnings.join("\n\n")));
     }
 
     // ffprobe yt-dlp ищет **сам** — рядом с тем ffmpeg, что назван в
@@ -239,6 +253,65 @@ pub fn start(
     });
 
     Ok(handle)
+}
+
+/// Что не так с выбранным файлом cookies, словами для баннера.
+/// `None` — файл на месте и годен либо вход берут не из файла.
+///
+/// Проверять приходится нам, потому что yt-dlp не проверяет. **Пропавший
+/// файл он не замечает вовсе**: проверено вживую (2026.07.04) — код возврата
+/// 0, ролик скачивается, cookies не применяются, и в выводе об этом ни слова
+/// даже без `--quiet` и `--no-warnings`. Молчание тут худшее из возможного:
+/// человек, у которого файл переименовали, получил бы «видео с возрастным
+/// ограничением» и пошёл бы чинить не то.
+///
+/// Закрытый на запись файл, наоборот, беда громкая, но приходит она в самый
+/// неудачный момент. После работы yt-dlp **дописывает в этот файл свежие
+/// cookies**, и на файле с атрибутом «Только чтение» он падает питоновским
+/// трейсбеком уже поверх скачанного ролика (проверено вживую). Сказанное
+/// заранее даёт отменить загрузку, пока она ничего не стоила; сказанное
+/// потом — только объяснить (см. примету `cookies.py` в `FAILURE_HINTS`).
+///
+/// Имя файла, а не путь: полный путь и так виден строкой под списком, а
+/// баннер от него растянулся бы на три строки.
+fn cookie_file_trouble(cookies: CookieSource, file: Option<&Path>) -> Option<String> {
+    if cookies != CookieSource::File {
+        return None;
+    }
+
+    let Some(file) = file else {
+        return Some(
+            "Вход просят из файла, а сам файл не выбран — ролик скачается без \
+             входа в аккаунт. Выберите файл под списком «Вход на сайт» или \
+             верните в нём пункт «Не использовать»."
+                .to_owned(),
+        );
+    };
+
+    let name = file
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("cookies"))
+        .to_string_lossy();
+
+    match std::fs::metadata(file) {
+        Err(_) => Some(format!(
+            "Файл cookies «{name}» не найден — ролик скачается без входа в \
+             аккаунт, и закрытый сайт его, скорее всего, не отдаст. Файл \
+             переименовали, перенесли или удалили: выберите его заново под \
+             списком «Вход на сайт»."
+        )),
+        // Права на запись спрашиваем у самого файла. На Unix это ещё не вся
+        // правда (у чужого файла с правами 644 бит записи есть, а нам он всё
+        // равно не по зубам), но случай с атрибутом «Только чтение» — тот,
+        // который встречается, — закрывает.
+        Ok(meta) if meta.permissions().readonly() => Some(format!(
+            "Файл cookies «{name}» закрыт для записи, а yt-dlp дописывает \
+             в него свежие cookies после загрузки — и оборвётся ошибкой, \
+             когда ролик уже будет скачан. Снимите с файла «Только чтение» \
+             или скопируйте его в обычную папку."
+        )),
+        Ok(_) => None,
+    }
 }
 
 /// Что качаем: всё, что пришло снаружи, одной посылкой.
@@ -354,8 +427,11 @@ fn run(
     // вопреки правилу «строго по одному». Своего события не нужно —
     // достаточно посмотреть на исход отправки той строки, что и так уходит
     // в журнал.
+    // Строку собирает `log_args`, а не `join`: путь к файлу cookies — это
+    // каталоги и имя пользователя, а журнал человек копирует кнопкой и
+    // вкладывает в сообщение о проблеме.
     if tx
-        .send(Event::Log(format!("yt-dlp {}", args.join(" "))))
+        .send(Event::Log(format!("yt-dlp {}", ytdlp::log_args(&args))))
         .is_err()
     {
         return Ok(());
@@ -627,7 +703,11 @@ fn send_cover(url: Option<String>, tx: &Sender<Event>, notify: &impl Fn()) {
 /// по ссылкам, которых в поле давно нет.
 fn probe(request: &Request, tools: &Tools, control: &Control) -> Option<MediaInfo> {
     let mut cmd = Command::new(&tools.ytdlp);
-    cmd.args(ytdlp::probe_args(&request.url, request.cookies))
+    cmd.args(ytdlp::probe_args(
+        &request.url,
+        request.cookies,
+        request.cookie_file.as_deref(),
+    ))
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .stdin(Stdio::null());
@@ -708,6 +788,7 @@ mod tests {
             options: DownloadOptions::default(),
             section: Section::default(),
             cookies: CookieSource::None,
+            cookie_file: None,
             sub_lang: crate::model::SubLang::default(),
         }
     }

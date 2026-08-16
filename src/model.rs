@@ -257,6 +257,12 @@ impl Tag {
 /// yt-dlp 2026.07.04), а на macOS база cookies лежит под защитой системы и
 /// читается только приложением с «Полным доступом к диску» — у неподписанного
 /// Savio его нет. Пункт, который заведомо не сработает, хуже отсутствующего.
+///
+/// Перечисление осталось `Copy`, хотя у файла есть путь: путь лежит
+/// **отдельным полем** [`Request::cookie_file`]. `PathBuf` внутри варианта
+/// лишил бы `Copy` тип, который сравнивают и копируют на каждой правке поля
+/// ссылки (цель предпросмотра), и заодно сделал бы невозможной константу
+/// [`CookieSource::ALL`], из которой рисуется список.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum CookieSource {
     /// Не передавать cookies вовсе — ровно то, что Savio делал до появления
@@ -271,6 +277,15 @@ pub enum CookieSource {
     Brave,
     Vivaldi,
     Chromium,
+    /// Готовый файл cookies в формате Netscape — ключ `--cookies`.
+    ///
+    /// Не роскошь, а единственный работающий вход для половины списка выше:
+    /// Chrome и всё, что на нём основано (Edge, Brave, Opera, Vivaldi), в
+    /// свежих версиях шифрует cookies через DPAPI так, что снаружи их не
+    /// прочитать (проверено вживую 2026-07-27). Изнутри браузера шифрования
+    /// уже нет, и расширение вроде «Get cookies.txt» выгружает те же самые
+    /// cookies в текстовый файл.
+    File,
 }
 
 impl CookieSource {
@@ -278,7 +293,9 @@ impl CookieSource {
     ///
     /// «Не использовать» первым: это и значение по умолчанию, и то, к чему
     /// возвращаются, когда cookies сделали хуже (см. `explain_failure`).
-    pub const ALL: [CookieSource; 8] = [
+    /// Файл последним: он требует ещё и выбрать файл, то есть стоит дороже
+    /// любого пункта над ним.
+    pub const ALL: [CookieSource; 9] = [
         CookieSource::None,
         CookieSource::Chrome,
         CookieSource::Edge,
@@ -287,16 +304,20 @@ impl CookieSource {
         CookieSource::Brave,
         CookieSource::Vivaldi,
         CookieSource::Chromium,
+        CookieSource::File,
     ];
 
     /// Имя браузера в том виде, в каком его понимает `--cookies-from-browser`.
     ///
-    /// `None` — cookies не нужны, и ключа в командной строке не будет вовсе.
+    /// `None` — браузер не при чём: либо cookies не нужны вовсе, либо их
+    /// берут из файла. Спрашивать этим «просят ли вход» нельзя, для этого
+    /// есть [`CookieSource::any`].
+    ///
     /// Имена строчные и без пробелов: yt-dlp сверяет их со своим списком
     /// дословно и на любое другое написание отвечает отказом.
     pub fn browser(self) -> Option<&'static str> {
         match self {
-            CookieSource::None => Option::None,
+            CookieSource::None | CookieSource::File => Option::None,
             CookieSource::Chrome => Some("chrome"),
             CookieSource::Edge => Some("edge"),
             CookieSource::Firefox => Some("firefox"),
@@ -305,6 +326,19 @@ impl CookieSource {
             CookieSource::Vivaldi => Some("vivaldi"),
             CookieSource::Chromium => Some("chromium"),
         }
+    }
+
+    /// Просят ли вход на сайт хоть каким-нибудь способом.
+    ///
+    /// Отдельно от `browser()`, и это не удобство. До появления файла
+    /// «вход просят» и «выбран браузер» значили одно и то же, и вопрос
+    /// задавался через `browser().is_some()` — в сводке тонких настроек,
+    /// в оговорке под списком и, что важнее всего, в `explain_failure`,
+    /// где на этом держится подсказка про пустой список дорожек у YouTube.
+    /// С файлом такой вопрос отвечает «вход не просят» на просьбу войти,
+    /// то есть молча гасит подсказку ровно там, где она нужна.
+    pub fn any(self) -> bool {
+        !matches!(self, CookieSource::None)
     }
 
     /// Подпись в списке. Полные имена, а не токены yt-dlp: в списке человек
@@ -320,6 +354,9 @@ impl CookieSource {
             CookieSource::Brave => "Brave",
             CookieSource::Vivaldi => "Vivaldi",
             CookieSource::Chromium => "Chromium",
+            // С многоточием, как принято у пунктов, открывающих диалог:
+            // выбрать этот пункт мало, следом придётся назвать файл.
+            CookieSource::File => "Из файла…",
         }
     }
 }
@@ -629,6 +666,14 @@ pub struct Request {
     /// первый же, кто честно допишет их в `any()`, начнёт ругаться на
     /// отсутствие ffmpeg там, где он не нужен.
     pub cookies: CookieSource,
+    /// Путь к файлу cookies. Значит что-нибудь только при
+    /// [`CookieSource::File`], в остальных случаях не смотрится.
+    ///
+    /// Отдельным полем, а не путём внутри варианта перечисления: `PathBuf`
+    /// там лишил бы [`CookieSource`] `Copy` (подробности — в его описании).
+    /// `None` при `File` — файл ещё не выбран; ключа в командной строке
+    /// тогда нет вовсе, а движок про это предупреждает.
+    pub cookie_file: Option<PathBuf>,
     /// Язык субтитров. Поле запроса, а не флажок внутри `DownloadOptions`:
     /// там всё `Copy`, а язык — строка, и одна её строчка лишила бы
     /// `Copy` структуру, которую копируют в каждом кадре.
@@ -2339,6 +2384,26 @@ mod tests {
         assert_eq!(CookieSource::default(), CookieSource::None);
         assert_eq!(CookieSource::None.browser(), None);
         assert_eq!(CookieSource::ALL[0], CookieSource::None);
+        assert!(!CookieSource::None.any(), "вход просят без просьбы");
+    }
+
+    /// «Вход просят» и «выбран браузер» — разные вопросы, и различаются они
+    /// ровно на файл. Спутай их — и подсказка про пустой список дорожек
+    /// у YouTube (`explain_failure`) молча пропала бы у тех, кто вошёл
+    /// файлом, а сводка тонких настроек перестала бы говорить про вход.
+    #[test]
+    fn a_login_is_asked_for_by_every_source_but_none() {
+        for source in CookieSource::ALL {
+            assert_eq!(
+                source.any(),
+                source != CookieSource::None,
+                "{source:?}: неверный ответ про вход"
+            );
+        }
+        assert!(
+            CookieSource::File.any() && CookieSource::File.browser().is_none(),
+            "файл — это вход, но не браузер"
+        );
     }
 
     /// Имя браузера уходит в командную строку дословно, и yt-dlp сверяет его
@@ -2356,7 +2421,12 @@ mod tests {
         let mut seen = Vec::new();
         for source in CookieSource::ALL {
             let Some(browser) = source.browser() else {
-                assert_eq!(source, CookieSource::None, "{source:?}: браузер без имени");
+                // Безымянных источников ровно два, и оба не браузеры:
+                // «не использовать» и файл.
+                assert!(
+                    matches!(source, CookieSource::None | CookieSource::File),
+                    "{source:?}: браузер без имени"
+                );
                 continue;
             };
             assert!(
@@ -2370,7 +2440,11 @@ mod tests {
             assert!(!seen.contains(&browser), "{browser}: повтор в списке");
             seen.push(browser);
         }
-        assert_eq!(seen.len(), CookieSource::ALL.len() - 1);
+        // Сверяемся со списком yt-dlp, а не с длиной `ALL` за вычетом
+        // не-браузеров: то вычитаемое пришлось бы править при каждом новом
+        // источнике вроде файла, а список yt-dlp — это то, что тест и
+        // проверяет.
+        assert_eq!(seen.len(), SUPPORTED.len(), "пропал браузер из списка");
     }
 
     /// Подписи в списке человек читает глазами: одинаковые или пустые

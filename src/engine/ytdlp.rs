@@ -34,28 +34,86 @@ const POSTPROCESS_TEMPLATE: &str = concat!(
 /// На этой стадии `--print` не включает `--simulate`, поэтому загрузка идёт как обычно.
 const DONE_TEMPLATE: &str = r#"after_move:{"event":"done","path":%(filepath)j}"#;
 
-pub fn probe_args(url: &str, cookies: CookieSource) -> Vec<String> {
+pub fn probe_args(url: &str, cookies: CookieSource, cookie_file: Option<&Path>) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "-J".into(),
         "--no-playlist".into(),
         "--no-warnings".into(),
     ];
-    push_cookies(&mut args, cookies);
+    push_cookies(&mut args, cookies, cookie_file);
     args.push(url.into());
     args
 }
 
-/// Дописывает `--cookies-from-browser`, если пользователь выбрал браузер.
+/// Ключ входа на сайт: `--cookies-from-browser <браузер>` либо
+/// `--cookies <файл>`.
 ///
 /// Общая для `probe_args` и `download_args` намеренно: спрашивать сайт двумя
 /// разными личностями нельзя. У закрытого ролика анонимный `-J` проваливается,
 /// и человек получил бы пустую карточку — без названия, длительности и обложки —
 /// у загрузки, которая на самом деле идёт и заканчивается файлом на диске.
-fn push_cookies(args: &mut Vec<String>, cookies: CookieSource) {
+///
+/// Двух ключей сразу не бывает: yt-dlp принял бы оба, и какой из двух входов
+/// победит, зависело бы от него, а не от того, что выбрал человек.
+///
+/// **Несуществующий файл ключа не получает.** Не из аккуратности: yt-dlp на
+/// пропавший файл не ругается вовсе — проверено вживую (2026.07.04), код
+/// возврата 0, ролик скачивается, cookies просто не применяются, и даже без
+/// `--no-warnings` в выводе об этом ни слова. То есть человек, у которого
+/// файл переименовали, получил бы «видео с возрастным ограничением» вместо
+/// «файл cookies не найден». Сказать правду может только Savio, и говорит он
+/// её `Event::Warning` из `engine::start`; здесь остаётся не делать вид, что
+/// вход передан.
+fn push_cookies(args: &mut Vec<String>, cookies: CookieSource, cookie_file: Option<&Path>) {
     if let Some(browser) = cookies.browser() {
         args.push("--cookies-from-browser".into());
         args.push(browser.to_owned());
+    } else if cookies == CookieSource::File
+        && let Some(file) = cookie_file
+    {
+        args.push("--cookies".into());
+        args.push(file.to_string_lossy().into_owned());
     }
+}
+
+/// Ключ, которым передаётся файл cookies. Рядом с разбором в `log_args`:
+/// разъедься эти два места — путь пользователя уехал бы в журнал.
+const COOKIE_FILE_FLAG: &str = "--cookies";
+
+/// Командная строка для журнала — та же, что уходит в yt-dlp, но без пути
+/// к файлу cookies: от него остаётся только имя.
+///
+/// Журнал человек копирует кнопкой и вкладывает в сообщение о проблеме, а
+/// путь к файлу — это его каталоги и его имя пользователя. Имя файла при этом
+/// оставляем: диагностика без него теряет смысл (перепутанный файл — самая
+/// частая беда этой возможности), а личного в «cookies.txt» нет.
+///
+/// Сама строка из журнала не убирается и убрана быть не может: на успехе её
+/// отправки держится проверка живого приёмника в `engine::run`.
+pub fn log_args(args: &[String]) -> String {
+    let mut out = String::new();
+    let mut hide_next = false;
+    for arg in args {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        if hide_next {
+            // `file_name()` отдаёт `None` только у пути, кончающегося на
+            // `..`, — такого файла не бывает, но подставлять на месте
+            // неразобранного пустоту тоже нельзя: строка журнала перестала
+            // бы читаться.
+            let name = Path::new(arg)
+                .file_name()
+                .unwrap_or_else(|| std::ffi::OsStr::new("файл cookies"));
+            out.push('…');
+            out.push(std::path::MAIN_SEPARATOR);
+            out.push_str(&name.to_string_lossy());
+        } else {
+            out.push_str(arg);
+        }
+        hide_next = arg == COOKIE_FILE_FLAG;
+    }
+    out
 }
 
 /// Собирает значение `-f` для видео.
@@ -260,7 +318,7 @@ pub fn download_args(
         }
     }
 
-    push_cookies(&mut args, request.cookies);
+    push_cookies(&mut args, request.cookies, request.cookie_file.as_deref());
 
     args.push(request.url.clone());
     args
@@ -388,8 +446,10 @@ const FAILURE_HINTS: &[(&[&str], &str)] = &[
         "Этот браузер не отдаёт cookies.\n\n\
          Chrome и браузеры на его основе (Edge, Brave, Opera, Vivaldi) в \
          свежих версиях шифруют cookies так, что снаружи их не прочитать. \
-         Это защита самого браузера, обойти её Savio не может. Выберите \
-         в списке Firefox — его cookies читаются.",
+         Это защита самого браузера, обойти её Savio не может. Выходов два: \
+         выбрать в списке Mozilla Firefox — его cookies читаются — или \
+         выгрузить cookies из этого же браузера расширением вроде «Get \
+         cookies.txt» и указать в списке «Из файла…» то, что оно сохранит.",
     ),
     (
         &["cookies database in", "could not find cookies"],
@@ -399,13 +459,38 @@ const FAILURE_HINTS: &[(&[&str], &str)] = &[
          открыт нужный сайт.",
     ),
     (
+        // Ответ на посторонний файл и, что менее очевидно, на пустой:
+        // проверено вживую (yt-dlp 2026.07.04) — оба дают эту же строку
+        // и код 1.
+        &["does not look like a netscape format cookies file"],
+        "Выбранный файл — не файл cookies.\n\n\
+         Нужен текстовый файл формата Netscape: такой выгружает расширение \
+         браузера, например «Get cookies.txt», кнопкой «Экспорт». Тем же \
+         ответом кончается и пустой файл. Выберите в строке под списком \
+         другой файл — или верните пункт «Не использовать».",
+    ),
+    (
+        // Примета — имя модуля из питоновского трейсбека, а не «permission
+        // denied»: последнее приходит и от папки сохранения, а совет там
+        // нужен совсем другой. В хвост из четырёх строк имя попадает
+        // (проверено вживую): трейсбек кончается строкой `cookies.py`,
+        // самим исключением и сообщением упаковщика.
+        &["cookies.py"],
+        "В файл cookies не удалось записать.\n\n\
+         После работы yt-dlp дописывает в этот файл свежие cookies — и не \
+         смог: скорее всего у файла стоит «Только чтение» либо он лежит там, \
+         куда писать нельзя. Ролик при этом, скорее всего, уже скачан — \
+         загляните в папку сохранения. Снимите с файла защиту от записи или \
+         скопируйте его в обычную папку.",
+    ),
+    (
         &["not a bot"],
         "Сайт требует подтвердить, что вы не робот.\n\n\
          Так отвечают, когда с вашего адреса приходит слишком много запросов. \
          Нажмите «Обновить движок» и попробуйте снова через несколько минут. \
          Если включён VPN — выключите его: одним адресом пользуются многие, \
          и проверка на нём срабатывает чаще. А если вы вошли на этот сайт \
-         в браузере — выберите его в списке «Cookies из браузера».",
+         в браузере — выберите его в списке «Вход на сайт».",
     ),
     (
         &[
@@ -416,7 +501,7 @@ const FAILURE_HINTS: &[(&[&str], &str)] = &[
         ],
         "Видео с возрастным ограничением.\n\n\
          Сайт отдаёт его только тем, кто вошёл в аккаунт. Выберите в списке \
-         «Cookies из браузера» тот браузер, где вы вошли, — Savio возьмёт вход \
+         «Вход на сайт» тот браузер, где вы вошли, — Savio возьмёт вход \
          оттуда. Иногда помогает и «Обновить движок»: свежий yt-dlp обходит \
          часть таких проверок.",
     ),
@@ -424,8 +509,8 @@ const FAILURE_HINTS: &[(&[&str], &str)] = &[
         &["private video", "is private"],
         "Доступ к видео закрыт.\n\n\
          Владелец сделал его приватным — оно отдаётся только тем, кому он \
-         открыл доступ. Если доступ открыт вам, выберите в списке «Cookies \
-         из браузера» тот браузер, где вы вошли в аккаунт. Иначе остаётся \
+         открыл доступ. Если доступ открыт вам, выберите в списке «Вход \
+         на сайт» тот браузер, где вы вошли в аккаунт. Иначе остаётся \
          поискать открытую копию по другой ссылке.",
     ),
     (
@@ -500,12 +585,15 @@ pub fn explain_failure(code: i32, tail: &str, cookies: CookieSource) -> String {
     // Без этой ветки человек получил бы совет из соседней таблицы про
     // качество или сырой английский хвост — и никогда бы не догадался, что
     // виноват список, который он сам только что переключил.
-    if cookies.browser().is_some()
+    //
+    // Спрашиваем `any()`, а не `browser()`: cookies из файла доезжают до
+    // сайта теми же самыми, и урезанный ответ плеера приходит на них так же.
+    if cookies.any()
         && (lower.contains("requested format is not available")
             || lower.contains("no video formats found"))
     {
         return "Сайт не отдал ни одной дорожки — похоже, из-за cookies.\n\n\
-                Верните в списке «Cookies из браузера» пункт «Не использовать» \
+                Верните в списке «Вход на сайт» пункт «Не использовать» \
                 и попробуйте снова. YouTube почти всегда отвечает так на запрос \
                 с cookies: он переключается на урезанный ответ, в котором \
                 дорожек нет вовсе. Включать cookies стоит только для тех \
@@ -1130,7 +1218,7 @@ mod tests {
         options: DownloadOptions,
         ffmpeg: bool,
     ) -> Vec<String> {
-        args_full(format, quality, options, ffmpeg, CookieSource::None)
+        args_full(format, quality, options, ffmpeg, CookieSource::None, None)
     }
 
     fn args_full(
@@ -1139,6 +1227,7 @@ mod tests {
         options: DownloadOptions,
         ffmpeg: bool,
         cookies: CookieSource,
+        cookie_file: Option<&str>,
     ) -> Vec<String> {
         let request = Request {
             url: "https://example.com/video".to_owned(),
@@ -1146,6 +1235,7 @@ mod tests {
             quality,
             options,
             cookies,
+            cookie_file: cookie_file.map(PathBuf::from),
             section: Section::default(),
             sub_lang: SubLang::default(),
         };
@@ -1166,6 +1256,7 @@ mod tests {
             quality: Quality::Best,
             options,
             cookies: CookieSource::None,
+            cookie_file: None,
             section: Section::default(),
             sub_lang: SubLang::default(),
         };
@@ -1189,6 +1280,7 @@ mod tests {
             quality: Quality::Best,
             options: DownloadOptions::default(),
             cookies: CookieSource::None,
+            cookie_file: None,
             section,
             sub_lang: SubLang::default(),
         };
@@ -1700,6 +1792,7 @@ mod tests {
             quality: Quality::Best,
             options: subs_options(true),
             cookies: CookieSource::None,
+            cookie_file: None,
             section: Section::default(),
             sub_lang: SubLang::default(),
         };
@@ -1740,8 +1833,9 @@ mod tests {
             let args = args_for(format, Quality::Best);
             assert!(!has(&args, COOKIE_FLAG), "{format:?}: непрошеные cookies");
         }
-        let probe = probe_args("https://example.com/video", CookieSource::None);
+        let probe = probe_args("https://example.com/video", CookieSource::None, None);
         assert!(!has(&probe, COOKIE_FLAG), "непрошеные cookies у -J");
+        assert!(!has(&probe, COOKIE_FILE_FLAG), "непрошеный файл cookies у -J");
         // Прежний состав `-J` при этом не поехал: ссылка идёт последней.
         assert_eq!(
             probe,
@@ -1768,6 +1862,7 @@ mod tests {
                 DownloadOptions::default(),
                 true,
                 source,
+                None,
             );
             assert_eq!(
                 value_of(&args, COOKIE_FLAG),
@@ -1790,6 +1885,7 @@ mod tests {
     /// пустую карточку у загрузки, которая на самом деле идёт.
     #[test]
     fn probe_asks_with_the_same_cookies_as_the_download() {
+        const FILE: &str = "/home/me/cookies.txt";
         for source in CookieSource::ALL {
             let download = args_full(
                 Format::Mp4,
@@ -1797,13 +1893,20 @@ mod tests {
                 DownloadOptions::default(),
                 true,
                 source,
+                Some(FILE),
             );
-            let probe = probe_args("https://example.com/video", source);
-            assert_eq!(
-                value_of(&probe, COOKIE_FLAG),
-                value_of(&download, COOKIE_FLAG),
-                "{source:?}: `-J` и загрузка спрашивают по-разному"
+            let probe = probe_args(
+                "https://example.com/video",
+                source,
+                Some(Path::new(FILE)),
             );
+            for flag in [COOKIE_FLAG, COOKIE_FILE_FLAG] {
+                assert_eq!(
+                    value_of(&probe, flag),
+                    value_of(&download, flag),
+                    "{source:?}: `-J` и загрузка спрашивают по-разному ({flag})"
+                );
+            }
         }
     }
 
@@ -1818,12 +1921,126 @@ mod tests {
             all_options(),
             true,
             CookieSource::Firefox,
+            None,
         );
         assert_eq!(value_of(&plain, "-f"), value_of(&with_cookies, "-f"));
         for flag in EMBED_FLAGS {
             assert_eq!(has(&plain, flag), has(&with_cookies, flag), "разъехался {flag}");
         }
         assert_eq!(with_cookies.len(), plain.len() + 2, "лишние аргументы");
+    }
+
+    /// Выбранный файл обязан доехать до `--cookies` целым путём — и у
+    /// загрузки, и у `-J`. Второй источник входа затевался ради тех, у кого
+    /// браузер cookies не отдаёт (DPAPI), так что молчаливая потеря пути
+    /// оставила бы их вовсе без входа.
+    #[test]
+    fn the_chosen_cookie_file_reaches_the_command_line() {
+        const FILE: &str = "/home/me/Загрузки/cookies.txt";
+        let args = args_full(
+            Format::Mp4,
+            Quality::Best,
+            DownloadOptions::default(),
+            true,
+            CookieSource::File,
+            Some(FILE),
+        );
+        assert_eq!(value_of(&args, COOKIE_FILE_FLAG), Some(FILE));
+        // Браузерного ключа при этом нет: два входа сразу — это выбор
+        // за yt-dlp, а не за человеком.
+        assert!(!has(&args, COOKIE_FLAG), "два источника входа разом");
+        // Ссылка обязана остаться последней: `--cookies` берёт следующее
+        // слово как своё значение.
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("https://example.com/video")
+        );
+    }
+
+    /// Файл, выбранный при браузере, в командную строку не попадает, и
+    /// наоборот. Поля два, а вход один: передай мы оба ключа, какой из них
+    /// победит, решал бы yt-dlp.
+    #[test]
+    fn only_the_chosen_source_reaches_the_command_line() {
+        let with_browser = args_full(
+            Format::Mp4,
+            Quality::Best,
+            DownloadOptions::default(),
+            true,
+            CookieSource::Firefox,
+            Some("/home/me/cookies.txt"),
+        );
+        assert_eq!(value_of(&with_browser, COOKIE_FLAG), Some("firefox"));
+        assert!(
+            !has(&with_browser, COOKIE_FILE_FLAG),
+            "файл уехал вместе с браузером"
+        );
+
+        // И зеркально: пункт «не использовать» не оживляет забытый путь.
+        let none = args_full(
+            Format::Mp4,
+            Quality::Best,
+            DownloadOptions::default(),
+            true,
+            CookieSource::None,
+            Some("/home/me/cookies.txt"),
+        );
+        assert!(!has(&none, COOKIE_FILE_FLAG), "непрошеный вход из файла");
+    }
+
+    /// «Из файла…» без файла — это отсутствие ключа, а не пустое значение.
+    /// Пустая строка после `--cookies` съела бы ссылку: yt-dlp берёт
+    /// следующее слово как значение ключа.
+    #[test]
+    fn a_missing_cookie_file_leaves_no_flag_behind() {
+        let args = args_full(
+            Format::Mp4,
+            Quality::Best,
+            DownloadOptions::default(),
+            true,
+            CookieSource::File,
+            None,
+        );
+        assert!(!has(&args, COOKIE_FILE_FLAG), "ключ без значения");
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("https://example.com/video"),
+            "ссылка перестала быть последней"
+        );
+    }
+
+    /// Путь к файлу cookies в журнал не уходит: журнал копируют кнопкой и
+    /// вкладывают в сообщение о проблеме, а в пути — каталоги и имя
+    /// пользователя. Имя файла остаётся: без него по журналу не понять,
+    /// тот ли файл выбрали, а личного в «cookies.txt» нет.
+    #[test]
+    fn the_log_keeps_the_file_name_but_not_the_path() {
+        let args = args_full(
+            Format::Mp4,
+            Quality::Best,
+            DownloadOptions::default(),
+            true,
+            CookieSource::File,
+            Some("/home/ivan/секретное/cookies.txt"),
+        );
+        let line = log_args(&args);
+
+        assert!(!line.contains("ivan"), "имя пользователя утекло: {line}");
+        assert!(!line.contains("секретное"), "каталог утёк: {line}");
+        assert!(line.contains("cookies.txt"), "потеряно имя файла: {line}");
+        assert!(line.contains(COOKIE_FILE_FLAG), "потерян сам ключ: {line}");
+        // Остальная командная строка не тронута: журнал остаётся
+        // диагностикой, а не пересказом.
+        assert!(line.contains("https://example.com/video"), "{line}");
+        assert!(line.contains("--merge-output-format mp4"), "{line}");
+    }
+
+    /// Без файла cookies строка журнала обязана остаться дословной: правка
+    /// ради чужого пути не должна калечить всё остальное.
+    #[test]
+    fn the_log_is_verbatim_when_there_is_no_cookie_file() {
+        let args = args_for(Format::Mp4, Quality::Best);
+        assert_eq!(log_args(&args), args.join(" "));
     }
 
     /// Хвосты сняты с живого вывода yt-dlp 2026.07.04 на Windows 11 —
@@ -1880,6 +2097,59 @@ mod tests {
         assert!(!locked.contains("не нашлись"), "{locked}");
         assert!(missing.contains("не нашлись"), "{missing}");
         assert!(!missing.contains("Закройте браузер"), "{missing}");
+    }
+
+    /// Беды файла cookies объясняются по-русски и не путаются с бедами
+    /// браузера: советы у них разные, а приметы сняты с живого вывода
+    /// (yt-dlp 2026.07.04, Windows 11).
+    #[test]
+    fn cookie_file_failures_are_explained_in_russian() {
+        // Посторонний файл — и точно так же пустой: проверено, ответ тот же.
+        let garbage = explain_failure(
+            1,
+            "ERROR: 'C:/Users/me/скачано/заметки.txt' does not look like a \
+             Netscape format cookies file",
+            CookieSource::File,
+        );
+        assert!(garbage.contains("не файл cookies"), "{garbage}");
+        assert!(garbage.contains("Netscape"), "{garbage}");
+        assert!(!garbage.contains("ERROR"), "утёк сырой вывод: {garbage}");
+
+        // Файл только для чтения. yt-dlp дописывает в него cookies после
+        // работы и падает питоновским трейсбеком — уже поверх скачанного
+        // ролика, поэтому в объяснении про папку сохранения сказано прямо.
+        let readonly = explain_failure(
+            1,
+            "  File \"yt_dlp\\cookies.py\", line 1305, in open\n\
+             PermissionError: [Errno 13] Permission denied: 'C:/Users/me/cookies.txt'\n\
+             [PYI-2684:ERROR] Failed to execute script '__main__' due to unhandled exception!",
+            CookieSource::File,
+        );
+        assert!(readonly.contains("не удалось записать"), "{readonly}");
+        assert!(readonly.contains("папку сохранения"), "{readonly}");
+        assert!(
+            !readonly.contains("PermissionError"),
+            "утёк трейсбек: {readonly}"
+        );
+
+        // И советы не перепутаны: у одной беды выбирают другой файл,
+        // у другой — снимают защиту от записи.
+        assert!(!garbage.contains("Только чтение"), "{garbage}");
+        assert!(!readonly.contains("Netscape"), "{readonly}");
+    }
+
+    /// Подсказка про пустой список дорожек у YouTube обязана появляться и
+    /// для входа из файла: cookies доезжают до сайта теми же самыми. До
+    /// появления файла этот вопрос задавался через `browser()`, и на файле
+    /// он молча отвечал бы «вход не просили».
+    #[test]
+    fn the_empty_format_list_hint_knows_about_the_file_login() {
+        let tail = "ERROR: [youtube] dQw4w9WgXcQ: Requested format is not available.";
+        let from_file = explain_failure(1, tail, CookieSource::File);
+        assert!(
+            from_file.contains("Не использовать"),
+            "нет совета вернуть список: {from_file}"
+        );
     }
 
     /// Главная ловушка задачи, и увидеть её можно только вживую: YouTube на

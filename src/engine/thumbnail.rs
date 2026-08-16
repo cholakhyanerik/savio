@@ -262,6 +262,7 @@ mod tests {
             quality: crate::model::Quality::Best,
             options: crate::model::DownloadOptions::default(),
             cookies: crate::model::CookieSource::None,
+            cookie_file: None,
             section: crate::model::Section::default(),
             sub_lang: crate::model::SubLang::default(),
         };

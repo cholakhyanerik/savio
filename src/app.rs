@@ -142,13 +142,22 @@ const PREVIEW_MAX_HEIGHT: f32 = 72.0;
 /// заработанная на ровном месте и ровно тем, что должно было помогать.
 const PREVIEW_DEBOUNCE: f64 = 0.8;
 
-/// Потолок высоты раскрытого списка браузеров.
+/// Потолок высоты раскрытого списка источников входа.
 ///
 /// Считается от числа источников, а не подобран на глаз: добавится браузер —
 /// список подрастёт сам, и никто не будет гадать, почему последний пункт
 /// уехал в прокрутку. 28 — строка списка (26 точек) плюс промежуток (2),
 /// 12 — поля рамки меню сверху и снизу.
 const COOKIE_LIST_HEIGHT: f32 = CookieSource::ALL.len() as f32 * 28.0 + 12.0;
+
+/// Что написано на кнопке файла cookies, пока файла нет.
+///
+/// В окне до этой надписи не дойти: пункт «Из файла…» сам открывает диалог,
+/// а отказ от диалога возвращает прежний выбор (см. `cookie_selector`). Но
+/// кнопка обязана говорить хоть что-то, и приглашение выбрать файл — ровно
+/// то, что она делает по нажатию.
+const PICK_COOKIE_FILE: &str = "Выбрать файл…";
+
 
 /// Потолок высоты раскрытого списка языков субтитров.
 ///
@@ -1413,6 +1422,12 @@ struct Preview {
     /// пустого списка дорожек), и смена браузера в списке обязана запрос
     /// перезапустить.
     cookies: CookieSource,
+    /// Каким файлом cookies спрашивали. Такая же часть цели, как и сам
+    /// источник: два разных файла — это два разных входа в аккаунт, и ответы
+    /// по ним отличаются ровно так же, как ответ Firefox от ответа без
+    /// cookies. Без этого поля смена файла оставила бы на экране карточку,
+    /// собранную по прежнему входу.
+    cookie_file: Option<PathBuf>,
     /// Когда истекает окно дебаунса, по часам egui. `None` — ждать нечего:
     /// либо уже спросили, либо спрашивать не о чем.
     due: Option<f64>,
@@ -1444,13 +1459,21 @@ impl Preview {
     /// Возвращает `true`, если цель сменилась: прежний ответ больше не про то,
     /// что в поле, и всё, что из него собрано (название, оговорка про высоту,
     /// список языков), показывать уже нельзя.
-    fn retarget(&mut self, url: &str, cookies: CookieSource, now: f64) -> bool {
-        if self.url == url && self.cookies == cookies {
+    fn retarget(
+        &mut self,
+        url: &str,
+        cookies: CookieSource,
+        cookie_file: Option<&Path>,
+        now: f64,
+    ) -> bool {
+        if self.url == url && self.cookies == cookies && self.cookie_file.as_deref() == cookie_file
+        {
             return false;
         }
 
         self.stop();
         self.cookies = cookies;
+        self.cookie_file = cookie_file.map(Path::to_path_buf);
         // Мусор из буфера обмена в yt-dlp не отправляем. Список поддерживаемых
         // сайтов принадлежит ему, и кнопку «непохожая» ссылка не блокирует, —
         // но каждый такой запуск это процесс и поход в сеть, а обрывок текста
@@ -1548,10 +1571,14 @@ impl Preview {
 
     /// Про ту же ли ссылку этот запрос.
     ///
-    /// Сверяем и адрес, и cookies: ответ на один и тот же адрес с чужим входом
-    /// в аккаунт — это другой ответ.
+    /// Сверяем и адрес, и вход в аккаунт целиком — источник вместе с файлом:
+    /// ответ на один и тот же адрес с чужим входом — это другой ответ.
     fn is_about(&self, request: Option<&Request>) -> bool {
-        request.is_some_and(|request| request.url == self.url && request.cookies == self.cookies)
+        request.is_some_and(|request| {
+            request.url == self.url
+                && request.cookies == self.cookies
+                && request.cookie_file == self.cookie_file
+        })
     }
 
     /// Ответ, годный для этой загрузки, — чтобы та не спрашивала сайт второй
@@ -1602,6 +1629,19 @@ pub struct SavioApp {
     /// он должен осознанно, а не сам собой через неделю после того, как
     /// понадобился один раз.
     cookies: CookieSource,
+    /// Выбранный файл cookies. Осмыслен только при `CookieSource::File`,
+    /// но переживает переключение списка: вернувшись к «Из файла…», человек
+    /// не должен искать тот же файл заново.
+    ///
+    /// Между запусками не запоминается по той же причине, что и сам источник,
+    /// и по своей вдобавок: путь к такому файлу — это не настройка, а след
+    /// того, чем человек занимался (задача 24 реестра).
+    cookie_file: Option<PathBuf>,
+    /// Путь к файлу cookies строкой — для кнопки под списком. Полем, а не
+    /// сборкой в кадре: `ui()` идёт 60 раз в секунду, а меняется это по
+    /// выбору файла. Пока файла нет — приглашение выбрать его, а не пустая
+    /// строка: пустая кнопка не сказала бы ничего.
+    cookie_file_display: String,
     /// ffmpeg не нашёлся при последней проверке. Снимок с запуска (и с конца
     /// установки) — единственное, что можно спросить, не трогая диск в кадре.
     /// Нужен, чтобы предупредить о бесполезных галочках **до** нажатия
@@ -1774,6 +1814,8 @@ impl SavioApp {
             section: Section::default(),
             section_error: None,
             cookies: CookieSource::default(),
+            cookie_file: None,
+            cookie_file_display: PICK_COOKIE_FILE.to_owned(),
             ffmpeg_missing: false,
             out_dir_display: display_dir(out_dir.as_deref()),
             out_dir,
@@ -2123,6 +2165,7 @@ impl SavioApp {
             quality: self.quality,
             options: self.options,
             cookies: self.cookies,
+            cookie_file: self.cookie_file.clone(),
             section: self.section,
             sub_lang: self.sub_lang.clone(),
         };
@@ -2379,7 +2422,7 @@ impl SavioApp {
         self.advanced_summary = advanced_summary(
             self.section_error.is_some(),
             self.section.any(),
-            self.cookies.browser().is_some(),
+            self.cookies.any(),
             &self.sub_lang,
         );
     }
@@ -2650,6 +2693,7 @@ impl SavioApp {
         let request = Request {
             url: self.preview.url.clone(),
             cookies: self.preview.cookies,
+            cookie_file: self.preview.cookie_file.clone(),
             // Остальное `probe` не спрашивает (см. `ytdlp::probe_args`), но
             // запрос — это запрос целиком, и половины его не бывает. Заодно
             // ровно эти поля уедут в загрузку, если нажмут «Скачать».
@@ -2672,7 +2716,12 @@ impl SavioApp {
     /// из кадра: сравнивать строки шестьдесят раз в секунду незачем.
     fn retarget_preview(&mut self, ctx: &egui::Context) {
         let now = ctx.input(|i| i.time);
-        if !self.preview.retarget(self.url.trim(), self.cookies, now) {
+        if !self.preview.retarget(
+            self.url.trim(),
+            self.cookies,
+            self.cookie_file.as_deref(),
+            now,
+        ) {
             return;
         }
 
@@ -3842,13 +3891,13 @@ impl SavioApp {
         changed
     }
 
-    /// Выпадающий список «взять вход из браузера».
+    /// Выпадающий список «откуда взять вход на сайт»: браузер или файл.
     ///
     /// Список, а не поле ввода: имена браузеров принадлежат yt-dlp, их список
     /// закрытый, и опечатка в нём обернулась бы английской руганью вместо
     /// загрузки.
     ///
-    /// Оговорка под ним меняется вместе с выбором и в обоих случаях статична —
+    /// Оговорка под ним меняется вместе с выбором и в каждом случае статична —
     /// в кадре отрисовки здесь ничего не собирается.
     fn cookie_selector(&mut self, ui: &mut egui::Ui) {
         // Ширину берём до `ComboBox`: внутри он заводит свою горизонтальную
@@ -3898,29 +3947,110 @@ impl SavioApp {
         });
 
         if self.cookies != before {
+            // Пункт «Из файла…» без файла не значит ничего, поэтому диалог
+            // открываем сразу, а не оставляем человека гадать, где выбрать
+            // файл. Отказ от диалога возвращает прежний выбор: пустой «Из
+            // файла…» выглядел бы включённым входом, а вход при нём не
+            // передавался бы вовсе — ровно тот молчаливый отказ, которого
+            // не должно быть.
+            if self.cookies == CookieSource::File && self.cookie_file.is_none() {
+                self.pick_cookie_file();
+                if self.cookie_file.is_none() {
+                    self.cookies = before;
+                }
+            }
             self.retarget_preview(ui.ctx());
             self.rebuild_advanced_summary();
         }
 
+        if self.cookies == CookieSource::File {
+            ui.add_space(6.0);
+            self.cookie_file_row(ui);
+        }
+
         ui.add_space(6.0);
-        if self.cookies.browser().is_some() {
-            note(
+        match self.cookies {
+            CookieSource::None => note(
+                ui,
+                "Для возрастных, приватных и «подтвердите, что вы не робот» \
+                 роликов: Savio возьмёт ваш вход на сайт из браузера или из \
+                 файла. Обычные ссылки скачиваются и без этого.",
+                theme::TEXT_MUTED,
+            ),
+            CookieSource::File => note(
+                ui,
+                "Нужен файл формата Netscape — такой выгружает расширение \
+                 браузера вроде «Get cookies.txt». После загрузки yt-dlp \
+                 допишет в него свежие cookies. И то же, что с браузером: \
+                 у YouTube cookies чаще мешают — перестало скачиваться, \
+                 верните «Не использовать».",
+                theme::STATE_WARNING,
+            ),
+            _ => note(
                 ui,
                 "Закройте браузер перед загрузкой: пока он открыт, файл cookies \
                  занят и не читается. И учтите: у YouTube cookies чаще мешают — \
                  сайт отвечает пустым списком дорожек. Перестало скачиваться — \
                  верните «Не использовать».",
                 theme::STATE_WARNING,
-            );
-        } else {
-            note(
-                ui,
-                "Для возрастных, приватных и «подтвердите, что вы не робот» \
-                 роликов: Savio возьмёт из браузера ваш вход на сайт. Обычные \
-                 ссылки скачиваются и без этого.",
-                theme::TEXT_MUTED,
-            );
+            ),
         }
+    }
+
+    /// Строка с выбранным файлом cookies: кнопка во всю ширину с самим путём.
+    ///
+    /// Устроена как `folder_row`, и по той же причине: пара «подпись + кнопка»
+    /// в узкой колонке разъезжается, а путь длинный почти всегда. Полный путь
+    /// с кнопки, как и там, не посмотреть — `show_tooltip_when_elided` есть
+    /// только у `Label` (дефект 48 реестра).
+    ///
+    /// Отдельного вида «файл не выбран» здесь нет, и это не упущение: пункт
+    /// «Из файла…» сам открывает диалог, а отказ от диалога возвращает
+    /// прежний выбор (см. `cookie_selector`), так что при выбранном источнике
+    /// файл есть всегда. На случай, если это когда-нибудь перестанет быть
+    /// правдой, на кнопке стоит [`PICK_COOKIE_FILE`] — приглашение сделать
+    /// ровно то, что она и делает.
+    fn cookie_file_row(&mut self, ui: &mut egui::Ui) {
+        let clicked = ui
+            .add_sized(
+                [ui.available_width(), theme::CONTROL_HEIGHT],
+                egui::Button::new(
+                    egui::RichText::new(&self.cookie_file_display)
+                        .color(theme::TEXT_SECONDARY),
+                )
+                .truncate(),
+            )
+            .on_hover_text("Откуда взять вход на сайт. Нажмите, чтобы выбрать другой файл.")
+            .clicked();
+
+        if clicked {
+            self.pick_cookie_file();
+            // Файл — часть вопроса к сайту наравне со ссылкой: сменили
+            // файл, значит прежний ответ уже не про этот вход.
+            self.retarget_preview(ui.ctx());
+        }
+    }
+
+    /// Спрашивает файл cookies. Отказ от диалога ничего не меняет: прежний
+    /// выбор остаётся на месте.
+    ///
+    /// Диалог блокирует поток, то есть и кадр, — как и выбор папки
+    /// сохранения. Это законно: пока открыт модальный диалог системы,
+    /// рисовать окну всё равно нечего.
+    fn pick_cookie_file(&mut self) {
+        let Some(file) = rfd::FileDialog::new()
+            // Фильтр по расширению, но не единственный: расширения у выгрузки
+            // разные, и запереть человека в `*.txt` значило бы не дать
+            // выбрать свой же файл.
+            .add_filter("Файлы cookies", &["txt"])
+            .add_filter("Все файлы", &["*"])
+            .pick_file()
+        else {
+            return;
+        };
+
+        self.cookie_file_display = file.display().to_string();
+        self.cookie_file = Some(file);
     }
 
     /// Куда класть готовые файлы: одна кнопка во всю ширину с самим путём.
@@ -6700,6 +6830,7 @@ mod tests {
             options: DownloadOptions::default(),
             section: Section::default(),
             cookies: CookieSource::default(),
+            cookie_file: None,
             sub_lang: SubLang::default(),
         }
     }
@@ -6741,7 +6872,7 @@ mod tests {
     /// всё решает приёмник, а ручка лишь убивает процесс.
     fn asking(url: &str) -> (Preview, std::sync::mpsc::Sender<Event>) {
         let mut preview = Preview::default();
-        assert!(preview.retarget(url, CookieSource::None, 0.0), "{url}");
+        assert!(preview.retarget(url, CookieSource::None, None, 0.0), "{url}");
 
         let (tx, rx) = channel();
         preview.due = None;
@@ -6763,7 +6894,7 @@ mod tests {
         // вторая.
         slow.send(Event::Info(info("Ролик по прежней ссылке")))
             .expect("канал ещё жив");
-        assert!(preview.retarget("https://site.ru/b", CookieSource::None, 0.0));
+        assert!(preview.retarget("https://site.ru/b", CookieSource::None, None, 0.0));
 
         assert!(
             preview.take_events().is_empty(),
@@ -6813,15 +6944,15 @@ mod tests {
     fn the_site_is_asked_only_after_a_pause() {
         let mut preview = Preview::default();
 
-        assert!(preview.retarget("https://site.ru/a", CookieSource::None, 10.0));
+        assert!(preview.retarget("https://site.ru/a", CookieSource::None, None, 10.0));
         assert_eq!(preview.due, Some(10.0 + PREVIEW_DEBOUNCE));
 
-        assert!(preview.retarget("https://site.ru/ab", CookieSource::None, 10.4));
+        assert!(preview.retarget("https://site.ru/ab", CookieSource::None, None, 10.4));
         assert_eq!(preview.due, Some(10.4 + PREVIEW_DEBOUNCE));
 
         // Та же ссылка и тот же вход — спрашивать заново нечего: срок
         // не сдвигается, а начатое не бросается.
-        assert!(!preview.retarget("https://site.ru/ab", CookieSource::None, 10.9));
+        assert!(!preview.retarget("https://site.ru/ab", CookieSource::None, None, 10.9));
         assert_eq!(preview.due, Some(10.4 + PREVIEW_DEBOUNCE));
     }
 
@@ -6831,7 +6962,7 @@ mod tests {
     fn junk_from_the_clipboard_is_not_worth_a_request() {
         let mut preview = Preview::default();
         for text in ["", "   ", "просто текст", "site.com/watch?v=a", "https://"] {
-            preview.retarget(text, CookieSource::None, 0.0);
+            preview.retarget(text, CookieSource::None, None, 0.0);
             assert_eq!(preview.due, None, "спросили про {text:?}");
             assert_eq!(preview.state, PreviewState::Idle, "на {text:?}");
         }
@@ -6843,7 +6974,7 @@ mod tests {
     #[test]
     fn the_answer_is_reused_only_for_the_very_same_request() {
         let mut preview = Preview::default();
-        preview.retarget("https://site.ru/a", CookieSource::None, 0.0);
+        preview.retarget("https://site.ru/a", CookieSource::None, None, 0.0);
         preview.info = Some(info("Ролик"));
 
         let mut same = request("https://site.ru/a", Format::Mp4, Quality::Best);
@@ -6854,6 +6985,39 @@ mod tests {
 
         same.cookies = CookieSource::Firefox;
         assert!(preview.answer_for(&same).is_none(), "чужой вход в аккаунт");
+    }
+
+    /// Тот же вопрос про файл: два разных файла cookies — это два разных
+    /// входа в аккаунт, и ответ по одному нельзя показывать под другим.
+    /// Сам источник (`File`) при этом не меняется, так что без сверки путей
+    /// подмена прошла бы незамеченной.
+    #[test]
+    fn a_different_cookie_file_is_a_different_question() {
+        let mine = PathBuf::from("/home/me/cookies.txt");
+        let other = PathBuf::from("/home/me/другой.txt");
+
+        let mut preview = Preview::default();
+        preview.retarget("https://site.ru/a", CookieSource::File, Some(&mine), 0.0);
+        preview.info = Some(info("Ролик"));
+
+        let mut request = request("https://site.ru/a", Format::Mp4, Quality::Best);
+        request.cookies = CookieSource::File;
+        request.cookie_file = Some(mine.clone());
+        assert!(preview.answer_for(&request).is_some(), "свой же ответ");
+
+        request.cookie_file = Some(other.clone());
+        assert!(preview.answer_for(&request).is_none(), "ответ по чужому файлу");
+
+        // И смена файла обязана перезапустить запрос — иначе на экране
+        // осталось бы название, полученное прежним входом.
+        assert!(
+            preview.retarget("https://site.ru/a", CookieSource::File, Some(&other), 1.0),
+            "смену файла не заметили"
+        );
+        assert!(
+            !preview.retarget("https://site.ru/a", CookieSource::File, Some(&other), 2.0),
+            "тот же файл — спрашивать заново нечего"
+        );
     }
 
     /// Строка очереди называется роликом сразу, а не через час, когда до неё
