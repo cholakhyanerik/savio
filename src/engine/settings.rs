@@ -1,9 +1,9 @@
 //! Выбор пользователя, переживающий закрытие окна.
 //!
-//! Формат, ступень качества, папка сохранения и то, что вшивается в файл,
-//! выставляются один раз и дальше обычно не меняются: тот, кто качает только
-//! MP3 к себе в «Музыку» и всегда вшивает обложку с названием, не должен
-//! переключать это при каждом запуске.
+//! Формат, ступень качества, папка сохранения, то, что вшивается в файл, и
+//! вход на сайт выставляются один раз и дальше обычно не меняются: тот, кто
+//! качает только MP3 к себе в «Музыку» и всегда вшивает обложку с названием,
+//! не должен переключать это при каждом запуске.
 //!
 //! Живёт в слое движка, а не UI, по той же причине, что и всё остальное здесь:
 //! это работа с файловой системой и разбор JSON, а `ui()` не должен ни читать,
@@ -21,7 +21,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use super::binaries;
-use crate::model::{DownloadOptions, Format, Quality};
+use crate::model::{CookieSource, DownloadOptions, Format, Quality};
 
 /// Имя файла в каталоге Savio.
 const FILE_NAME: &str = "settings.json";
@@ -61,6 +61,33 @@ pub struct Settings {
     /// и разложенные по отдельным полям они разъехались бы с
     /// [`DownloadOptions`] при первом же добавлении пятого.
     pub options: DownloadOptions,
+    /// Откуда брать вход на сайт.
+    ///
+    /// До 0.22 не запоминался намеренно: доступ к профилю браузера — не то же
+    /// самое, что формат файла. Решение поменяно сознательно (задача 24
+    /// реестра), потому что обратная сторона оказалась дороже: тот, кто качает
+    /// с закрытого сайта постоянно, выбирал вход при каждом запуске. Само же
+    /// опасение никуда не делось, и держат его две вещи в окне, которые
+    /// нельзя выбрасывать.
+    ///
+    /// Первая — жёлтая оговорка под списком, но она внутри «Тонких настроек»,
+    /// а те при запуске свёрнуты, так что запомненный вход её не покажет,
+    /// пока группу не раскроют. Значит, вся работа при запуске достаётся
+    /// второй — словам «вход на сайт» в заголовке свёрнутой группы. Отсюда
+    /// требование: заголовок обязан различать включённый вход и выключенный
+    /// (задача 51 реестра — сейчас различает хуже, чем хотелось бы). Без
+    /// этого запомненный вход становится невидимым, а он хрупкий: у YouTube
+    /// cookies ломают загрузку совсем, при открытом браузере база занята.
+    pub cookies: CookieSource,
+    /// Файл cookies, выбранный для [`CookieSource::File`].
+    ///
+    /// Пишется независимо от `cookies`: в окне выбранный файл переживает
+    /// переключение списка на «Не использовать» и обратно, и обрывать эту
+    /// память на закрытии окна было бы странностью без причины.
+    ///
+    /// `None` — файла не выбирали либо путь не выражается в UTF-8. В отличие
+    /// от `out_dir`, пропавший файл здесь **не** забывается, см. `load_from`.
+    pub cookie_file: Option<PathBuf>,
 }
 
 /// Читает настройки прошлого запуска.
@@ -91,6 +118,16 @@ fn load_from(path: &Path) -> Settings {
     if settings.out_dir.as_deref().is_some_and(|dir| !dir.is_dir()) {
         settings.out_dir = None;
     }
+
+    // А вот пропавший файл cookies здесь намеренно **не** проверяется, хотя
+    // соседняя проверка папки так и просит дописать вторую. Умолчания у этих
+    // двух разные по цене. Забытая папка откатывается к обычному каталогу
+    // загрузок — файл всё равно окажется на диске, и человек его найдёт.
+    // Забытый вход откатывается к «Не использовать», то есть к молчаливой
+    // загрузке без входа в аккаунт: закрытый ролик после этого отвечает «нужен
+    // вход», и чинить пойдут не то. Поэтому путь остаётся как есть, а про
+    // пропажу говорит `cookie_file_trouble` — с именем файла и перед началом
+    // загрузки, пока она ничего не стоила.
 
     settings
 }
@@ -151,6 +188,50 @@ fn quality_from_token(token: &str) -> Option<Quality> {
     }
 }
 
+/// Источник входа на сайт строкой.
+///
+/// Своя таблица, а не [`CookieSource::browser`], хотя для семи вариантов из
+/// девяти они совпадают буква в букву. Совпадение случайное: те строки —
+/// словарь `--cookies-from-browser`, они принадлежат yt-dlp и меняются вместе
+/// с ним, а этим на диске лежать годами. Переименуй yt-dlp завтра `chromium`,
+/// и общая таблица либо перестала бы работать ключом, либо молча забыла бы
+/// выбор у всех, кто им пользовался. Вдобавок `browser()` не различает
+/// «не использовать» и «из файла» — оба у него `None`.
+fn cookies_token(cookies: CookieSource) -> &'static str {
+    match cookies {
+        CookieSource::None => "none",
+        CookieSource::Chrome => "chrome",
+        CookieSource::Edge => "edge",
+        CookieSource::Firefox => "firefox",
+        CookieSource::Opera => "opera",
+        CookieSource::Brave => "brave",
+        CookieSource::Vivaldi => "vivaldi",
+        CookieSource::Chromium => "chromium",
+        CookieSource::File => "file",
+    }
+}
+
+/// Обратное преобразование. `None` — токена такого нет, и тогда сработает
+/// общее правило `parse`: остаётся умолчание, то есть [`CookieSource::None`].
+///
+/// **Откат обязан вести именно туда, а не к первому браузеру списка.** Файл
+/// от будущей версии Savio не должен молча включить чтение чужого профиля —
+/// вход включается по просьбе человека, а не по непонятной строке из файла.
+fn cookies_from_token(token: &str) -> Option<CookieSource> {
+    match token {
+        "none" => Some(CookieSource::None),
+        "chrome" => Some(CookieSource::Chrome),
+        "edge" => Some(CookieSource::Edge),
+        "firefox" => Some(CookieSource::Firefox),
+        "opera" => Some(CookieSource::Opera),
+        "brave" => Some(CookieSource::Brave),
+        "vivaldi" => Some(CookieSource::Vivaldi),
+        "chromium" => Some(CookieSource::Chromium),
+        "file" => Some(CookieSource::File),
+        _ => None,
+    }
+}
+
 /// Содержимое файла для текущих настроек.
 fn to_json(settings: &Settings) -> String {
     // Флажки пишем всегда, включая выключенные: снятая галочка — такой же
@@ -164,14 +245,23 @@ fn to_json(settings: &Settings) -> String {
         "embed_thumbnail": settings.options.embed_thumbnail,
         "embed_subs": settings.options.embed_subs,
         "auto_subs": settings.options.auto_subs,
+        // Пишем всегда, включая «none», и по той же причине, что и снятые
+        // флажки: «выбрал не использовать» и «версия ещё не умела это
+        // помнить» — разные вещи, а по отсутствию ключа их не отличить.
+        "cookies": cookies_token(settings.cookies),
     });
 
-    // Путь кладём только тогда, когда он выражается в UTF-8. Терять запомненную
-    // папку из-за экзотического имени обидно, но `display()` тут не годится:
-    // он подменяет непреобразуемые байты знаком вопроса, и при следующем
-    // запуске мы бы честно сохранили файл в **другой** каталог.
+    // Пути кладём только тогда, когда они выражаются в UTF-8. Терять
+    // запомненную папку из-за экзотического имени обидно, но `display()` тут
+    // не годится: он подменяет непреобразуемые байты знаком вопроса, и при
+    // следующем запуске мы бы честно сохранили файл в **другой** каталог.
+    // С файлом cookies промах был бы тише и хуже: yt-dlp не жалуется на
+    // несуществующий файл вовсе.
     if let Some(dir) = settings.out_dir.as_deref().and_then(Path::to_str) {
         value["out_dir"] = serde_json::Value::String(dir.to_owned());
+    }
+    if let Some(file) = settings.cookie_file.as_deref().and_then(Path::to_str) {
+        value["cookie_file"] = serde_json::Value::String(file.to_owned());
     }
 
     serde_json::to_string_pretty(&value).unwrap_or_default()
@@ -214,6 +304,25 @@ fn parse(text: &str) -> Settings {
         .filter(|dir| !dir.is_empty())
     {
         settings.out_dir = Some(PathBuf::from(dir));
+    }
+
+    if let Some(cookies) = value
+        .get("cookies")
+        .and_then(serde_json::Value::as_str)
+        .and_then(cookies_from_token)
+    {
+        settings.cookies = cookies;
+    }
+
+    // Пустую строку отбрасываем по той же причине, что и у папки: путь,
+    // который есть, но никуда не ведёт, дальше превратился бы в «файл выбран,
+    // но не найден» — оговорку про беду, которой не было.
+    if let Some(file) = value
+        .get("cookie_file")
+        .and_then(serde_json::Value::as_str)
+        .filter(|file| !file.is_empty())
+    {
+        settings.cookie_file = Some(PathBuf::from(file));
     }
 
     // Флажки вшивания. Каждый по отдельности и с тем же правилом: нет ключа
@@ -396,6 +505,8 @@ mod tests {
                 embed_subs: false,
                 auto_subs: true,
             },
+            cookies: CookieSource::File,
+            cookie_file: Some(PathBuf::from(r"C:\Users\Вася\cookies.txt")),
         };
         assert_eq!(parse(&to_json(&settings)), settings);
     }
@@ -423,15 +534,92 @@ mod tests {
     }
 
     #[test]
+    fn a_file_without_login_leaves_it_off() {
+        // Файл от версии до 0.22: входа в нём нет вовсе, и включиться сам
+        // он не должен — иначе обновление Savio начало бы читать профиль
+        // браузера у того, кто об этом не просил.
+        let text = r#"{"version": 1, "format": "mp4", "quality": "best"}"#;
+        let settings = parse(text);
+        assert_eq!(settings.cookies, CookieSource::None);
+        assert_eq!(settings.cookie_file, None);
+    }
+
+    #[test]
+    fn an_unknown_login_falls_back_to_none_not_to_a_browser() {
+        // Самая дорогая ошибка отката во всём модуле: источник от будущей
+        // версии Savio не должен превратиться в первый попавшийся браузер,
+        // то есть в незапрошенное чтение чужого профиля.
+        for token in [
+            r#""safari""#,
+            r#""SAFARI""#,
+            r#""""#,
+            r#""chrome ""#,
+            "42",
+            "true",
+            "null",
+            r#"["firefox"]"#,
+        ] {
+            let text = format!(r#"{{"cookies": {token}}}"#);
+            assert_eq!(
+                parse(&text).cookies,
+                CookieSource::None,
+                "на входе {token}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_login_from_a_file_survives_without_the_file_itself() {
+        // Путь мог не выразиться в UTF-8 — источник от этого не пропадает.
+        // В окне это законное состояние: под списком стоит приглашение
+        // выбрать файл, а перед загрузкой Savio скажет, что файла нет.
+        let text = r#"{"cookies": "file"}"#;
+        let settings = parse(text);
+        assert_eq!(settings.cookies, CookieSource::File);
+        assert_eq!(settings.cookie_file, None);
+    }
+
+    #[test]
+    fn the_cookie_file_is_kept_even_when_the_login_is_off() {
+        // Намеренно, и «прибрать» это тянет: зачем путь, если вход выключен?
+        // Затем же, зачем он держится в окне при переключении списка на
+        // «Не использовать» и обратно — чтобы не искать тот же файл заново.
+        // Обрывать эту память на закрытии окна было бы странностью без
+        // причины, а заметить пропажу можно только вернувшись к «Из файла…».
+        let settings = Settings {
+            cookies: CookieSource::None,
+            cookie_file: Some(PathBuf::from("/home/me/cookies.txt")),
+            ..Settings::default()
+        };
+        let json = to_json(&settings);
+        assert!(json.contains("cookies.txt"), "путь обязан уехать в файл");
+        assert_eq!(parse(&json), settings);
+    }
+
+    #[test]
+    fn an_empty_cookie_file_is_not_a_file() {
+        // `PathBuf::from("")` дальше стал бы «файл выбран, но не найден» —
+        // оговоркой про беду, которой не было.
+        let text = r#"{"cookies": "file", "cookie_file": ""}"#;
+        assert_eq!(parse(text).cookie_file, None);
+    }
+
+    #[test]
     fn round_trip_without_folder() {
         let settings = Settings {
             format: Format::Mp4,
             quality: Quality::Best,
             out_dir: None,
             options: DownloadOptions::default(),
+            cookies: CookieSource::None,
+            cookie_file: None,
         };
         let json = to_json(&settings);
         assert!(!json.contains("out_dir"), "пустого пути в файле быть не должно");
+        assert!(
+            !json.contains("cookie_file"),
+            "невыбранному файлу cookies в файле места нет"
+        );
         assert_eq!(parse(&json), settings);
     }
 
@@ -448,7 +636,8 @@ mod tests {
     #[test]
     fn wrong_types_fall_back_field_by_field() {
         let text = r#"{"format": 4, "quality": ["1080"], "out_dir": true,
-                       "embed_metadata": "да", "auto_subs": 1}"#;
+                       "embed_metadata": "да", "auto_subs": 1,
+                       "cookies": 7, "cookie_file": ["/tmp/c.txt"]}"#;
         assert_eq!(parse(text), Settings::default());
     }
 
@@ -483,6 +672,8 @@ mod tests {
                 embed_thumbnail: true,
                 ..DownloadOptions::default()
             },
+            cookies: CookieSource::Firefox,
+            cookie_file: None,
         };
 
         let mut saver = Saver::spawn_to(path.clone());
@@ -515,12 +706,16 @@ mod tests {
             quality: Quality::P480,
             out_dir: None,
             options: DownloadOptions::default(),
+            cookies: CookieSource::None,
+            cookie_file: None,
         });
         saver.save(Settings {
             format: Format::Mp3,
             quality: Quality::P720,
             out_dir: Some(dir.clone()),
             options: DownloadOptions::default(),
+            cookies: CookieSource::Chrome,
+            cookie_file: None,
         });
         saver.save(Settings {
             format: Format::Mp3,
@@ -530,6 +725,8 @@ mod tests {
                 embed_metadata: true,
                 ..DownloadOptions::default()
             },
+            cookies: CookieSource::Edge,
+            cookie_file: None,
         });
         saver.flush();
 
@@ -537,9 +734,39 @@ mod tests {
         assert_eq!(loaded.format, Format::Mp3);
         assert_eq!(loaded.quality, Quality::P2160);
         assert!(loaded.options.embed_metadata);
+        assert_eq!(loaded.cookies, CookieSource::Edge);
         // Папки на диске нет — UI должен получить `None` и взять свой обычный
         // каталог загрузок, а не пытаться сохранить в никуда.
         assert_eq!(loaded.out_dir, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cookie_file_that_vanished_is_remembered_anyway() {
+        // Обратная сторона предыдущего теста, и разница намеренная. Забытая
+        // папка откатывается к каталогу загрузок — файл всё равно найдётся.
+        // Забытый вход откатился бы к «Не использовать», то есть к молчаливой
+        // загрузке без входа в аккаунт, а закрытый ролик после этого отвечает
+        // «нужен вход» — и чинить пойдут не то. Поэтому путь остаётся, а про
+        // пропажу говорит `cookie_file_trouble` перед загрузкой.
+        let dir = scratch("cookie-vanished");
+        std::fs::create_dir_all(&dir).expect("временный каталог");
+        let path = dir.join(FILE_NAME);
+
+        let gone = dir.join("файл унесли.txt");
+
+        let mut saver = Saver::spawn_to(path.clone());
+        saver.save(Settings {
+            cookies: CookieSource::File,
+            cookie_file: Some(gone.clone()),
+            ..Settings::default()
+        });
+        saver.flush();
+
+        let loaded = load_from(&path);
+        assert_eq!(loaded.cookies, CookieSource::File);
+        assert_eq!(loaded.cookie_file, Some(gone));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -566,6 +793,9 @@ mod tests {
         }
         for quality in Quality::ALL {
             assert_eq!(quality_from_token(quality_token(quality)), Some(quality));
+        }
+        for cookies in CookieSource::ALL {
+            assert_eq!(cookies_from_token(cookies_token(cookies)), Some(cookies));
         }
     }
 }
