@@ -4,6 +4,7 @@
 //! Благодаря этому движок можно прицепить к CLI или к тестам, не трогая код.
 
 pub mod binaries;
+mod cut;
 pub mod hardware;
 pub mod metadata;
 pub mod monitor;
@@ -22,7 +23,8 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
 use crate::model::{
-    CookieSource, DownloadId, Event, MediaInfo, NO_DOWNLOAD, Request, SubtitlePlan, human_duration,
+    CookieSource, DownloadId, Event, MediaInfo, NO_DOWNLOAD, Request, SectionPlan, SubtitlePlan,
+    human_duration,
 };
 
 pub use binaries::{Tools, discover};
@@ -356,13 +358,18 @@ fn run(
     // той же картинкой — это секунды задержки перед началом загрузки впустую.
     let cover_wanted = known.is_none();
 
+    // Длительность ролика нужна и после разбора метаданных: по ней выбирается
+    // путь к фрагменту (`Section::plan`). `None` — `probe` не ответил, и это
+    // законный исход: тогда путь останется прежним.
+    let mut duration: Option<f64> = None;
+
     // Метаданные тянем отдельным быстрым вызовом, чтобы показать название
     // ещё до старта загрузки. Если не вышло — не страшно, идём дальше.
     if let Some(info) = known.or_else(|| probe(request, tools, control)) {
         // Адрес, длительность и план по субтитрам забираем до отправки:
         // `Info` уходит в UI вместе со структурой.
         let cover = info.thumbnail_url.clone();
-        let duration = info.duration_secs;
+        duration = info.duration_secs;
         subs = info.subtitle_plan(&request.sub_lang, request.options.auto_subs);
         // Провал отправки означает, что приёмник закрыт, то есть загрузку уже
         // отменили. Проверяем это именно здесь и именно ради обложки: запрос
@@ -416,7 +423,25 @@ fn run(
         return Ok(());
     }
 
-    let args = ytdlp::download_args(request, out_dir, tools, &subs);
+    // Каким путём брать фрагмент. Без ffmpeg вопроса нет вовсе: резать нечем,
+    // ключа обрезки в командной строке не будет, и ролик приедет целиком —
+    // про это в `start` уже сказано словами.
+    let plan = match tools.ffmpeg {
+        Some(_) => request.section.plan(duration),
+        None => SectionPlan::Whole,
+    };
+    if plan == SectionPlan::CutAfter {
+        // В журнал, а не баннером: беды здесь нет, а объяснение «почему в
+        // папке на минуту появился целый ролик» пригодится. Человеку про
+        // выбранный путь говорит оговорка под полями фрагмента.
+        let _ = tx.send(Event::Log(
+            "Фрагмент занимает больше половины ролика: качаем целиком быстрым \
+             путём и вырежем кусок сами."
+                .into(),
+        ));
+    }
+
+    let args = ytdlp::download_args(request, out_dir, tools, &subs, plan);
 
     // Второй признак того, что UI про нас забыл, — закрытый приёмник, и он
     // не заменяет флаг, а дополняет: флаг отвечает «просили ли отменить»,
@@ -526,6 +551,44 @@ fn run(
     if status.success() {
         match final_path {
             Some(path) => {
+                // Вторая стадия — своя обрезка. До неё дело доходит только по
+                // плану `CutAfter`: ролик уже лежит целиком, осталось вырезать
+                // кусок и подменить им файл.
+                if plan == SectionPlan::CutAfter
+                    && let Some(ffmpeg) = &tools.ffmpeg
+                {
+                    let _ = tx.send(Event::Stage("Вырезаю фрагмент…".into()));
+                    notify();
+
+                    match cut::cut(ffmpeg, &path, request.section, control, tx) {
+                        cut::Outcome::Done => {}
+                        // Молча, без `Failed`: «Отменено» UI показывает сам
+                        // (Правило 2), а на диске после отмены не осталось
+                        // ни фрагмента, ни ролика.
+                        cut::Outcome::Cancelled => return Ok(()),
+                        // Ролик скачан и лежит на диске — отдать его вместе
+                        // с объяснением честнее, чем показать «Ошибку» поверх
+                        // готового файла. Ровно та беда, из-за которой ключи
+                        // вшивания живут под проверкой на ffmpeg.
+                        // Про повторную попытку сказать надо здесь же:
+                        // ролик лежит под тем самым именем, под каким его
+                        // сохранил бы удавшийся фрагмент, а yt-dlp по
+                        // умолчанию готовый файл не перезаписывает. То есть
+                        // второе нажатие «Скачать» кончится не новой
+                        // попыткой, а «Готово (файл уже существовал)» —
+                        // и человек решит, что обрезка сломана насовсем.
+                        cut::Outcome::Failed(why) => {
+                            let _ = tx.send(Event::Warning(format!(
+                                "Вырезать фрагмент не вышло — ролик сохранён целиком.\n\n{why}\n\n\
+                                 Чтобы попробовать ещё раз, уберите или переименуйте сохранённый \
+                                 файл: пока он лежит на месте, загрузка считается сделанной и \
+                                 повторяться не будет."
+                            )));
+                            notify();
+                        }
+                    }
+                }
+
                 let _ = tx.send(Event::Done { id, path });
                 notify();
                 Ok(())

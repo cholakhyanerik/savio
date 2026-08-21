@@ -15,8 +15,8 @@ use crate::engine::power;
 use crate::model::{
     BALANCED_PLAN, CheckStatus, CookieSource, DownloadId, DownloadOptions, Event, Format, GpuInfo,
     MediaInfo, Metric, PerfSample, PowerMode, PowerModes, PowerState, Progress, Quality, Request,
-    Section, SectionError, SubLang, SystemReport, TRACE_LIMIT, Tag, Thumbnail, Trace, human_bytes,
-    human_duration, human_speed, looks_like_url, meta_kind, parse_section,
+    Section, SectionError, SectionPlan, SubLang, SystemReport, TRACE_LIMIT, Tag, Thumbnail, Trace,
+    human_bytes, human_duration, human_speed, looks_like_url, meta_kind, parse_section,
 };
 use crate::theme;
 
@@ -3669,15 +3669,51 @@ impl SavioApp {
                 theme::STATE_WARNING,
             );
         } else {
-            note(
-                ui,
+            note(ui, self.section_hint(), theme::TEXT_MUTED);
+        }
+    }
+
+    /// Чем обернётся заданный фрагмент: каким путём его возьмут и что при
+    /// этом будет видно в окне.
+    ///
+    /// Путей два, и разница между ними человеку заметна — ждать минуты
+    /// с неопределённой полосой или секунды с процентами, — так что молчать
+    /// о выборе нельзя. Правило выбора живёт в домене
+    /// ([`Section::plan`]), здесь только слова к нему.
+    ///
+    /// Считается прямо в кадре, и это не нарушение Правила 1: `plan` — это
+    /// пара сравнений без единой аллокации, а обе строки статические. Поле
+    /// с готовым текстом, как у `quality_note`, пришлось бы пересобирать
+    /// в четырёх местах (правка полей, ответ предпросмотра, смена ссылки,
+    /// очистка карточки), и первое же забытое показало бы путь от прошлой
+    /// ссылки — при том что считать тут нечего.
+    fn section_hint(&self) -> &'static str {
+        let duration = self
+            .preview
+            .info
+            .as_ref()
+            .and_then(|info| info.duration_secs);
+
+        match self.section.plan(duration) {
+            // `Whole` сюда не попадает: выше уже спрошено `section.any()`,
+            // а без границ плана «резать» не бывает. Ветка выписана вместе
+            // со `Stream`, а не через `_`, чтобы новый вариант `SectionPlan`
+            // компилятор потребовал разобрать и здесь.
+            SectionPlan::Stream | SectionPlan::Whole => {
                 "Фрагмент вырезает ffmpeg прямо по ходу загрузки: она идёт \
                  заметно медленнее обычной, а проценты и скорость при этом \
                  не показываются. У MP4 начало сдвигается к ближайшему \
                  ключевому кадру — файл может начаться на секунду-другую \
-                 раньше запрошенного.",
-                theme::TEXT_MUTED,
-            );
+                 раньше запрошенного."
+            }
+            SectionPlan::CutAfter => {
+                "Фрагмент занимает больше половины ролика, и Savio возьмёт его \
+                 быстрым путём: скачает ролик целиком, вырежет кусок и оставит \
+                 на диске только его. Проценты и скорость при этом видны, зато \
+                 из сети придёт целый ролик. У MP4 начало сдвигается к \
+                 ближайшему ключевому кадру — файл может начаться на \
+                 секунду-другую раньше запрошенного."
+            }
         }
     }
 

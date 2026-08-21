@@ -10,8 +10,8 @@ use std::process::Command;
 
 use super::binaries::Tools;
 use crate::model::{
-    CookieSource, Format, MediaInfo, Progress, Quality, Request, Section, SubtitlePlan,
-    SubtitleTrack,
+    CookieSource, Format, MediaInfo, Progress, Quality, Request, Section, SectionPlan,
+    SubtitlePlan, SubtitleTrack,
 };
 
 /// Каждое поле, способное прийти пустым, обязано иметь `|default`.
@@ -178,11 +178,17 @@ fn section_arg(section: Section) -> Option<String> {
 /// потому что взяться ему неоткуда до запроса метаданных: в запросе лежит
 /// просьба человека («язык ролика», «можно робота»), а здесь нужен уже
 /// разобранный ответ сайта.
+///
+/// `section` — каким путём брать фрагмент (`Section::plan`), и здесь он нужен
+/// ровно для одного: решить, просить ли кусок у самого yt-dlp. Отдельным
+/// параметром по той же причине, что и `subs`, — считается он по длительности
+/// из ответа `probe`, которой в запросе нет.
 pub fn download_args(
     request: &Request,
     out_dir: &Path,
     tools: &Tools,
     subs: &SubtitlePlan,
+    section: SectionPlan,
 ) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "--newline".into(),
@@ -297,7 +303,15 @@ pub fn download_args(
         // installed. Aborting`, код 1, файла нет вовсе. Поэтому ключ живёт
         // здесь, внутри ветки с живым ffmpeg, как и ключи вшивания, а про
         // пропуск говорит `Event::Warning` в `engine::start`.
-        if let Some(section) = section_arg(request.section) {
+        //
+        // И только по плану `Stream`. У `CutAfter` фрагмент просят тоже, но
+        // берут его иначе: ролик качается целиком быстрым путём, а кусок
+        // вырезается своим ffmpeg уже на диске (`engine::cut`). Появись здесь
+        // ключ вопреки плану — загрузка пошла бы медленным путём, а вырезали
+        // бы потом ещё раз из уже вырезанного, то есть не тот кусок.
+        if section == SectionPlan::Stream
+            && let Some(section) = section_arg(request.section)
+        {
             args.push("--download-sections".into());
             args.push(section);
 
@@ -1244,6 +1258,7 @@ mod tests {
             &PathBuf::from("out"),
             &fake_tools(ffmpeg),
             &SubtitlePlan::default(),
+            SectionPlan::Whole,
         )
     }
 
@@ -1260,7 +1275,13 @@ mod tests {
             section: Section::default(),
             sub_lang: SubLang::default(),
         };
-        download_args(&request, &PathBuf::from("out"), &fake_tools(true), plan)
+        download_args(
+            &request,
+            &PathBuf::from("out"),
+            &fake_tools(true),
+            plan,
+            SectionPlan::Whole,
+        )
     }
 
     /// План «язык такой-то, робот такой-то» — то, что отдаёт
@@ -1272,8 +1293,21 @@ mod tests {
         }
     }
 
-    /// Аргументы загрузки с запрошенным фрагментом.
+    /// Аргументы загрузки с запрошенным фрагментом — коротким, то есть тем,
+    /// который yt-dlp режет сам (`SectionPlan::Stream`). Именно так план и
+    /// выбирается у куска короче половины ролика.
     fn args_section(format: Format, section: Section, ffmpeg: bool) -> Vec<String> {
+        args_planned(format, section, ffmpeg, SectionPlan::Stream)
+    }
+
+    /// То же самое, но план называется явно: длинный фрагмент Savio берёт
+    /// целиком и режет сам, и ключа обрезки в командной строке быть не должно.
+    fn args_planned(
+        format: Format,
+        section: Section,
+        ffmpeg: bool,
+        plan: SectionPlan,
+    ) -> Vec<String> {
         let request = Request {
             url: "https://example.com/video".to_owned(),
             format,
@@ -1289,6 +1323,7 @@ mod tests {
             &PathBuf::from("out"),
             &fake_tools(ffmpeg),
             &SubtitlePlan::default(),
+            plan,
         )
     }
 
@@ -1458,9 +1493,32 @@ mod tests {
     #[test]
     fn nothing_is_trimmed_until_asked() {
         for format in [Format::Mp4, Format::Mp3] {
-            let args = args_section(format, Section::default(), true);
+            let args = args_planned(format, Section::default(), true, SectionPlan::Whole);
             assert!(!has(&args, SECTION_FLAG), "{format:?}: непрошеная обрезка");
             assert!(!has(&args, KEYFRAMES_FLAG), "{format:?}: лишний ключ");
+        }
+    }
+
+    /// Длинный фрагмент берётся другим путём: ролик качается целиком быстрым
+    /// способом, а кусок вырезает наш ffmpeg уже на диске (`engine::cut`).
+    /// Ключа обрезки в командной строке при этом быть не должно — иначе
+    /// загрузка снова пойдёт медленно, а резать станут дважды: сперва yt-dlp,
+    /// потом мы из уже вырезанного, то есть не тот кусок. Ни сборка, ни код
+    /// возврата такого не заметят.
+    #[test]
+    fn a_long_section_is_not_asked_from_ytdlp() {
+        let section = Section {
+            start: Some(90),
+            end: Some(240),
+        };
+        for format in [Format::Mp4, Format::Mp3] {
+            let args = args_planned(format, section, true, SectionPlan::CutAfter);
+            assert!(
+                !has(&args, SECTION_FLAG),
+                "{format:?}: длинный фрагмент ушёл медленным путём"
+            );
+            assert!(!has(&args, KEYFRAMES_FLAG), "{format:?}: лишний ключ");
+            assert!(has(&args, "https://example.com/video"), "потеряна ссылка");
         }
     }
 
@@ -1801,6 +1859,7 @@ mod tests {
             &PathBuf::from("out"),
             &fake_tools(false),
             &plan(Some("ru"), true),
+            SectionPlan::Whole,
         );
         for flag in ["--embed-subs", AUTO_FLAG, LANGS_FLAG] {
             assert!(!has(&args, flag), "{flag} без ffmpeg сорвёт загрузку");
