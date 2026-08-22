@@ -132,6 +132,7 @@ pub(super) fn cut(
         .stderr(Stdio::piped())
         .stdin(Stdio::null());
     super::ytdlp::hide_console(&mut cmd);
+    control.arm(&mut cmd);
 
     let mut child = match cmd.spawn() {
         Ok(child) => child,

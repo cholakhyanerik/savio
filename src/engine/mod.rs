@@ -13,6 +13,7 @@ pub mod settings;
 pub mod setup;
 pub mod sha256;
 pub mod thumbnail;
+mod tree;
 pub mod ytdlp;
 
 use std::io::{BufRead, BufReader, Read};
@@ -41,23 +42,39 @@ pub fn has_ffmpeg() -> bool {
 
 /// Чем «Отмена» останавливает загрузку. Общее у ручки и у потока движка.
 ///
-/// Половины две, и обе обязательны. Убить процесс можно, только когда он есть,
+/// Половин три, и все обязательны. Убить процесс можно, только когда он есть,
 /// а первые секунды после «Скачать» его нет: идёт `probe`, потом обложка, потом
 /// сам запуск. Всё это время слот пуст, и одного слота хватало ровно на то,
 /// чтобы отмена не отменяла ничего: окно закрывалось, а файл спокойно
 /// докачивался. Флаг отвечает на другой вопрос — «просили ли отменить», —
 /// и потому виден движку до появления процесса. Приём тот же, что у установки
 /// инструментов (`setup::Handle`), там он проверен.
+///
+/// Третья половина — [`tree::Group`]: слот держит **один** процесс, тот, что
+/// запустил сам Savio, а качает при обрезке его внук. Убийство одного процесса
+/// оставляло дерево работать (дефект 25), и группа отвечает на третий вопрос —
+/// «кого ещё он за собой привёл».
 #[derive(Clone, Default)]
 struct Control {
     child: Arc<Mutex<Option<Child>>>,
     cancelled: Arc<AtomicBool>,
+    group: Arc<tree::Group>,
 }
 
 impl Control {
     /// Просили ли отменить.
     fn cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Relaxed)
+    }
+
+    /// Готовит команду к запуску под присмотром «Отмены».
+    ///
+    /// Звать обязательно перед каждым `spawn`, чей процесс потом уйдёт в
+    /// `adopt`: на Unix своя группа процессов заказывается только при запуске.
+    /// Пропуск не заметят ни сборка, ни `clippy`, ни тесты — просто «Отмена»
+    /// снова достанет один процесс из трёх.
+    fn arm(&self, cmd: &mut Command) {
+        self.group.arm(cmd);
     }
 
     /// Отдаёт запущенный процесс под присмотр «Отмены».
@@ -72,6 +89,12 @@ impl Control {
     /// исхода нет: либо `cancel()` видит в слоте процесс и убивает его, либо
     /// мы видим её флаг и не начинаем.
     fn adopt(&self, mut child: Child) -> Result<bool, String> {
+        // В группу процесс попадает раньше всех проверок и до замка. Отмена,
+        // пришедшая в это самое мгновение, ничего не теряет: либо она увидит
+        // процесс уже в группе и убьёт дерево сама, либо мы увидим её флаг
+        // и убьём его сами — а группа к тому времени будет заполнена.
+        self.group.adopt(&child);
+
         match self.child.lock() {
             Ok(mut slot) => {
                 if !self.cancelled() {
@@ -82,14 +105,36 @@ impl Control {
             // Замок отравлен: в слот процесс не положить, а оставить его
             // работать нельзя тем более — «Отмена» до него уже не доберётся.
             Err(_) => {
-                kill_and_reap(&mut child);
+                self.kill_tree(&mut child);
                 return Err("Внутренняя ошибка синхронизации".into());
             }
         }
         // Замок здесь уже отпущен: `wait()` под ним заставил бы `cancel()`
         // ждать нас, а её задача — вернуть управление сразу.
-        kill_and_reap(&mut child);
+        self.kill_tree(&mut child);
         Ok(false)
+    }
+
+    /// Убивает процесс вместе со всем, что он успел запустить, и дожидается
+    /// его конца.
+    ///
+    /// Группу бьём первой: у убитого родителя потомки не умирают сами,
+    /// а вот `wait()` по убитому родителю вернётся сразу.
+    fn kill_tree(&self, child: &mut Child) {
+        self.group.kill();
+        kill_and_reap(child);
+    }
+
+    /// Освобождает слот и группу после того, как процесс дождались.
+    ///
+    /// Обе половины вместе, а не порознь: в тот же слот после `probe` ложится
+    /// сам yt-dlp, а после yt-dlp — наш ffmpeg, и оставленные там следы
+    /// прошлого процесса сбивали бы «Отмену» с толку.
+    fn release(&self) {
+        self.group.release();
+        if let Ok(mut guard) = self.child.lock() {
+            *guard = None;
+        }
     }
 }
 
@@ -97,6 +142,10 @@ impl Control {
 ///
 /// Ждать обязательно: `Child::drop` этого не делает, и на Unix убитый, но
 /// не дождавшийся потомок остаётся зомби до конца жизни Savio.
+///
+/// Одного процесса тут хватает только там, где потомством он обзавестись
+/// не успел, — то есть сразу после `spawn`. Всё остальное убивается вместе
+/// с деревом (`Control::kill_tree`).
 fn kill_and_reap(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
@@ -123,6 +172,16 @@ impl Handle {
         // местами — и вернётся ровно то окно, ради которого флаг заводился,
         // причём не сломается при этом ни сборка, ни тесты.
         self.control.cancelled.store(true, Ordering::Relaxed);
+
+        // Дерево убиваем до замка и вместо одного процесса. Слот держит того,
+        // кого запустили мы, а качает при обрезке его внук: убийство одного
+        // процесса оставляло ffmpeg и рабочий yt-dlp работать, и файл спокойно
+        // дописывался после «Отменено» в окне (дефект 25).
+        self.control.group.kill();
+
+        // Свой процесс всё-таки добиваем отдельно: группы могло и не быть —
+        // Windows вправе отказать в Job Object, а на Unix `spawn` мог ещё
+        // не случиться. Тогда это единственное, что «Отмену» и делает.
         if let Ok(mut guard) = self.control.child.lock()
             && let Some(child) = guard.as_mut() {
                 let _ = child.kill();
@@ -468,6 +527,7 @@ fn run(
         .stderr(Stdio::piped())
         .stdin(Stdio::null());
     ytdlp::hide_console(&mut cmd);
+    control.arm(&mut cmd);
 
     let mut child = cmd
         .spawn()
@@ -543,10 +603,7 @@ fn run(
         }
     };
     let _ = stderr_thread.join();
-
-    if let Ok(mut guard) = control.child.lock() {
-        *guard = None;
-    }
+    control.release();
 
     if status.success() {
         match final_path {
@@ -775,6 +832,7 @@ fn probe(request: &Request, tools: &Tools, control: &Control) -> Option<MediaInf
         .stderr(Stdio::null())
         .stdin(Stdio::null());
     ytdlp::hide_console(&mut cmd);
+    control.arm(&mut cmd);
 
     let mut child = cmd.spawn().ok()?;
     let stdout = child.stdout.take()?;
@@ -796,7 +854,7 @@ fn probe(request: &Request, tools: &Tools, control: &Control) -> Option<MediaInf
         .then(|| ytdlp::parse_media_info(&String::from_utf8_lossy(&json)))
 }
 
-/// Дожидается процесса из слота и освобождает слот.
+/// Дожидается процесса из слота и освобождает слот вместе с группой.
 ///
 /// Ждать обязательно (иначе зомби на Unix), освобождать — тоже: после `probe`
 /// в тот же слот ложится сам yt-dlp, и оставленный там отработавший процесс
@@ -806,9 +864,7 @@ fn wait_and_release(control: &Control) -> Option<ExitStatus> {
         let mut guard = control.child.lock().ok()?;
         guard.as_mut()?.wait().ok()?
     };
-    if let Ok(mut guard) = control.child.lock() {
-        *guard = None;
-    }
+    control.release();
     Some(status)
 }
 
@@ -976,6 +1032,244 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Живая проверка дефекта 25: после «Отмены» дерево процессов обязано
+    /// умереть целиком, а не только тот процесс, который запустили мы.
+    ///
+    /// Признак живого дерева тут — **закрытие канала**, и он выбран не от
+    /// бедности. Поток движка до конца сидит в `BufReader::lines()`, а труба
+    /// закрывается, лишь когда её отпустят все — и обёртка PyInstaller, и
+    /// рабочий yt-dlp, и ffmpeg. Пережил кто-то из них отмену — поток жив,
+    /// `Sender` жив, канал открыт. Так что «канал закрылся» и значит «дерева
+    /// больше нет», причём проверяется это ровно тем механизмом, на котором
+    /// дефект и держался.
+    ///
+    /// Мерить размером файла нельзя: пока `.part` открыт, каталожная запись
+    /// Windows показывает 0 байт. Считать процессы `Get-Process yt-dlp` тоже
+    /// нельзя — их два даже у исправной загрузки (обёртка и рабочий).
+    ///
+    /// **Срок после «Отмены» короткий, и это главное в тесте.** Убитое дерево
+    /// отпускает трубу мгновенно, а живое держит её до конца загрузки — вот
+    /// его-то и надо сделать заведомо долгим. Первая попытка брала фрагмент
+    /// 5–15 секунд, и он успевал скачаться раньше срока: тест проходил
+    /// с выломанной починкой, то есть не проверял ничего. Отсюда и качество
+    /// по умолчанию (`Best` — у этого ролика 4K), и фрагмент в полторы минуты.
+    ///
+    /// Замер 2026-08-22 (yt-dlp 2026.07.04, Windows 11): с починкой канал
+    /// закрывается за 4–6 миллисекунд во всех трёх случаях. С выломанной —
+    /// «целиком» и «длинный фрагмент» не закрываются и за три секунды, а вот
+    /// «короткий фрагмент» закрылся за 163 мс, то есть **сегодня он дефект
+    /// уже не ловит**: тот самый случай, с которого дефект начинали, за месяц
+    /// у yt-dlp изменился. Оставлен всё равно — он бесплатен, а измениться
+    /// может и обратно (Правило 6 про стареющие замеры).
+    ///
+    /// В обычном прогоне отключены: нужны сеть, yt-dlp и ffmpeg.
+    /// Запуск вручную: `cargo test -- --ignored --nocapture`.
+    fn live_cancel_kills_the_tree(section: Section, what: &str) {
+        use std::sync::mpsc::RecvTimeoutError;
+        use std::time::{Duration, Instant};
+
+        let dir = std::env::temp_dir().join(format!("savio-tree-{what}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("создать временный каталог");
+
+        let mut request = request();
+        request.url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ".into();
+        request.section = section;
+
+        let (tx, rx) = channel();
+        let handle =
+            start(1, request, dir.clone(), None, tx, || {}).expect("yt-dlp обязан быть найден");
+
+        // Ждём настоящей загрузки: пока не пришёл первый `Progress`, дерева
+        // ещё нет и убивать нечего — тест прошёл бы, ничего не проверив.
+        let mut running = false;
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(Event::Progress(_)) => {
+                    running = true;
+                    break;
+                }
+                Ok(_) | Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        assert!(running, "{what}: загрузка так и не пошла — проверять нечего");
+
+        handle.cancel();
+        let cancelled_at = Instant::now();
+
+        // Три секунды — это «мгновенно» с большим запасом на медленную машину
+        // и всё ещё несоизмеримо меньше, чем осталось качать 4K-ролику.
+        const GRACE: Duration = Duration::from_secs(3);
+        let mut closed_in = None;
+        while cancelled_at.elapsed() < GRACE {
+            match rx.recv_timeout(GRACE) {
+                Ok(_) => continue,
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(RecvTimeoutError::Disconnected) => {
+                    closed_in = Some(cancelled_at.elapsed());
+                    break;
+                }
+            }
+        }
+
+        // Число печатаем всегда: замер чужой программы стареет быстрее кода
+        // (Правило 6), и следующему пригодится не «прошло», а «за сколько».
+        println!("{what}: канал закрылся через {closed_in:?}");
+        assert!(
+            closed_in.is_some(),
+            "{what}: спустя {GRACE:?} после «Отмены» кто-то из дерева всё ещё \
+             держит трубу — то есть качает"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Загрузка без фрагмента: дерево мельче, но `Progress` после «Отмены»
+    /// шли ещё восемнадцать секунд (замер 2026-07-31).
+    #[test]
+    #[ignore = "требует доступа в сеть и установленного yt-dlp"]
+    fn real_cancel_stops_a_plain_download() {
+        live_cancel_kills_the_tree(Section::default(), "целиком");
+    }
+
+    /// Короткий фрагмент: путь `--download-sections`, и качает при нём ffmpeg
+    /// внуком. Тот случай, на котором дефект нашли.
+    ///
+    /// «Короткий» здесь про долю, а не про секунды: полторы минуты из
+    /// трёх с половиной — это меньше половины, то есть путь `Stream`.
+    /// Короче делать нельзя, иначе фрагмент успеет скачаться (см. `GRACE`).
+    #[test]
+    #[ignore = "требует доступа в сеть, yt-dlp и ffmpeg"]
+    fn real_cancel_stops_a_short_section() {
+        live_cancel_kills_the_tree(
+            Section {
+                start: Some(5),
+                end: Some(100),
+            },
+            "короткий-фрагмент",
+        );
+    }
+
+    /// Длинный фрагмент: с задачи 26 это другое дерево — ролик идёт обычной
+    /// загрузкой, а режет его наш собственный ffmpeg уже после.
+    #[test]
+    #[ignore = "требует доступа в сеть, yt-dlp и ffmpeg"]
+    fn real_cancel_stops_a_long_section() {
+        live_cancel_kills_the_tree(
+            Section {
+                start: Some(0),
+                end: Some(150),
+            },
+            "длинный-фрагмент",
+        );
+    }
+
+    /// Команда, которая запускает ещё одну и ждёт её конца, — то самое дерево,
+    /// на котором «Отмена» и спотыкалась (`yt-dlp` → `yt-dlp` → `ffmpeg`).
+    ///
+    /// Обе оболочки есть на своих системах всегда, скачивать для теста нечего.
+    #[cfg(windows)]
+    fn nested_process() -> Command {
+        let mut cmd = Command::new("cmd");
+        // `ping` по петле: тридцать секунд жизни и вывод в ту же трубу.
+        cmd.args(["/c", "ping", "-n", "30", "127.0.0.1"]);
+        cmd
+    }
+
+    #[cfg(unix)]
+    fn nested_process() -> Command {
+        let mut cmd = Command::new("/bin/sh");
+        // Тут важен каждый знак. У `sh -c 'sleep 30'` оболочка подменяет собой
+        // процесс (`exec`), никакого внука не появляется, и проверять было бы
+        // нечего. Амперсанд же ставит `sleep` в потомки и, главное, делает это
+        // **до** `echo`: первый байт в трубе значит, что внук уже родился.
+        // А `wait` не даёт оболочке уйти раньше него.
+        cmd.args(["-c", "sleep 30 & echo started; wait"]);
+        cmd
+    }
+
+    /// «Отмена» обязана убить всё дерево, а не один процесс.
+    ///
+    /// Ровно дефект 25: `Child::kill()` бьёт по тому, кого запустили мы, —
+    /// по обёртке PyInstaller, — а качает её внук, и после «Отменено» в окне
+    /// файл спокойно дописывался.
+    ///
+    /// Проверяем по трубе, а не по списку процессов, и это не обход, а тот же
+    /// механизм, которым дефект держался: дескриптор вывода достаётся и внуку,
+    /// поэтому конец потока наступает лишь тогда, когда его отпустят **все**.
+    /// Пережил внук отмену — `read_to_end` будет ждать его тридцать секунд,
+    /// и ждать бы движок, сидящий в `BufReader::lines()`.
+    ///
+    /// Перечислять процессы средствами системы было бы и дольше, и хуже:
+    /// у `Get-Process yt-dlp` два ответа даже на исправной загрузке.
+    #[test]
+    fn cancel_kills_the_whole_tree() {
+        let control = Control::default();
+        let handle = Handle {
+            control: control.clone(),
+        };
+
+        let mut cmd = nested_process();
+        cmd.stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null());
+        ytdlp::hide_console(&mut cmd);
+        control.arm(&mut cmd);
+
+        let mut child = cmd.spawn().expect("оболочка обязана быть в системе");
+        let stdout = child.stdout.take().expect("труба заказана piped");
+        assert!(
+            control.adopt(child).expect("замок не отравлен"),
+            "без отмены процесс обязан попасть в слот"
+        );
+
+        // Читающий поток говорит о двух событиях: о первых байтах и о конце
+        // потока. Первые — признак того, что внук родился; конец — того, что
+        // трубу отпустили все до единого.
+        let (first_bytes, grew) = channel();
+        let (done, closed) = channel();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            let mut buf = [0u8; 256];
+            while let Ok(read) = reader.read(&mut buf) {
+                if read == 0 {
+                    break;
+                }
+                let _ = first_bytes.send(());
+            }
+            let _ = done.send(());
+        });
+
+        // Ждём внука по его же выводу, а не по часам. Со `sleep` тест был бы
+        // честен ровно до первой загруженной машины: не успел внук родиться —
+        // и «дерево умерло» стало бы неотличимо от «дерева не было».
+        grew.recv_timeout(std::time::Duration::from_secs(15))
+            .expect("от запущенного дерева не пришло ни байта — проверять нечего");
+
+        handle.cancel();
+
+        let tree_died = closed
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .is_ok();
+
+        // Прибираем за собой в любом исходе: провалившийся тест не должен
+        // оставлять после себя полминуты чужой работы.
+        control.group.kill();
+        if let Ok(mut slot) = control.child.lock()
+            && let Some(child) = slot.as_mut()
+        {
+            kill_and_reap(child);
+        }
+
+        assert!(
+            tree_died,
+            "«Отмена» убила только свой процесс: потомок жив и держит трубу \
+             открытой — ровно то, из-за чего загрузка шла после «Отменено»"
+        );
     }
 
     /// Отмена уже идущей загрузки: процесс из слота убит, а флаг стоит —
