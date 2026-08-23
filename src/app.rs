@@ -18,7 +18,94 @@ use crate::model::{
     Section, SectionError, SectionPlan, SubLang, SystemReport, TRACE_LIMIT, Tag, Thumbnail, Trace,
     human_bytes, human_duration, human_speed, looks_like_url, meta_kind, parse_section,
 };
+use crate::motion;
 use crate::theme;
+
+/// Насколько быстрее вставки складывается убираемая строка очереди.
+///
+/// Уход короче прихода намеренно: приходящее провожают взглядом, уходящее —
+/// нет, и равная длительность читается как задержка.
+const QUEUE_LEAVE: f32 = 0.85;
+
+/// За сколько гаснет окно под модалкой.
+///
+/// Короче прихода самой модалки намеренно: затемнение обязано успеть лечь
+/// **до** того, как приедет окно, иначе слоя не читается — оба движения
+/// сливаются в одно.
+const MODAL_VEIL: f32 = 0.20;
+
+/// Насколько модальное окно меньше своего размера, когда только приезжает.
+///
+/// Четыре процента: заметно, что окно приблизилось, и не заметно, что оно
+/// при этом было другого размера. Больше — и текст внутри плывёт.
+const MODAL_SCALE: f32 = 0.96;
+
+/// Как модальное окно приезжает на этом кадре.
+#[derive(Clone, Copy)]
+struct ModalArrival {
+    /// Насколько уже погасло окно под ним.
+    veil: f32,
+    /// Насколько приехало само окно: масштаб и не более того.
+    rise: f32,
+}
+
+impl ModalArrival {
+    /// Кладёт затемнение под модалку — своим слоем, ниже её собственного.
+    ///
+    /// Своим, а не `Modal::backdrop_color`, и это не прихоть: свою вуаль
+    /// `Modal` рисует **в том же слое**, что и содержимое, — а слой модалки
+    /// масштабируется (приём 11), и вуаль вместе с ним съёжилась бы, оставив
+    /// по краям окна неприкрытую полосу. Модалке поэтому достаётся
+    /// прозрачный цвет: щелчок мимо окна она ловит своим невидимым фоном,
+    /// и `should_close` от этого не страдает.
+    ///
+    /// `Order::Middle` — выше панелей (`Background`) и ниже самой модалки
+    /// (`Foreground`).
+    fn veil(self, ctx: &egui::Context, name: &'static str) {
+        if self.veil <= 0.0 {
+            return;
+        }
+        let color = motion::mix(egui::Color32::TRANSPARENT, theme::MODAL_BACKDROP, self.veil);
+        ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Middle,
+            egui::Id::new("modal-veil").with(name),
+        ))
+        .rect_filled(ctx.content_rect(), 0.0, color);
+    }
+
+    /// Ставит слою модалки масштаб вокруг её середины.
+    ///
+    /// Своей вуали `Modal` при этом не рисует (ей передан прозрачный цвет),
+    /// и это обязательно: вуаль он кладёт **в тот же слой**, что содержимое,
+    /// — вместе со слоем она съёжилась бы, оставив по краям окна неприкрытую
+    /// полосу. Поэтому затемнение рисуется отдельно, до модалки.
+    ///
+    /// Тождественное преобразование ставится тоже, а не пропускается:
+    /// слой помнит своё, и забытый масштаб остался бы на окне навсегда.
+    fn apply(self, ctx: &egui::Context, response: &egui::Response) {
+        let scale = MODAL_SCALE + (1.0 - MODAL_SCALE) * self.rise;
+        let centre = response.rect.center().to_vec2();
+        ctx.set_transform_layer(
+            response.layer_id,
+            egui::emath::TSTransform::new(centre * (1.0 - scale), scale),
+        );
+    }
+}
+
+/// За сколько подложка перекладывается к выбранному разделу.
+///
+/// Дольше самого прихода раздела, и намеренно: свет за стеклом обязан
+/// отставать от содержимого, иначе он читается как часть карточек, а не
+/// как то, что лежит под ними.
+const DRIFT_PULL_TIME: f32 = 0.9;
+
+/// За сколько полоса прогресса догоняет присланную долю.
+///
+/// Не токен движения, а своё число, и намеренно: три общие длительности
+/// описывают отклик интерфейса, а здесь речь о чужом темпе. yt-dlp шлёт
+/// проценты рывками, и полоса обязана ехать **чуть дольше**, чем приходит
+/// следующая строка, — иначе она успевает встать и снова дёрнуться.
+const PROGRESS_CATCH_UP: f32 = 0.32;
 
 const LOG_LIMIT: usize = 400;
 
@@ -442,6 +529,14 @@ struct QueueItem {
     /// по той же причине, по какой снимком держится сам запрос: пока очередь
     /// идёт, в поле давно другая ссылка, и ответ там про неё.
     known: Option<MediaInfo>,
+    /// Когда по крестику щёлкнули, по часам egui. `None` — строка живёт.
+    ///
+    /// Строка не пропадает по щелчку, а складывается: соседи сходятся, а не
+    /// прыгают на её место (приём 10). Убирает её из списка `sweep_queue`,
+    /// когда складывание доиграло, — то есть удаление отложено ровно на один
+    /// цикл и **не** отменяется ничем: помеченная строка уже не считается
+    /// живой очередью нигде, кроме отрисовки.
+    removing_since: Option<f64>,
 }
 
 impl QueueItem {
@@ -543,6 +638,7 @@ impl Queue {
             out_dir,
             status: QueueStatus::Waiting,
             known,
+            removing_since: None,
         };
         item.rebuild_strings();
 
@@ -576,10 +672,13 @@ impl Queue {
     /// владение, а строка обязана остаться в списке — по ней рисуется
     /// состояние, и в неё же приходит исход.
     fn next_waiting(&self) -> Option<(DownloadId, Request, PathBuf, Option<MediaInfo>)> {
+        // Помеченная крестиком строка ждущей больше не считается, хотя ещё
+        // и рисуется: иначе «Скачать», нажатое в те четверть секунды, что она
+        // складывается, запустило бы ровно то, что убрали.
         let item = self
             .items
             .iter()
-            .find(|item| item.status == QueueStatus::Waiting)?;
+            .find(|item| item.status == QueueStatus::Waiting && item.removing_since.is_none())?;
         Some((
             item.id,
             item.request.clone(),
@@ -591,7 +690,23 @@ impl Queue {
     fn has_waiting(&self) -> bool {
         self.items
             .iter()
-            .any(|item| item.status == QueueStatus::Waiting)
+            .any(|item| item.status == QueueStatus::Waiting && item.removing_since.is_none())
+    }
+
+    /// Помечает строку убираемой: с этого мгновения она складывается.
+    ///
+    /// Не удаляет сразу и не откладывает решение до следующего кадра: строка
+    /// остаётся в списке ровно затем, чтобы её было чем рисовать, пока
+    /// складывание идёт. Убирает её [`SavioApp::sweep_queue`].
+    fn mark_removing(&mut self, id: DownloadId, now: f64) {
+        if let Some(item) = self
+            .items
+            .iter_mut()
+            .find(|item| item.id == id && item.status == QueueStatus::Waiting)
+        {
+            item.removing_since = Some(now);
+            self.rebuild_summary();
+        }
     }
 
     /// Номер идущей загрузки. Такая в списке не больше одной.
@@ -666,7 +781,11 @@ impl Queue {
         use std::fmt::Write as _;
 
         let (mut running, mut waiting, mut done, mut failed, mut cancelled) = (0, 0, 0, 0, 0);
-        for item in &self.items {
+        // Помеченные крестиком не считаем: строка ещё складывается, но
+        // очередью она уже не является, и сводка обязана сказать это сразу —
+        // иначе «В очереди: 3» держится лишнюю четверть секунды после того,
+        // как убрали третью.
+        for item in self.items.iter().filter(|item| item.removing_since.is_none()) {
             // Разбор по вариантам, а не `_`: появится состояние — компилятор
             // потребует решить, куда его считать.
             match &item.status {
@@ -1173,6 +1292,10 @@ const OVERLAY_SIZE: [f32; 2] = [300.0, 122.0];
 struct MonitorPanel {
     /// Последний замер. `None` — опрос только начался, первого замера ещё нет.
     sample: Option<PerfSample>,
+    /// Когда он пришёл, по часам egui. От этого мгновения считается дробная
+    /// фаза графика: ломаная едет влево ровно на один шаг за такт замера
+    /// (приём 13). `None` — замеров ещё не было, ехать нечему.
+    sampled_at: Option<f64>,
     /// История загрузки процессора и памяти — для графиков.
     cpu_trace: Trace,
     mem_trace: Trace,
@@ -1211,6 +1334,7 @@ impl MonitorPanel {
     fn new() -> Self {
         Self {
             sample: None,
+            sampled_at: None,
             cpu_trace: Trace::default(),
             mem_trace: Trace::default(),
             rx: None,
@@ -1323,6 +1447,7 @@ impl MonitorPanel {
 
     /// Принимает свежий замер.
     fn accept(&mut self, sample: PerfSample, ctx: &egui::Context) {
+        self.sampled_at = Some(ctx.input(|i| i.time));
         // В график кладём только то, что система вправду сказала: `None`
         // здесь означает «показания нет», и подставить на его месте ноль
         // значило бы нарисовать провал загрузки, которого не было.
@@ -1345,6 +1470,20 @@ impl MonitorPanel {
         }
 
         self.sample = Some(sample);
+    }
+
+    /// Дробная фаза графика: сколько прошло от последнего замера, долей такта.
+    ///
+    /// Кадры отсюда **не** просятся: сколько их нужно, знает только сам
+    /// график — там известна ширина шага сетки (см. `trace_plot`).
+    ///
+    /// С выключенными «Плавными переходами» отдаёт ноль: график стоит на
+    /// месте и обновляется раз в секунду, как до всех приёмов.
+    fn trace_phase(&self, ctx: &egui::Context, speed: f32) -> f32 {
+        let Some(at) = self.sampled_at.filter(|_| speed > 0.0) else {
+            return 0.0;
+        };
+        ((ctx.input(|i| i.time) - at) as f32 / motion::SAMPLE).clamp(0.0, 1.0)
     }
 
     /// Рисует оверлей, пока он включён.
@@ -1754,6 +1893,52 @@ pub struct SavioApp {
     advanced: bool,
     /// Раскрыт ли журнал в подвале.
     log_open: bool,
+    /// Включены ли плавные переходы. Запоминается между запусками.
+    ///
+    /// Это и есть тот самый выключатель движения, которого не сообщает ни
+    /// eframe, ни winit: системного «уменьшить движение» они не отдают, так
+    /// что спросить об этом можно только у человека.
+    smooth: bool,
+    /// Где сейчас бегущий по кромке блик, долей пути (приём 06).
+    ///
+    /// Считается один раз за кадр, там же, где `arrive`, и по тем же
+    /// соображениям. Живёт дольше самого прихода: карточка приезжает за
+    /// `LAYER`, а блик пробегает по её кромке за `GLOSS` — почти секунду.
+    sweep: f32,
+    /// Когда в последний раз сменили раздел, по часам egui.
+    ///
+    /// От этого мгновения считаются и блик, и дрейф подложки: оба длиннее
+    /// самого прихода, и `animate_*` для них уже не годится.
+    tab_changed_at: f64,
+    /// Наибольшая доля, которую полоса прогресса уже показывала в этой
+    /// загрузке.
+    ///
+    /// Полоса едет к присланному значению чуть дольше, чем приходит
+    /// следующее, — но **назад не дёргается никогда**, и потолок нужен
+    /// именно ради этого. Доля сама по себе не монотонна: yt-dlp качает
+    /// видео и звук по отдельности и на каждой дорожке начинает счёт байтов
+    /// заново, так что «73%» честно сменяется «2%». Сбрасывается там же, где
+    /// сама `progress`.
+    progress_peak: f32,
+    /// Насколько содержимое показанного раздела уже приехало: 0 — только что
+    /// переключились, 1 — стоит на месте (приём 04).
+    ///
+    /// Полем, а не расчётом по месту: карточек в разделе несколько, каждая
+    /// берёт из этого числа свою долю, и спрашивать egui об одном и том же
+    /// по разу на карточку было бы лишней работой в кадре. Считается один
+    /// раз за кадр, в `ui`.
+    arrive: f32,
+    /// Множитель длительностей, посчитанный из `smooth`.
+    ///
+    /// Отдельным полем, а не `motion::scale(self.smooth)` по месту, и по той
+    /// же причине, по какой рядом лежат готовые строки: `ui()` зовут 60 раз
+    /// в секунду, и каждый виджет спрашивал бы его заново. Меняется он от
+    /// щелчка по галочке — там и пересчитывается.
+    ///
+    /// Ноль означает «без движения», и отдельной ветки «если анимации
+    /// выключены» из-за этого не нужно нигде: `animate_*` с нулевым временем
+    /// встают на конечное значение сразу.
+    speed: f32,
     /// Состояние вкладки «Метаданные».
     meta: MetaPanel,
     /// Состояние вкладки «Система».
@@ -1873,6 +2058,16 @@ impl SavioApp {
             rail_tab: RailTab::Queue,
             advanced: false,
             log_open: false,
+            smooth: saved.smooth,
+            progress_peak: 0.0,
+            // Единица — «блика нет». При запуске он всё же пробежит: время
+            // egui начинается с нуля, и `GLOSS` от нуля ещё не истёк.
+            sweep: 0.0,
+            tab_changed_at: 0.0,
+            // Единица, а не ноль: первый кадр — это не смена раздела, и
+            // проявляться при запуске окну незачем.
+            arrive: 1.0,
+            speed: motion::scale(saved.smooth),
             meta: MetaPanel::new(),
             system: SystemPanel::new(),
             monitor: MonitorPanel::new(),
@@ -2019,6 +2214,7 @@ impl SavioApp {
         self.ffmpeg_missing = !engine::has_ffmpeg();
         self.stage.clear();
         self.progress = Progress::default();
+        self.progress_peak = 0.0;
         self.progress_line.clear();
         // Предпросмотр мог споткнуться ровно о то, чего до этой минуты не было:
         // без yt-dlp спрашивать сайт нечем, а молчит он об этом одинаково — и
@@ -2066,6 +2262,7 @@ impl SavioApp {
         self.rx = Some(rx);
         self.setup = Setup::Updating(what);
         self.progress = Progress::default();
+        self.progress_peak = 0.0;
         // Первая стадия у двух веток разная: у yt-dlp следом идёт запрос
         // выпуска, у ffmpeg — сразу загрузка, и «Проверяю версию…» висела бы
         // над полосой, которая на самом деле качает архив.
@@ -2116,6 +2313,7 @@ impl SavioApp {
             // файл переживает переключение списка на «Не использовать» и
             // обратно, и на закрытии окна эта память обрываться не должна.
             cookie_file: self.cookie_file.clone(),
+            smooth: self.smooth,
         });
     }
 }
@@ -2268,6 +2466,7 @@ impl SavioApp {
                 self.handle = Some(handle);
                 self.state = State::Running;
                 self.progress = Progress::default();
+                self.progress_peak = 0.0;
                 self.stage = "Запуск…".into();
                 self.log.clear();
                 self.done_path_display.clear();
@@ -2563,6 +2762,9 @@ impl SavioApp {
                     // и разводить там нечего: канал занят ею одной.
                     if self.setup.busy() || self.queue.is_running(p.download_id) {
                         self.progress = p;
+                        self.progress_peak = self
+                            .progress_peak
+                            .max(self.progress.fraction().unwrap_or(0.0));
                         progress_dirty = true;
                     }
                 }
@@ -2938,11 +3140,35 @@ impl eframe::App for SavioApp {
                 .send_viewport_cmd(egui::ViewportCommand::Maximized(true));
         }
 
+        self.arrive = self.tab_arrival(ui.ctx());
+        self.sweep = motion::elapsed(
+            ui.ctx(),
+            self.tab_changed_at,
+            motion::GLOSS * self.speed,
+        );
+        self.sweep_queue(ui.ctx());
+
         // Фон кладём первым и прямо в корневой `Ui`, до всех панелей: egui
         // рисует фигуры в порядке добавления, и всё, что появится дальше,
         // ляжет поверх. Заливки у панелей при этом нет вовсе (`panel_fill`
         // прозрачный) — иначе сплошной цвет закрасил бы пятна.
-        self.backdrop.paint(ui.painter(), ui.max_rect());
+        // Подложка слегка тянется к выбранному разделу (приём 07). Вечного
+        // дрейфа у неё намеренно нет: он один во всём наборе просил бы кадры
+        // в покое, а пересборка сетки — это сотни вершин и новый `Mesh`
+        // в куче, то есть далеко не пара сравнений. Сдвиг же доезжает за
+        // `DRIFT_PULL_TIME` и останавливается, и в покое Savio по-прежнему
+        // не тратит ни кадра.
+        let pull = match self.tab {
+            Tab::Download => -theme::DRIFT_PULL,
+            Tab::Metadata => 0.0,
+            Tab::Machine => theme::DRIFT_PULL,
+        };
+        let shift = ui.ctx().animate_value_with_time(
+            egui::Id::new("backdrop-shift"),
+            pull,
+            DRIFT_PULL_TIME * self.speed,
+        );
+        self.backdrop.paint(ui.painter(), ui.max_rect(), shift);
 
         // Шапка и подвал — панели, а не первая и последняя строки прокрутки:
         // они обязаны стоять на месте, пока содержимое едет. У панелей это
@@ -2980,19 +3206,152 @@ impl eframe::App for SavioApp {
 
         // Модалки рисуются последними, поверх всего остального.
         let ctx = ui.ctx().clone();
+        // Про приход спрашиваем **у всех трёх сразу**, включая закрытые, и по
+        // той же причине, что у разделов: `animate_bool_with_time`, впервые
+        // увидев идентификатор, отдаёт конечное значение — окно, о котором
+        // не спрашивали, пока его не было, возникло бы уже целиком.
+        let install = self.modal_arrival(&ctx, "setup", self.setup.busy());
+        let tags = self.modal_arrival(&ctx, "tags", self.meta.tags.is_some());
+        let confirm = self.modal_arrival(&ctx, "confirm", self.meta.confirming);
+
         if self.setup.busy() {
-            self.install_modal(&ctx);
+            self.install_modal(&ctx, install);
         }
         if self.meta.tags.is_some() {
-            self.tags_modal(&ctx);
+            self.tags_modal(&ctx, tags);
         }
         if self.meta.confirming {
-            self.confirm_modal(&ctx);
+            self.confirm_modal(&ctx, confirm);
         }
     }
 }
 
 impl SavioApp {
+    /// Насколько содержимое показанного раздела уже приехало (приём 04).
+    ///
+    /// Коэффициент спрашивается **у всех трёх** разделов, а не у одного
+    /// показанного, и это не расточительство. `animate_bool_with_time`,
+    /// увидев незнакомый идентификатор, отдаёт сразу конечное значение —
+    /// то есть раздел, о котором не спрашивали, пока на нём стояли, вернулся
+    /// бы уже приехавшим, и приём просто не сработал бы. Три сравнения
+    /// в кадре — цена того, что уходящий раздел успевает погаснуть.
+    fn tab_arrival(&self, ctx: &egui::Context) -> f32 {
+        let mut arrive = 1.0;
+        for (index, tab) in [Tab::Download, Tab::Metadata, Tab::Machine]
+            .into_iter()
+            .enumerate()
+        {
+            let here = tab == self.tab;
+            let t = ctx.animate_bool_with_time(
+                egui::Id::new("tab-arrive").with(index),
+                here,
+                motion::LAYER * self.speed,
+            );
+            if here {
+                arrive = t;
+            }
+        }
+        arrive
+    }
+
+    /// Насколько модальное окно уже пришло (приём 11).
+    ///
+    /// Порядок здесь — половина приёма: сначала гаснет окно под ним, потом
+    /// приезжает само окно. Так видно, что это слой поверх Savio, а не другое
+    /// приложение.
+    fn modal_arrival(&self, ctx: &egui::Context, name: &'static str, open: bool) -> ModalArrival {
+        let id = egui::Id::new("modal").with(name);
+        ModalArrival {
+            veil: ctx.animate_bool_with_time(id.with("veil"), open, MODAL_VEIL * self.speed),
+            rise: motion::glide(ctx.animate_bool_with_time(
+                id.with("rise"),
+                open,
+                motion::LAYER * self.speed,
+            )),
+        }
+    }
+
+    /// Убирает строки очереди, у которых складывание доиграло (приём 10).
+    ///
+    /// Отложенное удаление, а не мгновенное, нужно ровно затем, чтобы строку
+    /// было чем рисовать, пока она складывается. Ждущей она к этому моменту
+    /// уже не считается нигде — ни в сводке, ни в `next_waiting`, — так что
+    /// задержка не может ни запустить убранное, ни соврать в цифрах.
+    ///
+    /// Быстрый выход первой строкой не для красоты: помеченных строк почти
+    /// всегда нет, а зовут это на каждом кадре.
+    fn sweep_queue(&mut self, ctx: &egui::Context) {
+        if !self
+            .queue
+            .items
+            .iter()
+            .any(|item| item.removing_since.is_some())
+        {
+            return;
+        }
+
+        let now = ctx.input(|i| i.time);
+        let hold = f64::from(motion::MOVE * QUEUE_LEAVE * self.speed);
+
+        // Убираем через `Queue::remove`, а не своим `retain`, ради его
+        // страховки: идущую загрузку он не трогает, и держать это правило
+        // в двух местах — верный способ однажды его разъехать.
+        while let Some(id) = self
+            .queue
+            .items
+            .iter()
+            .find(|item| item.removing_since.is_some_and(|at| now - at >= hold))
+            .map(|item| item.id)
+        {
+            self.queue.remove(id);
+        }
+    }
+
+    /// Как выглядит на этом кадре элемент, появившийся по своему поводу:
+    /// баннер, подпись «Скопировано», карточка истории (приём 05).
+    ///
+    /// Отдельно от [`SavioApp::appear`], потому что повод другой: там весь
+    /// раздел приезжает разом и по номеру карточки, здесь — один элемент,
+    /// у которого своё «показан или нет».
+    fn appearing(
+        ctx: &egui::Context,
+        id: egui::Id,
+        shown: bool,
+        speed: f32,
+    ) -> Option<theme::Appear> {
+        let t = ctx.animate_bool_with_time(id, shown, motion::LAYER * speed);
+        if t >= 1.0 {
+            return None;
+        }
+        let t = motion::stagger(t, 0);
+        Some(theme::Appear {
+            offset: motion::RISE * (1.0 - t),
+            opacity: t,
+            // Блика у баннера нет: он не карточка стекла, а сообщение,
+            // и светлая точка по его кромке читалась бы как ещё один
+            // повод на него смотреть.
+            sweep: 1.0,
+        })
+    }
+
+    /// Как выглядит на этом кадре карточка номер `step` показанного раздела.
+    ///
+    /// `None` — карточка уже на месте: тогда `theme::card_rising` рисует ровно
+    /// то же, что рисовал `theme::card` до всех приёмов, и не стоит ничего.
+    fn appear(&self, step: u32) -> Option<theme::Appear> {
+        // Блик живёт дольше прихода, поэтому проверяются оба: вернуть `None`
+        // по одному только `arrive` значило бы гасить блик на трети пути.
+        if self.arrive >= 1.0 && self.sweep >= 1.0 {
+            return None;
+        }
+        let t = motion::stagger(self.arrive, step);
+        Some(theme::Appear {
+            offset: motion::RISE * (1.0 - t),
+            opacity: t,
+            sweep: self.sweep,
+        })
+    }
+
     /// Шапка окна: имя, три раздела, версия.
     ///
     /// Разделов три, и запас по ширине снова есть: «Метаданные» — самая
@@ -3022,19 +3381,21 @@ impl SavioApp {
 
             // Что нажали, применяем после дорожки: внутри замыкания `self`
             // занят целиком, и присвоить поле оттуда нельзя.
-            let mut picked = None;
-            theme::track_frame().show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 2.0;
-                    for (tab, label) in TABS {
-                        if segment_button(ui, label, self.tab == tab, 0.0) {
-                            picked = Some(tab);
-                        }
-                    }
-                });
-            });
-            if let Some(tab) = picked {
+            let picked = segment_track(
+                ui,
+                egui::Id::new("track:tab"),
+                self.speed,
+                self.tab,
+                &TABS,
+                false,
+            );
+            if let Some(tab) = picked
+                && tab != self.tab
+            {
                 self.tab = tab;
+                // Момент смены нужен блику и подложке: обоим отпущено больше
+                // времени, чем самому приходу, и `animate_*` им не подходит.
+                self.tab_changed_at = ui.ctx().input(|i| i.time);
             }
 
             // Версию прижимаем к правому краю: она нужна, когда выясняют,
@@ -3081,8 +3442,9 @@ impl SavioApp {
                 },
             );
 
+            let speed = self.speed;
             ui.add_enabled_ui(enabled, |ui| {
-                if pill_button(ui, "Обновить движок")
+                if pill_button(ui, "Обновить движок", speed)
                     .on_hover_text(
                         "Сайты меняются, и старый yt-dlp перестаёт их скачивать. \
                          Если ссылка вдруг не работает — обновите движок.",
@@ -3091,7 +3453,7 @@ impl SavioApp {
                 {
                     update = Some(setup::Component::Ytdlp);
                 }
-                if pill_button(ui, "Обновить ffmpeg")
+                if pill_button(ui, "Обновить ffmpeg", speed)
                     .on_hover_text(
                         "Свежая сборка ffmpeg качается целиком — больше сотни \
                          мегабайт. Обновлять его нужно редко.",
@@ -3107,13 +3469,40 @@ impl SavioApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let has_log = !self.log.is_empty();
                 let response = ui.add_enabled_ui(has_log, |ui| {
-                    toggle_pill(ui, "Журнал", self.log_open)
+                    toggle_pill(ui, "Журнал", self.log_open, speed)
                 });
                 if response.inner.clicked() {
                     self.log_open = !self.log_open;
                 }
                 if !has_log {
                     response.response.on_hover_text("Пока нечего показывать.");
+                }
+
+                // Выключатель движения стоит здесь, а не в «Тонких
+                // настройках», и это не вкусовщина: та группа при запуске
+                // свёрнута, а настройка запоминается между запусками —
+                // спрятанная за щелчком, она была бы невидима ровно тогда,
+                // когда о ней вспоминают. Подвал же виден на всех вкладках
+                // сразу и без единого щелчка.
+                //
+                // Порог по той же причине, что и у строки версий ниже, и
+                // проверен глазами: подвал — одна строка, и втроём с двумя
+                // кнопками обновления галочка в окно 520 не помещается —
+                // подпись налезает на «Обновить ffmpeg». Прятать
+                // переключатель жаль, но перекрытые надписи хуже: они врут
+                // о том, что вообще есть в подвале. Само окно при этом
+                // открывается развёрнутым, так что до порога доводят вручную.
+                const SWITCH_MIN: f32 = 180.0;
+                if ui.available_width() >= SWITCH_MIN
+                    && checkbox(ui, &mut self.smooth, "Плавные переходы", true)
+                        .on_hover_text(
+                            "Снимите, если движение в окне мешает или машина \
+                             слабая: всё станет переключаться мгновенно.",
+                        )
+                        .changed()
+                {
+                    self.speed = motion::scale(self.smooth);
+                    self.remember();
                 }
 
                 // Подсказку с полной строкой вешает сама обрезанная метка
@@ -3227,15 +3616,28 @@ impl SavioApp {
                 .map(|text| (text, theme::STATE_ERROR)),
         ];
 
-        for (text, color) in messages.into_iter().flatten() {
-            banner(ui, text, color);
+        // Про появление спрашиваем **у каждого места сразу**, включая пустые,
+        // и по той же причине, что у разделов: `animate_bool_with_time`,
+        // впервые увидев идентификатор, отдаёт конечное значение — баннер,
+        // о котором не спрашивали, пока его не было, возник бы уже целиком.
+        for (index, message) in messages.into_iter().enumerate() {
+            let appear = Self::appearing(
+                ui.ctx(),
+                egui::Id::new("banner").with(index),
+                message.is_some(),
+                self.speed,
+            );
+            let Some((text, color)) = message else {
+                continue;
+            };
+            theme::rising(ui, appear, |ui| banner(ui, text, color));
             ui.add_space(12.0);
         }
     }
 
     /// Главная колонка: всё, что нужно решить до нажатия «Скачать».
     fn download_main(&mut self, ui: &mut egui::Ui) {
-        theme::card(ui, |ui| {
+        theme::card_rising(ui, self.appear(0), |ui| {
             self.url_field(ui);
             // Превью идёт сразу под полем, а не в карточке хода работы
             // справа: оно про то, что собираются скачать, а не про то, что
@@ -3281,22 +3683,32 @@ impl SavioApp {
     /// сию секунду, другое — из чего она собрана. Порознь они занимали две
     /// из пяти вкладок и вытесняли в прокрутку всё остальное.
     fn machine_tab(&mut self, ui: &mut egui::Ui) {
+        // «Машина» приезжает одним слоем, без раскладки по карточкам, и это
+        // не небрежность. Задержка съедает начало общего хода (`STAGGER`),
+        // так что дальше седьмой карточки очередь просто не доходит — хвост
+        // остался бы недоехавшим навсегда. На половине «Сейчас» карточек
+        // около десятка, и очередь тут не годится по устройству, а не по
+        // вкусу; в «Загрузке» и «Метаданных» их две-три, там она к месту.
+        let appear = self.appear(0);
+        theme::rising(ui, appear, |ui| self.machine_body(ui));
+    }
+
+    /// Содержимое «Машины» без оболочки появления.
+    fn machine_body(&mut self, ui: &mut egui::Ui) {
         const HALVES: [(MachineTab, &str); 2] =
             [(MachineTab::Now, "Сейчас"), (MachineTab::Spec, "Состав")];
 
         let mut picked = None;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 12.0;
-            theme::track_frame().show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 2.0;
-                    for (half, label) in HALVES {
-                        if segment_button(ui, label, self.machine_tab == half, 0.0) {
-                            picked = Some(half);
-                        }
-                    }
-                });
-            });
+            picked = segment_track(
+                ui,
+                egui::Id::new("track:machine"),
+                self.speed,
+                self.machine_tab,
+                &HALVES,
+                false,
+            );
 
             // Плашка про опрос стоит рядом с переключателем, а не под
             // карточками: она объясняет ровно то, что человек включил,
@@ -3330,7 +3742,9 @@ impl SavioApp {
     /// нажали Esc», он ещё и поглощает Esc. Пока установка идёт, единственный
     /// выход — кнопка «Отменить», иначе оборвавшаяся загрузка заперла бы
     /// пользователя в окне без выхода.
-    fn install_modal(&mut self, ctx: &egui::Context) {
+    fn install_modal(&mut self, ctx: &egui::Context, arrival: ModalArrival) {
+        let speed = self.speed;
+        arrival.veil(ctx, "setup");
         // Строки статические и выбираются по режиму — в кадре ничего
         // не собирается и не выделяется.
         let (title, subtitle) = match self.setup {
@@ -3352,8 +3766,8 @@ impl SavioApp {
             ),
         };
 
-        let cancelled = egui::Modal::new(egui::Id::new("savio-setup"))
-            .backdrop_color(theme::MODAL_BACKDROP)
+        let modal = egui::Modal::new(egui::Id::new("savio-setup"))
+            .backdrop_color(egui::Color32::TRANSPARENT)
             .frame(
                 egui::Frame::new()
                     .fill(theme::MODAL_FILL)
@@ -3403,9 +3817,10 @@ impl SavioApp {
                 }
 
                 ui.add_space(18.0);
-                pill_button(ui, "Отменить").clicked()
-            })
-            .inner;
+                pill_button(ui, "Отменить", speed).clicked()
+            });
+        arrival.apply(ctx, &modal.response);
+        let cancelled = modal.inner;
 
         if cancelled {
             self.cancel_setup(ctx);
@@ -3538,20 +3953,20 @@ impl SavioApp {
     }
 
     fn format_selector(&mut self, ui: &mut egui::Ui) {
-        theme::track_frame().show(ui, |ui| {
-            ui.horizontal(|ui| {
-                const GAP: f32 = 2.0;
-                ui.spacing_mut().item_spacing.x = GAP;
-                let width = (ui.available_width() - GAP) / 2.0;
-                self.segment(ui, Format::Mp4, width);
-                self.segment(ui, Format::Mp3, width);
-            });
-        });
-    }
+        let items = [
+            (Format::Mp4, Format::Mp4.label()),
+            (Format::Mp3, Format::Mp3.label()),
+        ];
+        let picked = segment_track(
+            ui,
+            egui::Id::new("track:format"),
+            self.speed,
+            self.format,
+            &items,
+            true,
+        );
 
-    /// Одна половина переключателя формата.
-    fn segment(&mut self, ui: &mut egui::Ui, format: Format, width: f32) {
-        if segment_button(ui, format.label(), self.format == format, width) {
+        if let Some(format) = picked {
             self.format = format;
             // Подписи сегментов качества и оговорки под ними зависят от
             // формата — пересобрать их надо здесь, а не в кадре отрисовки.
@@ -3572,28 +3987,21 @@ impl SavioApp {
     /// что осталось.
     fn quality_selector(&mut self, ui: &mut egui::Ui) {
         let format = self.format;
-        let mut changed = false;
+        // Массив на стеке, а не сборка списка: шесть пар «ступень + подпись»
+        // ничего не выделяют, а подписи у `Quality` статические.
+        let items = Quality::ALL.map(|quality| (quality, quality.label(format)));
 
-        theme::track_frame().show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    const GAP: f32 = 2.0;
-                    ui.spacing_mut().item_spacing.x = GAP;
+        let picked = segment_track(
+            ui,
+            egui::Id::new("track:quality"),
+            self.speed,
+            self.quality,
+            &items,
+            true,
+        );
 
-                    let mut left = Quality::ALL.len() as f32;
-                    for quality in Quality::ALL {
-                        let width = (ui.available_width() - GAP * (left - 1.0)) / left;
-                        left -= 1.0;
-
-                        if segment_button(ui, quality.label(format), self.quality == quality, width)
-                        {
-                            self.quality = quality;
-                            changed = true;
-                        }
-                    }
-                });
-        });
-
-        if changed {
+        if let Some(quality) = picked {
+            self.quality = quality;
             self.rebuild_quality_note();
             self.remember();
         }
@@ -3751,19 +4159,40 @@ impl SavioApp {
         // отрисовки: `self` до конца замыкания занят.
         let mut subs_changed = false;
         let mut any_changed = false;
+        // Копией, а не `self.speed` по месту: внутри замыкания `self` занят
+        // изменяемо — там же правятся сами галочки.
+        let speed = self.speed;
 
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
 
-            any_changed |= chip(ui, &mut self.options.embed_metadata, "Метаданные", true)
-                .on_hover_text("Название, автор и дата уедут в сам файл.")
-                .changed();
-            any_changed |= chip(ui, &mut self.options.embed_thumbnail, "Обложку", true)
-                .on_hover_text("Картинка ролика станет обложкой файла.")
-                .changed();
-            subs_changed |= chip(ui, &mut self.options.embed_subs, "Субтитры", subs_enabled)
-                .on_disabled_hover_text("Субтитры бывают только у видео — выберите MP4.")
-                .changed();
+            any_changed |= chip(
+                ui,
+                &mut self.options.embed_metadata,
+                "Метаданные",
+                true,
+                speed,
+            )
+            .on_hover_text("Название, автор и дата уедут в сам файл.")
+            .changed();
+            any_changed |= chip(
+                ui,
+                &mut self.options.embed_thumbnail,
+                "Обложку",
+                true,
+                speed,
+            )
+            .on_hover_text("Картинка ролика станет обложкой файла.")
+            .changed();
+            subs_changed |= chip(
+                ui,
+                &mut self.options.embed_subs,
+                "Субтитры",
+                subs_enabled,
+                speed,
+            )
+            .on_disabled_hover_text("Субтитры бывают только у видео — выберите MP4.")
+            .changed();
 
             // Подчинённый чип появляется вместе с субтитрами, а не висит
             // выключенным рядом: без «Субтитров» он не значит ничего.
@@ -3773,6 +4202,7 @@ impl SavioApp {
                     &mut self.options.auto_subs,
                     "Можно автоматические",
                     true,
+                    speed,
                 )
                 .on_hover_text(
                     "Распознанные роботом субтитры лучше, чем никаких, но \
@@ -3815,6 +4245,7 @@ impl SavioApp {
     /// ролик скачался куском.
     fn advanced_group(&mut self, ui: &mut egui::Ui) {
         let open = self.advanced;
+        let speed = self.speed;
         let mut toggled = false;
 
         egui::Frame::new()
@@ -3824,40 +4255,39 @@ impl SavioApp {
             .inner_margin(egui::Margin::same(4))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                toggled = disclosure_row(ui, open, "Тонкие настройки", &self.advanced_summary);
+                toggled =
+                    disclosure_row(ui, open, "Тонкие настройки", &self.advanced_summary, speed);
 
-                if !open {
-                    return;
-                }
+                collapsing_body(ui, egui::Id::new("advanced-body"), open, speed, |ui| {
+                    egui::Frame::new()
+                        .inner_margin(egui::Margin {
+                            left: 12,
+                            right: 12,
+                            top: 4,
+                            bottom: 12,
+                        })
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
 
-                egui::Frame::new()
-                    .inner_margin(egui::Margin {
-                        left: 12,
-                        right: 12,
-                        top: 4,
-                        bottom: 12,
-                    })
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
+                            field_label(ui, "Фрагмент");
+                            self.section_row(ui);
 
-                        field_label(ui, "Фрагмент");
-                        self.section_row(ui);
-
-                        ui.add_space(14.0);
-                        field_label(ui, "Вход на сайт");
-                        self.cookie_selector(ui);
-
-                        // Список языков нужен, только если субтитры просят:
-                        // в остальное время он не значит ничего.
-                        if self.format == Format::Mp4 && self.options.embed_subs {
                             ui.add_space(14.0);
-                            field_label(ui, "Язык субтитров");
-                            if self.sub_lang_selector(ui) {
-                                self.rebuild_subtitles();
-                                self.rebuild_advanced_summary();
+                            field_label(ui, "Вход на сайт");
+                            self.cookie_selector(ui);
+
+                            // Список языков нужен, только если субтитры просят:
+                            // в остальное время он не значит ничего.
+                            if self.format == Format::Mp4 && self.options.embed_subs {
+                                ui.add_space(14.0);
+                                field_label(ui, "Язык субтитров");
+                                if self.sub_lang_selector(ui) {
+                                    self.rebuild_subtitles();
+                                    self.rebuild_advanced_summary();
+                                }
                             }
-                        }
-                    });
+                        });
+                });
             });
 
         if toggled {
@@ -4162,14 +4592,19 @@ impl SavioApp {
             theme::STATE_WARNING
         };
 
-        let clicked = ui
-            .add_sized(
-                [ui.available_width(), theme::CONTROL_HEIGHT],
-                egui::Button::new(egui::RichText::new(&self.out_dir_display).color(color))
-                    .truncate(),
-            )
-            .on_hover_text("Куда сохранять готовые файлы. Нажмите, чтобы выбрать другую папку.")
-            .clicked();
+        let clicked = sized_with_touch(
+            ui,
+            egui::vec2(ui.available_width(), theme::CONTROL_HEIGHT),
+            self.speed,
+            |ui| {
+                ui.add(
+                    egui::Button::new(egui::RichText::new(&self.out_dir_display).color(color))
+                        .truncate(),
+                )
+            },
+        )
+        .on_hover_text("Куда сохранять готовые файлы. Нажмите, чтобы выбрать другую папку.")
+        .clicked();
 
         if clicked && let Some(dir) = rfd::FileDialog::new().pick_folder() {
             self.out_dir_display = display_dir(Some(&dir));
@@ -4296,16 +4731,22 @@ impl SavioApp {
                 )
             };
 
-            for (state, fill) in [
-                (&mut v.widgets.inactive, rest),
-                (&mut v.widgets.hovered, hover),
-                (&mut v.widgets.active, press),
+            // Нажатие у кнопки из egui задаётся не своим прямоугольником,
+            // а `expansion` (приём 02): рисует её `Button`, и подменить ему
+            // рамку нечем. Полтора процента ширины на CTA — это около трёх
+            // точек; берём их отрицательным полем, так что раскладка не едет.
+            let squeeze = -width * motion::PRESS;
+
+            for (state, fill, expansion) in [
+                (&mut v.widgets.inactive, rest, 0.0),
+                (&mut v.widgets.hovered, hover, 0.0),
+                (&mut v.widgets.active, press, squeeze),
             ] {
                 state.weak_bg_fill = fill;
                 state.bg_stroke = egui::Stroke::NONE;
                 state.fg_stroke = egui::Stroke::new(1.0, theme::TEXT_ON_ACCENT);
                 state.corner_radius = egui::CornerRadius::same(theme::RADIUS_PILL);
-                state.expansion = 0.0;
+                state.expansion = expansion;
             }
             // Двойное ослабление не нужно: приглушённый оранжевый уже задан
             // явно, а поверх него прозрачность съела бы кнопку целиком.
@@ -4334,16 +4775,34 @@ impl SavioApp {
     /// в строке очереди ниже, где название и так стоит и подсвечено.
     fn status_section(&mut self, ui: &mut egui::Ui) {
         let (label, color) = self.status();
+        let speed = self.speed;
         // Куда открывать папку, решаем после карточки: внутри замыкания
         // `self` занят целиком, а `open_dir` запускает процесс.
         let mut open_at: Option<PathBuf> = None;
 
-        theme::card(ui, |ui| {
+        theme::card_rising(ui, self.appear(1), |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 9.0;
                 // Точка — подсказка глазу, а не носитель смысла: то же
                 // состояние сказано словом рядом.
+                //
+                // Дышит она ровно тогда, когда что-то вправду идёт (приём 14):
+                // погасшая пульсация означает «кончилось», и это единственное,
+                // что движется в покое. Цвет при этом переливается, а не
+                // подменяется, — состояние меняется одним движением.
                 let (dot, _) = ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
+                let running = matches!(self.state, State::Running);
+                let color = motion::tint(
+                    ui.ctx(),
+                    egui::Id::new("status-dot"),
+                    color,
+                    motion::MOVE * speed,
+                );
+                let color = if running {
+                    color.gamma_multiply(motion::breath(ui.ctx(), speed))
+                } else {
+                    color
+                };
                 ui.painter().circle_filled(dot.center(), 4.5, color);
                 ui.add(
                     egui::Label::new(
@@ -4367,8 +4826,19 @@ impl SavioApp {
                         // ровно то, что нужно. Проценты не пишем внутрь бара:
                         // тёмный текст утонул бы в жёлобе, светлый — в заливке.
                         let bar = match self.progress.fraction() {
-                            Some(f) => egui::ProgressBar::new(f),
-                            // Размер неизвестен — крутим неопределённый индикатор.
+                            // yt-dlp отдаёт проценты рывками, поэтому полоса
+                            // едет к присланному значению чуть дольше, чем
+                            // приходит следующее (приём 09). Показываем при
+                            // этом потолок, а не сам замер: см. `progress_peak`.
+                            Some(_) => egui::ProgressBar::new(ui.ctx().animate_value_with_time(
+                                egui::Id::new("progress-bar"),
+                                self.progress_peak,
+                                PROGRESS_CATCH_UP * speed,
+                            )),
+                            // Размер неизвестен — крутим неопределённый
+                            // индикатор. Он у egui штатный и остаётся как был:
+                            // это одна из трёх бесконечных анимаций набора, и
+                            // живёт она ровно столько, сколько идёт загрузка.
                             None => egui::ProgressBar::new(0.0).animate(true),
                         };
                         ui.add(bar.fill(theme::ACCENT).desired_height(8.0));
@@ -4404,7 +4874,7 @@ impl SavioApp {
                         ui.add_space(10.0);
                     }
                     if let Some(dir) = path.parent()
-                        && pill_button(ui, "Открыть папку").clicked()
+                        && pill_button(ui, "Открыть папку", speed).clicked()
                     {
                         open_at = Some(dir.to_path_buf());
                     }
@@ -4444,28 +4914,25 @@ impl SavioApp {
         let mut clear = false;
         let mut picked = None;
         let mut open_at: Option<PathBuf> = None;
+        let speed = self.speed;
 
-        theme::card(ui, |ui| {
+        theme::card_rising(ui, self.appear(2), |ui| {
             ui.horizontal(|ui| {
-                theme::track_frame().show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 2.0;
-                        for (tab, label) in
-                            [(RailTab::Queue, "Очередь"), (RailTab::History, "История")]
-                        {
-                            if segment_button(ui, label, self.rail_tab == tab, 0.0) {
-                                picked = Some(tab);
-                            }
-                        }
-                    });
-                });
+                picked = segment_track(
+                    ui,
+                    egui::Id::new("track:rail"),
+                    self.speed,
+                    self.rail_tab,
+                    &[(RailTab::Queue, "Очередь"), (RailTab::History, "История")],
+                    false,
+                );
 
                 // «Очистить» прижата к правому краю и есть только у очереди:
                 // история за этот запуск — единственный след того, куда что
                 // легло, и стирать её кнопкой рядом со списком опасно.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if self.rail_tab == RailTab::Queue && !self.queue.items.is_empty() {
-                        clear = pill_button(ui, "Очистить")
+                        clear = pill_button(ui, "Очистить", speed)
                             .on_hover_text(
                                 "Список опустеет: уйдут и скачанные, и те, что ещё \
                                  ждут. Идущая загрузка не прервётся — её \
@@ -4491,13 +4958,16 @@ impl SavioApp {
             open_dir(&dir);
         }
 
-        let emptied = remove.is_some() || clear;
         if let Some(id) = remove {
-            self.queue.remove(id);
+            // Не удаляем, а помечаем: строка складывается, а убирает её
+            // `sweep_queue`, когда складывание доиграло (приём 10).
+            let now = ui.ctx().input(|i| i.time);
+            self.queue.mark_removing(id, now);
         }
         if clear {
             self.queue.clear();
         }
+        let emptied = remove.is_some() || clear;
 
         // Экран не должен пережить очередь. Убрали последнее ожидающее — и
         // «В очереди» на плашке становится враньём, а совет под ней («нажмите
@@ -4513,6 +4983,7 @@ impl SavioApp {
 
     /// Содержимое половины «Очередь». Возвращает строку, которую убрали.
     fn queue_list(&self, ui: &mut egui::Ui) -> Option<DownloadId> {
+        let speed = self.speed;
         if self.queue.items.is_empty() {
             note(
                 ui,
@@ -4548,7 +5019,7 @@ impl SavioApp {
             if index > 0 {
                 ui.add_space(8.0);
             }
-            if queue_row(ui, item) {
+            if queue_row(ui, item, speed) {
                 remove = Some(item.id);
             }
         }
@@ -4649,7 +5120,7 @@ impl SavioApp {
         ui.horizontal(|ui| {
             let now = ui.input(|i| i.time);
 
-            let copied = pill_button(ui, "Скопировать")
+            let copied = pill_button(ui, "Скопировать", self.speed)
                 .on_hover_text(
                     "Журнал уйдёт в буфер обмена — его можно вставить \
                      в сообщение о проблеме.",
@@ -4702,7 +5173,7 @@ impl SavioApp {
         if ui.available_width() < theme::TWO_COLUMN_MIN {
             self.metadata_main(ui);
             ui.add_space(GAP);
-            metadata_rail(ui);
+            metadata_rail(ui, self.appear(1), self.appear(2));
             return;
         }
 
@@ -4727,7 +5198,7 @@ impl SavioApp {
                 |ui| {
                     ui.set_min_width(rail);
                     ui.set_max_width(rail);
-                    metadata_rail(ui);
+                    metadata_rail(ui, self.appear(1), self.appear(2));
                 },
             );
         });
@@ -4735,7 +5206,7 @@ impl SavioApp {
 
     /// Главная колонка вкладки: файл, кнопки и итог.
     fn metadata_main(&mut self, ui: &mut egui::Ui) {
-        theme::card(ui, |ui| {
+        theme::card_rising(ui, self.appear(0), |ui| {
             ui.label(
                 egui::RichText::new("Что файл рассказывает о вас")
                     .font(theme::display(21.0))
@@ -4776,15 +5247,16 @@ impl SavioApp {
             theme::TEXT_MUTED
         };
 
-        let clicked = ui
-            .add_enabled(
-                !self.meta.busy,
+        let width = ui.available_width();
+        let clicked = enabled_with_touch(ui, !self.meta.busy, self.speed, |ui| {
+            ui.add(
                 egui::Button::new(egui::RichText::new(&self.meta.path_display).color(color))
                     .truncate()
-                    .min_size(egui::vec2(ui.available_width(), theme::FIELD_HEIGHT)),
+                    .min_size(egui::vec2(width, theme::FIELD_HEIGHT)),
             )
-            .on_hover_text("Нажмите, чтобы выбрать MP3 или изображение.")
-            .clicked();
+        })
+        .on_hover_text("Нажмите, чтобы выбрать MP3 или изображение.")
+        .clicked();
 
         if clicked
             && let Some(path) = rfd::FileDialog::new()
@@ -4933,7 +5405,9 @@ impl SavioApp {
     }
 
     /// Окно со списком прочитанных метаданных.
-    fn tags_modal(&mut self, ctx: &egui::Context) {
+    fn tags_modal(&mut self, ctx: &egui::Context, arrival: ModalArrival) {
+        let speed = self.speed;
+        arrival.veil(ctx, "tags");
         let Some(tags) = &self.meta.tags else {
             return;
         };
@@ -4949,7 +5423,7 @@ impl SavioApp {
         let list_height = (screen.height() - 230.0).clamp(110.0, 320.0);
 
         let close = egui::Modal::new(egui::Id::new("savio-tags"))
-            .backdrop_color(theme::MODAL_BACKDROP)
+            .backdrop_color(egui::Color32::TRANSPARENT)
             .frame(
                 egui::Frame::new()
                     .fill(theme::MODAL_FILL)
@@ -5022,8 +5496,9 @@ impl SavioApp {
                 }
 
                 ui.add_space(18.0);
-                pill_button(ui, "Закрыть").clicked()
+                pill_button(ui, "Закрыть", speed).clicked()
             });
+        arrival.apply(ctx, &close.response);
 
         // В отличие от модалки установки, здесь `should_close` уместен:
         // окно ничего не делает и запереть в нём пользователя нечем, поэтому
@@ -5034,7 +5509,8 @@ impl SavioApp {
     }
 
     /// Подтверждение перезаписи файла.
-    fn confirm_modal(&mut self, ctx: &egui::Context) {
+    fn confirm_modal(&mut self, ctx: &egui::Context, arrival: ModalArrival) {
+        arrival.veil(ctx, "confirm");
         #[derive(PartialEq)]
         enum Answer {
             None,
@@ -5043,7 +5519,7 @@ impl SavioApp {
         }
 
         let answer = egui::Modal::new(egui::Id::new("savio-confirm"))
-            .backdrop_color(theme::MODAL_BACKDROP)
+            .backdrop_color(egui::Color32::TRANSPARENT)
             .frame(
                 egui::Frame::new()
                     .fill(theme::MODAL_FILL)
@@ -5106,6 +5582,7 @@ impl SavioApp {
                 })
                 .inner
             });
+        arrival.apply(ctx, &answer.response);
 
         // Esc и щелчок мимо — это отказ. Трактовать их как согласие на
         // необратимую операцию нельзя.
@@ -5268,6 +5745,11 @@ impl SavioApp {
         self.power_card(ui);
         ui.add_space(14.0);
 
+        let speed = self.speed;
+        // Фаза считается один раз на вкладку: карточек с графиком две, и
+        // разъехавшись на кадр они ехали бы вразнобой.
+        let phase = self.monitor.trace_phase(ui.ctx(), speed);
+
         let Some(sample) = &self.monitor.sample else {
             note(
                 ui,
@@ -5288,6 +5770,8 @@ impl SavioApp {
                     &sample.cpu,
                     &self.monitor.cpu_trace,
                     theme::ACCENT,
+                    phase,
+                    speed,
                 );
                 metric_card(
                     &mut columns[1],
@@ -5295,6 +5779,8 @@ impl SavioApp {
                     &sample.mem,
                     &self.monitor.mem_trace,
                     theme::STATE_SUCCESS,
+                    phase,
+                    speed,
                 );
             });
         } else {
@@ -5304,6 +5790,8 @@ impl SavioApp {
                 &sample.cpu,
                 &self.monitor.cpu_trace,
                 theme::ACCENT,
+                phase,
+                speed,
             );
             ui.add_space(12.0);
             metric_card(
@@ -5312,6 +5800,8 @@ impl SavioApp {
                 &sample.mem,
                 &self.monitor.mem_trace,
                 theme::STATE_SUCCESS,
+                phase,
+                speed,
             );
         }
         ui.add_space(12.0);
@@ -5333,6 +5823,7 @@ impl SavioApp {
         let busy = self.power.busy;
         let mut refresh = false;
         let mut change = None;
+        let speed = self.speed;
 
         theme::card(ui, |ui| {
             // Ряду задаётся высота, и это не украшение вёрстки. `with_layout`
@@ -5399,7 +5890,7 @@ impl SavioApp {
                             // Нажатие на уже активную ничего не значит:
                             // просить систему переключиться на то, что и так
                             // работает, — бодрый отчёт о безделье.
-                            if choice_pill(ui, &plan.name, on).clicked() && !on {
+                            if choice_pill(ui, &plan.name, on, speed).clicked() && !on {
                                 change = Some(power::Change::Plan(plan.id));
                             }
                         }
@@ -5424,7 +5915,7 @@ impl SavioApp {
                             if !mode.offered() && !on {
                                 continue;
                             }
-                            if choice_pill(ui, mode.label(), on).clicked() && !on {
+                            if choice_pill(ui, mode.label(), on, speed).clicked() && !on {
                                 change = Some(power::Change::Mode(mode));
                             }
                         }
@@ -5576,7 +6067,7 @@ impl SavioApp {
                 // Папку могли переименовать или унести вместе с флешкой —
                 // тогда об этом скажет проводник, и это честнее
                 // выключенной без объяснения кнопки.
-                if pill_button(ui, "Открыть папку").clicked() {
+                if pill_button(ui, "Открыть папку", self.speed).clicked() {
                     open_at = Some(dir.clone());
                 }
                 // Вложенная раскладка обязательна: в `right_to_left` метка
@@ -5607,8 +6098,12 @@ impl SavioApp {
 ///
 /// Свободная функция, а не метод: ни одно из двух объяснений не зависит от
 /// состояния приложения — обе карточки статические.
-fn metadata_rail(ui: &mut egui::Ui) {
-    theme::card(ui, |ui| {
+fn metadata_rail(
+    ui: &mut egui::Ui,
+    warning: Option<theme::Appear>,
+    kinds: Option<theme::Appear>,
+) {
+    theme::card_rising(ui, warning, |ui| {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 9.0;
             let (dot, _) = ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
@@ -5636,7 +6131,7 @@ fn metadata_rail(ui: &mut egui::Ui) {
 
     ui.add_space(14.0);
 
-    theme::card(ui, |ui| {
+    theme::card_rising(ui, kinds, |ui| {
         field_label(ui, "Что поддерживается");
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(7.0, 7.0);
@@ -5663,7 +6158,63 @@ fn metadata_rail(ui: &mut egui::Ui) {
 // Мелкие элементы
 // ---------------------------------------------------------------------------
 
-/// Один сегмент переключателя: выбранный — оранжевый, остальные прозрачные.
+/// Насколько виджет сейчас под курсором: 0 — совсем нет, 1 — полностью.
+///
+/// Спрашиваем **до** того, как виджет нарисован, и это не хитрость: egui
+/// решает, кто под курсором, в начале прохода — по прямоугольникам прошлого
+/// кадра, — так что ответ на этот момент уже готов. Ровно так же и ровно тем
+/// же `read_response` берёт свой вид сам `Button` в egui 0.36, поэтому
+/// заливка, кромка и подпись едут одним коэффициентом и не расходятся
+/// (приём 01).
+///
+/// Идентификатор виджета, которого ещё нет, даёт `ui.next_auto_id()`: он
+/// подглядывает следующий, а не выдаёт его, — и первый же добавленный после
+/// него виджет получает именно этот.
+fn touch_at(ui: &egui::Ui, id: egui::Id, speed: f32) -> f32 {
+    let hovered = ui.ctx().read_response(id).is_some_and(|r| r.hovered());
+    ui.ctx()
+        .animate_bool_with_time(id, hovered, motion::TOUCH * speed)
+}
+
+/// Ставит виджетам штатных состояний темы плавный отклик под курсором.
+///
+/// Красит `inactive` и `hovered` одинаково — тем, что получилось из `t`:
+/// какое из двух состояний возьмёт egui, зависит от того же самого наведения,
+/// и держать их разными нечем. Нажатие (`active`) остаётся мгновенным: это
+/// не отклик на приближение, а подтверждение действия.
+///
+/// `expansion` едет вместе с цветом намеренно. Раскладку это не двигает —
+/// у кнопки `outer_margin` ровно на столько же отрицательный, — но без него
+/// кромка прыгала бы на месте, пока цвет переливается.
+fn touch_visuals(ui: &mut egui::Ui, t: f32) {
+    let v = ui.visuals_mut();
+    let (rest, hover) = (v.widgets.inactive, v.widgets.hovered);
+    let weak = motion::mix(rest.weak_bg_fill, hover.weak_bg_fill, t);
+    let solid = motion::mix(rest.bg_fill, hover.bg_fill, t);
+    let border = motion::mix(rest.bg_stroke.color, hover.bg_stroke.color, t);
+    let text = motion::mix(rest.fg_stroke.color, hover.fg_stroke.color, t);
+    let expansion = rest.expansion + (hover.expansion - rest.expansion) * t;
+
+    for state in [&mut v.widgets.inactive, &mut v.widgets.hovered] {
+        state.weak_bg_fill = weak;
+        state.bg_fill = solid;
+        state.bg_stroke.color = border;
+        state.fg_stroke.color = text;
+        state.expansion = expansion;
+    }
+}
+
+/// Что осталось от сегмента после отрисовки.
+///
+/// Прямоугольник нужен дорожке: перетекающая таблетка (приём 03) едет к
+/// выбранному сегменту, а где он лёг, известно только после раскладки.
+struct Segment {
+    clicked: bool,
+    rect: egui::Rect,
+    touch: f32,
+}
+
+/// Один сегмент переключателя: подпись и отклик, но **без** заливки выбранного.
 ///
 /// Цвета задаём через `visuals`, а не через `Button::fill`: последний,
 /// по документации egui, отключает реакцию на наведение — кнопка выглядела бы
@@ -5671,38 +6222,61 @@ fn metadata_rail(ui: &mut egui::Ui) {
 /// качество, половины «Машины», очередь с историей: разъехавшись, одинаковые
 /// на вид элементы смотрелись бы досадной небрежностью.
 ///
+/// Оранжевого у выбранного сегмента здесь нет намеренно, и это половина
+/// приёма 03: заливку рисует одна на всю дорожку таблетка в [`segment_track`],
+/// которая к выбранному **едет**, а не зажигается на месте. Покрасить сегмент
+/// ещё и тут тянет при первом же взгляде на функцию — и тогда таблетка
+/// поедет по уже зажжённому месту, то есть весь приём пропадёт, а сборка,
+/// `clippy` и тесты этого не заметят.
+///
 /// `width` — это **минимум**, а не потолок: egui не сжимает кнопку под
 /// доступное место, а раздвигает раскладку. Ноль означает «по ширине текста»
 /// и нужен там, где дорожка стоит посреди строки, а не растянута на всё окно.
-fn segment_button(ui: &mut egui::Ui, label: &str, selected: bool, width: f32) -> bool {
+fn segment_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    selected: bool,
+    width: f32,
+    speed: f32,
+) -> Segment {
     ui.scope(|ui| {
         // Поля сегмента урезаем против штатных 16: шесть ступеней качества
         // («2160p») в окне шириной 520 иначе вылезли бы за кромку.
         ui.spacing_mut().button_padding.x = 10.0;
 
-        let v = ui.visuals_mut();
-        let (rest, hover, press) = if selected {
-            (theme::ACCENT, theme::ACCENT_HOVER, theme::ACCENT_ACTIVE)
+        let id = ui.next_auto_id();
+        let touch = touch_at(ui, id, speed);
+        // Выбранность едет отдельно и дольше отклика: подпись перекрашивается
+        // ровно за то время, что таблетка добирается до сегмента.
+        let chosen =
+            ui.ctx()
+                .animate_bool_with_time(id.with("chosen"), selected, motion::MOVE * speed);
+
+        // Под выбранным сегментом лежит таблетка, и своей заливки ему не
+        // нужно ни в покое, ни под курсором, ни под нажатием: серая подсветка
+        // легла бы поверх оранжевого.
+        let (rest, press) = if selected {
+            (egui::Color32::TRANSPARENT, egui::Color32::TRANSPARENT)
         } else {
             (
-                egui::Color32::TRANSPARENT,
-                theme::CARD_INNER,
+                motion::mix(egui::Color32::TRANSPARENT, theme::CARD_INNER, touch),
                 theme::CARD_FILL,
             )
         };
-        // Подпись выбранного сегмента тёмная — на оранжевом светлая даёт
-        // 1.9:1. У невыбранного она приглушена в покое и светлеет под
-        // курсором: это и есть отклик, заливки там почти нет.
-        let (rest_text, hover_text) = if selected {
-            (theme::TEXT_ON_ACCENT, theme::TEXT_ON_ACCENT)
-        } else {
-            (theme::TEXT_SECONDARY, theme::TEXT_PRIMARY)
-        };
+        // Подпись выбранного тёмная — на оранжевом светлая даёт 1.9:1.
+        // У невыбранного она приглушена в покое и светлеет под курсором:
+        // это и есть отклик, заливки там почти нет.
+        let text = motion::mix(
+            motion::mix(theme::TEXT_SECONDARY, theme::TEXT_PRIMARY, touch),
+            theme::TEXT_ON_ACCENT,
+            chosen,
+        );
 
-        for (state, fill, text) in [
-            (&mut v.widgets.inactive, rest, rest_text),
-            (&mut v.widgets.hovered, hover, hover_text),
-            (&mut v.widgets.active, press, hover_text),
+        let v = ui.visuals_mut();
+        for (state, fill) in [
+            (&mut v.widgets.inactive, rest),
+            (&mut v.widgets.hovered, rest),
+            (&mut v.widgets.active, press),
         ] {
             state.weak_bg_fill = fill;
             state.bg_stroke = egui::Stroke::NONE;
@@ -5712,10 +6286,87 @@ fn segment_button(ui: &mut egui::Ui, label: &str, selected: bool, width: f32) ->
             state.expansion = 0.0;
         }
 
-        ui.add(egui::Button::new(label).min_size(egui::vec2(width, theme::SEGMENT_HEIGHT)))
-            .clicked()
+        let response =
+            ui.add(egui::Button::new(label).min_size(egui::vec2(width, theme::SEGMENT_HEIGHT)));
+        Segment {
+            clicked: response.clicked(),
+            rect: response.rect,
+            touch,
+        }
     })
     .inner
+}
+
+/// Дорожка переключателя целиком: контурная «таблетка», сегменты внутри и
+/// одна оранжевая таблетка, перетекающая к выбранному (приём 03).
+///
+/// Возвращает то, по чему щёлкнули. Применять выбор надо снаружи: внутри
+/// замыкания `self` занят целиком, и присвоить поле оттуда нельзя.
+///
+/// Одна функция на все пять дорожек окна. Место под таблетку занимается
+/// **до** цикла: где она ляжет, известно только после раскладки, а лежать
+/// она обязана под подписями. `Shape::Noop` в резерве не стоит видеокарте
+/// ничего, если выбранного сегмента вдруг не окажется.
+///
+/// `stretch` растягивает сегменты на всю ширину поровну (формат, качество);
+/// без него каждый берёт ширину своей подписи — так дорожка стоит посреди
+/// строки, а не растянута на всё окно. Доля считается на каждом шаге заново,
+/// а не делится один раз: округления до пиксельной сетки накопили бы ошибку,
+/// и дорожка либо не дотянулась бы до правого края, либо вылезла за него.
+fn segment_track<T: Copy + PartialEq>(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    speed: f32,
+    current: T,
+    items: &[(T, &str)],
+    stretch: bool,
+) -> Option<T> {
+    const GAP: f32 = 2.0;
+
+    let mut picked = None;
+    theme::track_frame().show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = GAP;
+
+            let slot = ui.painter().add(egui::Shape::Noop);
+            let mut chosen: Option<Segment> = None;
+            let mut left = items.len() as f32;
+
+            for (item, label) in items {
+                let width = if stretch {
+                    let width = (ui.available_width() - GAP * (left - 1.0)) / left;
+                    left -= 1.0;
+                    width
+                } else {
+                    0.0
+                };
+
+                let segment = segment_button(ui, label, *item == current, width, speed);
+                if segment.clicked {
+                    picked = Some(*item);
+                }
+                if *item == current {
+                    chosen = Some(segment);
+                }
+            }
+
+            if let Some(chosen) = chosen {
+                let shown = motion::pill(ui.ctx(), id, chosen.rect, motion::MOVE * speed);
+                ui.painter().set(
+                    slot,
+                    egui::Shape::rect_filled(
+                        shown,
+                        egui::CornerRadius::same(theme::RADIUS_PILL),
+                        // Наведение на уже выбранный сегмент светлит саму
+                        // таблетку: до приёма 03 это делала его собственная
+                        // заливка, и терять отклик вместе с ней незачем.
+                        motion::mix(theme::ACCENT, theme::ACCENT_HOVER, chosen.touch),
+                    ),
+                );
+            }
+        });
+    });
+    picked
 }
 
 /// Заготовка вторичной кнопки: контурная «таблетка» штатной высоты.
@@ -5726,16 +6377,66 @@ fn pill(label: &str) -> egui::Button<'_> {
     egui::Button::new(label).min_size(egui::vec2(0.0, theme::CONTROL_HEIGHT))
 }
 
+/// Даёт плавный отклик тому виджету, который добавят следующим.
+///
+/// Подглядеть идентификатор и добавить виджет надо в **одном и том же** `Ui`:
+/// у потомка своя нумерация, и `next_auto_id`, взятый снаружи, указал бы не
+/// туда. Отсюда три обёртки ниже вместо одной — они отличаются ровно тем,
+/// какой `Ui` создают вокруг.
+///
+/// Правит `visuals` без возврата — значит, звать её можно только там, где
+/// правка и так не переживёт кадра: внутри `scope`, `add_enabled_ui` или
+/// `allocate_ui_*`.
+fn with_touch<R>(ui: &mut egui::Ui, speed: f32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let t = touch_at(ui, ui.next_auto_id(), speed);
+    touch_visuals(ui, t);
+    add(ui)
+}
+
 /// Вторичная кнопка.
-fn pill_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    ui.add(pill(label))
+fn pill_button(ui: &mut egui::Ui, label: &str, speed: f32) -> egui::Response {
+    ui.scope(|ui| with_touch(ui, speed, |ui| ui.add(pill(label))))
+        .inner
+}
+
+/// `ui.add_sized`, но с откликом под курсором.
+///
+/// Раскладка та же самая: `add_sized` — это и есть `allocate_ui_with_layout`
+/// с центрирующей раскладкой, здесь она просто выписана, чтобы внутрь
+/// поместился [`with_touch`].
+fn sized_with_touch<R>(
+    ui: &mut egui::Ui,
+    size: egui::Vec2,
+    speed: f32,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    ui.allocate_ui_with_layout(
+        size,
+        egui::Layout::centered_and_justified(egui::Direction::TopDown),
+        |ui| with_touch(ui, speed, add),
+    )
+    .inner
+}
+
+/// `ui.add_enabled`, но с откликом под курсором.
+///
+/// Выключенному виджету он ничего не стоит: под курсором тот не бывает, и
+/// коэффициент остаётся нулём, то есть покоем.
+fn enabled_with_touch<R>(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    speed: f32,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    ui.add_enabled_ui(enabled, |ui| with_touch(ui, speed, add))
+        .inner
 }
 
 /// Кнопка-выключатель: нажатая заливается мягким акцентом.
 ///
 /// Состояние сказано не только цветом — включённая ещё и обведена акцентной
 /// границей, а рядом с ней всегда есть то, что она показывает.
-fn toggle_pill(ui: &mut egui::Ui, label: &str, on: bool) -> egui::Response {
+fn toggle_pill(ui: &mut egui::Ui, label: &str, on: bool, speed: f32) -> egui::Response {
     ui.scope(|ui| {
         if on {
             let v = ui.visuals_mut();
@@ -5749,7 +6450,10 @@ fn toggle_pill(ui: &mut egui::Ui, label: &str, on: bool) -> egui::Response {
                 state.fg_stroke = egui::Stroke::new(1.0, theme::ACCENT_HOVER);
             }
         }
-        pill_button(ui, label)
+        // Отклик под курсором добавляет `pill_button`, и включённой кнопке
+        // он ничего не меняет: покой и наведение у неё выше выставлены
+        // одинаково, так что смешивать нечего.
+        pill_button(ui, label, speed)
     })
     .inner
 }
@@ -5816,7 +6520,13 @@ fn soft_pill(ui: &mut egui::Ui, text: &str, color: egui::Color32, fill: egui::Co
 ///
 /// Галочка обязательна, а не украшение: без неё включённость чипа была бы
 /// сказана одним цветом, а этого мало.
-fn chip(ui: &mut egui::Ui, checked: &mut bool, label: &str, enabled: bool) -> egui::Response {
+fn chip(
+    ui: &mut egui::Ui,
+    checked: &mut bool,
+    label: &str,
+    enabled: bool,
+    speed: f32,
+) -> egui::Response {
     const PAD: f32 = 14.0;
     const GAP: f32 = 8.0;
     const MARK: f32 = 14.0;
@@ -5845,19 +6555,41 @@ fn chip(ui: &mut egui::Ui, checked: &mut bool, label: &str, enabled: bool) -> eg
         }
 
         let on = *checked;
-        let (fill, stroke, text_color) = match (on, response.hovered()) {
-            (true, _) => (
-                theme::SUCCESS_SOFT,
-                theme::STATE_SUCCESS,
-                theme::TEXT_PRIMARY,
-            ),
-            (false, true) => (theme::CARD_INNER, theme::BORDER_HOVER, theme::TEXT_PRIMARY),
-            (false, false) => (
-                egui::Color32::TRANSPARENT,
-                theme::BORDER_STRONG,
-                theme::TEXT_SECONDARY,
-            ),
-        };
+        // Прямоугольник уже разложен, отклик получен — коэффициенты берутся
+        // тем же кадром, без заглядывания в прошлый.
+        let ctx = ui.ctx();
+        let touch =
+            ctx.animate_bool_with_time(response.id, response.hovered(), motion::TOUCH * speed);
+        // Включённость едет отдельно и дольше: это смена состояния, а не
+        // отклик на приближение курсора.
+        let on_t = ctx.animate_bool_with_time(response.id.with("on"), on, motion::MOVE * speed);
+        // Нажатие: приминаем на полтора процента ширины (приём 02). Кривая
+        // `glide` — приходящее тормозит у цели; время короче отклика, иначе
+        // кнопка залипает под пальцем.
+        let press = motion::glide(ctx.animate_bool_with_time(
+            response.id.with("press"),
+            response.is_pointer_button_down_on(),
+            motion::TOUCH * 0.75 * speed,
+        ));
+        let rect = motion::pressed(rect, press);
+
+        // Невыбранный чип светлеет под курсором, выбранный переливается
+        // в зелёный — и одно накладывается на другое, а не спорит с ним.
+        let fill = motion::mix(
+            motion::mix(egui::Color32::TRANSPARENT, theme::CARD_INNER, touch),
+            theme::SUCCESS_SOFT,
+            on_t,
+        );
+        let stroke = motion::mix(
+            motion::mix(theme::BORDER_STRONG, theme::BORDER_HOVER, touch),
+            theme::STATE_SUCCESS,
+            on_t,
+        );
+        let text_color = motion::mix(
+            motion::mix(theme::TEXT_SECONDARY, theme::TEXT_PRIMARY, touch),
+            theme::TEXT_PRIMARY,
+            on_t,
+        );
 
         let painter = ui.painter();
         painter.rect(
@@ -5877,11 +6609,17 @@ fn chip(ui: &mut egui::Ui, checked: &mut bool, label: &str, enabled: bool) -> eg
             mark,
             egui::CornerRadius::same(theme::RADIUS_TINY),
             egui::Color32::TRANSPARENT,
-            egui::Stroke::new(1.4, if on { theme::STATE_SUCCESS } else { stroke }),
+            egui::Stroke::new(1.4, motion::mix(stroke, theme::STATE_SUCCESS, on_t)),
             egui::StrokeKind::Inside,
         );
-        if on {
-            let tick = egui::Stroke::new(1.8, theme::STATE_SUCCESS);
+        // Птичка не возникает, а проявляется вместе с заливкой. Порог, а не
+        // `if on`: на нуле рисовать нечего, а прозрачные линии всё равно
+        // уехали бы в вершинный буфер.
+        if on_t > 0.0 {
+            let tick = egui::Stroke::new(
+                1.8,
+                motion::mix(egui::Color32::TRANSPARENT, theme::STATE_SUCCESS, on_t),
+            );
             let (l, t, w, h) = (mark.left(), mark.top(), mark.width(), mark.height());
             painter.line_segment(
                 [
@@ -5913,6 +6651,105 @@ fn chip(ui: &mut egui::Ui, checked: &mut bool, label: &str, enabled: bool) -> eg
     .inner
 }
 
+/// Содержимое, показанное на долю `t` своей высоты.
+///
+/// Общая половина приёмов 08 и 10: и раскрытие группы, и строка очереди
+/// раздвигают соседей, а не возникают на готовом месте. Полной высоты egui
+/// заранее не знает — узнать её можно только нарисовав, — поэтому она берётся
+/// с прошлого кадра и лежит в памяти контекста.
+///
+/// `opacity` отдельно от `t` не для гибкости: у группы содержимое проступает
+/// на второй половине пути, у строки — вместе с высотой, и это разные вещи.
+fn clipped(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    t: f32,
+    opacity: f32,
+    add: impl FnOnce(&mut egui::Ui),
+) {
+    let height = id.with("height");
+    if t >= 1.0 {
+        // Показано целиком: рисуем как обычно и заодно перемеряем высоту.
+        // Перемерять надо каждый раз — содержимое меняется само (список
+        // языков появляется вместе с субтитрами), и запомненное однажды
+        // число обрезало бы содержимое при следующем свёртывании.
+        let taken = ui.scope(add).response.rect.height();
+        ui.ctx().data_mut(|d| d.insert_temp(height, taken));
+        return;
+    }
+
+    let Some(full) = ui.ctx().data(|d| d.get_temp::<f32>(height)) else {
+        // Высоты ещё нет. Раскладываем содержимое за пределами видимого и
+        // места не занимаем: обрезать нечем, а показать целиком — мигнуть.
+        let at = ui.cursor().min;
+        let mut probe = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(egui::Rect::from_min_size(
+                    at,
+                    egui::vec2(ui.available_width(), 10_000.0),
+                ))
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+        );
+        probe.set_clip_rect(egui::Rect::NOTHING);
+        add(&mut probe);
+        let taken = probe.min_rect().height();
+        ui.ctx().data_mut(|d| d.insert_temp(height, taken));
+        ui.ctx().request_repaint();
+        return;
+    };
+
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), full * t), egui::Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+
+    // Содержимое рисуется во всю свою высоту, а видно из него столько,
+    // сколько отвела раскладка: обрезкой заведует `clip_rect`, а не виджет.
+    let mut body = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(egui::Rect::from_min_size(
+                rect.min,
+                egui::vec2(rect.width(), full.max(1.0)),
+            ))
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+    body.set_clip_rect(rect.intersect(ui.clip_rect()));
+    body.multiply_opacity(opacity);
+    add(&mut body);
+}
+
+/// Раскрывающееся тело группы: едет по высоте, содержимое проступает на
+/// второй половине пути (приём 08).
+///
+/// Полной высоты egui заранее не знает — узнать её можно только нарисовав, —
+/// поэтому она берётся с прошлого кадра и лежит в памяти контекста. Ровно так
+/// же устроен и штатный `CollapsingState`; своя реализация нужна лишь затем,
+/// чтобы длительность брать из `motion`, а не из общего `Style::animation_time`:
+/// иначе раскрытие не подчинялось бы «Плавным переходам».
+///
+/// В первое в жизни раскрытие тело успевает попасть один раз **невидимым**:
+/// высоты ещё нет, а показать его целиком, пока раскрытие только началось, —
+/// это мигнуть содержимым на кадр. Кадр короткий, поймать его снимком не
+/// вышло, но он настоящий: обмер стоит того, чтобы его не было.
+fn collapsing_body(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    open: bool,
+    speed: f32,
+    add: impl FnOnce(&mut egui::Ui),
+) {
+    let t = ui
+        .ctx()
+        .animate_bool_with_time(id, open, motion::MOVE * speed);
+    if t <= 0.0 {
+        return;
+    }
+    // Содержимое проступает на второй половине пути: на первой ещё нечему
+    // проступать — из-под кромки видна пара строк.
+    clipped(ui, id, t, ((t - 0.5) * 2.0).clamp(0.0, 1.0), add);
+}
+
 /// Заголовок раскрывающейся группы: треугольник, название и сводка справа.
 ///
 /// Возвращает `true`, когда по нему щёлкнули.
@@ -5920,7 +6757,13 @@ fn chip(ui: &mut egui::Ui, checked: &mut bool, label: &str, enabled: bool) -> eg
 /// Треугольник рисуется кистью по той же причине, что и галочка в [`chip`]:
 /// стрелок и треугольников в наших шрифтах нет. Подписи внутри намеренно
 /// невыделяемые — иначе выделение текста съедало бы щелчок по строке.
-fn disclosure_row(ui: &mut egui::Ui, open: bool, title: &str, summary: &str) -> bool {
+fn disclosure_row(
+    ui: &mut egui::Ui,
+    open: bool,
+    title: &str,
+    summary: &str,
+    speed: f32,
+) -> bool {
     let inner = ui.horizontal(|ui| {
         ui.style_mut().interaction.selectable_labels = false;
         ui.spacing_mut().item_spacing.x = 10.0;
@@ -5928,21 +6771,20 @@ fn disclosure_row(ui: &mut egui::Ui, open: bool, title: &str, summary: &str) -> 
 
         let (mark, _) = ui.allocate_exact_size(egui::vec2(11.0, 11.0), egui::Sense::hover());
         let c = mark.center();
-        let points = if open {
-            // Вниз — группа раскрыта.
-            vec![
-                egui::pos2(c.x - 5.0, c.y - 2.5),
-                egui::pos2(c.x + 5.0, c.y - 2.5),
-                egui::pos2(c.x, c.y + 3.5),
-            ]
-        } else {
-            // Вправо — группа свёрнута.
-            vec![
-                egui::pos2(c.x - 2.5, c.y - 5.0),
-                egui::pos2(c.x - 2.5, c.y + 5.0),
-                egui::pos2(c.x + 3.5, c.y),
-            ]
-        };
+        // Треугольник не подменяется другим, а доворачивается на 90° той же
+        // `liquid`, что везёт таблетку выбора: раскрытие — это тоже выбор,
+        // и лёгкий перелёт у стрелки читается как одно движение с группой.
+        let turn = motion::liquid(ui.ctx().animate_bool_with_time(
+            ui.id().with(title),
+            open,
+            motion::MOVE * speed,
+        ));
+        let (sin, cos) = (turn * std::f32::consts::FRAC_PI_2).sin_cos();
+        // Вершины свёрнутого (стрелка вправо), повёрнутые вокруг середины.
+        let points = [(-2.5, -5.0), (-2.5, 5.0), (3.5, 0.0)]
+            .into_iter()
+            .map(|(x, y)| egui::pos2(c.x + x * cos - y * sin, c.y + x * sin + y * cos))
+            .collect();
         ui.painter().add(egui::Shape::convex_polygon(
             points,
             theme::ACCENT,
@@ -6041,9 +6883,30 @@ fn labelled_row<R>(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::U
 ///
 /// Свободная функция, а не метод: строке нужен только сам элемент, и от
 /// заимствования всего `SavioApp` внутри цикла по списку это избавляет.
-fn queue_row(ui: &mut egui::Ui, item: &QueueItem) -> bool {
+fn queue_row(ui: &mut egui::Ui, item: &QueueItem, speed: f32) -> bool {
     let mut remove = false;
+    let id = egui::Id::new("queue-row").with(item.id);
 
+    // Строка не возникает и не пропадает, а раздвигает соседей и складывается
+    // обратно (приём 10). Вставка едет `MOVE`, удаление — чуть быстрее: уход
+    // провожать взглядом незачем.
+    let born = motion::since_first_seen(ui.ctx(), id.with("born"), motion::MOVE * speed);
+    let leaving = item.removing_since.map_or(0.0, |at| {
+        motion::elapsed(ui.ctx(), at, motion::MOVE * QUEUE_LEAVE * speed)
+    });
+    let t = born.min(1.0 - leaving);
+    if t <= 0.0 {
+        return false;
+    }
+
+    clipped(ui, id, t, t, |ui| {
+        queue_row_body(ui, item, speed, &mut remove);
+    });
+    remove
+}
+
+/// Внутренность строки очереди, без оболочки появления.
+fn queue_row_body(ui: &mut egui::Ui, item: &QueueItem, speed: f32, remove: &mut bool) {
     theme::inner_frame()
         .show(ui, |ui| {
             // Иначе строка сжалась бы по ширине своего названия: у короткого
@@ -6058,13 +6921,25 @@ fn queue_row(ui: &mut egui::Ui, item: &QueueItem) -> bool {
                 // Точка — подсказка глазу, а не носитель смысла: то же
                 // состояние сказано словом строкой ниже.
                 let (dot, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
-                ui.painter()
-                    .circle_filled(dot.center(), 4.0, item.status.color());
+                // Цвет переливается, а не подменяется, и дышит только у той
+                // строки, которая вправду идёт (приёмы 10 и 14).
+                let color = motion::tint(
+                    ui.ctx(),
+                    egui::Id::new("queue-dot").with(item.id),
+                    item.status.color(),
+                    motion::MOVE * speed,
+                );
+                let color = if item.status == QueueStatus::Running {
+                    color.gamma_multiply(motion::breath(ui.ctx(), speed))
+                } else {
+                    color
+                };
+                ui.painter().circle_filled(dot.center(), 4.0, color);
 
                 // Убрать можно только то, что ещё не началось: у идущей
                 // загрузки для этого есть «Отмена», а у отработавшей строка —
                 // единственный след того, чем всё кончилось.
-                let removable = item.status == QueueStatus::Waiting;
+                let removable = item.status == QueueStatus::Waiting && item.removing_since.is_none();
 
                 // Место под кнопку отмеряем сами, а не кладём её первой
                 // в раскладке справа налево: там короткое название прижалось
@@ -6097,7 +6972,7 @@ fn queue_row(ui: &mut egui::Ui, item: &QueueItem) -> bool {
                 );
 
                 if removable {
-                    remove = ui
+                    *remove = ui
                         .scope(|ui| {
                             // Поля кнопке урезаем, и это не косметика.
                             // `min_size` — только нижняя граница, а желаемую
@@ -6122,9 +6997,12 @@ fn queue_row(ui: &mut egui::Ui, item: &QueueItem) -> bool {
 
             ui.add_space(2.0);
             ui.label(
-                egui::RichText::new(&item.detail)
-                    .small()
-                    .color(item.status.color()),
+                egui::RichText::new(&item.detail).small().color(motion::tint(
+                    ui.ctx(),
+                    egui::Id::new("queue-detail").with(item.id),
+                    item.status.color(),
+                    motion::MOVE * speed,
+                )),
             );
 
             // Причина отказа — то, ради чего в этот список потом смотрят:
@@ -6144,8 +7022,6 @@ fn queue_row(ui: &mut egui::Ui, item: &QueueItem) -> bool {
                 );
             }
         });
-
-    remove
 }
 
 /// Одна галочка.
@@ -6264,7 +7140,7 @@ fn time_field(
 /// Здесь ширина известна заранее, из разложенного текста, и место просится
 /// через `allocate_exact_size` — то есть через ту самую логику переноса
 /// (так же устроен `chip`).
-fn choice_pill(ui: &mut egui::Ui, label: &str, on: bool) -> egui::Response {
+fn choice_pill(ui: &mut egui::Ui, label: &str, on: bool, speed: f32) -> egui::Response {
     const PAD: f32 = 14.0;
 
     let font = egui::TextStyle::Button.resolve(ui.style());
@@ -6283,15 +7159,31 @@ fn choice_pill(ui: &mut egui::Ui, label: &str, on: bool) -> egui::Response {
     // Выбранная сказана не одним цветом: у неё и заливка, и акцентная
     // кромка, и подпись другого тона. Невыбранная в покое почти прозрачна
     // и светлеет под курсором — это и есть отклик.
-    let (fill, stroke, text) = match (on, response.hovered()) {
-        (true, _) => (theme::ACCENT_SOFT, theme::ACCENT, theme::ACCENT_HOVER),
-        (false, true) => (theme::CARD_INNER, theme::BORDER_HOVER, theme::TEXT_PRIMARY),
-        (false, false) => (
-            egui::Color32::TRANSPARENT,
-            theme::BORDER_STRONG,
-            theme::TEXT_SECONDARY,
-        ),
-    };
+    let ctx = ui.ctx();
+    let touch = ctx.animate_bool_with_time(response.id, response.hovered(), motion::TOUCH * speed);
+    let on_t = ctx.animate_bool_with_time(response.id.with("on"), on, motion::MOVE * speed);
+    let press = motion::glide(ctx.animate_bool_with_time(
+        response.id.with("press"),
+        response.is_pointer_button_down_on(),
+        motion::TOUCH * 0.75 * speed,
+    ));
+    let rect = motion::pressed(rect, press);
+
+    let fill = motion::mix(
+        motion::mix(egui::Color32::TRANSPARENT, theme::CARD_INNER, touch),
+        theme::ACCENT_SOFT,
+        on_t,
+    );
+    let stroke = motion::mix(
+        motion::mix(theme::BORDER_STRONG, theme::BORDER_HOVER, touch),
+        theme::ACCENT,
+        on_t,
+    );
+    let text = motion::mix(
+        motion::mix(theme::TEXT_SECONDARY, theme::TEXT_PRIMARY, touch),
+        theme::ACCENT_HOVER,
+        on_t,
+    );
 
     let painter = ui.painter();
     painter.rect(
@@ -6503,6 +7395,8 @@ fn metric_card(
     metric: &Metric,
     trace: &Trace,
     color: egui::Color32,
+    phase: f32,
+    speed: f32,
 ) {
     theme::card(ui, |ui| {
             // Число прижато к правому краю: так проценты всех карточек
@@ -6510,7 +7404,27 @@ fn metric_card(
             // первым, справа налево, — обрезаемый заголовок иначе забрал бы
             // всю ширину и число ушло бы под него.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let text = metric.percent_text.as_deref().unwrap_or(DASH);
+                // Замер приходит раз в секунду и прыгает с 12% на 61%.
+                // Лерпится само число, а строка собирается уже из него
+                // (приём 12). `format!` в кадре здесь законен: числа монитора
+                // и так пересобираются каждый замер, а без этого на экране
+                // дребезг, за которым не видно тенденции.
+                //
+                // Готовая `percent_text` при этом остаётся хозяйкой формата:
+                // нет её — нет и показания, и рисуется прочерк. Подставить
+                // на месте «нет значения» ноль было бы враньём о машине
+                // (Правило 6).
+                let shown = metric.percent.map(|percent| {
+                    ui.ctx().animate_value_with_time(
+                        egui::Id::new("metric").with(title),
+                        percent,
+                        motion::MOVE * speed,
+                    )
+                });
+                let text = match (shown, metric.percent_text.as_deref()) {
+                    (Some(shown), Some(_)) => format!("{}%", shown.round() as i32),
+                    _ => DASH.to_owned(),
+                };
                 ui.label(
                     egui::RichText::new(text)
                         .font(theme::display(30.0))
@@ -6529,7 +7443,7 @@ fn metric_card(
             });
 
             ui.add_space(8.0);
-            trace_plot(ui, trace, color);
+            trace_plot(ui, trace, color, phase);
 
             if let Some(detail) = &metric.detail {
                 ui.add_space(6.0);
@@ -6543,7 +7457,7 @@ fn metric_card(
 /// Шкала жёстко от нуля до ста, а не «по максимуму в окне». Автомасштаб
 /// нарисовал бы у простаивающей машины ту же гору, что у загруженной, —
 /// график, который врёт ровно в ту сторону, в какую на него смотрят.
-fn trace_plot(ui: &mut egui::Ui, trace: &Trace, color: egui::Color32) {
+fn trace_plot(ui: &mut egui::Ui, trace: &Trace, color: egui::Color32, phase: f32) {
     const HEIGHT: f32 = 56.0;
 
     let (rect, _) = ui.allocate_exact_size(
@@ -6578,18 +7492,30 @@ fn trace_plot(ui: &mut egui::Ui, trace: &Trace, color: egui::Color32) {
     let step = rect.width() / (TRACE_LIMIT - 1) as f32;
     let newest = filled - 1;
 
+    // Кадры для сдвига просит сам график, и по своему шагу сетки.
+    //
+    // Соблазн поставить тут круглые «тридцать кадров в секунду» велик, и
+    // цена ему замерена: 7,1 с процессорного времени за 10 с работы вместо
+    // 0,6 с — в двенадцать раз больше на ровном месте (отладочная сборка,
+    // окно 1100×780). А ехать ломаной за такт всего один шаг, то есть около
+    // четырёх точек на широкой карточке: тридцати кадров хватило бы на
+    // сдвиг в **одну восьмую точки** за кадр — движение, которого не видит
+    // никто. Поэтому интервал считается от шага, а не выбирается на глаз:
+    // просим кадр на каждые полточки пути. В узком окне шаг вдвое меньше —
+    // и кадров там нужно вдвое меньше, само собой.
+    if phase < 1.0 && step > 0.0 {
+        let seconds = (0.5 / step * motion::SAMPLE).clamp(1.0 / 60.0, 0.5);
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_secs_f32(seconds));
+    }
+
     // Одна ломаная, а не сто девятнадцать отрезков: `Shape::line` кладёт
     // в список отрисовки один объект, отдельные `line_segment` — по одному
     // на каждую пару точек.
     let points: Vec<egui::Pos2> = trace
         .iter()
         .enumerate()
-        .map(|(i, value)| {
-            egui::pos2(
-                rect.right() - (newest - i) as f32 * step,
-                rect.bottom() - (value / 100.0).clamp(0.0, 1.0) * rect.height(),
-            )
-        })
+        .map(|(i, value)| motion::trace_point(rect, value, i, newest, step, phase))
         .collect();
     painter.add(egui::Shape::line(
         points,
@@ -7336,6 +8262,49 @@ mod tests {
         assert_eq!(queue.items.len(), 1);
         assert_eq!(queue.items[0].id, id[1]);
         assert_eq!(queue.summary, "Идёт: 1");
+    }
+
+    /// Помеченная крестиком строка ещё рисуется, но очередью уже не является.
+    ///
+    /// Это и есть цена отложенного удаления (приём 10): строка остаётся в
+    /// списке лишние четверть секунды, и всё, что считает очередь, обязано
+    /// её при этом не видеть. Промах тут тихий и злой — «Скачать», нажатое
+    /// в это окно, запустило бы ровно то, что убрали.
+    #[test]
+    fn a_row_on_its_way_out_is_no_longer_queued() {
+        let mut queue = queue_with(2);
+        let id = ids(&queue);
+
+        assert_eq!(queue.summary, "В очереди: 2");
+        queue.mark_removing(id[0], 100.0);
+
+        assert!(
+            queue.items.iter().any(|item| item.id == id[0]),
+            "строку убрали сразу — складываться будет нечему"
+        );
+        assert_eq!(queue.summary, "В очереди: 1", "сводка считает убранную");
+        assert_eq!(
+            queue.next_waiting().map(|(id, ..)| id),
+            Some(id[1]),
+            "следующей на запуск оказалась убранная строка"
+        );
+
+        // Обе убрали — ждать больше нечего, хотя строки ещё на экране.
+        queue.mark_removing(id[1], 100.0);
+        assert!(!queue.has_waiting());
+    }
+
+    /// Идущую загрузку крестик не помечает даже по ошибке: у неё для этого
+    /// есть «Отмена», а строка — единственный след того, чем всё кончилось.
+    #[test]
+    fn the_running_download_cannot_be_marked_for_removal() {
+        let mut queue = queue_with(2);
+        let id = ids(&queue);
+        queue.set_status(id[0], QueueStatus::Running);
+
+        queue.mark_removing(id[0], 100.0);
+        assert!(queue.items[0].removing_since.is_none());
+        assert_eq!(queue.summary, "Идёт: 1 · В очереди: 1");
     }
 
     /// Слова состояний человек читает в списке глазами: одинаковые или

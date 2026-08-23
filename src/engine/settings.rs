@@ -48,7 +48,7 @@ const DEBOUNCE: Duration = Duration::from_millis(500);
 /// Значение по умолчанию обязано совпадать с тем, что UI показывал до
 /// появления этого модуля: первый запуск (файла ещё нет) и запуск с битым
 /// файлом должны выглядеть одинаково и привычно.
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Settings {
     pub format: Format,
     pub quality: Quality,
@@ -88,6 +88,31 @@ pub struct Settings {
     /// `None` — файла не выбирали либо путь не выражается в UTF-8. В отличие
     /// от `out_dir`, пропавший файл здесь **не** забывается, см. `load_from`.
     pub cookie_file: Option<PathBuf>,
+    /// Плавные переходы в окне.
+    ///
+    /// Системного «уменьшить движение» ни eframe, ни winit не сообщают, так
+    /// что это единственный способ его выключить, и запоминать его надо тем
+    /// же порядком, что формат с качеством: выключают движение один раз и
+    /// навсегда, а не при каждом запуске.
+    ///
+    /// Умолчание — **включено**, и ради него у структуры руками написан
+    /// `Default`: производный дал бы `false`, то есть окно без движения
+    /// у всех, кто ни о чём не просил, причём молча.
+    pub smooth: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            format: Format::default(),
+            quality: Quality::default(),
+            out_dir: None,
+            options: DownloadOptions::default(),
+            cookies: CookieSource::default(),
+            cookie_file: None,
+            smooth: true,
+        }
+    }
 }
 
 /// Читает настройки прошлого запуска.
@@ -249,6 +274,7 @@ fn to_json(settings: &Settings) -> String {
         // флажки: «выбрал не использовать» и «версия ещё не умела это
         // помнить» — разные вещи, а по отсутствию ключа их не отличить.
         "cookies": cookies_token(settings.cookies),
+        "smooth": settings.smooth,
     });
 
     // Пути кладём только тогда, когда они выражаются в UTF-8. Терять
@@ -340,6 +366,14 @@ fn parse(text: &str) -> Settings {
     }
     if let Some(on) = flag(&value, "auto_subs") {
         options.auto_subs = on;
+    }
+
+    // Плавные переходы. Умолчание тут не общее «оставить как было», а
+    // осмысленное «включено»: файл от версии до 0.24 ключа не содержит, и
+    // прочитать его отсутствие как «выключено» значило бы отнять движение
+    // у всех, кто просто обновился.
+    if let Some(on) = flag(&value, "smooth") {
+        settings.smooth = on;
     }
 
     settings
@@ -507,8 +541,35 @@ mod tests {
             },
             cookies: CookieSource::File,
             cookie_file: Some(PathBuf::from(r"C:\Users\Вася\cookies.txt")),
+            smooth: false,
         };
         assert_eq!(parse(&to_json(&settings)), settings);
+    }
+
+    #[test]
+    fn a_file_without_the_motion_switch_keeps_transitions_on() {
+        // Файл от версии до 0.24: ключа `smooth` в нём нет. Общее правило
+        // разбора — «нет ключа, остаётся умолчание», и умолчание тут
+        // единственное осмысленное: тот, кто просто обновил Savio, движения
+        // не отключал, а молча отнятое движение выглядело бы поломкой.
+        let text = r#"{"version": 1, "format": "mp4", "quality": "best"}"#;
+        assert!(parse(text).smooth);
+    }
+
+    #[test]
+    fn switching_motion_off_survives_a_restart() {
+        // Выключенные переходы — такой же выбор, как снятая галочка, и
+        // отсутствие ключа означало бы «версия ещё не умела это помнить».
+        let settings = Settings {
+            smooth: false,
+            ..Settings::default()
+        };
+        let json = to_json(&settings);
+        assert!(json.contains("smooth"), "в файле нет ключа smooth");
+        assert!(
+            !parse(&json).smooth,
+            "выключенное движение не пережило запись"
+        );
     }
 
     #[test]
@@ -613,6 +674,7 @@ mod tests {
             options: DownloadOptions::default(),
             cookies: CookieSource::None,
             cookie_file: None,
+            smooth: true,
         };
         let json = to_json(&settings);
         assert!(!json.contains("out_dir"), "пустого пути в файле быть не должно");
@@ -674,6 +736,7 @@ mod tests {
             },
             cookies: CookieSource::Firefox,
             cookie_file: None,
+            smooth: false,
         };
 
         let mut saver = Saver::spawn_to(path.clone());
@@ -708,6 +771,7 @@ mod tests {
             options: DownloadOptions::default(),
             cookies: CookieSource::None,
             cookie_file: None,
+            smooth: true,
         });
         saver.save(Settings {
             format: Format::Mp3,
@@ -716,6 +780,7 @@ mod tests {
             options: DownloadOptions::default(),
             cookies: CookieSource::Chrome,
             cookie_file: None,
+            smooth: true,
         });
         saver.save(Settings {
             format: Format::Mp3,
@@ -727,6 +792,7 @@ mod tests {
             },
             cookies: CookieSource::Edge,
             cookie_file: None,
+            smooth: true,
         });
         saver.flush();
 

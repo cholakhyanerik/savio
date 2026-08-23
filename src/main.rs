@@ -4,6 +4,7 @@
 mod app;
 mod engine;
 mod model;
+mod motion;
 mod theme;
 
 use eframe::egui;

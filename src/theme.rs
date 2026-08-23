@@ -466,6 +466,8 @@ const CELL: f32 = 64.0;
 /// лишней работой, которой правило и не велит.
 pub struct Backdrop {
     rect: Rect,
+    /// Сдвиг центров пятен в долях окна, на котором собрана нынешняя сетка.
+    shift: f32,
     mesh: Arc<Mesh>,
 }
 
@@ -473,25 +475,44 @@ impl Default for Backdrop {
     fn default() -> Self {
         Self {
             rect: Rect::ZERO,
+            shift: 0.0,
             mesh: Arc::new(Mesh::default()),
         }
     }
 }
 
+/// Насколько центры пятен тянутся к выбранному разделу, в долях окна.
+///
+/// Три сотых — это несколько десятков точек на обычном окне: свет за стеклом
+/// заметно перекладывается, но узнать в этом «анимацию» нельзя, а именно так
+/// подложке и положено себя вести.
+pub const DRIFT_PULL: f32 = 0.03;
+
 impl Backdrop {
     /// Рисует фон в отведённом прямоугольнике, пересобрав сетку, если окно
-    /// изменило размер.
-    pub fn paint(&mut self, painter: &Painter, rect: Rect) {
-        if self.rect != rect {
+    /// изменило размер или пятна сдвинулись.
+    ///
+    /// `shift` — сдвиг центров пятен по горизонтали, в долях ширины окна.
+    ///
+    /// Пересборка **не бесплатна**, и это главное, что нужно про неё знать:
+    /// это сотни вершин, у каждой три пятна и вуаль, плюс новый `Mesh`
+    /// в куче. Поэтому сетка живёт полем и пересобирается только тогда,
+    /// когда одно из двух чисел вправду изменилось. В покое здесь по-прежнему
+    /// не тратится ни кадра — сдвиг доезжает до цели и останавливается,
+    /// а вечного дрейфа у Savio нет намеренно: он один просил бы кадры
+    /// всегда, а это ноутбук и батарея.
+    pub fn paint(&mut self, painter: &Painter, rect: Rect, shift: f32) {
+        if self.rect != rect || self.shift != shift {
             self.rect = rect;
-            self.mesh = Arc::new(build(rect));
+            self.shift = shift;
+            self.mesh = Arc::new(build(rect, shift));
         }
         painter.add(Shape::Mesh(Arc::clone(&self.mesh)));
     }
 }
 
 /// Считает цвет фона в точке.
-fn color_at(rect: Rect, at: Pos2) -> Color32 {
+fn color_at(rect: Rect, at: Pos2, shift: f32) -> Color32 {
     let (w, h) = (rect.width().max(1.0), rect.height().max(1.0));
     let (x, y) = (at.x - rect.left(), at.y - rect.top());
 
@@ -510,7 +531,9 @@ fn color_at(rect: Rect, at: Pos2) -> Color32 {
     };
 
     for spot in &SPOTS {
-        let dx = (x - spot.at.0 * w) / spot.radius.0;
+        // Сдвиг долей окна, а не точками: в развёрнутом окне пятна должны
+        // отъезжать заметнее, чем в маленьком, — иначе движение теряется.
+        let dx = (x - (spot.at.0 + shift) * w) / spot.radius.0;
         let dy = (y - spot.at.1 * h) / spot.radius.1;
         // Плотность падает от середины к краю линейно и обрывается на `stop` —
         // ровно так ведёт себя `radial-gradient(… , transparent 70%)` в CSS.
@@ -539,7 +562,7 @@ fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
 }
 
 /// Собирает сетку фона под прямоугольник окна.
-fn build(rect: Rect) -> Mesh {
+fn build(rect: Rect, shift: f32) -> Mesh {
     let cols = (rect.width() / CELL).ceil().max(1.0) as usize;
     let rows = (rect.height() / CELL).ceil().max(1.0) as usize;
 
@@ -553,7 +576,7 @@ fn build(rect: Rect) -> Mesh {
                 rect.left() + rect.width() * col as f32 / cols as f32,
                 rect.top() + rect.height() * row as f32 / rows as f32,
             );
-            mesh.colored_vertex(at, color_at(rect, at));
+            mesh.colored_vertex(at, color_at(rect, at, shift));
         }
     }
 
@@ -593,12 +616,61 @@ pub fn card_frame() -> Frame {
         .shadow(CARD_SHADOW)
 }
 
+/// Как появляющаяся карточка выглядит на этом кадре.
+///
+/// Значение, а не расчёт: длительности и кривые живут в `motion`, а этот
+/// слой знает только про оболочки карточек и обязан оставаться не знающим
+/// ни про загрузку, ни про `Event`.
+#[derive(Clone, Copy)]
+pub struct Appear {
+    /// Насколько карточка ещё ниже своего места, в точках.
+    pub offset: f32,
+    /// Насколько она уже проявилась: 0 — не видно, 1 — как обычно.
+    pub opacity: f32,
+    /// Где сейчас бегущий по кромке блик, долей пути (приём 06).
+    /// Единица и больше — блика нет.
+    pub sweep: f32,
+}
+
+/// Оболочка появляющегося содержимого: подъезжает снизу и проступает.
+///
+/// `None` означает «уже на месте» и не стоит ничего — ни лишнего `Ui`,
+/// ни лишнего отступа.
+///
+/// Прозрачность **умножается**, а не выставляется: содержимое вкладки может
+/// появляться внутри уже приглушённого слоя (модалка, выключенная группа),
+/// и `set_opacity` там вернул бы ему полную яркость.
+pub fn rising<R>(
+    ui: &mut Ui,
+    appear: Option<Appear>,
+    add_contents: impl FnOnce(&mut Ui) -> R,
+) -> R {
+    let Some(appear) = appear else {
+        return add_contents(ui);
+    };
+    ui.add_space(appear.offset);
+    ui.scope(|ui| {
+        ui.multiply_opacity(appear.opacity);
+        add_contents(ui)
+    })
+    .inner
+}
+
 /// Большая карточка: стекло, кромка, тень и блик по верхнему краю.
 ///
 /// Блик — то, что отличает стекло от матовой плашки: свет ложится на верхнюю
 /// грань. Рисуется поверх готовой карточки одной линией, потому что своей
 /// «внутренней тени» (`inset` из CSS) у `Frame` нет.
 pub fn card<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R> {
+    card_with_sweep(ui, 1.0, add_contents)
+}
+
+/// Та же карточка, но с блеском, бегущим по кромке.
+fn card_with_sweep<R>(
+    ui: &mut Ui,
+    sweep: f32,
+    add_contents: impl FnOnce(&mut Ui) -> R,
+) -> InnerResponse<R> {
     let result = card_frame().show(ui, |ui| {
         // Без этого карточка сжалась бы по ширине самого длинного слова
         // внутри, и у короткого содержимого вышла бы узкая полоска посреди
@@ -607,8 +679,22 @@ pub fn card<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerRes
         ui.set_width(ui.available_width());
         add_contents(ui)
     });
-    gloss(ui, result.response.rect);
+    gloss(ui, result.response.rect, sweep);
     result
+}
+
+/// Та же карточка, но всплывающая при появлении.
+///
+/// `None` в `appear` означает «уже на месте», и тогда это ровно [`card`] —
+/// ни лишнего `Ui`, ни лишнего отступа. Такова и договорённость: карточка,
+/// которой не сказали, как появляться, ведёт себя как раньше.
+pub fn card_rising<R>(
+    ui: &mut Ui,
+    appear: Option<Appear>,
+    add_contents: impl FnOnce(&mut Ui) -> R,
+) -> InnerResponse<R> {
+    let sweep = appear.map_or(1.0, |appear| appear.sweep);
+    rising(ui, appear, |ui| card_with_sweep(ui, sweep, add_contents))
 }
 
 /// Вложенная карточка: строка очереди, строка истории, пункт списка.
@@ -628,17 +714,62 @@ pub fn track_frame() -> Frame {
         .inner_margin(Margin::same(2))
 }
 
+/// Постоянный свет на верхней грани карточки.
+const GLOSS_LINE: Color32 = Color32::from_rgba_premultiplied(41, 40, 39, 42);
+/// Яркость бегущего пятна на той же грани.
+///
+/// Втрое ярче постоянного света и всё равно едва заметна: это блик по стеклу,
+/// а не подсветка. Ярче — и кромка начинает мигать, а мигающая кромка
+/// утомляет за минуту (потому приём 06 и разрешён **один раз** при появлении).
+const GLOSS_SPARK: Color32 = Color32::from_rgba_premultiplied(150, 146, 140, 150);
+
 /// Блик по верхней грани: одна светлая линия внутри кромки.
-fn gloss(ui: &Ui, rect: Rect) {
+///
+/// `sweep` — где сейчас бегущее пятно, долей пути слева направо. Единица и
+/// больше означает «пятна нет»: остаётся ровно та линия, что была до приёма 06.
+///
+/// Пятно рисуется `Mesh`-полоской с вершинными цветами, а не отрезком: у
+/// `Stroke` цвет один на всю линию, и мягкого края у пятна не вышло бы —
+/// получилась бы светлая чёрточка, ползущая по кромке.
+fn gloss(ui: &Ui, rect: Rect, sweep: f32) {
     let inset = RADIUS_CARD as f32 * 0.6;
     if rect.width() <= inset * 2.0 {
         return;
     }
-    ui.painter().hline(
-        Rangef::new(rect.left() + inset, rect.right() - inset),
-        rect.top() + 0.5,
-        Stroke::new(1.0, Color32::from_rgba_premultiplied(41, 40, 39, 42)),
+    let (left, right) = (rect.left() + inset, rect.right() - inset);
+    let y = rect.top() + 0.5;
+    let painter = ui.painter();
+    painter.hline(
+        Rangef::new(left, right),
+        y,
+        Stroke::new(1.0, GLOSS_LINE),
     );
+
+    if !(0.0..1.0).contains(&sweep) {
+        return;
+    }
+
+    // Ширина светового пятна — два радиуса карточки, как в макете.
+    let half = RADIUS_CARD as f32;
+    // Пятно выезжает из-за левого края и уезжает за правый: иначе оно
+    // возникало бы и пропадало на самой грани.
+    let at = left - half + (right - left + half * 2.0) * sweep;
+
+    let mut mesh = Mesh::default();
+    for (offset, color) in [
+        (-half, Color32::TRANSPARENT),
+        (0.0, GLOSS_SPARK),
+        (half, Color32::TRANSPARENT),
+    ] {
+        let x = (at + offset).clamp(left, right);
+        mesh.colored_vertex(pos2(x, y - 0.5), color);
+        mesh.colored_vertex(pos2(x, y + 0.5), color);
+    }
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(1, 3, 2);
+    mesh.add_triangle(2, 3, 4);
+    mesh.add_triangle(3, 5, 4);
+    painter.add(Shape::Mesh(Arc::new(mesh)));
 }
 
 /// Ставит стиль полосы шапки или подвала.
@@ -706,7 +837,7 @@ mod tests {
                         w * col as f32 / STEPS as f32,
                         h * row as f32 / STEPS as f32,
                     );
-                    let color = color_at(rect, at);
+                    let color = color_at(rect, at, 0.0);
                     if luminance(color) > luminance(brightest) {
                         brightest = color;
                     }
@@ -805,7 +936,7 @@ mod tests {
     #[test]
     fn the_backdrop_mesh_covers_the_window_and_is_built_once() {
         let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1100.0, 720.0));
-        let mesh = build(rect);
+        let mesh = build(rect, 0.0);
 
         let cols = (1100.0f32 / CELL).ceil() as usize;
         let rows = (720.0f32 / CELL).ceil() as usize;
