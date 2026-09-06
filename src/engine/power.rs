@@ -62,6 +62,11 @@ pub enum Change {
 }
 
 /// Чем кончилось переключение.
+// Оба исхода рождаются только в модуле `windows` ниже, а вне Windows `apply`
+// сразу отдаёт `Err` — то есть на Linux и macOS они честно мертвы, и
+// `dead_code` там прав. Гасим предупреждение ровно на этих системах: голый
+// `#[allow(dead_code)]` погасил бы его и на Windows, где оно должно работать.
+#[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
     /// Применилось, и это подтверждено перечитыванием.

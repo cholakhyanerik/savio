@@ -1742,6 +1742,14 @@ impl PlanId {
     }
 
     /// Байты как есть — для передачи обратно в систему.
+    // Зовёт это только `Guid::new` в `engine::power::windows`: вне Windows
+    // переключать нечего, и метод честно мёртв — на Linux и macOS `clippy`
+    // с `-D warnings` роняет на нём всю сборку. Гасим предупреждение ровно
+    // там, где оно право: голый `#[allow(dead_code)]` снял бы его и с
+    // Windows, где эта проверка должна работать. Прятать метод под
+    // `#[cfg(windows)]` нельзя — его зовут тесты ниже, и на Linux перестала
+    // бы компилироваться уже тестовая сборка.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub const fn bytes(self) -> [u8; 16] {
         self.0
     }
@@ -1821,6 +1829,8 @@ impl PowerMode {
     ///
     /// «Сбалансированный» — это нулевой GUID, и это не заглушка: система
     /// именно им обозначает «надстройки нет».
+    // Нужен только вызовам `powrprof.dll`; см. оговорку у `PlanId::bytes`.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub const fn id(self) -> PlanId {
         match self {
             Self::Saver => PlanId::from_parts(
@@ -1846,6 +1856,8 @@ impl PowerMode {
     }
 
     /// Чей это идентификатор. `None` — режим, которого Savio не знает.
+    // Разбирает им ответ системы только Windows-ветка; см. `PlanId::bytes`.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn from_id(id: PlanId) -> Option<Self> {
         Self::ALL.into_iter().find(|mode| mode.id() == id)
     }
@@ -1876,6 +1888,12 @@ pub enum PowerModes {
     #[default]
     Unsupported,
     /// Управляет, и вот в каком она сейчас.
+    // Собирает вариант только Windows-ветка `engine::power`: на прочих
+    // системах `read` отдаёт один `trouble`, и режимы остаются
+    // `Unsupported`. Разбирают же его на всех — карточка питания одна на все
+    // системы, — но разбор `dead_code` за использование не считает.
+    // См. оговорку у `PlanId::bytes`.
+    #[cfg_attr(not(windows), allow(dead_code))]
     Known {
         /// Действующий — тот, по которому машина работает прямо сейчас.
         /// `None` — система назвала режим, которого Savio не знает.
