@@ -2,7 +2,10 @@
   "permissions": {
     "allow": [
       "Bash(py --version)",
-      "Bash(python \"C:\\\\Users\\\\chola\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-chola-OneDrive-Documents-savio\\\\edf6a574-c59a-47e9-8efb-267d7f9cc653\\\\scratchpad\\\\reorder.py\")"
+      "Bash(python \"C:\\\\Users\\\\chola\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-chola-OneDrive-Documents-savio\\\\edf6a574-c59a-47e9-8efb-267d7f9cc653\\\\scratchpad\\\\reorder.py\")",
+      "PowerShell(gh run list --limit 3 --json databaseId,headSha,status,conclusion,displayTitle,createdAt)",
+      "PowerShell(gh run watch 34055848766 --exit-status --interval 30)",
+      "PowerShell(git check-ignore -v .claude/settings.json)"
     ]
   }
 }
