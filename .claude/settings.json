@@ -7,7 +7,10 @@
       "PowerShell(gh run watch 34055848766 --exit-status --interval 30)",
       "PowerShell(git check-ignore -v .claude/settings.json)",
       "PowerShell(gh run list --limit 3 --json databaseId,headSha,status,conclusion,displayTitle)",
-      "PowerShell(gh run watch 34055963685 --exit-status --interval 30; \"=== EXIT: $LASTEXITCODE ===\"; gh run view 34055963685 --json status,conclusion,jobs --jq '.status + \" / \" + .conclusion, \\(.jobs[] | .name + \": \" + .conclusion\\)')"
+      "PowerShell(gh run watch 34055963685 --exit-status --interval 30; \"=== EXIT: $LASTEXITCODE ===\"; gh run view 34055963685 --json status,conclusion,jobs --jq '.status + \" / \" + .conclusion, \\(.jobs[] | .name + \": \" + .conclusion\\)')",
+      "PowerShell(gh run view 34055963685 --json status,conclusion,jobs --jq '\"run: \" + .status + \" / \" + \\(.conclusion // \"-\"\\), \\(.jobs[] | \"  \" + .name + \": \" + .status + \" / \" + \\(.conclusion // \"-\"\\)\\)')",
+      "PowerShell(gh run list --limit 3 --json databaseId,status,conclusion,displayTitle)",
+      "PowerShell(gh run list --limit 1 --json databaseId,status,conclusion,displayTitle)"
     ]
   }
 }
