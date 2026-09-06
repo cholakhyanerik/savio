@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(py --version)",
+      "Bash(python \"C:\\\\Users\\\\chola\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-chola-OneDrive-Documents-savio\\\\edf6a574-c59a-47e9-8efb-267d7f9cc653\\\\scratchpad\\\\reorder.py\")"
+    ]
+  }
+}
