@@ -6051,34 +6051,43 @@ impl SavioApp {
             // обрезаемая метка забирает всю ширину, и кнопка налезает на
             // неё — в колонке шириной 340 путь и «Открыть папку» вместе
             // не помещаются. Проверено глазами: текст уходил под кнопку.
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 9.0;
-                // Лежит ли файл на месте, не спрашиваем: это обращение
-                // к диску, а `ui()` идёт 60 раз в секунду (Правило 1).
-                // Папку могли переименовать или унести вместе с флешкой —
-                // тогда об этом скажет проводник, и это честнее
-                // выключенной без объяснения кнопки.
-                if pill_button(ui, "Открыть папку", self.speed).clicked() {
-                    open_at = Some(dir.clone());
-                }
-                // Вложенная раскладка обязательна: в `right_to_left` метка
-                // занимает ровно себя и прижимается к правому краю — без
-                // неё путь сползал бы к кнопке, а слева оставалось бы
-                // пустое место во всю ширину (та же грабля, что в
-                // `process_row`).
-                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    // Подсказку с полным путём, как и у имени выше, вешает
-                    // сама обрезанная метка.
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(&entry.dir_display)
-                                .small()
-                                .color(theme::TEXT_MUTED),
-                        )
-                        .truncate(),
-                    );
-                });
-            });
+            //
+            // Высота ряда задаётся явно: `with_layout` отдал бы потомку весь
+            // остаток высоты, а `Align::Center` считает его занятым целиком
+            // (подробности — у `SavioApp::power_card`), и строка истории
+            // растянулась бы до нижней кромки окна (дефект 42).
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), theme::CONTROL_HEIGHT),
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
+                    ui.spacing_mut().item_spacing.x = 9.0;
+                    // Лежит ли файл на месте, не спрашиваем: это обращение
+                    // к диску, а `ui()` идёт 60 раз в секунду (Правило 1).
+                    // Папку могли переименовать или унести вместе с флешкой —
+                    // тогда об этом скажет проводник, и это честнее
+                    // выключенной без объяснения кнопки.
+                    if pill_button(ui, "Открыть папку", self.speed).clicked() {
+                        open_at = Some(dir.clone());
+                    }
+                    // Вложенная раскладка обязательна: в `right_to_left` метка
+                    // занимает ровно себя и прижимается к правому краю — без
+                    // неё путь сползал бы к кнопке, а слева оставалось бы
+                    // пустое место во всю ширину (та же грабля, что в
+                    // `process_row`).
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        // Подсказку с полным путём, как и у имени выше, вешает
+                        // сама обрезанная метка.
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&entry.dir_display)
+                                    .small()
+                                    .color(theme::TEXT_MUTED),
+                            )
+                            .truncate(),
+                        );
+                    });
+                },
+            );
         });
 
         open_at
@@ -7256,19 +7265,30 @@ fn check_card(ui: &mut egui::Ui, check: &crate::model::Check) {
             // длины заголовка. Кладём её первой, справа налево: обрезаемый
             // заголовок иначе занял бы всю ширину, и плашка налезла бы
             // на него.
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                status_pill(ui, check.status.label(), check_color(check.status));
-                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(&check.name)
-                                .font(theme::display(17.0))
-                                .color(theme::TEXT_PRIMARY),
-                        )
-                        .truncate(),
-                    );
-                });
-            });
+            //
+            // Высота ряда задаётся явно, и это не украшение вёрстки:
+            // `with_layout` отдал бы потомку весь остаток высоты карточки,
+            // а `Align::Center` считает его занятым целиком (подробности —
+            // у `SavioApp::power_card`). Внутри прокрутки остаток — почти
+            // весь экран, и карточка вырастала до нижней кромки, вытесняя
+            // соседние пункты, а заголовок схлопывался в «…» (дефект 42).
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), theme::CONTROL_HEIGHT),
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
+                    status_pill(ui, check.status.label(), check_color(check.status));
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&check.name)
+                                    .font(theme::display(17.0))
+                                    .color(theme::TEXT_PRIMARY),
+                            )
+                            .truncate(),
+                        );
+                    });
+                },
+            );
 
             ui.add_space(6.0);
             note(ui, &check.summary, theme::TEXT_SECONDARY);
@@ -7377,28 +7397,65 @@ fn field_label(ui: &mut egui::Ui, text: &str) {
 
 /// Плашка состояния: цветная точка плюс подпись тем же цветом.
 /// Цветом одним статус не передаём — рядом всегда есть текст.
+///
+/// Место плашка отмеряет себе сама и рисуется кистью — так же, как [`chip`]
+/// и [`choice_pill`], и по той же причине, только тут она весомее. Оболочка
+/// из `Frame` с раскладкой внутри выглядит проще, но растягивалась во всю
+/// строку: плашку ставят в `right_to_left`, у такой области `min_rect`
+/// растёт от **правого** края, а вложенная `left_to_right` кладёт своё
+/// содержимое от левого — и между ними оказывается вся ширина карточки.
+/// Раздувшаяся плашка забирала место у заголовка, и тот схлопывался в «…»
+/// (дефект 42, вторая его половина). Померено: 884 точки против 99 при
+/// ширине окна 900. Ни сборка, ни `clippy`, ни тесты этого не видели —
+/// теперь видит `a_status_pill_asks_only_for_its_own_width`.
+///
+/// Отсюда же и отказ от `ui.horizontal` внутри: тот, оказавшись внутри уже
+/// горизонтальной раскладки, наследует её направление, и точка с подписью
+/// менялись местами. Кисти направление не указ.
 fn status_pill(ui: &mut egui::Ui, label: &str, color: egui::Color32) {
-    egui::Frame::new()
-        .stroke(egui::Stroke::new(1.0, theme::BORDER_SUBTLE))
-        .corner_radius(egui::CornerRadius::same(theme::RADIUS_PILL))
-        .inner_margin(egui::Margin::symmetric(11, 5))
-        .show(ui, |ui| {
-            // Раскладку задаём явно, а не `ui.horizontal`: тот, оказавшись
-            // внутри уже горизонтальной раскладки, наследует её направление —
-            // а плашку ставят как раз в `right_to_left`, чтобы прижать её
-            // к правому краю карточки. Без этого точка и подпись менялись
-            // местами, и одна и та же плашка выглядела по-разному в разных
-            // местах окна. Проверено глазами: ни сборка, ни тесты этого
-            // не видят.
-            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 7.0;
-                let (dot, _) = ui.allocate_exact_size(egui::vec2(7.0, 7.0), egui::Sense::hover());
-                ui.painter().circle_filled(dot.center(), 3.5, color);
-                ui.add(
-                    egui::Label::new(egui::RichText::new(label).small().color(color)).truncate(),
-                );
-            });
-        });
+    const PAD: f32 = 11.0;
+    const GAP: f32 = 7.0;
+    const DOT: f32 = 7.0;
+    /// Поля сверху и снизу: плашка обязана быть ниже кнопки, иначе
+    /// в ряду с заголовком она читалась бы как ещё одна кнопка.
+    const RIM: f32 = 5.0;
+
+    let font = egui::TextStyle::Small.resolve(ui.style());
+    // Раскладка текста у egui кэшируется по самой строке, так что повторный
+    // вызов с той же подписью считает только хеш.
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), font, egui::Color32::PLACEHOLDER);
+
+    let size = egui::vec2(
+        PAD * 2.0 + DOT + GAP + galley.size().x,
+        galley.size().y.max(DOT) + RIM * 2.0,
+    );
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+
+    let painter = ui.painter();
+    painter.rect_stroke(
+        rect,
+        egui::CornerRadius::same(theme::RADIUS_PILL),
+        egui::Stroke::new(1.0, theme::BORDER_SUBTLE),
+        egui::StrokeKind::Inside,
+    );
+    painter.circle_filled(
+        egui::pos2(rect.left() + PAD + DOT / 2.0, rect.center().y),
+        DOT / 2.0,
+        color,
+    );
+    painter.galley(
+        egui::pos2(
+            rect.left() + PAD + DOT + GAP,
+            rect.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        color,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -7421,49 +7478,65 @@ fn metric_card(
     phase: f32,
     speed: f32,
 ) {
+    // Шрифт числа заведён именем, а не выписан по месту дважды: высоту ряда
+    // считаем по нему же, и разъехавшись, эти двое обрезали бы число сверху.
+    let number = theme::display(30.0);
+    // Высота ряда задаётся явно, и это не украшение вёрстки: `with_layout`
+    // отдал бы потомку весь остаток высоты карточки, а `Align::Center`
+    // считает его занятым целиком (подробности — у `SavioApp::power_card`).
+    // Внутри прокрутки остаток — почти весь экран, и карточка вырастала до
+    // нижней кромки, а число с подписью висели в её середине (дефект 42).
+    //
+    // Число выше кнопки, поэтому `CONTROL_HEIGHT` тут не потолок, а пол:
+    // спрашиваем настоящую высоту строки у шрифта, а не берём её на глаз —
+    // заниженная обрезала бы число, и увидеть это можно только глазами.
+    let row = ui
+        .fonts_mut(|fonts| fonts.row_height(&number))
+        .max(theme::CONTROL_HEIGHT);
+
     theme::card(ui, |ui| {
             // Число прижато к правому краю: так проценты всех карточек
             // стоят в одну колонку и читаются сверху вниз. Кладём его
             // первым, справа налево, — обрезаемый заголовок иначе забрал бы
             // всю ширину и число ушло бы под него.
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // Замер приходит раз в секунду и прыгает с 12% на 61%.
-                // Лерпится само число, а строка собирается уже из него
-                // (приём 12). `format!` в кадре здесь законен: числа монитора
-                // и так пересобираются каждый замер, а без этого на экране
-                // дребезг, за которым не видно тенденции.
-                //
-                // Готовая `percent_text` при этом остаётся хозяйкой формата:
-                // нет её — нет и показания, и рисуется прочерк. Подставить
-                // на месте «нет значения» ноль было бы враньём о машине
-                // (Правило 6).
-                let shown = metric.percent.map(|percent| {
-                    ui.ctx().animate_value_with_time(
-                        egui::Id::new("metric").with(title),
-                        percent,
-                        motion::MOVE * speed,
-                    )
-                });
-                let text = match (shown, metric.percent_text.as_deref()) {
-                    (Some(shown), Some(_)) => format!("{}%", shown.round() as i32),
-                    _ => DASH.to_owned(),
-                };
-                ui.label(
-                    egui::RichText::new(text)
-                        .font(theme::display(30.0))
-                        .color(color),
-                );
-                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(title)
-                                .small()
-                                .color(theme::TEXT_MUTED),
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), row),
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
+                    // Замер приходит раз в секунду и прыгает с 12% на 61%.
+                    // Лерпится само число, а строка собирается уже из него
+                    // (приём 12). `format!` в кадре здесь законен: числа
+                    // монитора и так пересобираются каждый замер, а без этого
+                    // на экране дребезг, за которым не видно тенденции.
+                    //
+                    // Готовая `percent_text` при этом остаётся хозяйкой
+                    // формата: нет её — нет и показания, и рисуется прочерк.
+                    // Подставить на месте «нет значения» ноль было бы враньём
+                    // о машине (Правило 6).
+                    let shown = metric.percent.map(|percent| {
+                        ui.ctx().animate_value_with_time(
+                            egui::Id::new("metric").with(title),
+                            percent,
+                            motion::MOVE * speed,
                         )
-                        .truncate(),
-                    );
-                });
-            });
+                    });
+                    let text = match (shown, metric.percent_text.as_deref()) {
+                        (Some(shown), Some(_)) => format!("{}%", shown.round() as i32),
+                        _ => DASH.to_owned(),
+                    };
+                    ui.label(egui::RichText::new(text).font(number).color(color));
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(title)
+                                    .small()
+                                    .color(theme::TEXT_MUTED),
+                            )
+                            .truncate(),
+                        );
+                    });
+                },
+            );
 
             ui.add_space(8.0);
             trace_plot(ui, trace, color, phase);
@@ -8734,5 +8807,179 @@ mod tests {
         let short = log_body_height(false, 2);
         assert!(short > 0.0, "две строки всё же занимают место");
         assert!(short < LOG_HEIGHT, "под двумя строками пусто: {short}");
+    }
+
+    /// Высота карточки, нарисованной в самом верху длинной прокрутки.
+    ///
+    /// Прокрутка здесь не для красоты: дефект 42 в том и состоит, что
+    /// центрирующий ряд забирает весь остаток высоты, — а в окне остаток
+    /// как раз и есть «до нижней кромки». В голом `Ui` остатка нет, и
+    /// проверка прошла бы на сломанном коде.
+    ///
+    /// Три кадра — по той же причине, что у [`log_body_height`]: и
+    /// прокрутка, и карточка узнают размер по прошлому кадру.
+    fn card_height(add: impl Fn(&mut egui::Ui)) -> f32 {
+        let ctx = egui::Context::default();
+        // Без темы карточка мерилась бы чужими шрифтами, а `theme::display`
+        // и вовсе уронил бы кадр: семейства с таким именем в умолчаниях нет.
+        theme::apply(&ctx);
+        let mut height = 0.0;
+
+        for _ in 0..3 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(520.0, 420.0),
+                )),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            height = ui.scope(&add).response.rect.height();
+                        });
+                });
+            });
+            output.textures_delta.clear();
+        }
+
+        height
+    }
+
+    /// Плашка состояния просит ровно свою ширину — и справа налево тоже.
+    ///
+    /// Вторая половина дефекта 42, и от первой она не зависит: у области,
+    /// разложенной справа налево, `min_rect` растёт от правого края, а
+    /// прежняя оболочка плашки клала своё содержимое от левого — между
+    /// ними оказывалась вся ширина карточки. Раздувшаяся плашка не
+    /// оставляла места заголовку, и тот схлопывался в «…».
+    ///
+    /// Проверено красным: с прежней оболочкой из `Frame` проверка падает —
+    /// 884 точки против 99 при ширине окна 900.
+    #[test]
+    fn a_status_pill_asks_only_for_its_own_width() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let (mut backwards, mut plain) = (0.0, 0.0);
+
+        for _ in 0..3 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 420.0),
+                )),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    // Ровно то окружение, в котором плашка и живёт: ряд
+                    // заголовка карточки, разложенный справа налево.
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(ui.available_width(), theme::CONTROL_HEIGHT),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            backwards = ui
+                                .scope(|ui| status_pill(ui, "В порядке", theme::ACCENT))
+                                .response
+                                .rect
+                                .width();
+                        },
+                    );
+                    ui.horizontal(|ui| {
+                        plain = ui
+                            .scope(|ui| status_pill(ui, "В порядке", theme::ACCENT))
+                            .response
+                            .rect
+                            .width();
+                    });
+                });
+            });
+            output.textures_delta.clear();
+        }
+
+        assert!(plain > 40.0, "плашка схлопнулась: {plain}");
+        assert!(plain < 200.0, "плашка непомерно широка: {plain}");
+        assert_eq!(
+            backwards, plain,
+            "справа налево плашка шире самой себя: {backwards} против {plain}"
+        );
+    }
+
+    /// Карточки «Машины» занимают своё содержимое, а не весь экран.
+    ///
+    /// Дефект 42: `with_layout(right_to_left(Align::Center))` отдаёт ряду
+    /// всю оставшуюся высоту, а центрирующая раскладка считает её занятой
+    /// целиком (`Placer::advance_after_rects`, «pretend we used whole
+    /// frame»). Внутри прокрутки остаток — почти весь экран, и первая же
+    /// карточка вырастала до нижней кромки, вытесняя остальные.
+    ///
+    /// Проверено красным: с прежним `ui.with_layout` вместо
+    /// `allocate_ui_with_layout` обе проверки падают — 434 точки при окне
+    /// высотой 420. Стало 102 и 175.
+    ///
+    /// Нижние границы тут не для симметрии: заниженная высота ряда обрезала
+    /// бы содержимое сверху, а число показателя набрано тридцатым кеглем —
+    /// оно выше кнопки, и `CONTROL_HEIGHT` ему мал.
+    #[test]
+    fn a_machine_card_does_not_stretch_to_the_whole_window() {
+        let checked = card_height(|ui| check_card(ui, &sample_check()));
+        assert!(checked > 60.0, "карточка пункта обрезана: {checked}");
+        assert!(checked < 160.0, "карточка пункта во весь экран: {checked}");
+
+        let metric = Metric::new(37.0, Some("13.1 ГБ из 31.9 ГБ".to_owned()));
+        let trace = Trace::default();
+        let measured = card_height(|ui| {
+            metric_card(ui, "Процессор", &metric, &trace, theme::ACCENT, 0.0, 1.0);
+        });
+        assert!(measured > 140.0, "карточка показателя обрезана: {measured}");
+        assert!(
+            measured < 220.0,
+            "карточка показателя во весь экран: {measured}"
+        );
+    }
+
+    /// Те же ряды, что уже лежат в `ui.horizontal`, не растягиваются и так.
+    ///
+    /// Это не повтор предыдущей проверки, а её обратная сторона.
+    /// `ui.horizontal` задаёт потомку высоту (`interact_size.y`), поэтому
+    /// вложенный в него центрирующий ряд ничего лишнего не забирает — и
+    /// правки дефекта 42 этим местам не понадобилось. Сторож нужен затем,
+    /// что обёртка выглядит лишней прослойкой и её тянет заменить прямым
+    /// `with_layout`: сборка, `clippy` и тесты такой замены не заметили бы.
+    ///
+    /// Проверено красным: с `ui.with_layout(left_to_right(Center))` вместо
+    /// `ui.horizontal` в [`process_row`] проверка падает (431 против 61).
+    #[test]
+    fn a_row_inside_a_horizontal_keeps_its_height() {
+        let row = crate::model::ProcRow {
+            name: "yt-dlp.exe".to_owned(),
+            cpu: 12.0,
+            cpu_text: "12%".to_owned(),
+            mem_text: "310 МБ".to_owned(),
+        };
+        let process = card_height(|ui| process_row(ui, &row));
+        assert!(process > 30.0, "строка процесса обрезана: {process}");
+        assert!(process < 100.0, "строка процесса во весь экран: {process}");
+
+        let disclosure = card_height(|ui| {
+            disclosure_row(ui, false, "Тонкие настройки", "по умолчанию", 1.0);
+        });
+        assert!(disclosure > 20.0, "заголовок группы обрезан: {disclosure}");
+        assert!(
+            disclosure < 100.0,
+            "заголовок группы во весь экран: {disclosure}"
+        );
+    }
+
+    fn sample_check() -> crate::model::Check {
+        crate::model::Check {
+            name: "Процессор".to_owned(),
+            status: crate::model::CheckStatus::Ok,
+            summary: "Загрузка в норме.".to_owned(),
+            rows: Vec::new(),
+            advice: None,
+        }
     }
 }
