@@ -273,6 +273,38 @@ const COPIED_NOTICE_SECS: f64 = 2.0;
 /// единой аллокации.
 const VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 
+/// Что за приложение — первый абзац окна «О программе».
+///
+/// Дословно первый абзац README, и держит это тест
+/// `the_about_text_is_the_readme_intro`: два описания одной программы,
+/// правленные в разное время, расходятся молча, и заметить это можно,
+/// только положив их рядом. Правите вступление README — правьте и здесь.
+const ABOUT_TEXT: &str = "Savio — это кроссплатформенное десктопное приложение для \
+    скачивания видео и аудио с популярных онлайн-платформ. Приложение позволяет \
+    быстро загружать контент по ссылке: по умолчанию — в максимально доступном \
+    качестве, а при желании можно выбрать разрешение видео или битрейт звука самому.";
+
+/// Кто сделал Savio.
+const AUTHOR: &str = "Эрик Чолахян";
+
+/// Куда писать об ошибках и с идеями.
+///
+/// Не тот адрес, что в истории коммитов, и это не опечатка: для отзывов
+/// автор назвал отдельный.
+const FEEDBACK_EMAIL: &str = "cholakhyanerik@hotmail.com";
+
+/// Страница проекта. Из `Cargo.toml`, как и версия: у адреса один источник.
+const PROJECT_URL: &str = env!("CARGO_PKG_REPOSITORY");
+
+/// Список изменений по версиям — то, что в окне называется «Что изменилось».
+///
+/// Ветка `main`, а не тег своей версии: человеку со старой сборкой нужно
+/// как раз то, что вышло после неё, а теги ставятся не на каждую версию.
+const CHANGELOG_URL: &str = concat!(env!("CARGO_PKG_REPOSITORY"), "/blob/main/CHANGELOG.md");
+
+/// Лицензия. Из `Cargo.toml` по той же причине, что и адрес страницы.
+const LICENSE: &str = env!("CARGO_PKG_LICENSE");
+
 enum State {
     Idle,
     /// В очереди есть ссылки, но ничего не качается: их поставили и ещё не
@@ -1878,6 +1910,11 @@ pub struct SavioApp {
     /// Когда журнал скопировали, по часам egui. Нужно только для подписи
     /// «Скопировано»: она живёт `COPIED_NOTICE_SECS` и гаснет сама.
     log_copied_at: Option<f64>,
+    /// Открыто ли окно «О программе».
+    about_open: bool,
+    /// Когда скопировали адрес для отзывов — ради той же подписи
+    /// «Скопировано», что у журнала, только в окне «О программе».
+    about_copied_at: Option<f64>,
     /// Показанная вкладка.
     tab: Tab,
     /// Половина вкладки «Машина».
@@ -2053,6 +2090,8 @@ impl SavioApp {
             advanced_summary: String::new(),
             url_invalid: false,
             log_copied_at: None,
+            about_open: false,
+            about_copied_at: None,
             tab: Tab::Download,
             machine_tab: MachineTab::Now,
             rail_tab: RailTab::Queue,
@@ -3206,13 +3245,14 @@ impl eframe::App for SavioApp {
 
         // Модалки рисуются последними, поверх всего остального.
         let ctx = ui.ctx().clone();
-        // Про приход спрашиваем **у всех трёх сразу**, включая закрытые, и по
+        // Про приход спрашиваем **у всех сразу**, включая закрытые, и по
         // той же причине, что у разделов: `animate_bool_with_time`, впервые
         // увидев идентификатор, отдаёт конечное значение — окно, о котором
         // не спрашивали, пока его не было, возникло бы уже целиком.
         let install = self.modal_arrival(&ctx, "setup", self.setup.busy());
         let tags = self.modal_arrival(&ctx, "tags", self.meta.tags.is_some());
         let confirm = self.modal_arrival(&ctx, "confirm", self.meta.confirming);
+        let about = self.modal_arrival(&ctx, "about", self.about_open);
 
         if self.setup.busy() {
             self.install_modal(&ctx, install);
@@ -3222,6 +3262,9 @@ impl eframe::App for SavioApp {
         }
         if self.meta.confirming {
             self.confirm_modal(&ctx, confirm);
+        }
+        if self.about_open {
+            self.about_modal(&ctx, about);
         }
     }
 }
@@ -3401,17 +3444,39 @@ impl SavioApp {
             // Версию прижимаем к правому краю: она нужна, когда выясняют,
             // почему что-то не работает, но в остальное время не должна
             // тянуть на себя внимание.
+            //
+            // Щелчок по ней открывает «О программе», и это не украшение, а
+            // запасной вход. Кнопка в подвале помещается только в окно шире
+            // ~620 точек (задача 44, замерено кадром без окна: в окне 520
+            // после «Журнала» там остаётся 31 точка), а номер версии виден
+            // при любой ширине и места под себя не просит. Без него в узком
+            // окне адрес для отзывов был бы недостижим вовсе. Вид тот же,
+            // что и был: подпись лишь светлеет под курсором.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(
-                    egui::RichText::new(VERSION)
-                        .small()
-                        .color(theme::TEXT_MUTED),
-                );
+                let t = touch_at(ui, ui.next_auto_id(), self.speed);
+                let version = ui
+                    .add(
+                        egui::Label::new(
+                            egui::RichText::new(VERSION)
+                                .small()
+                                .color(motion::mix(theme::TEXT_MUTED, theme::TEXT_PRIMARY, t)),
+                        )
+                        .selectable(false)
+                        .sense(egui::Sense::click()),
+                    )
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text(
+                        "О программе: кто сделал Savio и куда писать, если \
+                         что-то не работает.",
+                    );
+                if version.clicked() {
+                    self.about_open = true;
+                }
             });
         });
     }
 
-    /// Подвал: версии инструментов, их обновление и журнал.
+    /// Подвал: версии инструментов, их обновление, журнал и «О программе».
     ///
     /// Внизу, а не рядом с кнопкой «Скачать», и намеренно: это то, за чем
     /// идут, когда что-то перестало работать, — соседство с журналом тут
@@ -3476,6 +3541,28 @@ impl SavioApp {
                 }
                 if !has_log {
                     response.response.on_hover_text("Пока нечего показывать.");
+                }
+
+                // «О программе» — сразу за журналом: оба про то, за чем идут,
+                // когда что-то сломалось, — что случилось и кому об этом
+                // написать. И раньше галочки, то есть важнее её: в окне уже
+                // ~800 точек теперь прячется галочка, а не адрес для отзывов.
+                //
+                // Порог — ширина самой кнопки (124.75 точки штатными шрифтами
+                // темы, замерено кадром без окна) с запасом на округление.
+                // В окне 520 места нет вовсе: после «Журнала» остаётся 31
+                // точка. Там окно открывается щелчком по номеру версии в
+                // шапке — см. `header`.
+                const ABOUT_MIN: f32 = 130.0;
+                if ui.available_width() >= ABOUT_MIN
+                    && pill_button(ui, "О программе", speed)
+                        .on_hover_text(
+                            "Кто сделал Savio, куда писать об ошибках и что \
+                             изменилось в новых версиях.",
+                        )
+                        .clicked()
+                {
+                    self.about_open = true;
                 }
 
                 // Выключатель движения стоит здесь, а не в «Тонких
@@ -5588,6 +5675,175 @@ impl SavioApp {
             Answer::None => {}
         }
     }
+
+    /// Окно «О программе»: здесь то, что делают его кнопки, а само окно
+    /// рисует [`about_window`].
+    fn about_modal(&mut self, ctx: &egui::Context, arrival: ModalArrival) {
+        arrival.veil(ctx, "about");
+
+        // «Скопировано» гаснет само, как у журнала, и кадр к сроку так же
+        // приходится просить: без ввода egui окно не перерисовывает, и
+        // подпись висела бы до первого движения мыши.
+        let now = ctx.input(|i| i.time);
+        let copied_left = self
+            .about_copied_at
+            .map(|at| COPIED_NOTICE_SECS - (now - at))
+            .filter(|left| *left > 0.0);
+        match copied_left {
+            Some(left) => ctx.request_repaint_after(std::time::Duration::from_secs_f64(left)),
+            None => self.about_copied_at = None,
+        }
+
+        let window = about_window(ctx, self.speed, copied_left.is_some());
+        arrival.apply(ctx, &window.response);
+
+        // Как у списка метаданных: окно ничего не делает и запереть в нём
+        // нечем, поэтому Esc и щелчок мимо закрывают его как обычно.
+        let mut close = window.should_close();
+        match window.inner {
+            // Аллокация здесь — по нажатию, а не в кадре.
+            Some(AboutAction::Write) => open_url(&feedback_mailto()),
+            Some(AboutAction::Copy) => {
+                ctx.copy_text(FEEDBACK_EMAIL.to_owned());
+                self.about_copied_at = Some(now);
+                // Этот кадр подпись уже не застал — нужен следующий.
+                ctx.request_repaint();
+            }
+            Some(AboutAction::Project) => open_url(PROJECT_URL),
+            Some(AboutAction::Changelog) => open_url(CHANGELOG_URL),
+            Some(AboutAction::Close) => close = true,
+            None => {}
+        }
+        if close {
+            self.about_open = false;
+            self.about_copied_at = None;
+        }
+    }
+}
+
+/// Что нажали в окне «О программе».
+#[derive(Clone, Copy)]
+enum AboutAction {
+    Write,
+    Copy,
+    Project,
+    Changelog,
+    Close,
+}
+
+/// Окно «О программе»: что за приложение, кто сделал, куда писать.
+///
+/// Свободной функцией, а не методом, ради теста раскладки
+/// (`the_about_window_fits_the_smallest_window`): `SavioApp` в тесте не
+/// собрать — конструктор читает настройки с диска и спрашивает версии у
+/// внешних программ, — а окну из всего состояния нужно одно: горит ли
+/// «Скопировано».
+fn about_window(
+    ctx: &egui::Context,
+    speed: f32,
+    copied: bool,
+) -> egui::ModalResponse<Option<AboutAction>> {
+    // Ширина от окна, как у списка метаданных: фиксированная вылезла бы
+    // за кромку окна минимального размера.
+    let width = 440.0_f32.min(ctx.content_rect().width() - 48.0);
+
+    egui::Modal::new(egui::Id::new("savio-about"))
+        .backdrop_color(egui::Color32::TRANSPARENT)
+        .frame(
+            egui::Frame::new()
+                .fill(theme::MODAL_FILL)
+                .stroke(egui::Stroke::new(1.0, theme::BORDER_SUBTLE))
+                .corner_radius(egui::CornerRadius::same(theme::RADIUS_CARD))
+                .inner_margin(egui::Margin::same(24)),
+        )
+        .show(ctx, |ui| {
+            ui.set_width(width);
+            let mut action = None;
+
+            ui.label(
+                egui::RichText::new("О программе")
+                    .heading()
+                    .strong()
+                    .color(theme::TEXT_PRIMARY),
+            );
+            ui.add_space(8.0);
+            note(ui, ABOUT_TEXT, theme::TEXT_SECONDARY);
+            ui.add_space(14.0);
+
+            // Строки те же, что в карточках «Машины»: одинаковые по смыслу
+            // таблицы должны и выглядеть одинаково.
+            stat_row(ui, "Версия", Some(VERSION));
+            stat_row(ui, "Разработчик", Some(AUTHOR));
+            stat_row(ui, "Лицензия", Some(LICENSE));
+            stat_row(ui, "Отзывы и ошибки", Some(FEEDBACK_EMAIL));
+
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                // Копирование рядом с «Написать» обязательно, а не для
+                // удобства. Без почтовой программы `mailto:` ошибки не даёт:
+                // Windows в лучшем случае спрашивает, чем открыть адрес, а
+                // `xdg-open` может и промолчать (Правило 6) — Savio об этом
+                // не узнает. Скопированный адрес работает везде: в веб-почте,
+                // на телефоне.
+                if pill_button(ui, "Написать", speed)
+                    .on_hover_text(
+                        "Откроет почтовую программу — с версией Savio в теме \
+                         письма. Нет почтовой программы — скопируйте адрес.",
+                    )
+                    .clicked()
+                {
+                    action = Some(AboutAction::Write);
+                }
+                if pill_button(ui, "Скопировать адрес", speed).clicked() {
+                    action = Some(AboutAction::Copy);
+                }
+                if copied {
+                    ui.label(
+                        egui::RichText::new("Скопировано")
+                            .small()
+                            .color(theme::STATE_SUCCESS),
+                    );
+                }
+            });
+
+            ui.add_space(18.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                // Полный адрес — в подсказке: куда ведёт кнопка, лучше знать
+                // до щелчка, а не по открывшемуся браузеру.
+                if pill_button(ui, "Страница проекта", speed)
+                    .on_hover_text(PROJECT_URL)
+                    .clicked()
+                {
+                    action = Some(AboutAction::Project);
+                }
+                if pill_button(ui, "Что изменилось", speed)
+                    .on_hover_text(CHANGELOG_URL)
+                    .clicked()
+                {
+                    action = Some(AboutAction::Changelog);
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if pill_button(ui, "Закрыть", speed).clicked() {
+                        action = Some(AboutAction::Close);
+                    }
+                });
+            });
+
+            action
+        })
+}
+
+/// Адрес для кнопки «Написать»: почта для отзывов и версия в теме письма.
+///
+/// Версия в теме — ровно за тем же, за чем она стоит в шапке: жалобу
+/// «не качает» без номера сборки воспроизводить нечем, а переспрашивать
+/// его вторым письмом — терять половину ответов. Тема только из ASCII и
+/// с `%20` вместо пробела: `mailto:` — это адрес, и сырой пробел в нём
+/// почтовые программы понимают по-разному.
+fn feedback_mailto() -> String {
+    format!("mailto:{FEEDBACK_EMAIL}?subject=Savio%20{VERSION}")
 }
 
 // ---------------------------------------------------------------------------
@@ -7921,6 +8177,8 @@ fn banner(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
         });
 }
 
+/// Показывает папку в файловом менеджере системы. Адреса — через
+/// [`open_url`]: `explorer` в них не разбирается.
 fn open_dir(dir: &Path) {
     #[cfg(windows)]
     let (program, args) = ("explorer", vec![dir.to_string_lossy().into_owned()]);
@@ -7930,6 +8188,41 @@ fn open_dir(dir: &Path) {
     let (program, args) = ("xdg-open", vec![dir.to_string_lossy().into_owned()]);
 
     let _ = std::process::Command::new(program).args(args).spawn();
+}
+
+/// Открывает адрес — страницу или `mailto:` — той программой, что назначена
+/// в системе для его схемы, как если бы по нему щёлкнули где угодно.
+///
+/// На Windows это `url.dll,FileProtocolHandler`, то есть ShellExecute, и
+/// ни один из двух напрашивающихся путей не годится — оба ошибаются молча:
+///
+/// * `explorer`, которым открывается папка, в адресах не разбирается.
+///   Проверено вживую (2026-09-11, Windows 11, почтовая программа не
+///   назначена): `mailto:` с темой письма он открывает как… папку
+///   «Документы» — ни письма, ни ошибки. ShellExecute по тому же адресу
+///   честно спрашивает, чем его открыть.
+/// * Штатный `ctx.open_url` eframe идёт крейтом `webbrowser`, а тот на
+///   Windows спрашивает систему, чем открывается **http**, и отдаёт этой
+///   программе любой адрес (webbrowser 1.2.4, windows.rs:41–83): письмо
+///   уехало бы в браузер, а не в почтовую программу.
+///
+/// Пробелов в адресе быть не должно: `FileProtocolHandler` берёт остаток
+/// командной строки целиком, и кавычки, которыми `Command` обернул бы такой
+/// аргумент, доехали бы до него как часть адреса. Наши адреса — константы
+/// без пробелов, а у темы письма пробел закодирован (`feedback_mailto`).
+fn open_url(url: &str) {
+    #[cfg(windows)]
+    let mut command = {
+        let mut command = std::process::Command::new("rundll32");
+        command.arg("url.dll,FileProtocolHandler");
+        command
+    };
+    #[cfg(target_os = "macos")]
+    let mut command = std::process::Command::new("open");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = std::process::Command::new("xdg-open");
+
+    let _ = command.arg(url).spawn();
 }
 
 #[cfg(test)]
@@ -8970,6 +9263,102 @@ mod tests {
         assert!(
             disclosure < 100.0,
             "заголовок группы во весь экран: {disclosure}"
+        );
+    }
+
+    /// Описание в окне «О программе» — дословно вступление README.
+    ///
+    /// Два описания одной программы, правленные в разное время, расходятся
+    /// молча: ни сборка, ни `clippy` не знают, что это один и тот же текст.
+    /// Жирное начертание в README — разметка, а не слова, поэтому `**`
+    /// снимается перед сверкой.
+    #[test]
+    fn the_about_text_is_the_readme_intro() {
+        let readme = include_str!("../README.md");
+        let intro: Vec<&str> = readme
+            .lines()
+            .skip_while(|line| !line.starts_with("# "))
+            .skip(1)
+            .skip_while(|line| line.trim().is_empty())
+            .take_while(|line| !line.trim().is_empty())
+            .map(str::trim)
+            .collect();
+        assert_eq!(
+            intro.join(" ").replace("**", ""),
+            ABOUT_TEXT,
+            "вступление README разошлось с окном «О программе» — поправьте ABOUT_TEXT"
+        );
+    }
+
+    /// Письмо из «Написать» уходит по адресу для отзывов и с версией в теме.
+    ///
+    /// Адрес сверяется целиком, и это не придирка: он отличается от адреса
+    /// в истории коммитов, и «поправить» его по ней тянет при первом взгляде.
+    /// А только ASCII и без пробелов — потому что `mailto:` это адрес, и сырой
+    /// пробел или кириллицу почтовые программы понимают по-разному; пробел
+    /// вдобавок заставил бы `Command` взять адрес в кавычки, и они доехали бы
+    /// до `url.dll,FileProtocolHandler` как его часть (см. [`open_url`]).
+    #[test]
+    fn the_feedback_letter_carries_the_address_and_the_version() {
+        let mailto = feedback_mailto();
+        assert!(
+            mailto.starts_with("mailto:cholakhyanerik@hotmail.com?subject="),
+            "{mailto}"
+        );
+        assert!(
+            mailto.ends_with(concat!("v", env!("CARGO_PKG_VERSION"))),
+            "в теме нет версии: {mailto}"
+        );
+        assert!(mailto.is_ascii() && !mailto.contains(' '), "{mailto}");
+    }
+
+    /// Адрес страницы и лицензия приехали из `Cargo.toml`.
+    ///
+    /// `env!` на поле, которого в `Cargo.toml` нет, не падает, а отдаёт
+    /// пустую строку: убери `repository` — и кнопки открывали бы
+    /// «/blob/main/CHANGELOG.md», а строка лицензии осталась бы пустой.
+    #[test]
+    fn the_about_links_come_from_the_manifest() {
+        assert!(PROJECT_URL.starts_with("https://github.com/"), "{PROJECT_URL}");
+        assert!(
+            CHANGELOG_URL.starts_with(PROJECT_URL) && CHANGELOG_URL.ends_with("/CHANGELOG.md"),
+            "{CHANGELOG_URL}"
+        );
+        assert_eq!(LICENSE, "MIT");
+    }
+
+    /// Окно «О программе» целиком помещается в окно минимального размера.
+    ///
+    /// Ровно так уже ломалось окно метаданных: в 520×420 модалка
+    /// фиксированного размера теряла заголовок сверху и «Закрыть» снизу,
+    /// и закрыть её становилось нечем. Сборка этого не видит, а тест
+    /// видит — модалка, которой не хватило высоты, выходит за кромку.
+    ///
+    /// Три кадра — по той же причине, что у [`log_body_height`]: модалка —
+    /// это `Area`, и свой размер она узнаёт по прошлому кадру.
+    #[test]
+    fn the_about_window_fits_the_smallest_window() {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(520.0, 420.0));
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let mut rect = egui::Rect::NOTHING;
+
+        for _ in 0..3 {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                // «Скопировано» горит: так ряд с адресом самый широкий.
+                rect = about_window(ui.ctx(), 1.0, true).response.rect;
+            });
+            output.textures_delta.clear();
+        }
+
+        assert!(rect.height() > 200.0, "окно схлопнулось: {rect:?}");
+        assert!(
+            screen.contains_rect(rect),
+            "окно «О программе» не влезает в 520×420: {rect:?}"
         );
     }
 
