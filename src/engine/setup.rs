@@ -1343,7 +1343,11 @@ mod tests {
     fn macos_arm_primary_source_has_no_version_in_url() {
         let urls: Vec<&str> = match &FFMPEG_SOURCES[0] {
             FfmpegSource::Split { ffmpeg, ffprobe } => vec![*ffmpeg, *ffprobe],
-            FfmpegSource::Bundle(url) => vec![*url],
+            // `Bundle` — вариант с именованными полями, а не кортеж: рядом
+            // с адресом у него лежит `sums` (задача 12). Кортежный образец
+            // тут собирался ровно до 0.13.0 и с тех пор ронял сборку тестов
+            // на macOS — единственной системе, где этот `#[cfg]` включён.
+            FfmpegSource::Bundle { url, .. } => vec![*url],
         };
 
         for url in urls {

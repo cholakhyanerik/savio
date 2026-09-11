@@ -43,7 +43,15 @@
       "Bash(awk 'NR==1697{print \"model.rs:\" NR \"  \" $0}' src/model.rs)",
       "Bash(awk 'NR==78||NR==105||NR==127||NR==154{print \"setup.rs:\" NR \"  \" $0}' src/engine/setup.rs)",
       "Bash(awk 'NR==100||NR==115{print \"binaries.rs:\" NR \"  \" $0}' src/engine/binaries.rs)",
-      "PowerShell(cargo test 2>&1 | Select-String -Pattern 'test result|FAILED|panicked|^error' | Out-String; \"test exit: $LASTEXITCODE\"; git status --short)"
+      "PowerShell(cargo test 2>&1 | Select-String -Pattern 'test result|FAILED|panicked|^error' | Out-String; \"test exit: $LASTEXITCODE\"; git status --short)",
+      "PowerShell(gh run list --limit 12 --json conclusion,displayTitle,createdAt --jq '.[] | .createdAt[0:10] + \\\\\" \\\\\" + .conclusion + \\\\\"  \\\\\" + .displayTitle' 2>&1)",
+      "PowerShell(git show -s --format='%h %ad %s' --date=short d46dd47 2>&1 | Out-String; git show d46dd47:Cargo.toml 2>$null | Select-String -Pattern '^version' | ForEach-Object { $_.Line }; git show d46dd47 -- src/engine/setup.rs 2>$null | Select-String -Pattern 'Bundle\\\\\\(url\\\\\\)|Bundle \\\\{ url' | ForEach-Object { $_.Line } | Out-String)",
+      "PowerShell(gh run view 34628095394 --json status,jobs 2>&1 | ConvertFrom-Json | ForEach-Object { \"run: $\\($_.status\\)\"; $_.jobs | ForEach-Object { \"  {0}: {1} / {2}\" -f $_.name, $_.status, $_.conclusion } })",
+      "PowerShell(gh run watch 34628095394 --exit-status --interval 30 2>&1 | Select-Object -Last 6 | Out-String; \"watch exit: $LASTEXITCODE\")",
+      "PowerShell(gh run view 34628095394 --json status,conclusion,jobs 2>&1 | ConvertFrom-Json | ForEach-Object { \"run: $\\($_.status\\) / $\\($_.conclusion\\)\"; $_.jobs | ForEach-Object { \"  {0}: {1}\" -f $_.name, $_.conclusion } })",
+      "PowerShell($o = cargo outdated --root-deps-only 2>&1 | Out-String; $o; \"exit: $LASTEXITCODE\")",
+      "PowerShell($s = 'C:\\\\Users\\\\chola\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-chola-OneDrive-Documents-savio\\\\9260e627-88cb-4c89-a8bd-c97813a6750b\\\\scratchpad'; New-Item -ItemType Directory -Force $s | Out-Null; Copy-Item src\\\\engine\\\\setup.rs \"$s\\\\setup.rs.bak\" -Force; $t = [System.IO.File]::ReadAllText\\(\"$PWD\\\\src\\\\engine\\\\setup.rs\"\\); $old = '#[cfg\\(all\\(target_os = \"macos\", target_arch = \"aarch64\"\\)\\)]' + \"`r`n\" + '    #[test]' + \"`r`n\" + '    fn macos_arm_primary_source_has_no_version_in_url'; $has = $t.Contains\\($old\\); \"anchor found: $has\"; if \\($has\\) { $t = $t.Replace\\($old, '#[cfg\\(windows\\)]' + \"`r`n\" + '    #[test]' + \"`r`n\" + '    fn macos_arm_primary_source_has_no_version_in_url'\\); [System.IO.File]::WriteAllText\\(\"$PWD\\\\src\\\\engine\\\\setup.rs\", $t, \\(New-Object System.Text.UTF8Encoding $false\\)\\); 'predicate swapped' })",
+      "PowerShell(cargo clippy --all-targets -- -D warnings 2>&1 | Select-String -Pattern 'error\\\\[|error:|-->|warning:' | Select-Object -First 12 | ForEach-Object { $_.Line } | Out-String -Width 200)"
     ]
   }
 }
