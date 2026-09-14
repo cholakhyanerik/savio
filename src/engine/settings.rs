@@ -20,8 +20,11 @@ use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use super::binaries;
-use crate::model::{CookieSource, DownloadOptions, Format, Quality};
+use super::{binaries, weather};
+use crate::model::{
+    CookieSource, DownloadOptions, FAVORITES_LIMIT, Format, Place, PressureUnit, Quality, TempUnit,
+    WeatherUnits, WindUnit,
+};
 
 /// Имя файла в каталоге Savio.
 const FILE_NAME: &str = "settings.json";
@@ -48,7 +51,10 @@ const DEBOUNCE: Duration = Duration::from_millis(500);
 /// Значение по умолчанию обязано совпадать с тем, что UI показывал до
 /// появления этого модуля: первый запуск (файла ещё нет) и запуск с битым
 /// файлом должны выглядеть одинаково и привычно.
-#[derive(Clone, PartialEq, Eq, Debug)]
+///
+/// `Eq` у структуры нет с тех пор, как в ней появилось место погоды:
+/// координаты — `f64`, а у тех равенство только частичное.
+#[derive(Clone, PartialEq, Debug)]
 pub struct Settings {
     pub format: Format,
     pub quality: Quality,
@@ -99,6 +105,17 @@ pub struct Settings {
     /// `Default`: производный дал бы `false`, то есть окно без движения
     /// у всех, кто ни о чём не просил, причём молча.
     pub smooth: bool,
+    /// Место, для которого показывается погода. `None` — ещё не выбирали:
+    /// тогда вкладка при первом открытии определит его по IP.
+    ///
+    /// Запоминается, чтобы IP-адрес уходил геолокатору один раз, а не при
+    /// каждом запуске, — и чтобы город, найденный руками вместо чужого
+    /// города VPN, не терялся на закрытии окна.
+    pub weather_place: Option<Place>,
+    /// Градусы, ветер и давление.
+    pub weather_units: WeatherUnits,
+    /// Избранные места, не больше [`FAVORITES_LIMIT`].
+    pub weather_favorites: Vec<Place>,
 }
 
 impl Default for Settings {
@@ -111,6 +128,9 @@ impl Default for Settings {
             cookies: CookieSource::default(),
             cookie_file: None,
             smooth: true,
+            weather_place: None,
+            weather_units: WeatherUnits::default(),
+            weather_favorites: Vec::new(),
         }
     }
 }
@@ -257,6 +277,55 @@ fn cookies_from_token(token: &str) -> Option<CookieSource> {
     }
 }
 
+/// Единицы погоды строками.
+///
+/// Свои короткие метки, а не подписи из домена: «°C» и «мм рт. ст.»
+/// принадлежат интерфейсу и вправе смениться, а файлу на диске лежать годами.
+fn temp_token(unit: TempUnit) -> &'static str {
+    match unit {
+        TempUnit::Celsius => "c",
+        TempUnit::Fahrenheit => "f",
+    }
+}
+
+fn temp_from_token(token: &str) -> Option<TempUnit> {
+    match token {
+        "c" => Some(TempUnit::Celsius),
+        "f" => Some(TempUnit::Fahrenheit),
+        _ => None,
+    }
+}
+
+fn wind_token(unit: WindUnit) -> &'static str {
+    match unit {
+        WindUnit::MetersPerSecond => "ms",
+        WindUnit::KilometersPerHour => "kmh",
+    }
+}
+
+fn wind_from_token(token: &str) -> Option<WindUnit> {
+    match token {
+        "ms" => Some(WindUnit::MetersPerSecond),
+        "kmh" => Some(WindUnit::KilometersPerHour),
+        _ => None,
+    }
+}
+
+fn pressure_token(unit: PressureUnit) -> &'static str {
+    match unit {
+        PressureUnit::MmHg => "mmhg",
+        PressureUnit::Hectopascal => "hpa",
+    }
+}
+
+fn pressure_from_token(token: &str) -> Option<PressureUnit> {
+    match token {
+        "mmhg" => Some(PressureUnit::MmHg),
+        "hpa" => Some(PressureUnit::Hectopascal),
+        _ => None,
+    }
+}
+
 /// Содержимое файла для текущих настроек.
 fn to_json(settings: &Settings) -> String {
     // Флажки пишем всегда, включая выключенные: снятая галочка — такой же
@@ -275,7 +344,25 @@ fn to_json(settings: &Settings) -> String {
         // помнить» — разные вещи, а по отсутствию ключа их не отличить.
         "cookies": cookies_token(settings.cookies),
         "smooth": settings.smooth,
+        "weather_units": {
+            "temp": temp_token(settings.weather_units.temp),
+            "wind": wind_token(settings.weather_units.wind),
+            "pressure": pressure_token(settings.weather_units.pressure),
+        },
+        // Пустой список тоже пишется: «убрал всё из избранного» — выбор,
+        // а не отсутствие памяти.
+        "weather_favorites": settings
+            .weather_favorites
+            .iter()
+            .take(FAVORITES_LIMIT)
+            .map(weather::place_to_json)
+            .collect::<Vec<_>>(),
     });
+
+    // Места нет — ключа нет: «ещё не выбирали» и есть умолчание.
+    if let Some(place) = &settings.weather_place {
+        value["weather_place"] = weather::place_to_json(place);
+    }
 
     // Пути кладём только тогда, когда они выражаются в UTF-8. Терять
     // запомненную папку из-за экзотического имени обидно, но `display()` тут
@@ -374,6 +461,51 @@ fn parse(text: &str) -> Settings {
     // у всех, кто просто обновился.
     if let Some(on) = flag(&value, "smooth") {
         settings.smooth = on;
+    }
+
+    // Погода. Каждое поле само по себе, как и всё выше: битое место не
+    // стирает единицы, а незнакомая единица — соседние.
+    if let Some(place) = value
+        .get("weather_place")
+        .and_then(weather::place_from_json)
+    {
+        settings.weather_place = Some(place);
+    }
+    if let Some(units) = value.get("weather_units") {
+        let units_ref = &mut settings.weather_units;
+        if let Some(temp) = units
+            .get("temp")
+            .and_then(serde_json::Value::as_str)
+            .and_then(temp_from_token)
+        {
+            units_ref.temp = temp;
+        }
+        if let Some(wind) = units
+            .get("wind")
+            .and_then(serde_json::Value::as_str)
+            .and_then(wind_from_token)
+        {
+            units_ref.wind = wind;
+        }
+        if let Some(pressure) = units
+            .get("pressure")
+            .and_then(serde_json::Value::as_str)
+            .and_then(pressure_from_token)
+        {
+            units_ref.pressure = pressure;
+        }
+    }
+    if let Some(list) = value
+        .get("weather_favorites")
+        .and_then(serde_json::Value::as_array)
+    {
+        // Битое место выпадает само, уцелевшие остаются. Потолок — и здесь,
+        // а не только при записи: файл могли поправить руками.
+        settings.weather_favorites = list
+            .iter()
+            .filter_map(weather::place_from_json)
+            .take(FAVORITES_LIMIT)
+            .collect();
     }
 
     settings
@@ -542,8 +674,82 @@ mod tests {
             cookies: CookieSource::File,
             cookie_file: Some(PathBuf::from(r"C:\Users\Вася\cookies.txt")),
             smooth: false,
+            weather_place: Some(nizhny()),
+            weather_units: WeatherUnits {
+                temp: TempUnit::Fahrenheit,
+                wind: WindUnit::KilometersPerHour,
+                pressure: PressureUnit::Hectopascal,
+            },
+            weather_favorites: vec![nizhny(), new_york()],
         };
         assert_eq!(parse(&to_json(&settings)), settings);
+    }
+
+    fn nizhny() -> Place {
+        Place {
+            name: "Нижний Новгород".to_owned(),
+            region: Some("Нижегородская Область".to_owned()),
+            country: Some("Россия".to_owned()),
+            latitude: 56.32867,
+            longitude: 44.00205,
+        }
+    }
+
+    /// Западное полушарие и место без области: минус в координате и пустой
+    /// ключ обязаны пережить запись так же, как всё остальное.
+    fn new_york() -> Place {
+        Place {
+            name: "New York".to_owned(),
+            region: None,
+            country: None,
+            latitude: 40.7128,
+            longitude: -74.006,
+        }
+    }
+
+    #[test]
+    fn a_file_without_weather_leaves_it_unset() {
+        // Файл от версии до 0.26: погоды в нём нет вовсе. Место остаётся
+        // невыбранным — вкладка сама определит его при первом открытии, — а
+        // единицы остаются привычными: градусы Цельсия, м/с и мм рт. ст.
+        let text = r#"{"version": 1, "format": "mp4", "quality": "best"}"#;
+        let settings = parse(text);
+        assert_eq!(settings.weather_place, None);
+        assert_eq!(settings.weather_units, WeatherUnits::default());
+        assert!(settings.weather_favorites.is_empty());
+    }
+
+    #[test]
+    fn weather_fields_fall_back_one_by_one() {
+        // Незнакомая единица не стирает соседние, битое место в избранном —
+        // уцелевшие, а место без координат — не место.
+        let text = r#"{
+            "weather_units": {"temp": "kelvin", "wind": "kmh", "pressure": 5},
+            "weather_favorites": [
+                {"name": "Нижний Новгород", "region": "Нижегородская Область",
+                 "country": "Россия", "latitude": 56.32867, "longitude": 44.00205},
+                {"name": "Без координат"},
+                "не место"
+            ],
+            "weather_place": {"name": "Ереван"}
+        }"#;
+        let settings = parse(text);
+        assert_eq!(settings.weather_units.temp, TempUnit::Celsius);
+        assert_eq!(settings.weather_units.wind, WindUnit::KilometersPerHour);
+        assert_eq!(settings.weather_units.pressure, PressureUnit::MmHg);
+        assert_eq!(settings.weather_favorites, vec![nizhny()]);
+        assert_eq!(settings.weather_place, None);
+    }
+
+    #[test]
+    fn favorites_stay_bounded_even_in_a_hand_edited_file() {
+        let many: Vec<serde_json::Value> = (0..FAVORITES_LIMIT + 5)
+            .map(|i| {
+                serde_json::json!({"name": format!("Город {i}"), "latitude": i, "longitude": i})
+            })
+            .collect();
+        let text = serde_json::json!({ "weather_favorites": many }).to_string();
+        assert_eq!(parse(&text).weather_favorites.len(), FAVORITES_LIMIT);
     }
 
     #[test]
@@ -675,9 +881,14 @@ mod tests {
             cookies: CookieSource::None,
             cookie_file: None,
             smooth: true,
+            ..Settings::default()
         };
         let json = to_json(&settings);
         assert!(!json.contains("out_dir"), "пустого пути в файле быть не должно");
+        assert!(
+            !json.contains("weather_place"),
+            "невыбранному месту погоды в файле места нет"
+        );
         assert!(
             !json.contains("cookie_file"),
             "невыбранному файлу cookies в файле места нет"
@@ -737,6 +948,16 @@ mod tests {
             cookies: CookieSource::Firefox,
             cookie_file: None,
             smooth: false,
+            // Место настоящим диском — ради ровно той записи, что уходит
+            // в `settings.json`: без него тест не видел бы, что координаты
+            // переживают текст и обратно.
+            weather_place: Some(nizhny()),
+            weather_units: WeatherUnits {
+                temp: TempUnit::Celsius,
+                wind: WindUnit::KilometersPerHour,
+                pressure: PressureUnit::MmHg,
+            },
+            weather_favorites: vec![new_york()],
         };
 
         let mut saver = Saver::spawn_to(path.clone());
@@ -772,6 +993,7 @@ mod tests {
             cookies: CookieSource::None,
             cookie_file: None,
             smooth: true,
+            ..Settings::default()
         });
         saver.save(Settings {
             format: Format::Mp3,
@@ -781,6 +1003,7 @@ mod tests {
             cookies: CookieSource::Chrome,
             cookie_file: None,
             smooth: true,
+            ..Settings::default()
         });
         saver.save(Settings {
             format: Format::Mp3,
@@ -793,6 +1016,7 @@ mod tests {
             cookies: CookieSource::Edge,
             cookie_file: None,
             smooth: true,
+            ..Settings::default()
         });
         saver.flush();
 

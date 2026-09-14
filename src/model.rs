@@ -1166,6 +1166,23 @@ pub enum Event {
     /// перечитывании. Поэтому событие с состоянием идёт **после** `Notice`
     /// или `Warning` об исходе, а не вместо него.
     Power(PowerState),
+    /// Место для погоды определено по IP-адресу.
+    ///
+    /// Отдельно от `Weather` и раньше него: прогноз может и не приехать
+    /// (место нашлось, а сервер погоды молчит), а запомнить найденное надо
+    /// в любом случае — иначе при следующем открытии вкладки его снова
+    /// спрашивали бы у геолокатора, отдавая ему IP-адрес ещё раз.
+    WeatherPlace(Place),
+    /// Места, найденные по названию. Пустой список — законный исход «ничего
+    /// не нашлось», а не ошибка.
+    WeatherPlaces(Vec<Place>),
+    /// Прогноз готов — свежий или сохранённый на диске (`saved`).
+    ///
+    /// В коробке: отчёт с почасовым и недельным прогнозом в разы крупнее
+    /// остальных вариантов, а перечисление занимает место по самому
+    /// крупному — без коробки каждое событие прогресса загрузки таскало бы
+    /// по каналу место под погоду.
+    Weather(Box<WeatherReport>),
 }
 
 /// Похожа ли строка на ссылку, которую есть смысл отдавать yt-dlp.
@@ -1937,6 +1954,786 @@ impl PowerState {
     /// Название активной схемы.
     pub fn active_name(&self) -> Option<&str> {
         self.active.and_then(|id| self.plan_name(id))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Погода
+//
+// Типы прогноза и всё его форматирование. Откуда числа берутся, знает
+// `engine::weather`; каким значком рисуется небо — `app.rs`. Домен не знает
+// ни про сеть, ни про кисти.
+//
+// Сквозное правило то же, что у снимка системы: **«нет значения» — отдельное
+// состояние.** Open-Meteo вправе прислать `null` в любом поле, а на месте
+// пропуска подставленный ноль дал бы «0 °C» — правдоподобную температуру,
+// которой никто не измерял. Поэтому каждое число здесь — `Option`, а `None`
+// рисуется прочерком.
+//
+// Хранится всё в одних единицах — °C, км/ч, гПа, — ровно в тех, что присылает
+// сервер. Переводит в выбранные человеком только форматирование: так смена
+// единиц не требует нового запроса, а сохранённый на диске отчёт не устаревает
+// от того, что человек переключил градусы.
+// ---------------------------------------------------------------------------
+
+/// Сколько мест помним в избранном.
+///
+/// Потолок обязателен по Правилу 1, как `HISTORY_LIMIT`: список пишется в файл
+/// настроек и рисуется рядом таблеток. Десяти хватает на дом, дачу и родных,
+/// а больше в карточку не уместится без прокрутки.
+pub const FAVORITES_LIMIT: usize = 10;
+
+/// Сколько часов вперёд показывает почасовой прогноз.
+///
+/// Двое суток: «что будет вечером» и «что будет завтра в это же время» —
+/// ровно то, за чем открывают почасовой прогноз. Сервер отдаёт неделю, но
+/// полтораста столбиков в горизонтальной прокрутке уже никто не листает.
+pub const HOURS_SHOWN: usize = 48;
+
+/// Место, для которого показывается погода.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Place {
+    /// Название населённого пункта: «Ереван».
+    pub name: String,
+    /// Область или штат. `None` — источник не назвал.
+    pub region: Option<String>,
+    pub country: Option<String>,
+    pub latitude: f64,
+    pub longitude: f64,
+}
+
+impl Place {
+    /// Как место называется в шапке вкладки: «Ереван, Армения».
+    pub fn title(&self) -> String {
+        match self
+            .country
+            .as_deref()
+            .filter(|country| !country.is_empty() && *country != self.name)
+        {
+            Some(country) => format!("{}, {country}", self.name),
+            None => self.name.clone(),
+        }
+    }
+
+    /// Вторая строка в списке найденного: «Нижегородская Область, Россия».
+    ///
+    /// Область, совпадающая с названием, пропускается: у столиц она называется
+    /// так же, и «Ереван, Армения» под «Ереван» читалось бы опечаткой в два
+    /// слова «Ереван, Ереван, Армения».
+    pub fn detail(&self) -> String {
+        let region = self
+            .region
+            .as_deref()
+            .filter(|region| !region.is_empty() && *region != self.name);
+        let country = self.country.as_deref().filter(|country| !country.is_empty());
+        match (region, country) {
+            (Some(region), Some(country)) => format!("{region}, {country}"),
+            (Some(one), None) | (None, Some(one)) => one.to_owned(),
+            (None, None) => String::new(),
+        }
+    }
+
+    /// То же ли это место.
+    ///
+    /// По координатам с допуском, а не по названию: одно и то же место бывает
+    /// названо по-разному («Yerevan» от геолокатора, если русского имени
+    /// рядом не нашлось, и «Ереван» из поиска), а два разных города с одним
+    /// именем — обычное дело. Сотая градуса — около километра: соседние
+    /// города так не сольются, а одна точка, пришедшая дважды, узнается.
+    pub fn same_as(&self, other: &Place) -> bool {
+        (self.latitude - other.latitude).abs() < 0.01
+            && (self.longitude - other.longitude).abs() < 0.01
+    }
+}
+
+/// В чём показывать температуру.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum TempUnit {
+    #[default]
+    Celsius,
+    Fahrenheit,
+}
+
+impl TempUnit {
+    pub const ALL: [TempUnit; 2] = [TempUnit::Celsius, TempUnit::Fahrenheit];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TempUnit::Celsius => "°C",
+            TempUnit::Fahrenheit => "°F",
+        }
+    }
+
+    fn convert(self, celsius: f64) -> f64 {
+        match self {
+            TempUnit::Celsius => celsius,
+            TempUnit::Fahrenheit => celsius * 9.0 / 5.0 + 32.0,
+        }
+    }
+}
+
+/// В чём показывать скорость ветра.
+///
+/// Умолчание — метры в секунду: так ветер называют российские службы погоды.
+/// Сервер отдаёт километры в час, перевод делается при форматировании.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum WindUnit {
+    #[default]
+    MetersPerSecond,
+    KilometersPerHour,
+}
+
+impl WindUnit {
+    pub const ALL: [WindUnit; 2] = [WindUnit::MetersPerSecond, WindUnit::KilometersPerHour];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            WindUnit::MetersPerSecond => "м/с",
+            WindUnit::KilometersPerHour => "км/ч",
+        }
+    }
+
+    fn convert(self, kmh: f64) -> f64 {
+        match self {
+            WindUnit::MetersPerSecond => kmh / 3.6,
+            WindUnit::KilometersPerHour => kmh,
+        }
+    }
+}
+
+/// В чём показывать давление.
+///
+/// Умолчание — миллиметры ртутного столба, по той же причине, что у ветра.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum PressureUnit {
+    #[default]
+    MmHg,
+    Hectopascal,
+}
+
+impl PressureUnit {
+    pub const ALL: [PressureUnit; 2] = [PressureUnit::MmHg, PressureUnit::Hectopascal];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PressureUnit::MmHg => "мм рт. ст.",
+            PressureUnit::Hectopascal => "гПа",
+        }
+    }
+
+    fn convert(self, hpa: f64) -> f64 {
+        match self {
+            // Один гектопаскаль — 0.750062 мм рт. ст.: 1013.25 гПа это 760 мм.
+            PressureUnit::MmHg => hpa * 0.750_062,
+            PressureUnit::Hectopascal => hpa,
+        }
+    }
+}
+
+/// Все три выбора единиц разом — так они и запоминаются.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct WeatherUnits {
+    pub temp: TempUnit,
+    pub wind: WindUnit,
+    pub pressure: PressureUnit,
+}
+
+/// Каким значком рисовать небо.
+///
+/// Восемь картинок на двадцать восемь кодов WMO: различать «слабый» и
+/// «сильный» дождь значком незачем, это делает подпись рядом.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Sky {
+    Clear,
+    PartlyCloudy,
+    Cloudy,
+    Fog,
+    Drizzle,
+    Rain,
+    Snow,
+    Thunder,
+    /// Код, которого Savio не знает, или кода нет вовсе.
+    Unknown,
+}
+
+/// Все коды погоды, которые описывает Open-Meteo (таблица WMO 4677 в его
+/// сокращении). Нужен тестам: словарь обязан покрывать каждый.
+#[cfg(test)]
+pub const WMO_CODES: [u16; 28] = [
+    0, 1, 2, 3, 45, 48, 51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 71, 73, 75, 77, 80, 81, 82, 85, 86,
+    95, 96, 99,
+];
+
+/// Какой значок у кода погоды.
+pub fn wmo_sky(code: u16) -> Sky {
+    match code {
+        0 | 1 => Sky::Clear,
+        2 => Sky::PartlyCloudy,
+        3 => Sky::Cloudy,
+        45 | 48 => Sky::Fog,
+        51 | 53 | 55 | 56 | 57 => Sky::Drizzle,
+        61 | 63 | 65 | 66 | 67 | 80 | 81 | 82 => Sky::Rain,
+        71 | 73 | 75 | 77 | 85 | 86 => Sky::Snow,
+        95 | 96 | 99 => Sky::Thunder,
+        _ => Sky::Unknown,
+    }
+}
+
+/// Что подписать под кодом погоды, если его не знает Savio.
+///
+/// Общее описание, а не пустая строка и не паника: источник вправе завести
+/// новый код, и вкладка не должна из-за этого белеть.
+pub const WMO_UNKNOWN: &str = "Погода без описания";
+
+/// Описание погоды по коду WMO.
+pub fn wmo_description(code: u16) -> &'static str {
+    match code {
+        0 => "Ясно",
+        1 => "Преимущественно ясно",
+        2 => "Переменная облачность",
+        3 => "Пасмурно",
+        45 => "Туман",
+        48 => "Туман с изморозью",
+        51 => "Слабая морось",
+        53 => "Морось",
+        55 => "Сильная морось",
+        56 => "Слабая ледяная морось",
+        57 => "Ледяная морось",
+        61 => "Слабый дождь",
+        63 => "Дождь",
+        65 => "Сильный дождь",
+        66 => "Слабый ледяной дождь",
+        67 => "Ледяной дождь",
+        71 => "Слабый снег",
+        73 => "Снег",
+        75 => "Сильный снег",
+        77 => "Снежные зёрна",
+        80 => "Слабый ливень",
+        81 => "Ливень",
+        82 => "Сильный ливень",
+        85 => "Слабый снегопад",
+        86 => "Сильный снегопад",
+        95 => "Гроза",
+        96 => "Гроза с небольшим градом",
+        99 => "Гроза с сильным градом",
+        _ => WMO_UNKNOWN,
+    }
+}
+
+/// Погода прямо сейчас, в единицах сервера: °C, %, мм, гПа, км/ч, градусы.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct WeatherNow {
+    pub temperature: Option<f64>,
+    pub feels_like: Option<f64>,
+    pub humidity: Option<f64>,
+    /// `false` — ночь. Единственный признак ночи в ответе: без него солнце на
+    /// значке светило бы и в полночь.
+    pub is_day: Option<bool>,
+    pub precipitation: Option<f64>,
+    pub code: Option<u16>,
+    pub cloud_cover: Option<f64>,
+    /// Давление у поверхности, а не приведённое к уровню моря: именно его
+    /// показывает барометр на месте и называют российские сводки в мм рт. ст.
+    /// В Ереване на высоте тысяча метров это около 680 мм, а не 760.
+    pub pressure: Option<f64>,
+    pub wind_speed: Option<f64>,
+    /// Откуда дует ветер, в градусах: 0 — с севера, 90 — с востока.
+    pub wind_direction: Option<f64>,
+    pub wind_gusts: Option<f64>,
+    pub uv_index: Option<f64>,
+}
+
+/// Один час почасового прогноза.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HourForecast {
+    /// Начало часа, секунды Unix.
+    pub at: i64,
+    pub temperature: Option<f64>,
+    pub code: Option<u16>,
+    /// Вероятность осадков, %.
+    pub precipitation_chance: Option<f64>,
+    pub is_day: Option<bool>,
+}
+
+/// Один день недельного прогноза.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DayForecast {
+    /// Номер местного дня от 1970-01-01: так даты сравниваются без календаря.
+    pub day: i64,
+    pub code: Option<u16>,
+    pub temperature_max: Option<f64>,
+    pub temperature_min: Option<f64>,
+    /// Секунды Unix. `None` — нет (полярный день и ночь) или сервер не сказал.
+    pub sunrise: Option<i64>,
+    pub sunset: Option<i64>,
+    pub uv_index_max: Option<f64>,
+    pub precipitation_chance: Option<f64>,
+}
+
+/// Качество воздуха: европейский индекс и взвеси, мкг/м³.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AirQuality {
+    pub european_aqi: Option<f64>,
+    pub pm2_5: Option<f64>,
+    pub pm10: Option<f64>,
+}
+
+/// Всё, что известно о погоде в месте.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WeatherReport {
+    pub place: Place,
+    /// Смещение местного времени места от UTC, в секундах. Западнее Гринвича
+    /// оно отрицательное.
+    pub utc_offset: i64,
+    /// Когда прогноз получен, секунды Unix. `None` — часы машины стоят раньше
+    /// 1970 года, и сказать «когда» нечем.
+    pub fetched_at: Option<i64>,
+    /// Отчёт достан с диска, а не только что пришёл из сети.
+    pub saved: bool,
+    /// `None` — блока «сейчас» в ответе не было. Частичный успех законен:
+    /// недельный прогноз без текущей погоды лучше пустого экрана.
+    pub now: Option<WeatherNow>,
+    pub hours: Vec<HourForecast>,
+    pub days: Vec<DayForecast>,
+    /// `None` — сведения о воздухе не пришли. Запрос у них отдельный, к другому
+    /// хосту, и его неудача прогноз не роняет.
+    pub air: Option<AirQuality>,
+}
+
+const DAY_SECS: i64 = 86_400;
+
+/// Номер дня от 1970-01-01 по календарной дате.
+///
+/// Алгоритм `days_from_civil` Говарда Хиннанта: целочисленный и без таблиц,
+/// верен для любых дат по пролептическому григорианскому календарю.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let year_of_era = year.rem_euclid(400);
+    // Год здесь начинается с марта: так високосный день оказывается последним.
+    let month_from_march = (month + 9) % 12;
+    let day_of_year = (153 * month_from_march + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+/// Обратное: год, месяц и число по номеру дня.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_from_march = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_from_march + 2) / 5 + 1;
+    let month = if month_from_march < 10 {
+        month_from_march + 3
+    } else {
+        month_from_march - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    (year, month, day)
+}
+
+/// Местное время из строки Open-Meteo — «2026-09-14T19:45» или «2026-09-14» —
+/// в секунды так, будто эти часы показывают UTC.
+///
+/// Настоящее время Unix из него получается вычитанием смещения места. Своим
+/// разбором, а не календарной библиотекой: формат у сервера один, а `chrono`
+/// ради пары строк — лишняя зависимость.
+pub fn parse_local_time(text: &str) -> Option<i64> {
+    let (date, time) = match text.split_once('T') {
+        Some((date, time)) => (date, Some(time)),
+        None => (text, None),
+    };
+
+    let mut parts = date.split('-');
+    let year: i64 = parts.next()?.parse().ok()?;
+    let month: i64 = parts.next()?.parse().ok()?;
+    let day: i64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+
+    let mut seconds = days_from_civil(year, month, day) * DAY_SECS;
+    if let Some(time) = time {
+        let mut parts = time.split(':');
+        let hour: i64 = parts.next()?.parse().ok()?;
+        let minute: i64 = parts.next()?.parse().ok()?;
+        if !(0..24).contains(&hour) || !(0..60).contains(&minute) {
+            return None;
+        }
+        seconds += hour * 3600 + minute * 60;
+    }
+    Some(seconds)
+}
+
+/// «19:45» — часы и минуты момента `unix` при смещении `offset`.
+///
+/// Смещение прибавляется **до** остатка от деления на сутки, а не к готовому
+/// часу по Гринвичу: «02:30 UTC минус четыре часа» иначе давало бы «−2:30».
+/// В Москве и Ереване всё сходилось бы и так, ошибка видна только западнее
+/// Гринвича, где смещение отрицательное, — и держит её тест на Нью-Йорке
+/// (проверено красным). `rem_euclid`, а не `%`, — ради моментов до 1970
+/// года: там сумма отрицательная, а `%` в Rust берёт знак делимого.
+pub fn clock(unix: i64, offset: i64) -> String {
+    let second = (unix + offset).rem_euclid(DAY_SECS);
+    format!("{:02}:{:02}", second / 3600, second % 3600 / 60)
+}
+
+/// Номер местного дня момента `unix` — по той же причине через `div_euclid`.
+pub fn local_day(unix: i64, offset: i64) -> i64 {
+    (unix + offset).div_euclid(DAY_SECS)
+}
+
+const WEEKDAYS: [&str; 7] = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"];
+const MONTHS: [&str; 12] = [
+    "янв", "фев", "мар", "апр", "мая", "июн", "июл", "авг", "сен", "окт", "ноя", "дек",
+];
+
+/// «16 сен» по номеру дня.
+fn day_month(day: i64) -> String {
+    let (_, month, date) = civil_from_days(day);
+    format!("{date} {}", MONTHS[(month - 1).clamp(0, 11) as usize])
+}
+
+/// «Сегодня», «Завтра» или «ср, 16 сен».
+fn day_label(day: i64, today: i64) -> String {
+    match day - today {
+        0 => "Сегодня".to_owned(),
+        1 => "Завтра".to_owned(),
+        // Первое января 1970 года — четверг, отсюда сдвиг на три.
+        _ => format!("{}, {}", WEEKDAYS[(day + 3).rem_euclid(7) as usize], day_month(day)),
+    }
+}
+
+/// Округлённое число со знаком — типографским минусом, как в сводках.
+///
+/// «−0» не выходит никогда: −0.3 °C честно округляется в минус ноль, а такой
+/// температуры не бывает.
+fn signed(value: f64) -> String {
+    let rounded = value.round();
+    if rounded == 0.0 {
+        "0".to_owned()
+    } else if rounded < 0.0 {
+        format!("−{}", -rounded as i64)
+    } else {
+        format!("{}", rounded as i64)
+    }
+}
+
+/// «26°» — для столбиков прогноза, где единица видна рядом.
+pub fn temp_short(celsius: Option<f64>, unit: TempUnit) -> String {
+    match celsius {
+        Some(value) => format!("{}°", signed(unit.convert(value))),
+        None => "—".to_owned(),
+    }
+}
+
+/// «26 °C» — для крупного числа, стоящего отдельно.
+pub fn temp_full(celsius: Option<f64>, unit: TempUnit) -> String {
+    match celsius {
+        Some(value) => format!("{} {}", signed(unit.convert(value)), unit.label()),
+        None => "—".to_owned(),
+    }
+}
+
+/// Откуда дует ветер, одним словом.
+///
+/// Словами, а не буквами «СВ» и не стрелкой: в сводке «ветер северо-восточный»
+/// однозначно значит «с северо-востока», а у стрелки направление приходится
+/// угадывать — куда она показывает, откуда или куда дует.
+fn wind_from(degrees: f64) -> &'static str {
+    const POINTS: [&str; 8] = [
+        "северный",
+        "северо-восточный",
+        "восточный",
+        "юго-восточный",
+        "южный",
+        "юго-западный",
+        "западный",
+        "северо-западный",
+    ];
+    POINTS[((degrees / 45.0).round() as i64).rem_euclid(8) as usize]
+}
+
+/// «3 м/с, северо-восточный · порывы до 6 м/с».
+pub fn wind_text(
+    speed_kmh: Option<f64>,
+    gusts_kmh: Option<f64>,
+    direction: Option<f64>,
+    unit: WindUnit,
+) -> Option<String> {
+    let speed = unit.convert(speed_kmh?).round();
+    let mut text = if speed <= 0.0 {
+        "штиль".to_owned()
+    } else {
+        let mut text = format!("{} {}", speed as i64, unit.label());
+        // В штиль направления нет, и называть его незачем.
+        if let Some(direction) = direction {
+            text.push_str(", ");
+            text.push_str(wind_from(direction));
+        }
+        text
+    };
+    // Порывы — только когда они сильнее самого ветра: «3 м/с, порывы до 3 м/с»
+    // не сообщает ничего.
+    if let Some(gusts) = gusts_kmh.map(|gusts| unit.convert(gusts).round())
+        && gusts > speed
+    {
+        text.push_str(&format!(" · порывы до {} {}", gusts as i64, unit.label()));
+    }
+    Some(text)
+}
+
+/// «680 мм рт. ст.»
+pub fn pressure_text(hpa: f64, unit: PressureUnit) -> String {
+    format!("{} {}", unit.convert(hpa).round() as i64, unit.label())
+}
+
+/// «37%»
+pub fn percent_text(value: f64) -> String {
+    format!("{}%", value.round() as i64)
+}
+
+/// «0 мм» или «1.2 мм»: десятые — только когда они есть.
+pub fn precipitation_text(mm: f64) -> String {
+    let tenths = (mm * 10.0).round() / 10.0;
+    if tenths.fract() == 0.0 {
+        format!("{} мм", tenths as i64)
+    } else {
+        format!("{tenths:.1} мм")
+    }
+}
+
+/// «7 — высокий»: УФ-индекс со шкалой ВОЗ.
+pub fn uv_text(index: f64) -> String {
+    let rounded = index.round().max(0.0);
+    let level = match rounded as i64 {
+        0..=2 => "низкий",
+        3..=5 => "умеренный",
+        6..=7 => "высокий",
+        8..=10 => "очень высокий",
+        _ => "экстремальный",
+    };
+    format!("{} — {level}", rounded as i64)
+}
+
+/// «33 — удовлетворительное»: европейский индекс качества воздуха.
+///
+/// Границы — шкала EAQI, как её описывает Open-Meteo: через каждые двадцать
+/// пунктов до сотни и «крайне плохое» выше.
+pub fn aqi_text(index: f64) -> String {
+    let level = match index {
+        i if i <= 20.0 => "хорошее",
+        i if i <= 40.0 => "удовлетворительное",
+        i if i <= 60.0 => "умеренное",
+        i if i <= 80.0 => "плохое",
+        i if i <= 100.0 => "очень плохое",
+        _ => "крайне плохое",
+    };
+    format!("{} — {level}", index.round() as i64)
+}
+
+/// «4.9 мкг/м³»
+pub fn particles_text(value: f64) -> String {
+    format!("{value:.1} мкг/м³")
+}
+
+/// Один столбик почасового прогноза, готовый к показу.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HourView {
+    /// «20:00», а у текущего часа — «Сейчас».
+    pub time: String,
+    pub temperature: String,
+    /// «40%». `None` — осадков не ждут или сервер не сказал: столбик без
+    /// подписи читается легче, чем полсотни «0%» подряд.
+    pub chance: Option<String>,
+    pub sky: Sky,
+    pub night: bool,
+    pub now: bool,
+}
+
+/// Один день недельного прогноза, готовый к показу.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DayView {
+    pub label: String,
+    /// «17° … 31°»
+    pub temperatures: String,
+    pub chance: Option<String>,
+    pub sky: Sky,
+    pub description: &'static str,
+}
+
+/// Весь прогноз строками — то, что рисует вкладка.
+///
+/// Собирается один раз: на приёме отчёта и при смене единиц. В кадре
+/// отрисовки остаётся только положить готовые строки на экран — `format!`
+/// шестьдесят раз в секунду ради чисел, меняющихся раз в пятнадцать минут,
+/// это ровно то, чего не велит Правило 1.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WeatherView {
+    pub title: String,
+    /// «Обновлено в 19:45» — без неё не понять, свежие цифры на экране или
+    /// вчерашние.
+    pub updated: String,
+    pub temperature: String,
+    pub feels_like: Option<String>,
+    /// `None` — кода погоды в ответе не было вовсе.
+    pub description: Option<&'static str>,
+    pub sky: Sky,
+    pub night: bool,
+    /// «Влажность — 37%» и так далее. Значение `None` рисуется прочерком.
+    pub rows: Vec<(&'static str, Option<String>)>,
+    /// Пусто — сведения о воздухе не пришли.
+    pub air: Vec<(&'static str, Option<String>)>,
+    pub hours: Vec<HourView>,
+    pub days: Vec<DayView>,
+}
+
+/// Собирает строки прогноза.
+///
+/// `now` — сейчас, секунды Unix (`None` — часы машины сбиты): по нему
+/// отбрасываются прошедшие часы и дни — сохранённый вчера отчёт иначе начинался
+/// бы со вчерашнего утра. `local_offset` — смещение часов самой машины: время
+/// обновления показывается по ним, а не по часам места, иначе у человека из
+/// Еревана, открывшего Москву, «обновлено в 18:45» стояло бы при 19:45 на его
+/// собственных часах.
+pub fn weather_view(
+    report: &WeatherReport,
+    units: WeatherUnits,
+    now: Option<i64>,
+    local_offset: Option<i64>,
+) -> WeatherView {
+    let offset = report.utc_offset;
+    let today = now
+        .map(|now| local_day(now, offset))
+        .or_else(|| report.days.first().map(|day| day.day));
+    let today_forecast = report
+        .days
+        .iter()
+        .find(|day| Some(day.day) == today)
+        .or_else(|| report.days.first());
+
+    let prefix = if report.saved {
+        "Сохранённый отчёт"
+    } else {
+        "Обновлено"
+    };
+    let updated = match (report.fetched_at, local_offset) {
+        (None, _) => "Когда получен прогноз, неизвестно: часы компьютера показывают \
+                      дату раньше 1970 года."
+            .to_owned(),
+        (Some(at), Some(mine)) => {
+            let same_day = now.is_some_and(|now| local_day(now, mine) == local_day(at, mine));
+            if same_day {
+                format!("{prefix} в {}", clock(at, mine))
+            } else {
+                format!(
+                    "{prefix} {} в {}",
+                    day_month(local_day(at, mine)),
+                    clock(at, mine)
+                )
+            }
+        }
+        // Часовой пояс машины система не назвала — честнее сказать время по
+        // UTC, чем выдать чужие часы за местные.
+        (Some(at), None) => format!("{prefix} в {} UTC", clock(at, 0)),
+    };
+
+    let current = report.now.as_ref();
+    let field = |pick: fn(&WeatherNow) -> Option<f64>| current.and_then(pick);
+    let rows = vec![
+        ("Влажность", field(|n| n.humidity).map(percent_text)),
+        (
+            "Ветер",
+            current.and_then(|n| wind_text(n.wind_speed, n.wind_gusts, n.wind_direction, units.wind)),
+        ),
+        (
+            "Давление",
+            field(|n| n.pressure).map(|hpa| pressure_text(hpa, units.pressure)),
+        ),
+        ("Облачность", field(|n| n.cloud_cover).map(percent_text)),
+        ("Осадки", field(|n| n.precipitation).map(precipitation_text)),
+        ("УФ-индекс", field(|n| n.uv_index).map(uv_text)),
+        (
+            "Восход",
+            today_forecast
+                .and_then(|day| day.sunrise)
+                .map(|at| clock(at, offset)),
+        ),
+        (
+            "Закат",
+            today_forecast
+                .and_then(|day| day.sunset)
+                .map(|at| clock(at, offset)),
+        ),
+    ];
+
+    let air = match &report.air {
+        Some(air) => vec![
+            ("Воздух", air.european_aqi.map(aqi_text)),
+            ("PM2.5", air.pm2_5.map(particles_text)),
+            ("PM10", air.pm10.map(particles_text)),
+        ],
+        None => Vec::new(),
+    };
+
+    let chance = |value: Option<f64>| value.filter(|chance| chance.round() > 0.0).map(percent_text);
+
+    let hours = report
+        .hours
+        .iter()
+        .filter(|hour| now.is_none_or(|now| hour.at + 3600 > now))
+        .take(HOURS_SHOWN)
+        .map(|hour| {
+            let is_now = now.is_some_and(|now| hour.at <= now);
+            HourView {
+                time: if is_now {
+                    "Сейчас".to_owned()
+                } else {
+                    clock(hour.at, offset)
+                },
+                temperature: temp_short(hour.temperature, units.temp),
+                chance: chance(hour.precipitation_chance),
+                sky: hour.code.map_or(Sky::Unknown, wmo_sky),
+                night: hour.is_day == Some(false),
+                now: is_now,
+            }
+        })
+        .collect();
+
+    let days = report
+        .days
+        .iter()
+        .filter(|day| today.is_none_or(|today| day.day >= today))
+        .map(|day| DayView {
+            label: day_label(day.day, today.unwrap_or(day.day)),
+            temperatures: format!(
+                "{} … {}",
+                temp_short(day.temperature_min, units.temp),
+                temp_short(day.temperature_max, units.temp)
+            ),
+            chance: chance(day.precipitation_chance),
+            sky: day.code.map_or(Sky::Unknown, wmo_sky),
+            description: day.code.map_or(WMO_UNKNOWN, wmo_description),
+        })
+        .collect();
+
+    WeatherView {
+        title: report.place.title(),
+        updated,
+        temperature: temp_full(field(|n| n.temperature), units.temp),
+        feels_like: field(|n| n.feels_like)
+            .map(|value| format!("ощущается как {}", temp_short(Some(value), units.temp))),
+        description: current.and_then(|n| n.code).map(wmo_description),
+        sky: current.and_then(|n| n.code).map_or(Sky::Unknown, wmo_sky),
+        night: current.is_some_and(|n| n.is_day == Some(false)),
+        rows,
+        air,
+        hours,
+        days,
     }
 }
 
@@ -3001,5 +3798,349 @@ mod tests {
             ..state
         };
         assert_eq!(lost.active_name(), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Погода
+    // -----------------------------------------------------------------------
+
+    /// Полночь 2024-01-01 по UTC — опорная точка: её номер дня известен
+    /// независимо от наших функций (1704067200 / 86400).
+    const JAN_1_2024: i64 = 1_704_067_200;
+
+    /// Каждый код WMO описан своими словами и получает свой значок, а
+    /// незнакомый — общее описание, а не пустую строку и не панику.
+    #[test]
+    fn every_wmo_code_is_described() {
+        for code in WMO_CODES {
+            assert_ne!(wmo_description(code), WMO_UNKNOWN, "код {code} без описания");
+            assert_ne!(wmo_sky(code), Sky::Unknown, "код {code} без значка");
+        }
+        for code in [4, 42, 100, u16::MAX] {
+            assert_eq!(wmo_description(code), WMO_UNKNOWN);
+            assert_eq!(wmo_sky(code), Sky::Unknown);
+        }
+    }
+
+    /// Дата туда и обратно — без календарной библиотеки.
+    #[test]
+    fn calendar_arithmetic_round_trips() {
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(days_from_civil(2024, 1, 1) * 86_400, JAN_1_2024);
+        // Високосный день и переход через год.
+        assert_eq!(days_from_civil(2024, 3, 1) - days_from_civil(2024, 2, 28), 2);
+        assert_eq!(days_from_civil(2025, 1, 1) - days_from_civil(2024, 12, 31), 1);
+
+        for day in (-800_000..800_000).step_by(997) {
+            let (year, month, date) = civil_from_days(day);
+            assert_eq!(days_from_civil(year, month, date), day, "день {day}");
+        }
+    }
+
+    /// Строки времени Open-Meteo читаются, мусор — нет.
+    #[test]
+    fn local_times_are_parsed() {
+        assert_eq!(parse_local_time("2024-01-01"), Some(JAN_1_2024));
+        assert_eq!(
+            parse_local_time("2024-01-01T19:45"),
+            Some(JAN_1_2024 + 19 * 3600 + 45 * 60)
+        );
+        for junk in ["", "2024", "2024-13-01", "2024-01-01T25:00", "2024-01-01T12", "вчера"] {
+            assert_eq!(parse_local_time(junk), None, "принято: {junk:?}");
+        }
+    }
+
+    /// Часы западнее Гринвича не уходят в минус.
+    ///
+    /// Нью-Йорк, UTC−4: момент 02:30 по Гринвичу — это 22:30 **вчерашнего**
+    /// дня. Со смещением, прибавленным к уже взятому часу по Гринвичу, здесь
+    /// выходило «−1:−30» (проверено красным), а в Москве и Ереване разницы
+    /// не видно вовсе.
+    #[test]
+    fn clock_west_of_greenwich_stays_positive() {
+        let moment = JAN_1_2024 + 2 * 3600 + 30 * 60;
+        let new_york = -4 * 3600;
+        assert_eq!(clock(moment, new_york), "22:30");
+        assert_eq!(local_day(moment, new_york), JAN_1_2024 / 86_400 - 1);
+        assert_eq!(clock(moment, 4 * 3600), "06:30");
+        assert_eq!(clock(JAN_1_2024 - 1, 0), "23:59");
+    }
+
+    /// «Сегодня», «Завтра», а дальше — день недели и дата.
+    #[test]
+    fn days_are_named_relative_to_today() {
+        let today = JAN_1_2024 / 86_400;
+        assert_eq!(day_label(today, today), "Сегодня");
+        assert_eq!(day_label(today + 1, today), "Завтра");
+        // 2024-01-03 — среда.
+        assert_eq!(day_label(today + 2, today), "ср, 3 янв");
+        assert_eq!(day_label(today + 6, today), "вс, 7 янв");
+    }
+
+    /// Минус типографский, минус ноль не бывает, Фаренгейт пересчитан.
+    #[test]
+    fn temperatures_are_signed_and_converted() {
+        assert_eq!(temp_short(Some(25.7), TempUnit::Celsius), "26°");
+        assert_eq!(temp_short(Some(-2.6), TempUnit::Celsius), "−3°");
+        assert_eq!(temp_short(Some(-0.3), TempUnit::Celsius), "0°");
+        assert_eq!(temp_short(Some(0.0), TempUnit::Fahrenheit), "32°");
+        assert_eq!(temp_full(Some(-40.0), TempUnit::Fahrenheit), "−40 °F");
+        assert_eq!(temp_full(None, TempUnit::Celsius), "—");
+    }
+
+    /// Ветер: единицы, направление словами, порывы только сильнее ветра.
+    #[test]
+    fn wind_is_told_in_words() {
+        let ms = WindUnit::MetersPerSecond;
+        assert_eq!(
+            wind_text(Some(36.0), Some(54.0), Some(45.0), ms).as_deref(),
+            Some("10 м/с, северо-восточный · порывы до 15 м/с")
+        );
+        assert_eq!(
+            wind_text(Some(36.0), Some(36.0), Some(350.0), WindUnit::KilometersPerHour).as_deref(),
+            Some("36 км/ч, северный")
+        );
+        // Отрицательный угол — тот же север, а не паника на индексе.
+        assert_eq!(
+            wind_text(Some(10.0), None, Some(-10.0), ms).as_deref(),
+            Some("3 м/с, северный")
+        );
+        assert_eq!(
+            wind_text(Some(1.0), Some(11.0), Some(90.0), ms).as_deref(),
+            Some("штиль · порывы до 3 м/с")
+        );
+        assert_eq!(wind_text(None, Some(20.0), Some(90.0), ms), None);
+    }
+
+    /// Давление и шкалы УФ и воздуха — на своих границах.
+    #[test]
+    fn scales_break_where_they_should() {
+        assert_eq!(pressure_text(1013.25, PressureUnit::MmHg), "760 мм рт. ст.");
+        assert_eq!(pressure_text(904.5, PressureUnit::Hectopascal), "905 гПа");
+
+        assert_eq!(uv_text(2.4), "2 — низкий");
+        assert_eq!(uv_text(2.6), "3 — умеренный");
+        assert_eq!(uv_text(7.0), "7 — высокий");
+        assert_eq!(uv_text(10.4), "10 — очень высокий");
+        assert_eq!(uv_text(11.0), "11 — экстремальный");
+
+        assert_eq!(aqi_text(20.0), "20 — хорошее");
+        assert_eq!(aqi_text(33.0), "33 — удовлетворительное");
+        assert_eq!(aqi_text(101.0), "101 — крайне плохое");
+
+        assert_eq!(precipitation_text(0.0), "0 мм");
+        assert_eq!(precipitation_text(1.24), "1.2 мм");
+        assert_eq!(particles_text(4.9), "4.9 мкг/м³");
+    }
+
+    fn place(name: &str, region: Option<&str>, country: Option<&str>) -> Place {
+        Place {
+            name: name.to_owned(),
+            region: region.map(str::to_owned),
+            country: country.map(str::to_owned),
+            latitude: 40.17765,
+            longitude: 44.5126,
+        }
+    }
+
+    /// Название места не повторяет само себя.
+    #[test]
+    fn a_place_names_itself_without_repeating() {
+        let capital = place("Ереван", Some("Ереван"), Some("Армения"));
+        assert_eq!(capital.title(), "Ереван, Армения");
+        assert_eq!(capital.detail(), "Армения", "область-тёзка пропускается");
+
+        let bare = place("Монако", None, Some("Монако"));
+        assert_eq!(bare.title(), "Монако");
+        assert_eq!(bare.detail(), "Монако");
+
+        let nowhere = place("Точка", None, None);
+        assert_eq!(nowhere.title(), "Точка");
+        assert_eq!(nowhere.detail(), "");
+    }
+
+    /// Одно место узнаётся по координатам, а не по названию.
+    #[test]
+    fn a_place_is_recognised_by_its_coordinates() {
+        let russian = place("Ереван", None, Some("Армения"));
+        let english = Place {
+            latitude: 40.1776484,
+            longitude: 44.5125866,
+            ..place("Yerevan", None, Some("Armenia"))
+        };
+        assert!(russian.same_as(&english));
+
+        let moscow = Place {
+            latitude: 55.7558,
+            longitude: 37.6173,
+            ..place("Ереван", None, None)
+        };
+        assert!(!russian.same_as(&moscow), "тёзки в разных местах — разные места");
+    }
+
+    /// Отчёт на 2024-01-01 для Нью-Йорка: три прошедших часа, три будущих
+    /// и три дня, из которых первый — вчера.
+    fn new_york_report() -> WeatherReport {
+        let offset = -5 * 3600;
+        let midnight = JAN_1_2024 - offset;
+        let today = JAN_1_2024 / 86_400;
+        WeatherReport {
+            place: place("New York", None, Some("США")),
+            utc_offset: offset,
+            fetched_at: Some(midnight + 10 * 3600),
+            saved: false,
+            now: Some(WeatherNow {
+                temperature: Some(-1.4),
+                feels_like: Some(-5.0),
+                humidity: Some(81.0),
+                is_day: Some(true),
+                code: Some(71),
+                wind_speed: Some(18.0),
+                wind_direction: Some(270.0),
+                ..WeatherNow::default()
+            }),
+            hours: (7..13)
+                .map(|hour| HourForecast {
+                    at: midnight + hour * 3600,
+                    temperature: Some(-2.0),
+                    code: Some(3),
+                    precipitation_chance: Some(if hour == 11 { 40.0 } else { 0.0 }),
+                    is_day: Some(hour >= 8),
+                })
+                .collect(),
+            days: (-1..2)
+                .map(|shift| DayForecast {
+                    day: today + shift,
+                    code: Some(71),
+                    temperature_max: Some(1.0),
+                    temperature_min: Some(-6.0),
+                    sunrise: Some(midnight + shift * 86_400 + 7 * 3600 + 20 * 60),
+                    sunset: Some(midnight + shift * 86_400 + 16 * 3600 + 39 * 60),
+                    uv_index_max: Some(1.0),
+                    precipitation_chance: Some(60.0),
+                })
+                .collect(),
+            air: None,
+        }
+    }
+
+    /// Прошедшее отброшено, текущий час отмечен, дни названы от сегодня.
+    ///
+    /// Именно это спасает сохранённый вчера отчёт: без отсечки по «сейчас»
+    /// вкладка начиналась бы со вчерашнего утра и называла бы вчера «Сегодня».
+    #[test]
+    fn the_view_starts_from_now() {
+        let report = new_york_report();
+        let midnight = JAN_1_2024 - report.utc_offset;
+        // 10:20 по Нью-Йорку.
+        let now = midnight + 10 * 3600 + 20 * 60;
+        let view = weather_view(&report, WeatherUnits::default(), Some(now), Some(3 * 3600));
+
+        let times: Vec<&str> = view.hours.iter().map(|hour| hour.time.as_str()).collect();
+        assert_eq!(times, ["Сейчас", "11:00", "12:00"]);
+        assert!(view.hours[0].now && !view.hours[1].now);
+        assert_eq!(view.hours[1].chance.as_deref(), Some("40%"));
+        assert_eq!(view.hours[0].chance, None, "«0%» не пишется");
+
+        let labels: Vec<&str> = view.days.iter().map(|day| day.label.as_str()).collect();
+        assert_eq!(labels, ["Сегодня", "Завтра"]);
+        assert_eq!(view.days[0].temperatures, "−6° … 1°");
+        assert_eq!(view.days[0].description, "Слабый снег");
+
+        assert_eq!(view.title, "New York, США");
+        assert_eq!(view.temperature, "−1 °C");
+        assert_eq!(view.feels_like.as_deref(), Some("ощущается как −5°"));
+        assert_eq!(view.description, Some("Слабый снег"));
+        assert_eq!(view.sky, Sky::Snow);
+        assert!(!view.night);
+
+        let row = |label: &str| {
+            view.rows
+                .iter()
+                .find(|(name, _)| *name == label)
+                .and_then(|(_, value)| value.clone())
+        };
+        assert_eq!(row("Влажность").as_deref(), Some("81%"));
+        assert_eq!(row("Ветер").as_deref(), Some("5 м/с, западный"));
+        assert_eq!(row("Восход").as_deref(), Some("07:20"), "по часам места");
+        assert_eq!(row("Закат").as_deref(), Some("16:39"));
+        // Давления в ответе не было: прочерк, а не «0 мм рт. ст.».
+        assert_eq!(row("Давление"), None);
+        assert!(view.air.is_empty(), "воздух не пришёл — строк нет");
+
+        // Обновлено в 10:00 по Нью-Йорку — это 18:00 по часам машины в UTC+3.
+        assert_eq!(view.updated, "Обновлено в 18:00");
+    }
+
+    /// Смена единиц меняет строки, не трогая отчёт.
+    #[test]
+    fn units_change_the_strings_only() {
+        let report = new_york_report();
+        let now = report.fetched_at;
+        let units = WeatherUnits {
+            temp: TempUnit::Fahrenheit,
+            wind: WindUnit::KilometersPerHour,
+            pressure: PressureUnit::Hectopascal,
+        };
+        let view = weather_view(&report, units, now, Some(0));
+        assert_eq!(view.temperature, "29 °F");
+        assert!(
+            view.rows
+                .iter()
+                .any(|(name, value)| *name == "Ветер" && value.as_deref() == Some("18 км/ч, западный"))
+        );
+    }
+
+    /// Когда получен прогноз — по часам машины, с датой, если не сегодня,
+    /// и честно, если часы сбиты или пояс неизвестен.
+    #[test]
+    fn the_update_time_is_honest() {
+        let mut report = new_york_report();
+        let fetched = report.fetched_at.expect("время есть");
+        let units = WeatherUnits::default();
+
+        let next_day = fetched + 20 * 3600;
+        assert_eq!(
+            weather_view(&report, units, Some(next_day), Some(0)).updated,
+            "Обновлено 1 янв в 15:00"
+        );
+        assert_eq!(
+            weather_view(&report, units, Some(fetched), None).updated,
+            "Обновлено в 15:00 UTC"
+        );
+
+        report.saved = true;
+        assert!(
+            weather_view(&report, units, Some(fetched), Some(0))
+                .updated
+                .starts_with("Сохранённый отчёт")
+        );
+
+        report.fetched_at = None;
+        assert!(
+            weather_view(&report, units, None, Some(0))
+                .updated
+                .contains("раньше 1970 года")
+        );
+    }
+
+    /// Без блока «сейчас» — прочерки, а не нули.
+    #[test]
+    fn a_report_without_now_shows_dashes() {
+        let report = WeatherReport {
+            now: None,
+            ..new_york_report()
+        };
+        let view = weather_view(&report, WeatherUnits::default(), report.fetched_at, Some(0));
+        assert_eq!(view.temperature, "—");
+        assert_eq!(view.feels_like, None);
+        assert_eq!(view.description, None);
+        assert_eq!(view.sky, Sky::Unknown);
+        assert!(
+            view.rows
+                .iter()
+                .filter(|(name, _)| !matches!(*name, "Восход" | "Закат"))
+                .all(|(_, value)| value.is_none())
+        );
     }
 }
