@@ -58,7 +58,8 @@
       "PowerShell(\"--- git:\"; git status --short; git status -sb | Select-Object -First 1; \"--- незакоммиченного: $\\(\\(git status --porcelain | Measure-Object\\).Count\\) файлов\"; \"--- процессы savio: $\\(@\\(Get-Process savio -ErrorAction SilentlyContinue\\).Count\\)\"; \"--- контейнеры docker: $\\(\\(docker ps -q 2>$null | Measure-Object\\).Count\\)\"; \"--- последний CI:\"; gh run list --limit 1 --json conclusion,displayTitle 2>&1 | Out-String)",
       "PowerShell(cmd /c \"cargo build 2>&1\" | Select-String -Pattern \"^\\(error|warning\\)|Finished\" | ForEach-Object { $_.Line })",
       "PowerShell(& \"C:\\\\Users\\\\chola\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-chola-OneDrive-Documents-savio\\\\9d813a7b-0ca7-4ca4-8af8-f2cb90920bd6\\\\scratchpad\\\\drive.ps1\" shot -Name \"01-start-520\")",
-      "PowerShell(cmd /c \"cargo test the_crescent_stays_inside_the_moon 2>&1\" | Select-String -Pattern \"^test |test result|panicked|точка серпа|толщина|^error\" | ForEach-Object { $_.Line })"
+      "PowerShell(cmd /c \"cargo test the_crescent_stays_inside_the_moon 2>&1\" | Select-String -Pattern \"^test |test result|panicked|точка серпа|толщина|^error\" | ForEach-Object { $_.Line })",
+      "PowerShell(\"git:\"; git status --short; \"savio: $\\(@\\(Get-Process savio -ErrorAction SilentlyContinue\\).Count\\)\"; \"docker: $\\(\\(docker ps -q 2>$null | Measure-Object\\).Count\\)\")"
     ]
   }
 }

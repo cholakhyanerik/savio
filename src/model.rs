@@ -1183,6 +1183,12 @@ pub enum Event {
     /// крупному — без коробки каждое событие прогресса загрузки таскало бы
     /// по каналу место под погоду.
     Weather(Box<WeatherReport>),
+    /// Что происходит с раздачей файлов на телефон.
+    ///
+    /// Одним вариантом со своим перечислением внутри, а не семью соседями
+    /// здесь: у раздачи свой приёмник, и остальным приёмникам хватает одной
+    /// строки, чтобы честно сказать «это не ко мне».
+    Share(ShareEvent),
 }
 
 /// Похожа ли строка на ссылку, которую есть смысл отдавать yt-dlp.
@@ -2737,9 +2743,155 @@ pub fn weather_view(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Раздача файлов на телефон
+// ---------------------------------------------------------------------------
+
+/// Сколько передач помнит экран «Телефон».
+///
+/// Потолок по Правилу 1, как у журнала: полсотни фотографий, отправленных
+/// разом, — обычное дело, а раздача может идти весь вечер.
+pub const TRANSFER_LIMIT: usize = 40;
+
+/// Сколько подключившихся устройств помнит экран.
+pub const VISITOR_LIMIT: usize = 8;
+
+/// Адрес, по которому телефон откроет страницу раздачи.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShareAddress {
+    /// Полный адрес с ключом: его показывают, копируют и кладут в QR-код.
+    pub url: String,
+    /// Подпись для выбора, когда адресов несколько: «192.168.1.42 · Wi-Fi».
+    ///
+    /// Имя интерфейса обязательно: у машины с VPN, WSL или виртуальной машиной
+    /// адресов бывает пять, и по одним числам не понять, какой из них Wi-Fi.
+    pub label: String,
+}
+
+impl ShareAddress {
+    pub fn new(ip: std::net::Ipv4Addr, port: u16, key: &str, interface: &str) -> Self {
+        Self {
+            url: format!("http://{ip}:{port}/?k={key}"),
+            label: if interface.is_empty() {
+                ip.to_string()
+            } else {
+                format!("{ip} · {interface}")
+            },
+        }
+    }
+}
+
+/// Куда идёт файл.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransferDirection {
+    /// Телефон отправляет, компьютер принимает.
+    ToComputer,
+    /// Телефон забирает из папки раздачи.
+    ToPhone,
+}
+
+impl TransferDirection {
+    pub fn label(self) -> &'static str {
+        match self {
+            TransferDirection::ToComputer => "На компьютер",
+            TransferDirection::ToPhone => "На телефон",
+        }
+    }
+}
+
+/// Новости раздачи — всё, что UI узнаёт о ней от движка.
+#[derive(Clone, Debug)]
+pub enum ShareEvent {
+    /// Сервер слушает. Адресов хотя бы один: без адреса телефону некуда
+    /// идти, и тогда вместо этого приходит `Stopped`.
+    Ready(Vec<ShareAddress>),
+    /// Страницу открыло устройство: «Android · 192.168.1.50».
+    ///
+    /// Это единственное доказательство того, что раздача видна снаружи.
+    /// Успешный `bind` его не заменяет: слушать брандмауэр разрешает всегда,
+    /// а пускать — нет (Правило 6).
+    Visitor(String),
+    /// Файл пошёл. Номер сквозной на всю раздачу.
+    Started {
+        id: u64,
+        direction: TransferDirection,
+        name: String,
+        /// Сколько байт будет всего. Известно всегда, но `Option` ради
+        /// честности: ноль здесь читался бы как «пустой файл».
+        total: Option<u64>,
+    },
+    /// Сколько байт уже прошло.
+    Progress { id: u64, done: u64 },
+    /// Файл дошёл. `name` — имя, под которым он лёг в папку: при совпадении
+    /// с уже лежащим к нему дописывается «(2)», и показать надо настоящее.
+    Finished { id: u64, name: String },
+    /// Передача оборвалась, и вот почему — словами для человека.
+    Failed { id: u64, message: String },
+    /// Раздача кончилась не по кнопке: порт не открылся, адресов нет.
+    Stopped(String),
+}
+
+/// Сколько прошло из скольки: «12.4 МБ из 1.2 ГБ».
+///
+/// Собирается на приёме события, а не в кадре: прогресс приезжает
+/// несколько раз в секунду, кадров — шестьдесят (Правило 1).
+pub fn transfer_line(done: u64, total: Option<u64>) -> String {
+    match total {
+        Some(total) if done < total => format!("{} из {}", human_bytes(done), human_bytes(total)),
+        Some(total) => human_bytes(total),
+        None => human_bytes(done),
+    }
+}
+
+/// Модули QR-кода: сторона и построчно «тёмный ли».
+///
+/// Кодирование чистое и дорогое по меркам кадра, поэтому зовут его один раз
+/// на адрес, а рисует результат текстура. `None` — строка не влезла даже в
+/// самую большую версию кода; у адреса в полсотни знаков так не бывает.
+pub fn qr_modules(text: &str) -> Option<(usize, Vec<bool>)> {
+    let code = qrcode::QrCode::new(text.as_bytes()).ok()?;
+    let width = code.width();
+    let dark = code
+        .into_colors()
+        .into_iter()
+        .map(|color| color == qrcode::Color::Dark)
+        .collect();
+    Some((width, dark))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn share_address_names_its_interface() {
+        let ip = std::net::Ipv4Addr::new(192, 168, 1, 42);
+        let address = ShareAddress::new(ip, 8080, "abc", "Wi-Fi");
+        assert_eq!(address.url, "http://192.168.1.42:8080/?k=abc");
+        assert_eq!(address.label, "192.168.1.42 · Wi-Fi");
+        // Имя интерфейса бывает неизвестно (адрес подсказал маршрут, а не
+        // список интерфейсов) — тогда без висящей точки.
+        assert_eq!(ShareAddress::new(ip, 8080, "abc", "").label, "192.168.1.42");
+    }
+
+    #[test]
+    fn transfer_line_counts_up_to_the_total() {
+        assert_eq!(transfer_line(0, Some(2048)), "0 Б из 2.0 КБ");
+        // Дошедший файл — просто размер: «2 КБ из 2 КБ» читается как недосказанность.
+        assert_eq!(transfer_line(2048, Some(2048)), "2.0 КБ");
+        assert_eq!(transfer_line(1024, None), "1.0 КБ");
+    }
+
+    #[test]
+    fn qr_code_is_square_and_has_dark_modules() {
+        let (width, dark) = qr_modules("http://192.168.1.42:8080/?k=abcdefghjkmn").expect("адрес влез");
+        assert_eq!(dark.len(), width * width);
+        // Версия 1 — это 21 модуль; адрес в сорок с лишним знаков в неё не
+        // помещается, и код обязан вырасти, а не обрезать строку.
+        assert!(width > 21, "ширина {width}");
+        // Три поисковых узора в углах — левый верхний модуль тёмный всегда.
+        assert!(dark[0]);
+    }
 
     #[test]
     fn url_accepts_real_links() {

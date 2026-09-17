@@ -12,14 +12,16 @@ use crate::engine::setup;
 use crate::engine::{self, Handle, MetaTask, metadata};
 use crate::engine::monitor;
 use crate::engine::power;
+use crate::engine::share;
 use crate::engine::weather;
 use crate::model::{
     BALANCED_PLAN, CheckStatus, CookieSource, DownloadId, DownloadOptions, Event, FAVORITES_LIMIT,
     Format, GpuInfo, MediaInfo, Metric, PerfSample, Place, PowerMode, PowerModes, PowerState,
-    PressureUnit, Progress, Quality, Request, Section, SectionError, SectionPlan, Sky, SubLang,
-    SystemReport, TRACE_LIMIT, Tag, TempUnit, Thumbnail, Trace, WeatherReport, WeatherUnits,
-    WeatherView, WindUnit, human_bytes, human_duration, human_speed, looks_like_url, meta_kind,
-    parse_section, weather_view,
+    PressureUnit, Progress, Quality, Request, Section, SectionError, SectionPlan, ShareAddress,
+    ShareEvent, Sky, SubLang, SystemReport, TRACE_LIMIT, TRANSFER_LIMIT, Tag, TempUnit, Thumbnail,
+    Trace, TransferDirection, VISITOR_LIMIT, WeatherReport, WeatherUnits, WeatherView, WindUnit,
+    human_bytes, human_duration, human_speed, looks_like_url, meta_kind, parse_section, qr_modules,
+    transfer_line, weather_view,
 };
 use crate::motion;
 use crate::theme;
@@ -367,10 +369,18 @@ enum Tab {
     Machine,
     /// Живёт в меню «Ещё», а не в дорожке.
     Weather,
+    /// Раздача файлов на телефон. Тоже в меню «Ещё».
+    Phone,
 }
 
 /// Все разделы — для тех, кто обязан спросить про каждый (см. `tab_arrival`).
-const ALL_TABS: [Tab; 4] = [Tab::Download, Tab::Metadata, Tab::Machine, Tab::Weather];
+const ALL_TABS: [Tab; 5] = [
+    Tab::Download,
+    Tab::Metadata,
+    Tab::Machine,
+    Tab::Weather,
+    Tab::Phone,
+];
 
 /// Что стоит в дорожке шапки: раздел или вход в меню «Ещё».
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -399,7 +409,11 @@ const TRACK: [(TrackItem, &str); 4] = [
 ///
 /// Пустым меню быть не должно — оно обещало бы то, чего нет (задача 41 реестра
 /// так и записала: кнопка появляется вместе с первым четвёртым разделом).
-const MORE_TABS: [(Tab, &str); 1] = [(Tab::Weather, "Погода")];
+///
+/// «Телефон», а не «Найти смартфон»: компьютер телефон не ищет и найти не
+/// может — слушает Savio, а подключается телефон (подробности у
+/// `engine::share`). Обещать в подписи невыполнимое нельзя.
+const MORE_TABS: [(Tab, &str); 2] = [(Tab::Weather, "Погода"), (Tab::Phone, "Телефон")];
 
 /// Что случилось в шапке за кадр.
 struct HeaderRow {
@@ -1047,7 +1061,8 @@ impl MetaPanel {
                 | Event::Perf(_)
                 | Event::WeatherPlace(_)
                 | Event::WeatherPlaces(_)
-                | Event::Weather(_) => {}
+                | Event::Weather(_)
+                | Event::Share(_) => {}
             }
         }
 
@@ -1152,7 +1167,8 @@ impl SystemPanel {
                 | Event::Perf(_)
                 | Event::WeatherPlace(_)
                 | Event::WeatherPlaces(_)
-                | Event::Weather(_) => {}
+                | Event::Weather(_)
+                | Event::Share(_) => {}
             }
         }
 
@@ -1299,7 +1315,8 @@ impl PowerPanel {
                 | Event::Perf(_)
                 | Event::WeatherPlace(_)
                 | Event::WeatherPlaces(_)
-                | Event::Weather(_) => {}
+                | Event::Weather(_)
+                | Event::Share(_) => {}
             }
         }
 
@@ -1651,7 +1668,8 @@ impl WeatherPanel {
                 | Event::SystemReport(_)
                 | Event::Power(_)
                 | Event::Perf(_)
-                | Event::WeatherPlaces(_) => {}
+                | Event::WeatherPlaces(_)
+                | Event::Share(_) => {}
             }
         }
 
@@ -1726,7 +1744,8 @@ impl WeatherPanel {
                 | Event::Power(_)
                 | Event::Perf(_)
                 | Event::WeatherPlace(_)
-                | Event::Weather(_) => {}
+                | Event::Weather(_)
+                | Event::Share(_) => {}
             }
         }
 
@@ -1734,6 +1753,360 @@ impl WeatherPanel {
             self.search_rx = None;
             self.searching = false;
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Раздача файлов на телефон
+// ---------------------------------------------------------------------------
+
+/// Сколько ждём первого подключения, прежде чем подсказка про брандмауэр
+/// станет предупреждением.
+///
+/// Полминуты — столько уходит на то, чтобы достать телефон, навести камеру
+/// и дождаться страницы. Раньше жёлтая плашка пугала бы того, кто ещё не
+/// успел; позже человек уже решил бы, что Savio сломан.
+const SHARE_QUIET_SECS: f64 = 30.0;
+
+/// Сторона QR-кода на экране, точек. Камера телефона читает его с полуметра.
+const QR_SIDE: f32 = 184.0;
+
+/// Тихая зона вокруг кода, в модулях. Четыре — требование стандарта: без неё
+/// край кода сливается с карточкой, и часть камер его не находит.
+const QR_QUIET: usize = 4;
+
+/// Что объяснить, если телефон так и не подключился.
+///
+/// Savio узнать это сам не может: подключение к своему же адресу идёт мимо
+/// брандмауэра, и изнутри раздача видна всегда (см. `engine::share`). Отсюда
+/// слова, а не проверка.
+const SHARE_HELP: &str = "Страница не открывается на телефоне? Проверьте, что телефон \
+    в той же сети Wi-Fi, что и компьютер, — не в мобильном интернете и не в гостевой \
+    сети. Если система спрашивала, пускать ли Savio в сеть, — разрешите (в Windows — \
+    для частных сетей): брандмауэр мог закрыть вход, а в сети с профилем \
+    «Общедоступная» входящие подключения закрыты всегда. В гостевых сетях кафе и \
+    отелей устройства друг друга не видят вовсе — там поможет только другая сеть, \
+    например точка доступа на самом телефоне.";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShareState {
+    Off,
+    /// Поток запущен, адресов ещё нет.
+    Starting,
+    On,
+}
+
+/// Чем кончилась передача.
+enum TransferOutcome {
+    Going,
+    Done,
+    Failed(String),
+}
+
+/// Строка списка передач. Все строки готовые: прогресс приезжает несколько
+/// раз в секунду, а кадров шестьдесят (Правило 1).
+struct TransferRow {
+    id: u64,
+    direction: TransferDirection,
+    name: String,
+    total: Option<u64>,
+    /// Доля для полосы. `None` — неизвестна.
+    fraction: Option<f32>,
+    /// «На компьютер · 12.4 МБ из 1.2 ГБ».
+    line: String,
+    outcome: TransferOutcome,
+}
+
+impl TransferRow {
+    fn rebuild(&mut self, done: u64) {
+        self.fraction = self
+            .total
+            .filter(|total| *total > 0)
+            .map(|total| (done as f32 / total as f32).clamp(0.0, 1.0));
+        self.line = format!("{} · {}", self.direction.label(), transfer_line(done, self.total));
+    }
+}
+
+/// Состояние экрана «Телефон».
+///
+/// Устроено как `MonitorPanel`: поток, свой приёмник и останов, когда на
+/// экран не смотрят. Причина останова здесь серьёзнее, чем там: забытый
+/// опрос греет ноутбук, а забытая раздача держит папку открытой всей сети.
+struct SharePanel {
+    state: ShareState,
+    handle: Option<share::Handle>,
+    rx: Option<Receiver<Event>>,
+    /// Своя папка раздачи. `None` — папка сохранения загрузок.
+    own_dir: Option<PathBuf>,
+    own_dir_display: String,
+    /// Какая папка раздаётся сейчас, для подписи. Своей строкой, потому что
+    /// папку сохранения могут сменить на экране загрузки посреди раздачи,
+    /// а сервер раздаёт ту, с которой запущен.
+    serving_display: String,
+    addresses: Vec<ShareAddress>,
+    picked: usize,
+    /// QR-код выбранного адреса. Текстура, а не тысяча прямоугольников
+    /// в кадре: собирается один раз на адрес.
+    qr: Option<egui::TextureHandle>,
+    /// Когда раздача заработала, по часам egui.
+    started_at: f64,
+    visitors: Vec<String>,
+    /// «Android · 192.168.1.50, iPhone · 192.168.1.51» — готовой строкой.
+    visitors_line: String,
+    /// Старые сверху, свежие снизу; рисуются в обратном порядке.
+    transfers: Vec<TransferRow>,
+    /// Что сказать о прошлой раздаче: почему остановилась.
+    note: Option<(String, egui::Color32)>,
+    copied_at: Option<f64>,
+}
+
+impl SharePanel {
+    fn new() -> Self {
+        Self {
+            state: ShareState::Off,
+            handle: None,
+            rx: None,
+            own_dir: None,
+            own_dir_display: String::new(),
+            serving_display: String::new(),
+            addresses: Vec::new(),
+            picked: 0,
+            qr: None,
+            started_at: 0.0,
+            visitors: Vec::new(),
+            visitors_line: String::new(),
+            transfers: Vec::new(),
+            note: None,
+            copied_at: None,
+        }
+    }
+
+    fn running(&self) -> bool {
+        self.state != ShareState::Off
+    }
+
+    fn start(&mut self, dir: PathBuf, ctx: &egui::Context) {
+        self.stop(None);
+        let (tx, rx) = channel();
+        let notify_ctx = ctx.clone();
+        self.serving_display = display_dir(Some(&dir));
+        self.handle = Some(share::start(dir, tx, move || notify_ctx.request_repaint()));
+        self.rx = Some(rx);
+        self.state = ShareState::Starting;
+        self.note = None;
+        self.visitors.clear();
+        self.visitors_line.clear();
+        self.transfers.clear();
+    }
+
+    /// Останавливает раздачу. `why` — что сказать под кнопкой.
+    fn stop(&mut self, why: Option<&str>) {
+        if let Some(handle) = self.handle.take() {
+            handle.stop();
+        }
+        // Приёмник бросаем вместе с ручкой: исходы оборванных передач сюда
+        // уже не дойдут, поэтому их и помечаем сами.
+        self.rx = None;
+        for row in &mut self.transfers {
+            if matches!(row.outcome, TransferOutcome::Going) {
+                row.outcome = TransferOutcome::Failed("Раздача остановлена — передача не закончена.".to_owned());
+            }
+        }
+        if self.running() && let Some(why) = why {
+            self.note = Some((why.to_owned(), theme::TEXT_MUTED));
+        }
+        self.state = ShareState::Off;
+        self.addresses.clear();
+        self.qr = None;
+        self.copied_at = None;
+    }
+
+    /// Останавливает раздачу, когда экран закрыли, и просит кадр к сроку
+    /// подсказки про брандмауэр.
+    ///
+    /// Зовётся на каждом кадре из `ui`, а не из экрана, — по той же причине,
+    /// что у монитора: закрытый экран не рисуется, и заметить своё закрытие
+    /// ему нечем.
+    fn watch(&mut self, open: bool, ctx: &egui::Context) {
+        if !open {
+            if self.running() {
+                self.stop(Some(
+                    "Раздача остановлена: вы ушли с экрана «Телефон». Папка больше \
+                     не открыта для сети.",
+                ));
+            }
+            return;
+        }
+        // Подсказка сменится на предупреждение сама, но только если в этот
+        // момент будет кадр: egui рисует по вводу, а человек в это время
+        // смотрит в телефон, а не водит мышью.
+        if self.state == ShareState::On && self.visitors.is_empty() {
+            let left = SHARE_QUIET_SECS - (ctx.input(|i| i.time) - self.started_at);
+            if left > 0.0 {
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64(left));
+            }
+        }
+    }
+
+    /// Выбирает адрес для показа.
+    fn pick(&mut self, index: usize, ctx: &egui::Context) {
+        if index < self.addresses.len() && index != self.picked {
+            self.picked = index;
+            self.copied_at = None;
+            self.rebuild_qr(ctx);
+        }
+    }
+
+    fn rebuild_qr(&mut self, ctx: &egui::Context) {
+        self.qr = self.addresses.get(self.picked).and_then(|address| {
+            let (width, dark) = qr_modules(&address.url)?;
+            let side = width + QR_QUIET * 2;
+            let mut pixels = vec![theme::QR_LIGHT; side * side];
+            for (index, _) in dark.iter().enumerate().filter(|(_, dark)| **dark) {
+                let x = index % width + QR_QUIET;
+                let y = index / width + QR_QUIET;
+                pixels[y * side + x] = theme::QR_DARK;
+            }
+            // Ближайший сосед, а не сглаживание: модуль в несколько точек,
+            // размытый по краям, камера читает хуже.
+            Some(ctx.load_texture(
+                "savio-share-qr",
+                egui::ColorImage::new([side, side], pixels),
+                egui::TextureOptions::NEAREST,
+            ))
+        });
+    }
+
+    fn drain(&mut self, ctx: &egui::Context) {
+        let mut events = Vec::new();
+        let mut disconnected = false;
+
+        if let Some(rx) = &self.rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(event) => events.push(event),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        for event in events {
+            match event {
+                Event::Share(event) => self.accept(event, ctx),
+                // Остальное ходит по чужим каналам. Перечислено явно, а не
+                // через `_`, чтобы компилятор и дальше требовал разбирать
+                // новые варианты `Event` во всех приёмниках.
+                Event::Info(_)
+                | Event::Thumbnail(_)
+                | Event::Stage(_)
+                | Event::Progress(_)
+                | Event::Log(_)
+                | Event::Done { .. }
+                | Event::Failed { .. }
+                | Event::Ready
+                | Event::Warning(_)
+                | Event::Notice(_)
+                | Event::Tags(_)
+                | Event::Cleaned(_)
+                | Event::Versions(_)
+                | Event::SystemReport(_)
+                | Event::Perf(_)
+                | Event::Power(_)
+                | Event::WeatherPlace(_)
+                | Event::WeatherPlaces(_)
+                | Event::Weather(_) => {}
+            }
+        }
+
+        if disconnected && self.running() {
+            // Поток кончился сам, не сказав почему. Держать экран в состоянии
+            // «раздача идёт» при мёртвом сервере — ровно то враньё, которого
+            // здесь быть не должно.
+            self.stop(None);
+            self.note = Some((
+                "Раздача прекратилась. Запустите её заново.".to_owned(),
+                theme::STATE_WARNING,
+            ));
+        }
+    }
+
+    fn accept(&mut self, event: ShareEvent, ctx: &egui::Context) {
+        match event {
+            ShareEvent::Ready(addresses) => {
+                self.state = ShareState::On;
+                self.addresses = addresses;
+                self.picked = 0;
+                self.started_at = ctx.input(|i| i.time);
+                self.rebuild_qr(ctx);
+            }
+            ShareEvent::Visitor(who) => {
+                if !self.visitors.contains(&who) {
+                    if self.visitors.len() >= VISITOR_LIMIT {
+                        self.visitors.remove(0);
+                    }
+                    self.visitors.push(who);
+                    self.visitors_line = self.visitors.join(", ");
+                }
+            }
+            ShareEvent::Started { id, direction, name, total } => {
+                if self.transfers.len() >= TRANSFER_LIMIT {
+                    // Уходит старейшая законченная; идущие не трогаем, пока
+                    // есть что убрать кроме них.
+                    let index = self
+                        .transfers
+                        .iter()
+                        .position(|row| !matches!(row.outcome, TransferOutcome::Going))
+                        .unwrap_or(0);
+                    self.transfers.remove(index);
+                }
+                let mut row = TransferRow {
+                    id,
+                    direction,
+                    name,
+                    total,
+                    fraction: None,
+                    line: String::new(),
+                    outcome: TransferOutcome::Going,
+                };
+                row.rebuild(0);
+                self.transfers.push(row);
+            }
+            ShareEvent::Progress { id, done } => {
+                if let Some(row) = self.row(id) {
+                    row.rebuild(done);
+                }
+            }
+            ShareEvent::Finished { id, name } => {
+                if let Some(row) = self.row(id) {
+                    row.name = name;
+                    row.outcome = TransferOutcome::Done;
+                    row.fraction = Some(1.0);
+                    row.line = format!(
+                        "{} · готово · {}",
+                        row.direction.label(),
+                        row.total.map(human_bytes).unwrap_or_default()
+                    );
+                }
+            }
+            ShareEvent::Failed { id, message } => match self.row(id) {
+                Some(row) => row.outcome = TransferOutcome::Failed(message),
+                // Отказ до начала передачи (в папку нельзя писать): строки
+                // ещё нет, а сказать надо.
+                None => self.note = Some((message, theme::STATE_ERROR)),
+            },
+            ShareEvent::Stopped(message) => {
+                self.stop(None);
+                self.note = Some((message, theme::STATE_ERROR));
+            }
+        }
+    }
+
+    fn row(&mut self, id: u64) -> Option<&mut TransferRow> {
+        self.transfers.iter_mut().find(|row| row.id == id)
     }
 }
 
@@ -1908,7 +2281,8 @@ impl MonitorPanel {
                 | Event::SystemReport(_)
                 | Event::WeatherPlace(_)
                 | Event::WeatherPlaces(_)
-                | Event::Weather(_) => {}
+                | Event::Weather(_)
+                | Event::Share(_) => {}
             }
         }
 
@@ -2430,6 +2804,8 @@ pub struct SavioApp {
     power: PowerPanel,
     /// Состояние вкладки «Погода».
     weather: WeatherPanel,
+    /// Состояние экрана «Телефон».
+    share: SharePanel,
     /// Открыто ли меню «Ещё» в шапке.
     more_open: bool,
     /// Чем eframe рисует это окно.
@@ -2567,6 +2943,11 @@ impl SavioApp {
                 saved.weather_units,
                 saved.weather_favorites,
             ),
+            // Своя папка раздачи не запоминается: запоминаемая настройка
+            // встречает человека при запуске, а папку, открытую для всей
+            // сети, лучше выбирать осознанно, а не находить выбранной неделю
+            // назад. По умолчанию — папка сохранения.
+            share: SharePanel::new(),
             more_open: false,
             gpu: None,
             history: History::default(),
@@ -3332,7 +3713,8 @@ impl SavioApp {
                 | Event::Perf(_)
                 | Event::WeatherPlace(_)
                 | Event::WeatherPlaces(_)
-                | Event::Weather(_) => {}
+                | Event::Weather(_)
+                | Event::Share(_) => {}
             }
         }
 
@@ -3410,7 +3792,8 @@ impl SavioApp {
                 | Event::Perf(_)
                 | Event::WeatherPlace(_)
                 | Event::WeatherPlaces(_)
-                | Event::Weather(_) => {}
+                | Event::Weather(_)
+                | Event::Share(_) => {}
             }
         }
 
@@ -3617,6 +4000,14 @@ impl eframe::App for SavioApp {
             handle.cancel();
         }
         self.preview.stop();
+        // Раздачу тоже, и с ожиданием: сокеты закроет и смерть процесса, но
+        // недопринятый файл удаляет только поток приёма, увидевший остановку,
+        // а `process::exit` сразу за нами ему этого не дал бы. Ждём не дольше
+        // секунды и только пока что-то передаётся — в покое выход мгновенный.
+        if let Some(handle) = &self.share.handle {
+            handle.stop_and_wait(std::time::Duration::from_secs(1));
+        }
+        self.share.stop(None);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -3633,6 +4024,7 @@ impl eframe::App for SavioApp {
             self.remember();
         }
         self.weather.drain_search();
+        self.share.drain(ui.ctx());
         self.drain_versions();
         self.drain_gpu_errors();
 
@@ -3652,6 +4044,9 @@ impl eframe::App for SavioApp {
         // тогда, когда вкладка ещё не рисовалась, а закрытая вкладка не
         // должна просить ни кадра.
         self.weather.watch(self.tab == Tab::Weather, ui.ctx());
+        // Раздача — по той же причине и строже: ушли с экрана — папка больше
+        // не открыта для сети.
+        self.share.watch(self.tab == Tab::Phone, ui.ctx());
 
         if self.maximize_pending {
             self.maximize_pending = false;
@@ -3683,7 +4078,7 @@ impl eframe::App for SavioApp {
         let pull = match self.tab {
             Tab::Download => -theme::DRIFT_PULL,
             Tab::Metadata => 0.0,
-            Tab::Machine | Tab::Weather => theme::DRIFT_PULL,
+            Tab::Machine | Tab::Weather | Tab::Phone => theme::DRIFT_PULL,
         };
         let shift = ui.ctx().animate_value_with_time(
             egui::Id::new("backdrop-shift"),
@@ -3719,6 +4114,7 @@ impl eframe::App for SavioApp {
                         Tab::Metadata => self.metadata_tab(ui),
                         Tab::Machine => self.machine_tab(ui),
                         Tab::Weather => self.weather_tab(ui),
+                        Tab::Phone => self.phone_tab(ui),
                     });
             });
 
@@ -7433,6 +7829,426 @@ impl SavioApp {
             self.remember();
         }
     }
+}
+
+impl SavioApp {
+    /// Экран «Телефон»: раздача слева, передачи справа.
+    ///
+    /// Колонки по той же причине, что у погоды: на список передач смотрят
+    /// рядом с адресом, пока телефон отправляет, а не под ним, прокрутив
+    /// экран. Ниже [`theme::TWO_COLUMN_MIN`] колонки встают друг под друга.
+    fn phone_tab(&mut self, ui: &mut egui::Ui) {
+        const GAP: f32 = 18.0;
+        if ui.available_width() < theme::TWO_COLUMN_MIN {
+            self.share_card(ui);
+            ui.add_space(GAP);
+            self.transfers_card(ui);
+            return;
+        }
+
+        let total = ui.available_width();
+        let rail = theme::RAIL_WIDTH;
+        let main = total - rail - GAP;
+
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = GAP;
+            for (width, which) in [(main, true), (rail, false)] {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(width, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        // Ширина с обеих сторон — по той же причине, что
+                        // у колонок `download_tab`.
+                        ui.set_min_width(width);
+                        ui.set_max_width(width);
+                        if which {
+                            self.share_card(ui);
+                        } else {
+                            self.transfers_card(ui);
+                        }
+                    },
+                );
+            }
+        });
+    }
+
+    /// Карточка раздачи: папка, кнопка, адрес с QR-кодом и кто подключился.
+    fn share_card(&mut self, ui: &mut egui::Ui) {
+        let speed = self.speed;
+        let now = ui.ctx().input(|i| i.time);
+        let mut toggle = false;
+        let mut choose_dir = false;
+        let mut open_dir_clicked = false;
+        let mut picked: Option<usize> = None;
+        let mut copy = false;
+
+        // Какая папка будет раздана, если нажать сейчас.
+        let dir = self.share.own_dir.clone().or_else(|| self.out_dir.clone());
+
+        theme::card_rising(ui, self.appear(0), |ui| {
+            let panel = &self.share;
+            let running = panel.running();
+
+            // Высота ряду задаётся явно, а плашка кладётся первой справа
+            // налево — обе грабли разобраны у `SavioApp::power_card`.
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), theme::CONTROL_HEIGHT),
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
+                    let (label, color) = match panel.state {
+                        ShareState::Off => ("Выключена", theme::TEXT_MUTED),
+                        ShareState::Starting => ("Запускается", theme::TEXT_SECONDARY),
+                        ShareState::On => ("Раздача идёт", theme::STATE_SUCCESS),
+                    };
+                    status_pill(ui, label, color);
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new("Телефон")
+                                    .font(theme::display(21.0))
+                                    .color(theme::TEXT_PRIMARY),
+                            )
+                            .truncate(),
+                        );
+                    });
+                },
+            );
+            ui.add_space(4.0);
+            note(
+                ui,
+                "Телефон и компьютер — в одной сети Wi-Fi. Savio откроет страницу, \
+                 на которую телефон зайдёт браузером, и файлы пойдут напрямую: \
+                 без облака, без провода и без пережатия.",
+                theme::TEXT_SECONDARY,
+            );
+
+            ui.add_space(14.0);
+            field_label(ui, "Папка раздачи");
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), theme::CONTROL_HEIGHT),
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
+                    open_dir_clicked = ui
+                        .add_enabled(dir.is_some(), pill("Открыть"))
+                        .on_hover_text("Показать папку раздачи в проводнике.")
+                        .clicked();
+
+                    let display = if running {
+                        panel.serving_display.as_str()
+                    } else if panel.own_dir.is_some() {
+                        panel.own_dir_display.as_str()
+                    } else {
+                        self.out_dir_display.as_str()
+                    };
+                    let color = if dir.is_some() {
+                        theme::TEXT_SECONDARY
+                    } else {
+                        theme::STATE_WARNING
+                    };
+                    let size = egui::vec2(ui.available_width(), theme::CONTROL_HEIGHT);
+                    choose_dir = ui
+                        .add_enabled_ui(!running, |ui| {
+                            sized_with_touch(ui, size, speed, |ui| {
+                                ui.add(
+                                    egui::Button::new(egui::RichText::new(display).color(color))
+                                        .truncate(),
+                                )
+                            })
+                        })
+                        .inner
+                        .on_hover_text("Нажмите, чтобы раздать другую папку.")
+                        .on_disabled_hover_text(
+                            "Папку раздачи меняют, когда раздача остановлена.",
+                        )
+                        .clicked();
+                },
+            );
+            ui.add_space(6.0);
+            note(
+                ui,
+                if panel.own_dir.is_some() || running {
+                    "Отсюда телефон забирает файлы, сюда же кладёт свои. Вложенные \
+                     папки не раздаются."
+                } else {
+                    "Сейчас это папка сохранения загрузок. Отсюда телефон забирает \
+                     файлы, сюда же кладёт свои."
+                },
+                theme::TEXT_MUTED,
+            );
+
+            ui.add_space(14.0);
+            let width = ui.available_width();
+            if running {
+                toggle = ui
+                    .add_sized([width, theme::CTA_HEIGHT], egui::Button::new("Остановить"))
+                    .on_hover_text("Закроет страницу для телефона и оборвёт идущие передачи.")
+                    .clicked();
+            } else {
+                toggle = accent_button(
+                    ui,
+                    "Раздать файлы",
+                    width,
+                    dir.is_some(),
+                    "Сначала выберите папку раздачи.",
+                );
+            }
+            ui.add_space(6.0);
+            // Видно без единого щелчка: остановка при уходе с экрана — не
+            // оговорка на всякий случай, а поведение, о которое споткнутся.
+            note(
+                ui,
+                "Раздача остановится сама, если уйти с этого экрана или закрыть Savio.",
+                theme::TEXT_MUTED,
+            );
+
+            if let Some((text, color)) = &panel.note {
+                ui.add_space(10.0);
+                banner(ui, text, *color);
+            }
+
+            if panel.state == ShareState::Starting {
+                ui.add_space(12.0);
+                note(ui, "Открываю порт и ищу адрес компьютера…", theme::TEXT_SECONDARY);
+            }
+
+            let Some(address) = panel.addresses.get(panel.picked) else {
+                return;
+            };
+
+            ui.add_space(16.0);
+            // Код и адрес рядом, пока ширины хватает, и друг под другом — когда
+            // нет. Порог по адресу, а не по подсказке: адрес — сорок знаков
+            // полужирным, около 330 точек, и в колонке уже этого он рвётся
+            // посередине (`…8080/?` на одной строке, `k=…` на другой). Так
+            // и было при пороге в 240 — проверено глазами в окне 520.
+            let beside = ui.available_width() >= QR_SIDE + 350.0;
+            let address_block = |ui: &mut egui::Ui, copy: &mut bool| {
+                field_label(ui, "Адрес для телефона");
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(&address.url)
+                            .font(theme::bold(17.0))
+                            .color(theme::TEXT_PRIMARY),
+                    )
+                    .wrap(),
+                );
+                ui.add_space(6.0);
+                note(
+                    ui,
+                    "Наведите камеру телефона на код или наберите адрес в браузере \
+                     телефона. Браузер напишет «не защищено» — для своей сети это \
+                     нормально.",
+                    theme::TEXT_MUTED,
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    *copy = pill_button(ui, "Скопировать адрес", speed).clicked();
+                    if let Some(at) = panel.copied_at {
+                        let left = COPIED_NOTICE_SECS - (now - at);
+                        if left > 0.0 {
+                            ui.label(
+                                egui::RichText::new("Скопировано")
+                                    .small()
+                                    .color(theme::STATE_SUCCESS),
+                            );
+                            ui.ctx()
+                                .request_repaint_after(std::time::Duration::from_secs_f64(left));
+                        }
+                    }
+                });
+            };
+
+            if beside {
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = 18.0;
+                    qr_image(ui, panel.qr.as_ref());
+                    ui.vertical(|ui| address_block(ui, &mut copy));
+                });
+            } else {
+                qr_image(ui, panel.qr.as_ref());
+                ui.add_space(12.0);
+                address_block(ui, &mut copy);
+            }
+
+            if panel.addresses.len() > 1 {
+                ui.add_space(14.0);
+                field_label(ui, "Адрес компьютера");
+                // Таблетки с переносом, а не дорожка: подписи с именем сети
+                // длинные, и в строку окна 520 не встают и две.
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+                    for (index, other) in panel.addresses.iter().enumerate() {
+                        if choice_pill(ui, &other.label, index == panel.picked, speed).clicked() {
+                            picked = Some(index);
+                        }
+                    }
+                });
+                ui.add_space(6.0);
+                note(
+                    ui,
+                    "Адресов несколько: VPN, WSL и виртуальные машины заводят свои \
+                     сети. Первым стоит самый вероятный; если страница не открывается, \
+                     попробуйте другой.",
+                    theme::TEXT_MUTED,
+                );
+            }
+
+            ui.add_space(14.0);
+            if panel.visitors.is_empty() {
+                if now - panel.started_at < SHARE_QUIET_SECS {
+                    note(ui, "Ждём телефон…", theme::TEXT_SECONDARY);
+                    ui.add_space(6.0);
+                    note(ui, SHARE_HELP, theme::TEXT_MUTED);
+                } else {
+                    // Та же подсказка, но жёлтым: полминуты тишины — уже повод.
+                    banner(ui, SHARE_HELP, theme::STATE_WARNING);
+                }
+            } else {
+                field_label(ui, "Подключились");
+                note(ui, &panel.visitors_line, theme::STATE_SUCCESS);
+            }
+        });
+
+        // Всё исполняем после карточки: внутри замыкания `self` одолжен.
+        let ctx = ui.ctx().clone();
+        if open_dir_clicked && let Some(dir) = &dir {
+            open_dir(dir);
+        }
+        if choose_dir && let Some(picked_dir) = rfd::FileDialog::new().pick_folder() {
+            self.share.own_dir_display = display_dir(Some(&picked_dir));
+            self.share.own_dir = Some(picked_dir);
+        }
+        if toggle {
+            if self.share.running() {
+                self.share.stop(None);
+            } else if let Some(dir) = dir {
+                self.share.start(dir, &ctx);
+            }
+        }
+        if let Some(index) = picked {
+            self.share.pick(index, &ctx);
+        }
+        if copy && let Some(address) = self.share.addresses.get(self.share.picked) {
+            ctx.copy_text(address.url.clone());
+            self.share.copied_at = Some(now);
+        }
+    }
+
+    /// Карточка передач: что идёт, что дошло, что оборвалось.
+    fn transfers_card(&self, ui: &mut egui::Ui) {
+        theme::card_rising(ui, self.appear(1), |ui| {
+            ui.label(
+                egui::RichText::new("Передачи")
+                    .font(theme::display(17.0))
+                    .color(theme::TEXT_PRIMARY),
+            );
+            ui.add_space(8.0);
+
+            if self.share.transfers.is_empty() {
+                note(
+                    ui,
+                    "Пока ничего не передавалось. Здесь появится каждый файл: куда \
+                     он идёт и сколько осталось.",
+                    theme::TEXT_MUTED,
+                );
+                return;
+            }
+
+            for row in self.share.transfers.iter().rev() {
+                ui.add(
+                    egui::Label::new(egui::RichText::new(&row.name).color(theme::TEXT_PRIMARY))
+                        .truncate(),
+                );
+                let color = match row.outcome {
+                    TransferOutcome::Going => theme::TEXT_SECONDARY,
+                    TransferOutcome::Done => theme::STATE_SUCCESS,
+                    TransferOutcome::Failed(_) => theme::TEXT_MUTED,
+                };
+                note(ui, &row.line, color);
+                match &row.outcome {
+                    TransferOutcome::Going => {
+                        ui.add_space(4.0);
+                        let bar = match row.fraction {
+                            Some(fraction) => egui::ProgressBar::new(fraction),
+                            None => egui::ProgressBar::new(0.0).animate(true),
+                        };
+                        ui.add(bar.fill(theme::ACCENT).desired_height(6.0));
+                    }
+                    TransferOutcome::Done => {}
+                    TransferOutcome::Failed(message) => note(ui, message, theme::STATE_ERROR),
+                }
+                ui.add_space(12.0);
+            }
+        });
+    }
+}
+
+/// QR-код адреса. Пока текстуры нет (строка не влезла в код — у адреса так
+/// не бывает), место под код остаётся пустым, а не прыгает.
+fn qr_image(ui: &mut egui::Ui, texture: Option<&egui::TextureHandle>) {
+    let size = egui::vec2(QR_SIDE, QR_SIDE);
+    match texture {
+        Some(texture) => {
+            ui.add(
+                egui::Image::new(texture)
+                    .fit_to_exact_size(size)
+                    .corner_radius(egui::CornerRadius::same(theme::RADIUS_TINY)),
+            );
+        }
+        None => {
+            ui.allocate_exact_size(size, egui::Sense::hover());
+        }
+    }
+}
+
+/// Главная кнопка экрана в акцентной заливке. Возвращает `true`, когда нажали.
+///
+/// Вид тот же, что у «Скачать» (`SavioApp::primary_button`): состояния заданы
+/// через `visuals`, выключенная — приглушённым оранжевым явно, потому что
+/// `ui.disable()` сам её от включённой не отличает (Правило 4).
+fn accent_button(ui: &mut egui::Ui, label: &str, width: f32, enabled: bool, hint: &str) -> bool {
+    ui.scope(|ui| {
+        let v = ui.visuals_mut();
+        let (rest, hover, press) = if enabled {
+            (theme::ACCENT, theme::ACCENT_HOVER, theme::ACCENT_ACTIVE)
+        } else {
+            (theme::ACCENT_DISABLED, theme::ACCENT_DISABLED, theme::ACCENT_DISABLED)
+        };
+        let squeeze = -width * motion::PRESS;
+        for (state, fill, expansion) in [
+            (&mut v.widgets.inactive, rest, 0.0),
+            (&mut v.widgets.hovered, hover, 0.0),
+            (&mut v.widgets.active, press, squeeze),
+        ] {
+            state.weak_bg_fill = fill;
+            state.bg_stroke = egui::Stroke::NONE;
+            state.fg_stroke = egui::Stroke::new(1.0, theme::TEXT_ON_ACCENT);
+            state.corner_radius = egui::CornerRadius::same(theme::RADIUS_PILL);
+            state.expansion = expansion;
+        }
+        v.disabled_alpha = 1.0;
+
+        // В горизонтальном ряду, а не прямо в колонке: растянутая `min_size`
+        // кнопка кладёт подпись по выравниванию раскладки, и в колонке
+        // `top_down(Min)` «Раздать файлы» уезжала к левому краю. «Скачать»
+        // стоит в ряду с «В очередь» и этого не знает. Проверено глазами.
+        ui.horizontal(|ui| {
+            ui.add_enabled(
+                enabled,
+                egui::Button::new(
+                    egui::RichText::new(label)
+                        .font(theme::display(17.0))
+                        .color(theme::TEXT_ON_ACCENT),
+                )
+                .min_size(egui::vec2(width, theme::CTA_HEIGHT)),
+            )
+            .on_disabled_hover_text(hint)
+            .clicked()
+        })
+        .inner
+    })
+    .inner
 }
 
 /// Что сказать под прочерком в карточках погоды.

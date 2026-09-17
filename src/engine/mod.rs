@@ -11,6 +11,7 @@ pub mod monitor;
 pub mod power;
 pub mod settings;
 pub mod setup;
+pub mod share;
 pub mod sha256;
 pub mod thumbnail;
 mod tree;

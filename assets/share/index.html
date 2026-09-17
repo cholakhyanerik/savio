@@ -1,0 +1,355 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#100e0c">
+<title>Savio — обмен файлами</title>
+<!--
+  Страница раздачи Savio. Зашита в бинарник (`include_str!` в engine/share.rs)
+  и отдаётся по адресу `/?k=<ключ>`. Всё внутри одного файла: отдельные стили
+  и скрипты пришлось бы раздавать отдельными маршрутами.
+
+  Имена файлов — чужие данные: они пришли из папки на компьютере и могут
+  содержать что угодно, в том числе разметку. Поэтому в страницу они попадают
+  только через `textContent`, а в адреса — через `encodeURIComponent`.
+  `innerHTML` с именем файла здесь был бы дырой: скрипт из имени увидел бы
+  ключ в адресной строке.
+
+  Цвета — палитра Savio из theme.rs, те же пары текста и фона.
+-->
+<style>
+  :root {
+    --bg: #100e0c;
+    --card: #1b1916;
+    --inner: #141210;
+    --border: #2e2b27;
+    --text: #f9f4ed;
+    --text-2: #dcd3c4;
+    --muted: #bab0a0;
+    --accent: #f6a06b;
+    --accent-hover: #ffc6a5;
+    --on-accent: #402310;
+    --success: #aebf92;
+    --error: #f39a8f;
+    --warning: #e8b96a;
+    --track: #070605;
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 16px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    padding: max(16px, env(safe-area-inset-top)) 16px max(28px, env(safe-area-inset-bottom));
+  }
+  main { max-width: 640px; margin: 0 auto; }
+  header { display: flex; align-items: center; gap: 10px; margin: 4px 4px 18px; }
+  header h1 { font-size: 24px; margin: 0; letter-spacing: 0.2px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--accent); }
+  header .sub { margin-left: auto; color: var(--muted); font-size: 14px; }
+  section {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 24px;
+    padding: 18px;
+    margin-bottom: 14px;
+  }
+  h2 { font-size: 19px; margin: 0 0 4px; }
+  .note { color: var(--muted); font-size: 14px; margin: 0 0 14px; }
+  .row { display: flex; align-items: center; gap: 10px; }
+  .row h2 { margin: 0; }
+  .row .grow { flex: 1; min-width: 0; }
+  .button {
+    display: inline-flex; align-items: center; justify-content: center;
+    min-height: 44px; padding: 0 18px;
+    border-radius: 999px; border: 1px solid #9e9385;
+    background: transparent; color: var(--text);
+    font: inherit; font-size: 15px; text-decoration: none;
+    cursor: pointer; -webkit-tap-highlight-color: transparent;
+  }
+  .button:active { background: var(--inner); }
+  .button.primary {
+    width: 100%; min-height: 52px;
+    background: var(--accent); border-color: var(--accent);
+    color: var(--on-accent); font-size: 17px; font-weight: 600;
+  }
+  .button.primary:active { background: #e08b57; }
+  .button.small { min-height: 36px; padding: 0 14px; font-size: 14px; }
+  input[type=file] { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+  ul { list-style: none; margin: 14px 0 0; padding: 0; }
+  li {
+    background: var(--inner);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 12px 14px;
+    margin-top: 8px;
+  }
+  .name { font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .meta { color: var(--muted); font-size: 13px; }
+  .meta.ok { color: var(--success); }
+  .meta.bad { color: var(--error); }
+  .bar { height: 6px; border-radius: 3px; background: var(--track); margin: 8px 0 4px; overflow: hidden; }
+  .bar > div { height: 100%; width: 0; background: var(--accent); transition: width 0.25s linear; }
+  .actions { display: flex; gap: 8px; margin-top: 10px; }
+  .banner {
+    border-left: 3px solid var(--warning);
+    background: var(--inner);
+    border-radius: 12px;
+    padding: 10px 12px;
+    color: var(--warning);
+    font-size: 14px;
+    margin-top: 12px;
+  }
+  .banner.bad { border-color: var(--error); color: var(--error); }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <span class="dot" aria-hidden="true"></span>
+    <h1>Savio</h1>
+    <span class="sub">обмен файлами</span>
+  </header>
+
+  <div id="stale" class="hidden">
+    <section>
+      <h2>Ссылка устарела</h2>
+      <p class="note">Откройте адрес заново из окна Savio — ключ в нём меняется при каждом запуске раздачи.</p>
+    </section>
+  </div>
+
+  <div id="app">
+    <section>
+      <h2>На компьютер</h2>
+      <p class="note">Фото, видео, музыка — любого размера. Файлы ложатся в папку раздачи как есть, без пережатия.</p>
+      <label class="button primary" for="pick">Выбрать файлы</label>
+      <input id="pick" type="file" multiple>
+      <div id="ios" class="banner hidden">iPhone может пережать видео, выбранное из «Фото». Чтобы отправить оригинал, сохраните ролик в «Файлы» и выберите его оттуда.</div>
+      <div id="awake" class="banner hidden">Не гасите экран и не уходите со страницы, пока файлы идут: браузер телефона может остановить передачу.</div>
+      <ul id="uploads"></ul>
+    </section>
+
+    <section>
+      <div class="row">
+        <h2 class="grow">С компьютера</h2>
+        <button id="refresh" class="button small" type="button">Обновить</button>
+      </div>
+      <p class="note" id="list-note">Загружаю список…</p>
+      <ul id="files"></ul>
+    </section>
+
+    <div id="offline" class="banner bad hidden">Компьютер не отвечает: раздачу остановили, или телефон ушёл из той сети, где компьютер.</div>
+  </div>
+</main>
+
+<script>
+"use strict";
+
+var key = new URLSearchParams(location.search).get("k") || "";
+var queue = [];
+var busy = false;
+
+function $(id) { return document.getElementById(id); }
+
+function withKey(path, extra) {
+  return path + "?k=" + encodeURIComponent(key) + (extra || "");
+}
+
+function bytes(n) {
+  var units = ["Б", "КБ", "МБ", "ГБ", "ТБ"];
+  var i = 0;
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+  return i === 0 ? n + " " + units[0] : n.toFixed(1) + " " + units[i];
+}
+
+function el(tag, className, text) {
+  var node = document.createElement(tag);
+  if (className) node.className = className;
+  // Только textContent: имя файла может быть разметкой.
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+function stale() {
+  $("app").classList.add("hidden");
+  $("stale").classList.remove("hidden");
+}
+
+function offline(on) {
+  $("offline").classList.toggle("hidden", !on);
+}
+
+// ---- Отправка на компьютер ------------------------------------------------
+
+if (/iPhone|iPad|iPod/.test(navigator.userAgent)) {
+  $("ios").classList.remove("hidden");
+}
+
+$("pick").addEventListener("change", function (event) {
+  var files = Array.prototype.slice.call(event.target.files || []);
+  files.forEach(function (file) {
+    var item = el("li");
+    var name = el("div", "name", file.name);
+    var bar = el("div", "bar");
+    var fill = el("div");
+    bar.appendChild(fill);
+    var meta = el("div", "meta", "Ждёт очереди · " + bytes(file.size));
+    item.appendChild(name);
+    item.appendChild(bar);
+    item.appendChild(meta);
+    $("uploads").insertBefore(item, $("uploads").firstChild);
+    queue.push({ file: file, fill: fill, meta: meta, item: item });
+  });
+  // Тот же файл можно выбрать ещё раз.
+  event.target.value = "";
+  next();
+});
+
+// По одному: параллельная отправка десятка роликов по Wi-Fi не быстрее,
+// а оборвавшейся передачей рискует всеми сразу.
+function next() {
+  if (busy) return;
+  var job = queue.shift();
+  if (!job) {
+    $("awake").classList.add("hidden");
+    return;
+  }
+  busy = true;
+  $("awake").classList.remove("hidden");
+  send(job);
+}
+
+function send(job) {
+  var xhr = new XMLHttpRequest();
+  var started = Date.now();
+  xhr.open("PUT", withKey("/upload/" + encodeURIComponent(job.file.name)));
+  job.meta.className = "meta";
+  job.meta.textContent = "Отправляю…";
+
+  xhr.upload.onprogress = function (event) {
+    if (!event.lengthComputable) return;
+    var share = event.total ? event.loaded / event.total : 0;
+    job.fill.style.width = (share * 100).toFixed(1) + "%";
+    var seconds = (Date.now() - started) / 1000;
+    var speed = seconds > 0.5 ? " · " + bytes(Math.round(event.loaded / seconds)) + "/с" : "";
+    job.meta.textContent = bytes(event.loaded) + " из " + bytes(event.total) + speed;
+  };
+
+  xhr.onload = function () {
+    busy = false;
+    if (xhr.status === 200) {
+      var saved = job.file.name;
+      try { saved = JSON.parse(xhr.responseText).name || saved; } catch (e) {}
+      job.fill.style.width = "100%";
+      job.meta.className = "meta ok";
+      job.meta.textContent = saved === job.file.name
+        ? "Готово · " + bytes(job.file.size)
+        : "Готово · сохранён как «" + saved + "»";
+      offline(false);
+      loadFiles();
+    } else if (xhr.status === 403) {
+      stale();
+    } else {
+      failed(job, "Компьютер не принял файл. Попробуйте ещё раз.");
+    }
+    next();
+  };
+
+  xhr.onerror = function () {
+    busy = false;
+    failed(job, "Передача оборвалась. Проверьте, что телефон в той же сети.");
+    offline(true);
+    next();
+  };
+
+  xhr.send(job.file);
+}
+
+function failed(job, text) {
+  job.meta.className = "meta bad";
+  job.meta.textContent = text;
+  var again = el("button", "button small", "Отправить ещё раз");
+  again.type = "button";
+  var actions = el("div", "actions");
+  actions.appendChild(again);
+  job.item.appendChild(actions);
+  again.addEventListener("click", function () {
+    job.item.removeChild(actions);
+    job.fill.style.width = "0";
+    job.meta.className = "meta";
+    job.meta.textContent = "Ждёт очереди · " + bytes(job.file.size);
+    queue.push(job);
+    next();
+  });
+}
+
+window.addEventListener("beforeunload", function (event) {
+  if (busy || queue.length) {
+    event.preventDefault();
+    event.returnValue = "";
+  }
+});
+
+// ---- Забрать с компьютера -------------------------------------------------
+
+function loadFiles() {
+  var request = new XMLHttpRequest();
+  request.open("GET", withKey("/api/files"));
+  request.onload = function () {
+    if (request.status === 403) { stale(); return; }
+    if (request.status !== 200) {
+      $("list-note").textContent = "Список не пришёл. Нажмите «Обновить».";
+      return;
+    }
+    offline(false);
+    var files = [];
+    try { files = JSON.parse(request.responseText); } catch (e) {}
+    showFiles(files);
+  };
+  request.onerror = function () {
+    $("list-note").textContent = "Список не пришёл.";
+    offline(true);
+  };
+  request.send();
+}
+
+function showFiles(files) {
+  var list = $("files");
+  while (list.firstChild) list.removeChild(list.firstChild);
+  $("list-note").textContent = files.length
+    ? "Что лежит в папке раздачи. Свежие сверху."
+    : "Папка раздачи пуста.";
+
+  files.forEach(function (file) {
+    var item = el("li");
+    item.appendChild(el("div", "name", file.name));
+    var when = file.modified
+      ? " · " + new Date(file.modified * 1000).toLocaleString("ru-RU", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })
+      : "";
+    item.appendChild(el("div", "meta", bytes(file.size) + when));
+
+    var path = "/files/" + encodeURIComponent(file.name);
+    var actions = el("div", "actions");
+    var open = el("a", "button small", "Открыть");
+    open.href = withKey(path);
+    open.target = "_blank";
+    open.rel = "noopener";
+    var take = el("a", "button small", "Скачать");
+    take.href = withKey(path, "&dl=1");
+    take.setAttribute("download", file.name);
+    actions.appendChild(open);
+    actions.appendChild(take);
+    item.appendChild(actions);
+    list.appendChild(item);
+  });
+}
+
+$("refresh").addEventListener("click", loadFiles);
+loadFiles();
+</script>
+</body>
+</html>
