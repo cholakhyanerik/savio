@@ -520,6 +520,10 @@ fn stopping_cuts_an_upload_in_flight() {
     let server = live(&dir);
 
     let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, server.port)).expect("подключиться");
+    // Таймаут — сразу, пока подключение живо. После обрыва macOS отвечает на
+    // `setsockopt` «Invalid argument», и тест падал на подготовке проверки,
+    // а не на ней самой (CI 0.27.0; Windows и Linux это пропускают).
+    stream.set_read_timeout(Some(Duration::from_secs(5))).expect("таймаут");
     let head = format!(
         "PUT /upload/big.mp4?k={} HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
         server.key,
@@ -556,7 +560,6 @@ fn stopping_cuts_an_upload_in_flight() {
         other => panic!("ждали обрыва, пришло {other:?}"),
     }
     // Подключение закрыто сервером: чтение не висит до таймаута.
-    stream.set_read_timeout(Some(Duration::from_secs(5))).expect("таймаут");
     let mut rest = Vec::new();
     let cut = Instant::now();
     let _ = stream.read_to_end(&mut rest);

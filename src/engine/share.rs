@@ -418,8 +418,11 @@ const LINGER: Duration = Duration::from_secs(2);
 /// потом бросить сокет. Дочитываем с потолком по времени: иначе клиент,
 /// который не закрывается, держал бы поток.
 fn close_gently(reader: &mut impl Read, writer: &TcpStream) {
-    let _ = writer.shutdown(Shutdown::Write);
+    // Таймаут до `shutdown`, а не после: macOS на `setsockopt` у подключения,
+    // которое уже закрыто, отвечает «Invalid argument» (так упал тест в CI
+    // 0.27.0), и дочитывание осталось бы без потолка.
     let _ = writer.set_read_timeout(Some(LINGER));
+    let _ = writer.shutdown(Shutdown::Write);
     let started = Instant::now();
     let mut sink = [0u8; 16 * 1024];
     while started.elapsed() < LINGER {
