@@ -21,6 +21,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use super::{binaries, weather};
+use crate::i18n::Lang;
 use crate::model::{
     CookieSource, DownloadOptions, FAVORITES_LIMIT, Format, Place, PressureUnit, Quality, TempUnit,
     WeatherUnits, WindUnit,
@@ -116,6 +117,21 @@ pub struct Settings {
     pub weather_units: WeatherUnits,
     /// Избранные места, не больше [`FAVORITES_LIMIT`].
     pub weather_favorites: Vec<Place>,
+    /// Язык интерфейса.
+    ///
+    /// Запоминается по той же причине, что формат и качество: язык — это
+    /// предпочтение человека, а не свойство ссылки, и выставлять его при
+    /// каждом запуске он не должен. Умолчание — русский: он был у Savio
+    /// единственным, и обновление не имеет права молча сменить язык окна.
+    ///
+    /// Переключатель при этом стоит **в шапке**, рядом с номером версии, то
+    /// есть виден без единого щелчка. Это требование, а не вкус: запомненная
+    /// настройка, спрятанная за щелчком, встречает человека своими
+    /// последствиями при запуске, а объяснением — только если он сам полезет
+    /// её искать. У языка цена такой ошибки наибольшая: человек, которому окно
+    /// открылось на незнакомом алфавите, не прочтёт и подписи «Тонкие
+    /// настройки».
+    pub lang: Lang,
 }
 
 impl Default for Settings {
@@ -131,6 +147,7 @@ impl Default for Settings {
             weather_place: None,
             weather_units: WeatherUnits::default(),
             weather_favorites: Vec::new(),
+            lang: Lang::default(),
         }
     }
 }
@@ -344,6 +361,9 @@ fn to_json(settings: &Settings) -> String {
         // помнить» — разные вещи, а по отсутствию ключа их не отличить.
         "cookies": cookies_token(settings.cookies),
         "smooth": settings.smooth,
+        // Двухбуквенный код языка, а не имя варианта: имена принадлежат коду
+        // и переименовываются рефакторингом, а файлу лежать годами.
+        "lang": settings.lang.code(),
         "weather_units": {
             "temp": temp_token(settings.weather_units.temp),
             "wind": wind_token(settings.weather_units.wind),
@@ -461,6 +481,18 @@ fn parse(text: &str) -> Settings {
     // у всех, кто просто обновился.
     if let Some(on) = flag(&value, "smooth") {
         settings.smooth = on;
+    }
+
+    // Язык. Незнакомый код откатывается к русскому, как и всё остальное
+    // непонятное: файл от будущей версии Savio не должен открыть окно на
+    // языке, которого эта сборка не знает, — в ней он вышел бы пустыми
+    // подписями.
+    if let Some(lang) = value
+        .get("lang")
+        .and_then(serde_json::Value::as_str)
+        .and_then(Lang::from_code)
+    {
+        settings.lang = lang;
     }
 
     // Погода. Каждое поле само по себе, как и всё выше: битое место не
@@ -681,8 +713,49 @@ mod tests {
                 pressure: PressureUnit::Hectopascal,
             },
             weather_favorites: vec![nizhny(), new_york()],
+            lang: Lang::Am,
         };
         assert_eq!(parse(&to_json(&settings)), settings);
+    }
+
+    /// Файл от версии до появления языка обязан открываться по-русски.
+    ///
+    /// Умолчание тут не общее «оставить как было», а осмысленное: русский был
+    /// у Savio единственным языком, и обновление не имеет права молча сменить
+    /// язык окна у всех, кто просто обновился.
+    #[test]
+    fn a_file_without_a_language_opens_in_russian() {
+        let text = r#"{"version":1,"format":"mp3"}"#;
+        assert_eq!(parse(text).lang, Lang::Ru);
+    }
+
+    /// Незнакомый код языка откатывается к русскому, а не к первому попавшемуся.
+    ///
+    /// Файл от будущей версии Savio не должен открыть окно на языке, которого
+    /// эта сборка не знает: в ней он вышел бы пустыми подписями, то есть окном
+    /// без единого читаемого слова.
+    #[test]
+    fn an_unknown_language_falls_back_to_russian() {
+        for text in [
+            r#"{"lang":"zz"}"#,
+            r#"{"lang":""}"#,
+            r#"{"lang":42}"#,
+            r#"{"lang":null}"#,
+        ] {
+            assert_eq!(parse(text).lang, Lang::Ru, "на входе {text}");
+        }
+    }
+
+    /// Выбранный язык переживает закрытие окна — ради этого поле и заведено.
+    #[test]
+    fn the_chosen_language_survives_a_restart() {
+        for lang in Lang::ALL {
+            let settings = Settings {
+                lang,
+                ..Settings::default()
+            };
+            assert_eq!(parse(&to_json(&settings)).lang, lang, "{lang:?}");
+        }
     }
 
     fn nizhny() -> Place {
@@ -941,6 +1014,7 @@ mod tests {
             format: Format::Mp3,
             quality: Quality::P1080,
             out_dir: Some(dir.clone()),
+            lang: Lang::En,
             options: DownloadOptions {
                 embed_thumbnail: true,
                 ..DownloadOptions::default()

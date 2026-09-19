@@ -214,6 +214,17 @@ pub const CONTROL_HEIGHT: f32 = 34.0;
 pub const FIELD_HEIGHT: f32 = 42.0;
 /// Высота сегмента в дорожке переключателя.
 pub const SEGMENT_HEIGHT: f32 = 30.0;
+/// Поля по бокам подписи сегмента — против штатных 16 у кнопки.
+///
+/// Урезаны намеренно: в дорожке качества шесть ступеней, и в окне шириной
+/// 520 со штатными полями подписи не влезают в свою долю, раздвигают кнопки
+/// и уносят дорожку за кромку. Живёт здесь, а не в `segment_button`, чтобы
+/// проверка ширины (`the_segment_tracks_fit_the_smallest_window`) считала
+/// по тому же числу: своя копия в тесте разъехалась бы с раскладкой при
+/// первой же правке и молча перестала бы что-либо ловить.
+pub const SEGMENT_PADDING: f32 = 10.0;
+/// Промежуток между сегментами дорожки.
+pub const SEGMENT_GAP: f32 = 2.0;
 /// Ширина правой колонки экрана загрузки.
 pub const RAIL_WIDTH: f32 = 340.0;
 /// Ниже этой ширины правая колонка не помещается и уходит под главную.
@@ -226,12 +237,20 @@ pub const TWO_COLUMN_MIN: f32 = RAIL_WIDTH + 360.0 + 60.0;
 // ---------------------------------------------------------------------------
 // Шрифты
 //
-// Свои, а не те, что кладёт eframe, — и подобраны они парами, потому что
-// кириллицы нет ни в Caprasimo, ни в Figtree: обе гарнитуры латинские.
-// egui подбирает шрифт **на каждый знак отдельно**, идя по списку семейства
-// сверху вниз, так что пара «латинский + кириллический» работает сама собой:
-// «MP4 — видео» набирается Figtree и Nunito одновременно, и это ровно то же,
-// что делает браузер со списком `font-family` из макета.
+// Свои, а не те, что кладёт eframe, — и подобраны они тройками, потому что
+// кириллицы нет ни в Caprasimo, ни в Figtree, а армянского нет ни в одной из
+// четырёх латино-кириллических гарнитур. egui подбирает шрифт **на каждый знак
+// отдельно**, идя по списку семейства сверху вниз, так что тройка
+// «латинский + кириллический + армянский» работает сама собой: «MP4 — видео»
+// набирается Figtree и Nunito одновременно, и это ровно то же, что делает
+// браузер со списком `font-family` из макета.
+//
+// Армянский без своего файла — это ряды пустых прямоугольников, и ничем, кроме
+// глаз, этого не увидеть. Штатный хвост eframe здесь не спасает: у Ubuntu-Light
+// армянских знаков ноль, а Hack (их там 86) стоит только в `Monospace`, а
+// запасной глиф egui подбирает **строго внутри своего семейства**. Числа сняты
+// разбором таблицы `cmap` у самих файлов: из девяти вшитых гарнитур армянский
+// есть ровно у трёх, добавленных ниже, — по 91 знаку у каждой.
 //
 // Начертания статические, и это важно. У переменных шрифтов Google Fonts
 // умолчание оси `wght` — вовсе не 400: у Figtree оно 300, у Nunito 200.
@@ -247,6 +266,13 @@ const FIGTREE: &[u8] = include_bytes!("../assets/fonts/Figtree-Regular.ttf");
 const FIGTREE_BOLD: &[u8] = include_bytes!("../assets/fonts/Figtree-Bold.ttf");
 const NUNITO: &[u8] = include_bytes!("../assets/fonts/Nunito-Regular.ttf");
 const NUNITO_BOLD: &[u8] = include_bytes!("../assets/fonts/Nunito-Bold.ttf");
+const ARMENIAN: &[u8] = include_bytes!("../assets/fonts/NotoSansArmenian-Regular.ttf");
+const ARMENIAN_BOLD: &[u8] = include_bytes!("../assets/fonts/NotoSansArmenian-Bold.ttf");
+/// Заголовочный армянский. Serif, а не sans, ровно затем, чтобы заголовок на
+/// армянском оставался заголовком: латиницу и кириллицу там набирают плитные
+/// Caprasimo и Kelly Slab, и сансерифная вставка посреди них читалась бы
+/// обычным текстом, набранным крупнее.
+const ARMENIAN_DISPLAY: &[u8] = include_bytes!("../assets/fonts/NotoSerifArmenian-Regular.ttf");
 
 /// Заголовочное семейство: плитный serif. Им набраны «Savio», названия
 /// карточек и крупные числа монитора.
@@ -284,6 +310,9 @@ fn fonts() -> FontDefinitions {
         ("FigtreeBold", FIGTREE_BOLD),
         ("Nunito", NUNITO),
         ("NunitoBold", NUNITO_BOLD),
+        ("Armenian", ARMENIAN),
+        ("ArmenianBold", ARMENIAN_BOLD),
+        ("ArmenianDisplay", ARMENIAN_DISPLAY),
     ] {
         defs.font_data
             .insert(name.to_owned(), Arc::new(FontData::from_static(bytes)));
@@ -304,17 +333,17 @@ fn fonts() -> FontDefinitions {
 
     defs.families.insert(
         FontFamily::Proportional,
-        with_fallback(&["Figtree", "Nunito"]),
+        with_fallback(&["Figtree", "Nunito", "Armenian"]),
     );
     defs.families.insert(
         DISPLAY.clone(),
         // Nunito третьим: у Kelly Slab нет ни стрелок, ни части знаков
         // препинания, а заголовок бывает и с числами.
-        with_fallback(&["Caprasimo", "KellySlab", "Nunito"]),
+        with_fallback(&["Caprasimo", "KellySlab", "Nunito", "ArmenianDisplay"]),
     );
     defs.families.insert(
         BOLD.clone(),
-        with_fallback(&["FigtreeBold", "NunitoBold"]),
+        with_fallback(&["FigtreeBold", "NunitoBold", "ArmenianBold"]),
     );
 
     defs
@@ -969,6 +998,51 @@ mod tests {
                 "светлая подпись на {name} внезапно проходит порог — \
                  проверьте, тот ли это цвет"
             );
+        }
+    }
+
+    /// Каждое семейство обязано уметь нарисовать все три алфавита.
+    ///
+    /// Отсутствующий знак рисуется пустым прямоугольником, и не видят этого
+    /// ни сборка, ни `clippy`, ни `cargo test` — только глаза, и только у того,
+    /// кто выбрал третий язык. Ровно из-за этого армянский интерфейс без
+    /// своего шрифта был бы рядами квадратов: запасной глиф egui подбирает
+    /// **строго внутри списка своего семейства**, а Hack с его армянскими
+    /// знаками стоит лишь в `Monospace`.
+    ///
+    /// Проверяется тут и то, ради чего семейства вообще собраны тройками:
+    /// у каждой гарнитуры свой алфавит, и выпади любая из списка — тест
+    /// покраснеет на том алфавите, который она и закрывала.
+    #[test]
+    fn every_family_can_draw_all_three_alphabets() {
+        // По одному знаку с каждого конца алфавита плюс точка-разделитель,
+        // которой Savio делит части строк.
+        const SAMPLES: [(&str, &str); 4] = [
+            ("латиница", "MP4 Quality"),
+            ("кириллица", "Качество Ёё"),
+            ("армянский", "Որակ ևֆ"),
+            ("разделитель", "·"),
+        ];
+
+        let ctx = Context::default();
+        apply(&ctx);
+        // Шрифтов нет до первого кадра — `Context::fonts_mut` на этом прямо
+        // паникует, так что кадр обязателен.
+        let mut output = ctx.run_ui(Default::default(), |_| {});
+        output.textures_delta.clear();
+
+        let families = [
+            ("Proportional", FontId::new(15.0, FontFamily::Proportional)),
+            ("savio-display", display(22.0)),
+            ("savio-bold", bold(15.0)),
+        ];
+        for (family, font) in families {
+            for (alphabet, sample) in SAMPLES {
+                assert!(
+                    ctx.fonts_mut(|fonts| fonts.has_glyphs(&font, sample)),
+                    "{family}: {alphabet} рисуется пустыми прямоугольниками"
+                );
+            }
         }
     }
 

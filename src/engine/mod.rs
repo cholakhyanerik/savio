@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
+use crate::i18n::{self, Key, Lang};
 use crate::model::{
     CookieSource, DownloadId, Event, MediaInfo, NO_DOWNLOAD, Request, SectionPlan, SubtitlePlan,
     human_duration,
@@ -90,7 +91,11 @@ impl Control {
     /// ровно в них, не нашла бы в слоте ничего. Под общим замком третьего
     /// исхода нет: либо `cancel()` видит в слоте процесс и убивает его, либо
     /// мы видим её флаг и не начинаем.
-    fn adopt(&self, mut child: Child) -> Result<bool, String> {
+    ///
+    /// `lang` нужен ровно на один исход — отравленный замок; держать язык
+    /// полем `Control` ради него значило бы дать движку состояние, которого
+    /// у него быть не должно.
+    fn adopt(&self, mut child: Child, lang: Lang) -> Result<bool, String> {
         // В группу процесс попадает раньше всех проверок и до замка. Отмена,
         // пришедшая в это самое мгновение, ничего не теряет: либо она увидит
         // процесс уже в группе и убьёт дерево сама, либо мы увидим её флаг
@@ -108,7 +113,7 @@ impl Control {
             // работать нельзя тем более — «Отмена» до него уже не доберётся.
             Err(_) => {
                 self.kill_tree(&mut child);
-                return Err("Внутренняя ошибка синхронизации".into());
+                return Err(i18n::t(lang, Key::EngineSyncError).into());
             }
         }
         // Замок здесь уже отпущен: `wait()` под ним заставил бы `cancel()`
@@ -211,10 +216,11 @@ pub fn start(
     request: Request,
     out_dir: PathBuf,
     known: Option<MediaInfo>,
+    lang: Lang,
     tx: Sender<Event>,
     notify: impl Fn() + Send + 'static,
 ) -> Result<Handle, String> {
-    let tools = discover()?;
+    let tools = discover(lang)?;
 
     // Предупреждения копим, а шлём одним сообщением. Причина в UI:
     // `Event::Warning` живёт там в единственном поле, и второе сообщение
@@ -225,8 +231,7 @@ pub fn start(
 
     if tools.ffmpeg.is_none() {
         let _ = tx.send(Event::Log(
-            "ffmpeg не найден — склейка видео со звуком и конвертация в MP3 работать не будут."
-                .into(),
+            i18n::t(lang, Key::EngineFfmpegMissingLog).into(),
         ));
 
         // Про несделанное говорим отдельно и громче журнала: журнал свёрнут
@@ -239,28 +244,23 @@ pub fn start(
         // Предупреждение одно на оба случая, хотя случая два: перечислять
         // потерянное списком не нужно, фраза покрывает обе беды разом.
         let warning = match (request.section.any(), request.options.any()) {
-            (true, true) => Some(
-                "Без ffmpeg не выйдет ни вырезать фрагмент, ни вшить метаданные, \
-                 обложку и субтитры: ролик скачается целиком и без них.",
-            ),
-            (true, false) => Some(
-                "Вырезать фрагмент без ffmpeg нельзя — ролик скачается целиком.",
-            ),
-            (false, true) => Some(
-                "Вшить метаданные, обложку и субтитры без ffmpeg нельзя — файл \
-                 сохранится без них.",
-            ),
+            (true, true) => Some(Key::EngineNoFfmpegBoth),
+            (true, false) => Some(Key::EngineNoFfmpegSection),
+            (false, true) => Some(Key::EngineNoFfmpegEmbed),
             (false, false) => None,
         };
         if let Some(warning) = warning {
             warnings.push(format!(
-                "{warning} Перезапустите Savio: при старте он сам попробует \
-                 скачать ffmpeg ещё раз."
+                "{} {}",
+                i18n::t(lang, warning),
+                i18n::t(lang, Key::EngineRestartForFfmpeg)
             ));
         }
     }
 
-    if let Some(warning) = cookie_file_trouble(request.cookies, request.cookie_file.as_deref()) {
+    if let Some(warning) =
+        cookie_file_trouble(request.cookies, request.cookie_file.as_deref(), lang)
+    {
         warnings.push(warning);
     }
 
@@ -279,10 +279,9 @@ pub fn start(
     if let (Some(ffmpeg), Some(ffprobe)) = (&tools.ffmpeg, &tools.ffprobe)
         && ffmpeg.parent() != ffprobe.parent()
     {
-        let _ = tx.send(Event::Log(format!(
-            "ffprobe лежит не рядом с ffmpeg ({} и {}) — yt-dlp его не увидит.",
-            ffmpeg.display(),
-            ffprobe.display()
+        let _ = tx.send(Event::Log(i18n::fill(
+            i18n::t(lang, Key::EngineFfprobeApart),
+            &[&ffmpeg.display().to_string(), &ffprobe.display().to_string()],
         )));
     }
 
@@ -297,6 +296,7 @@ pub fn start(
             request: &request,
             known,
             out_dir: &out_dir,
+            lang,
         };
         let result = run(job, &tools, &tx, &notify, &control);
         if let Err(err) = result {
@@ -337,18 +337,17 @@ pub fn start(
 ///
 /// Имя файла, а не путь: полный путь и так виден строкой под списком, а
 /// баннер от него растянулся бы на три строки.
-fn cookie_file_trouble(cookies: CookieSource, file: Option<&Path>) -> Option<String> {
+fn cookie_file_trouble(
+    cookies: CookieSource,
+    file: Option<&Path>,
+    lang: Lang,
+) -> Option<String> {
     if cookies != CookieSource::File {
         return None;
     }
 
     let Some(file) = file else {
-        return Some(
-            "Вход просят из файла, а сам файл не выбран — ролик скачается без \
-             входа в аккаунт. Выберите файл под списком «Вход на сайт» или \
-             верните в нём пункт «Не использовать»."
-                .to_owned(),
-        );
+        return Some(i18n::t(lang, Key::CookieFileNotPicked).to_owned());
     };
 
     let name = file
@@ -357,21 +356,17 @@ fn cookie_file_trouble(cookies: CookieSource, file: Option<&Path>) -> Option<Str
         .to_string_lossy();
 
     match std::fs::metadata(file) {
-        Err(_) => Some(format!(
-            "Файл cookies «{name}» не найден — ролик скачается без входа в \
-             аккаунт, и закрытый сайт его, скорее всего, не отдаст. Файл \
-             переименовали, перенесли или удалили: выберите его заново под \
-             списком «Вход на сайт»."
+        Err(_) => Some(i18n::fill(
+            i18n::t(lang, Key::CookieFileMissing),
+            &[&name],
         )),
         // Права на запись спрашиваем у самого файла. На Unix это ещё не вся
         // правда (у чужого файла с правами 644 бит записи есть, а нам он всё
         // равно не по зубам), но случай с атрибутом «Только чтение» — тот,
         // который встречается, — закрывает.
-        Ok(meta) if meta.permissions().readonly() => Some(format!(
-            "Файл cookies «{name}» закрыт для записи, а yt-dlp дописывает \
-             в него свежие cookies после загрузки — и оборвётся ошибкой, \
-             когда ролик уже будет скачан. Снимите с файла «Только чтение» \
-             или скопируйте его в обычную папку."
+        Ok(meta) if meta.permissions().readonly() => Some(i18n::fill(
+            i18n::t(lang, Key::CookieFileReadonly),
+            &[&name],
         )),
         Ok(_) => None,
     }
@@ -388,6 +383,8 @@ struct Job<'a> {
     /// Готовый ответ `probe` от вызывающего — см. `known` у [`start`].
     known: Option<MediaInfo>,
     out_dir: &'a Path,
+    /// На каком языке говорить со стадиями, предупреждениями и отказами.
+    lang: Lang,
 }
 
 fn run(
@@ -402,9 +399,10 @@ fn run(
         request,
         known,
         out_dir,
+        lang,
     } = job;
 
-    let _ = tx.send(Event::Stage("Читаю ссылку…".into()));
+    let _ = tx.send(Event::Stage(i18n::t(lang, Key::StageReadingLink).into()));
     notify();
 
     // Что просить по субтитрам: до `probe` этого знать неоткуда — ни языка
@@ -426,7 +424,7 @@ fn run(
 
     // Метаданные тянем отдельным быстрым вызовом, чтобы показать название
     // ещё до старта загрузки. Если не вышло — не страшно, идём дальше.
-    if let Some(info) = known.or_else(|| probe(request, tools, control)) {
+    if let Some(info) = known.or_else(|| probe(request, tools, control, lang)) {
         // Адрес, длительность и план по субтитрам забираем до отправки:
         // `Info` уходит в UI вместе со структурой.
         let cover = info.thumbnail_url.clone();
@@ -456,12 +454,12 @@ fn run(
             && duration > 0.0
             && start as f64 >= duration
         {
-            let _ = tx.send(Event::Warning(format!(
-                "Начало фрагмента ({}) лежит за концом ролика ({}) — вырезать \
-                 оттуда нечего, и файл получится не тот, что вы ждёте. \
-                 Поправьте границы и запустите снова.",
-                human_duration(start),
-                human_duration(duration as u64)
+            let _ = tx.send(Event::Warning(i18n::fill(
+                i18n::t(lang, Key::WarnSectionStartPastEnd),
+                &[
+                    &human_duration(start),
+                    &human_duration(duration as u64),
+                ],
             )));
             notify();
         }
@@ -469,7 +467,7 @@ fn run(
         // Обложку тянем после `Info`, а не вместо него: название должно
         // появиться сразу, не дожидаясь картинки.
         if cover_wanted && listening {
-            send_cover(cover, tx, notify);
+            send_cover(cover, tx, notify, lang);
         }
     }
 
@@ -495,11 +493,7 @@ fn run(
         // В журнал, а не баннером: беды здесь нет, а объяснение «почему в
         // папке на минуту появился целый ролик» пригодится. Человеку про
         // выбранный путь говорит оговорка под полями фрагмента.
-        let _ = tx.send(Event::Log(
-            "Фрагмент занимает больше половины ролика: качаем целиком быстрым \
-             путём и вырежем кусок сами."
-                .into(),
-        ));
+        let _ = tx.send(Event::Log(i18n::t(lang, Key::LogCutAfterPlan).into()));
     }
 
     let args = ytdlp::download_args(request, out_dir, tools, &subs, plan);
@@ -517,7 +511,10 @@ fn run(
     // каталоги и имя пользователя, а журнал человек копирует кнопкой и
     // вкладывает в сообщение о проблеме.
     if tx
-        .send(Event::Log(format!("yt-dlp {}", ytdlp::log_args(&args))))
+        .send(Event::Log(format!(
+            "yt-dlp {}",
+            ytdlp::log_args(&args, lang)
+        )))
         .is_err()
     {
         return Ok(());
@@ -533,14 +530,20 @@ fn run(
 
     let mut child = cmd
         .spawn()
-        .map_err(|e| format!("Не удалось запустить yt-dlp: {e}"))?;
+        .map_err(|e| i18n::fill(i18n::t(lang, Key::ErrYtdlpLaunch), &[&e.to_string()]))?;
 
-    let stdout = child.stdout.take().ok_or("Нет stdout у yt-dlp")?;
-    let stderr = child.stderr.take().ok_or("Нет stderr у yt-dlp")?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| i18n::t(lang, Key::ErrNoStdout).to_owned())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| i18n::t(lang, Key::ErrNoStderr).to_owned())?;
 
     // Отмена могла прийти, пока процесс запускался. Тогда он уже убит,
     // и дальше идти незачем — снова молча, без `Failed`.
-    if !control.adopt(child)? {
+    if !control.adopt(child, lang)? {
         return Ok(());
     }
 
@@ -555,7 +558,7 @@ fn run(
                 if line.trim().is_empty() {
                     continue;
                 }
-                if let ytdlp::Line::Stage(stage) = ytdlp::parse_line(&line) {
+                if let ytdlp::Line::Stage(stage) = ytdlp::parse_line(&line, lang) {
                     let _ = tx.send(Event::Stage(stage));
                     continue;
                 }
@@ -568,11 +571,11 @@ fn run(
     };
 
     let mut final_path: Option<PathBuf> = None;
-    let _ = tx.send(Event::Stage("Загрузка…".into()));
+    let _ = tx.send(Event::Stage(i18n::t(lang, Key::StageDownloading).into()));
     notify();
 
     for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-        match ytdlp::parse_line(&line) {
+        match ytdlp::parse_line(&line, lang) {
             // Номер загрузки ставим здесь, а не в `parse_line`: тот разбирает
             // одну строку вывода и про очередь ничего не знает — тем он и
             // остаётся чистой функцией, которую легко покрыть тестами.
@@ -598,10 +601,12 @@ fn run(
         let mut guard = control
             .child
             .lock()
-            .map_err(|_| "Внутренняя ошибка синхронизации".to_string())?;
+            .map_err(|_| i18n::t(lang, Key::EngineSyncError).to_owned())?;
         match guard.as_mut() {
-            Some(child) => child.wait().map_err(|e| format!("Сбой ожидания: {e}"))?,
-            None => return Err("Процесс потерян".into()),
+            Some(child) => child.wait().map_err(|e| {
+                i18n::fill(i18n::t(lang, Key::ErrWaitFailed), &[&e.to_string()])
+            })?,
+            None => return Err(i18n::t(lang, Key::ErrProcessLost).into()),
         }
     };
     let _ = stderr_thread.join();
@@ -616,10 +621,10 @@ fn run(
                 if plan == SectionPlan::CutAfter
                     && let Some(ffmpeg) = &tools.ffmpeg
                 {
-                    let _ = tx.send(Event::Stage("Вырезаю фрагмент…".into()));
+                    let _ = tx.send(Event::Stage(i18n::t(lang, Key::StageCutting).into()));
                     notify();
 
-                    match cut::cut(ffmpeg, &path, request.section, control, tx) {
+                    match cut::cut(ffmpeg, &path, request.section, control, tx, lang) {
                         cut::Outcome::Done => {}
                         // Молча, без `Failed`: «Отменено» UI показывает сам
                         // (Правило 2), а на диске после отмены не осталось
@@ -637,11 +642,9 @@ fn run(
                         // попыткой, а «Готово (файл уже существовал)» —
                         // и человек решит, что обрезка сломана насовсем.
                         cut::Outcome::Failed(why) => {
-                            let _ = tx.send(Event::Warning(format!(
-                                "Вырезать фрагмент не вышло — ролик сохранён целиком.\n\n{why}\n\n\
-                                 Чтобы попробовать ещё раз, уберите или переименуйте сохранённый \
-                                 файл: пока он лежит на месте, загрузка считается сделанной и \
-                                 повторяться не будет."
+                            let _ = tx.send(Event::Warning(i18n::fill(
+                                i18n::t(lang, Key::WarnCutFailed),
+                                &[&why],
                             )));
                             notify();
                         }
@@ -655,7 +658,9 @@ fn run(
             // Успех без пути означает, что файл уже был на диске
             // и yt-dlp пропустил стадию after_move.
             None => {
-                let _ = tx.send(Event::Stage("Готово (файл уже существовал)".into()));
+                let _ = tx.send(Event::Stage(
+                    i18n::t(lang, Key::StageAlreadyExisted).into(),
+                ));
                 notify();
                 Ok(())
             }
@@ -677,6 +682,7 @@ fn run(
             status.code().unwrap_or(-1),
             &tail,
             request.cookies,
+            lang,
         ))
     }
 }
@@ -701,24 +707,29 @@ pub enum MetaTask {
 pub fn start_metadata(
     path: PathBuf,
     task: MetaTask,
+    lang: Lang,
     tx: Sender<Event>,
     notify: impl Fn() + Send + 'static,
 ) {
     std::thread::spawn(move || {
         let result = match task {
             MetaTask::Read => {
-                let _ = tx.send(Event::Stage("Читаю метаданные…".into()));
+                let _ = tx.send(Event::Stage(
+                    i18n::t(lang, Key::StageReadingMetadata).into(),
+                ));
                 notify();
                 // ffprobe нужен только для MP3 и только ради битрейта с
                 // длительностью. Его отсутствие — не повод отказать в работе:
                 // изображения разбираются без единой внешней программы.
                 let ffprobe = binaries::locate(binaries::FFPROBE_NAME);
-                metadata::read(&path, ffprobe.as_deref()).map(Event::Tags)
+                metadata::read(&path, ffprobe.as_deref(), lang).map(Event::Tags)
             }
             MetaTask::Clean => {
-                let _ = tx.send(Event::Stage("Удаляю метаданные…".into()));
+                let _ = tx.send(Event::Stage(
+                    i18n::t(lang, Key::StageStrippingMetadata).into(),
+                ));
                 notify();
-                metadata::strip(&path).map(Event::Cleaned)
+                metadata::strip(&path, lang).map(Event::Cleaned)
             }
         };
 
@@ -751,6 +762,7 @@ pub fn start_metadata(
 /// «Скачать» по-прежнему можно нажать — вдруг сайт ответит ему.
 pub fn start_probe(
     request: Request,
+    lang: Lang,
     tx: Sender<Event>,
     notify: impl Fn() + Send + 'static,
 ) -> Handle {
@@ -760,10 +772,10 @@ pub fn start_probe(
     };
 
     std::thread::spawn(move || {
-        let Ok(tools) = discover() else {
+        let Ok(tools) = discover(lang) else {
             return;
         };
-        let Some(info) = probe(&request, &tools, &control) else {
+        let Some(info) = probe(&request, &tools, &control, lang) else {
             return;
         };
 
@@ -780,7 +792,7 @@ pub fn start_probe(
         if control.cancelled() {
             return;
         }
-        send_cover(cover, &tx, &notify);
+        send_cover(cover, &tx, &notify, lang);
     });
 
     handle
@@ -792,17 +804,20 @@ pub fn start_probe(
 /// Любая неудача здесь — строка в журнале, и только. Ни `Failed`, ни даже
 /// `Warning`: превью — украшение, а баннер во весь экран из-за мёртвой ссылки
 /// на картинку выглядел бы поломкой загрузки, которой не произошло.
-fn send_cover(url: Option<String>, tx: &Sender<Event>, notify: &impl Fn()) {
+fn send_cover(url: Option<String>, tx: &Sender<Event>, notify: &impl Fn(), lang: Lang) {
     let Some(url) = url else {
         return;
     };
-    match thumbnail::fetch(&url) {
+    match thumbnail::fetch(&url, lang) {
         Ok(cover) => {
             let _ = tx.send(Event::Thumbnail(cover));
             notify();
         }
         Err(err) => {
-            let _ = tx.send(Event::Log(format!("Обложка не загрузилась: {err}")));
+            let _ = tx.send(Event::Log(i18n::fill(
+                i18n::t(lang, Key::LogThumbnailFailed),
+                &[&err],
+            )));
         }
     }
 }
@@ -823,7 +838,12 @@ fn send_cover(url: Option<String>, tx: &Sender<Event>, notify: &impl Fn()) {
 /// бы нечем. Для загрузки это то самое окно, в которое «Отмена» не отменяла
 /// ничего (дефект 14), а для предпросмотра — накопившиеся фоновые процессы
 /// по ссылкам, которых в поле давно нет.
-fn probe(request: &Request, tools: &Tools, control: &Control) -> Option<MediaInfo> {
+fn probe(
+    request: &Request,
+    tools: &Tools,
+    control: &Control,
+    lang: Lang,
+) -> Option<MediaInfo> {
     let mut cmd = Command::new(&tools.ytdlp);
     cmd.args(ytdlp::probe_args(
         &request.url,
@@ -841,7 +861,7 @@ fn probe(request: &Request, tools: &Tools, control: &Control) -> Option<MediaInf
 
     // Бросили, пока запускались, — `adopt` его уже убил, и ждать ответа
     // не от кого.
-    if !control.adopt(child).ok()? {
+    if !control.adopt(child, lang).ok()? {
         return None;
     }
 
@@ -898,6 +918,7 @@ mod tests {
             request: REQUEST.get_or_init(request),
             known,
             out_dir: OUT_DIR.get_or_init(std::env::temp_dir),
+            lang: Lang::Ru,
         }
     }
 
@@ -1008,8 +1029,8 @@ mod tests {
         request.url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ".into();
 
         let (tx, rx) = channel();
-        let handle =
-            start(1, request, dir.clone(), None, tx, || {}).expect("yt-dlp обязан быть найден");
+        let handle = start(1, request, dir.clone(), None, Lang::Ru, tx, || {})
+            .expect("yt-dlp обязан быть найден");
 
         std::thread::sleep(std::time::Duration::from_millis(300));
         handle.cancel();
@@ -1081,8 +1102,8 @@ mod tests {
         request.section = section;
 
         let (tx, rx) = channel();
-        let handle =
-            start(1, request, dir.clone(), None, tx, || {}).expect("yt-dlp обязан быть найден");
+        let handle = start(1, request, dir.clone(), None, Lang::Ru, tx, || {})
+            .expect("yt-dlp обязан быть найден");
 
         // Ждём настоящей загрузки: пока не пришёл первый `Progress`, дерева
         // ещё нет и убивать нечего — тест прошёл бы, ничего не проверив.
@@ -1225,7 +1246,7 @@ mod tests {
         let mut child = cmd.spawn().expect("оболочка обязана быть в системе");
         let stdout = child.stdout.take().expect("труба заказана piped");
         assert!(
-            control.adopt(child).expect("замок не отравлен"),
+            control.adopt(child, Lang::Ru).expect("замок не отравлен"),
             "без отмены процесс обязан попасть в слот"
         );
 

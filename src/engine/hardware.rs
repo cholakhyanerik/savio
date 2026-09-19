@@ -37,6 +37,7 @@ use starship_battery::units::{
     electric_potential::volt, energy::watt_hour, power::watt, ratio::percent,
 };
 
+use crate::i18n::{self, Key, Lang};
 use crate::model::{
     Check, CheckRow, CheckStatus, Event, GpuInfo, SystemReport, human_bytes, human_mhz,
     human_percent, human_uptime, usb_version,
@@ -69,12 +70,17 @@ const USB_LIMIT: usize = 24;
 /// Устроено по образцу `start_metadata`: свой канал на запуск, `notify`
 /// будит кадр. Опрос стоит от долей секунды до пары секунд — в `ui()` ему
 /// места нет ни в каком виде (Правило 1).
-pub fn start(gpu: Option<GpuInfo>, tx: Sender<Event>, notify: impl Fn() + Send + 'static) {
+pub fn start(
+    gpu: Option<GpuInfo>,
+    lang: Lang,
+    tx: Sender<Event>,
+    notify: impl Fn() + Send + 'static,
+) {
     std::thread::spawn(move || {
-        let _ = tx.send(Event::Stage("Опрашиваю систему…".into()));
+        let _ = tx.send(Event::Stage(i18n::t(lang, Key::StageProbingSystem).into()));
         notify();
 
-        let _ = tx.send(Event::SystemReport(collect(gpu.as_ref())));
+        let _ = tx.send(Event::SystemReport(collect(gpu.as_ref(), lang)));
         notify();
     });
 }
@@ -83,7 +89,7 @@ pub fn start(gpu: Option<GpuInfo>, tx: Sender<Event>, notify: impl Fn() + Send +
 ///
 /// Порядок пунктов — порядок карточек на экране: сначала то, что есть у
 /// всех и всегда, потом то, чего на конкретной машине может не быть.
-pub fn collect(gpu: Option<&GpuInfo>) -> SystemReport {
+pub fn collect(gpu: Option<&GpuInfo>, lang: Lang) -> SystemReport {
     let mut sys = sysinfo::System::new_with_specifics(
         sysinfo::RefreshKind::nothing()
             .with_cpu(sysinfo::CpuRefreshKind::everything())
@@ -97,20 +103,25 @@ pub fn collect(gpu: Option<&GpuInfo>) -> SystemReport {
     std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
     sys.refresh_cpu_all();
 
-    let mut checks = vec![system_check(), cpu_check(&sys), memory_check(&sys)];
-    checks.extend(disk_checks());
-    checks.push(network_check());
-    checks.push(battery_check());
-    checks.push(usb_check());
+    let mut checks = vec![
+        system_check(lang),
+        cpu_check(&sys, lang),
+        memory_check(&sys, lang),
+    ];
+    checks.extend(disk_checks(lang));
+    checks.push(network_check(lang));
+    checks.push(battery_check(lang));
+    checks.push(usb_check(lang));
     if let Some(gpu) = gpu {
-        checks.push(gpu_check(gpu));
+        checks.push(gpu_check(gpu, lang));
     }
 
     SystemReport { checks }
 }
 
 /// Что за система и сколько работает.
-fn system_check() -> Check {
+fn system_check(lang: Lang) -> Check {
+    let name_of = |key| i18n::t(lang, key);
     // Все эти — ассоциированные функции, а не методы: экземпляр `System`
     // им не нужен, и каждая пересчитывается при вызове.
     let name = sysinfo::System::long_os_version().or_else(sysinfo::System::name);
@@ -119,13 +130,13 @@ fn system_check() -> Check {
     // Названия системы среди строк нет намеренно: оно уже стоит итогом
     // карточки, и повторённое слово в слово читается как задвоение вёрстки.
     let rows = vec![
-        CheckRow::maybe("Ядро", sysinfo::System::kernel_version()),
-        CheckRow::maybe("Имя машины", sysinfo::System::host_name()),
+        CheckRow::maybe(name_of(Key::HwKernel), sysinfo::System::kernel_version()),
+        CheckRow::maybe(name_of(Key::HwHostName), sysinfo::System::host_name()),
         // `cpu_arch` не возвращает `Option`: не ответившая система подменяется
         // архитектурой, под которую собран сам Savio. Врать этим нельзя,
         // но и отличить подмену нечем — берём как есть, оговорки не будет.
-        CheckRow::new("Разрядность", sysinfo::System::cpu_arch()),
-        CheckRow::new("Работает", human_uptime(uptime)),
+        CheckRow::new(name_of(Key::HwBitness), sysinfo::System::cpu_arch()),
+        CheckRow::new(name_of(Key::HwUptime), human_uptime(uptime, lang)),
     ];
 
     // Пустой `System::name()` бывает на неизвестной платформе. Пункт при этом
@@ -134,12 +145,12 @@ fn system_check() -> Check {
         Some(name) => (CheckStatus::Ok, name.clone()),
         None => (
             CheckStatus::Unknown,
-            "Система себя не назвала.".to_owned(),
+            name_of(Key::HwSystemUnnamed).to_owned(),
         ),
     };
 
     Check {
-        name: "Система".to_owned(),
+        name: name_of(Key::HwSystem).to_owned(),
         status,
         summary,
         rows,
@@ -147,7 +158,8 @@ fn system_check() -> Check {
     }
 }
 
-fn cpu_check(sys: &sysinfo::System) -> Check {
+fn cpu_check(sys: &sysinfo::System, lang: Lang) -> Check {
+    let name_of = |key| i18n::t(lang, key);
     let cpus = sys.cpus();
     let logical = cpus.len();
     let physical = sysinfo::System::physical_core_count();
@@ -174,19 +186,21 @@ fn cpu_check(sys: &sysinfo::System) -> Check {
     // Модели здесь нет по той же причине, что и названия системы выше: она
     // и есть итог карточки.
     let rows = vec![
-        CheckRow::maybe("Производитель", vendor),
+        CheckRow::maybe(name_of(Key::HwVendor), vendor),
         CheckRow::maybe(
-            "Физических ядер",
+            name_of(Key::HwPhysicalCores),
             physical.map(|n| n.to_string()),
         ),
-        CheckRow::new("Логических ядер", logical.to_string()),
+        CheckRow::new(name_of(Key::HwLogicalCores), logical.to_string()),
         // Частота приезжает нулём и когда её не спросили, и когда система
         // не ответила, — `human_mhz` превращает такой ноль в прочерк.
         CheckRow::maybe(
-            "Частота",
-            first.map(sysinfo::Cpu::frequency).and_then(human_mhz),
+            name_of(Key::HwFrequency),
+            first
+                .map(sysinfo::Cpu::frequency)
+                .and_then(|mhz| human_mhz(mhz, lang)),
         ),
-        CheckRow::maybe("Загрузка", human_percent(usage)),
+        CheckRow::maybe(name_of(Key::HwLoad), human_percent(usage)),
     ];
 
     let (status, summary) = match &brand {
@@ -195,12 +209,12 @@ fn cpu_check(sys: &sysinfo::System) -> Check {
         // тут заведомо было — значит, система действительно промолчала.
         None => (
             CheckStatus::Unknown,
-            "Процессор себя не назвал.".to_owned(),
+            name_of(Key::HwCpuUnnamed).to_owned(),
         ),
     };
 
     Check {
-        name: "Процессор".to_owned(),
+        name: name_of(Key::HwCpu).to_owned(),
         status,
         summary,
         rows,
@@ -208,7 +222,8 @@ fn cpu_check(sys: &sysinfo::System) -> Check {
     }
 }
 
-fn memory_check(sys: &sysinfo::System) -> Check {
+fn memory_check(sys: &sysinfo::System, lang: Lang) -> Check {
+    let name_of = |key| i18n::t(lang, key);
     // Все значения памяти у `sysinfo` — в байтах. В версии 0.30 единицы
     // сменились с килобайт на байты, и делить на 1024 самим не надо:
     // получилось бы ровно в тысячу раз меньше правды.
@@ -220,50 +235,51 @@ fn memory_check(sys: &sysinfo::System) -> Check {
     // Ноль здесь означал бы, что обновления памяти не было, — но оно было.
     if total == 0 {
         return Check {
-            name: "Память".to_owned(),
+            name: name_of(Key::HwMemory).to_owned(),
             status: CheckStatus::Unknown,
-            summary: "Система не сообщила объём памяти.".to_owned(),
-            rows: vec![CheckRow::missing("Всего")],
+            summary: name_of(Key::HwMemoryUnknown).to_owned(),
+            rows: vec![CheckRow::missing(name_of(Key::HwTotal))],
             advice: None,
         };
     }
 
     let free_share = available as f64 / total as f64;
     let rows = vec![
-        CheckRow::new("Всего", human_bytes(total)),
-        CheckRow::new("Занято", human_bytes(used)),
-        CheckRow::new("Доступно", human_bytes(available)),
+        CheckRow::new(name_of(Key::HwTotal), human_bytes(total, lang)),
+        CheckRow::new(name_of(Key::HwUsed), human_bytes(used, lang)),
+        CheckRow::new(name_of(Key::HwAvailable), human_bytes(available, lang)),
         // Своп, выключенный пользователем, — это честный ноль, а не «нет
         // данных»: так и пишем словами, а не прочерком.
         CheckRow::new(
-            "Подкачка",
+            name_of(Key::HwSwap),
             if total_swap == 0 {
-                "выключена".to_owned()
+                name_of(Key::HwSwapOff).to_owned()
             } else {
-                format!("{} из {}", human_bytes(sys.used_swap()), human_bytes(total_swap))
+                i18n::fill(
+                    name_of(Key::AmountOfTotal),
+                    &[
+                        &human_bytes(sys.used_swap(), lang),
+                        &human_bytes(total_swap, lang),
+                    ],
+                )
             },
         ),
     ];
 
     let low = free_share < DISK_LOW_FREE;
     Check {
-        name: "Память".to_owned(),
+        name: name_of(Key::HwMemory).to_owned(),
         status: if low {
             CheckStatus::Warning
         } else {
             CheckStatus::Ok
         },
-        summary: format!(
-            "{} из {} свободно",
-            human_bytes(available),
-            human_bytes(total)
+        summary: i18n::fill(
+            name_of(Key::HwFreeOfTotal),
+            &[&human_bytes(available, lang), &human_bytes(total, lang)],
         ),
         rows,
-        advice: low.then(|| {
-            "Свободной памяти меньше десятой части. Закройте лишние программы: \
-             при нехватке система начнёт выгружать их на диск, и всё замедлится."
-                .to_owned()
-        }),
+        advice: low.then(|| name_of(Key::HwMemoryLowAdvice).to_owned()),
     }
 }
 
@@ -273,13 +289,16 @@ fn memory_check(sys: &sysinfo::System) -> Check {
 /// монтирования, поэтому два раздела одного SSD дадут две записи, а диск
 /// без буквы не покажется вовсе. Называть это «дисками» было бы неправдой,
 /// и подпись карточки говорит «Том».
-fn disk_checks() -> Vec<Check> {
+fn disk_checks(lang: Lang) -> Vec<Check> {
+    let name_of = |key| i18n::t(lang, key);
+    let volume = |mount: &str| i18n::fill(name_of(Key::HwVolume), &[mount]);
+
     let disks = sysinfo::Disks::new_with_refreshed_list();
     if disks.is_empty() {
         return vec![Check {
-            name: "Диски".to_owned(),
+            name: name_of(Key::HwDisks).to_owned(),
             status: CheckStatus::Unknown,
-            summary: "Система не перечислила ни одного тома.".to_owned(),
+            summary: name_of(Key::HwNoVolumes).to_owned(),
             rows: Vec::new(),
             advice: None,
         }];
@@ -296,10 +315,10 @@ fn disk_checks() -> Vec<Check> {
             // и размер должен был приехать вместе с ним.
             if total == 0 {
                 return Check {
-                    name: format!("Том {mount}"),
+                    name: volume(&mount),
                     status: CheckStatus::Unknown,
-                    summary: "Система не сообщила объём тома.".to_owned(),
-                    rows: vec![CheckRow::missing("Всего")],
+                    summary: name_of(Key::HwVolumeUnknown).to_owned(),
+                    rows: vec![CheckRow::missing(name_of(Key::HwTotal))],
                     advice: None,
                 };
             }
@@ -308,44 +327,55 @@ fn disk_checks() -> Vec<Check> {
             let low = free_share < DISK_LOW_FREE;
 
             let rows = vec![
-                CheckRow::new("Точка монтирования", mount.clone()),
-                CheckRow::new("Файловая система", disk.file_system().to_string_lossy()),
-                CheckRow::new("Всего", human_bytes(total)),
-                CheckRow::new("Свободно", human_bytes(available)),
+                CheckRow::new(name_of(Key::HwMountPoint), mount.clone()),
+                CheckRow::new(
+                    name_of(Key::HwFileSystem),
+                    disk.file_system().to_string_lossy(),
+                ),
+                CheckRow::new(name_of(Key::HwTotal), human_bytes(total, lang)),
+                CheckRow::new(name_of(Key::HwFree), human_bytes(available, lang)),
                 // `DiskKind::Unknown` — честный признак «не спросили или не
                 // ответили», и у NVMe он выпадает часто. Прочерк вместо
                 // выдумки: показать «HDD» на SSD хуже, чем не показать ничего.
                 CheckRow::maybe(
-                    "Тип",
+                    name_of(Key::HwKind),
                     match disk.kind() {
-                        sysinfo::DiskKind::HDD => Some("жёсткий диск".to_owned()),
+                        sysinfo::DiskKind::HDD => Some(name_of(Key::HwHardDisk).to_owned()),
+                        // «SSD» — сокращение, а не слово: перевода у него нет.
                         sysinfo::DiskKind::SSD => Some("SSD".to_owned()),
                         _ => None,
                     },
                 ),
-                CheckRow::new("Съёмный", if disk.is_removable() { "да" } else { "нет" }),
+                CheckRow::new(
+                    name_of(Key::HwRemovable),
+                    name_of(if disk.is_removable() {
+                        Key::WordYes
+                    } else {
+                        Key::WordNo
+                    }),
+                ),
             ];
 
             Check {
-                name: format!("Том {mount}"),
+                name: volume(&mount),
                 status: if low {
                     CheckStatus::Warning
                 } else {
                     CheckStatus::Ok
                 },
-                summary: format!("{} из {} свободно", human_bytes(available), human_bytes(total)),
+                summary: i18n::fill(
+                    name_of(Key::HwFreeOfTotal),
+                    &[&human_bytes(available, lang), &human_bytes(total, lang)],
+                ),
                 rows,
-                advice: low.then(|| {
-                    "На томе осталось меньше десятой части места. Скачивать сюда \
-                     большие ролики уже рискованно: yt-dlp прервётся на середине."
-                        .to_owned()
-                }),
+                advice: low.then(|| name_of(Key::HwDiskLowAdvice).to_owned()),
             }
         })
         .collect()
 }
 
-fn network_check() -> Check {
+fn network_check(lang: Lang) -> Check {
+    let name_of = |key| i18n::t(lang, key);
     let networks = sysinfo::Networks::new_with_refreshed_list();
 
     let mut rows = Vec::new();
@@ -362,20 +392,26 @@ fn network_check() -> Check {
 
     if count == 0 {
         return Check {
-            name: "Сеть".to_owned(),
+            name: name_of(Key::HwNetwork).to_owned(),
             status: CheckStatus::Unknown,
-            summary: "Система не перечислила сетевые интерфейсы.".to_owned(),
+            summary: name_of(Key::HwNoInterfaces).to_owned(),
             rows,
             advice: None,
         };
     }
 
     Check {
-        name: "Сеть".to_owned(),
+        name: name_of(Key::HwNetwork).to_owned(),
         status: CheckStatus::Ok,
         summary: format!(
             "{count} {}",
-            crate::model::plural_ru(count as u64, "интерфейс", "интерфейса", "интерфейсов")
+            i18n::plural(
+                lang,
+                count as u64,
+                name_of(Key::HwInterfaceOne),
+                name_of(Key::HwInterfaceFew),
+                name_of(Key::HwInterfaceMany),
+            )
         ),
         rows,
         advice: None,
@@ -388,8 +424,9 @@ fn network_check() -> Check {
 /// (настольная машина), и это не беда. `Err` на создании — спросить не
 /// вышло. `Err` на отдельном элементе — драйвер не сообщил ёмкость или
 /// напряжение именно этой батареи; такую пропускаем, а не роняем весь опрос.
-fn battery_check() -> Check {
-    let name = "Батарея".to_owned();
+fn battery_check(lang: Lang) -> Check {
+    let name_of = |key| i18n::t(lang, key);
+    let name = name_of(Key::HwBattery).to_owned();
 
     let manager = match starship_battery::Manager::new() {
         Ok(manager) => manager,
@@ -397,7 +434,10 @@ fn battery_check() -> Check {
             return Check {
                 name,
                 status: CheckStatus::Failed,
-                summary: format!("Не удалось обратиться к батарее: {err}"),
+                summary: i18n::fill(
+                    name_of(Key::HwBatteryManagerFailed),
+                    &[&err.to_string()],
+                ),
                 rows: Vec::new(),
                 advice: None,
             };
@@ -410,7 +450,7 @@ fn battery_check() -> Check {
             return Check {
                 name,
                 status: CheckStatus::Failed,
-                summary: format!("Не удалось перечислить батареи: {err}"),
+                summary: i18n::fill(name_of(Key::HwBatteryListFailed), &[&err.to_string()]),
                 rows: Vec::new(),
                 advice: None,
             };
@@ -423,7 +463,7 @@ fn battery_check() -> Check {
         return Check {
             name,
             status: CheckStatus::Unknown,
-            summary: "Батарея не обнаружена — обычное дело для настольной машины.".to_owned(),
+            summary: name_of(Key::HwNoBattery).to_owned(),
             rows: Vec::new(),
             advice: None,
         };
@@ -439,8 +479,8 @@ fn battery_check() -> Check {
     // На Linux ещё прямее: при нулевой `energy_full` крейт возвращает
     // захардкоженные 100 %, вовсе минуя деление. Ровно то, чего эта вкладка
     // обещает не делать, и ни сборка, ни тесты этого не видят.
-    let full = capacity(battery.energy_full().get::<watt_hour>());
-    let design = capacity(battery.energy_full_design().get::<watt_hour>());
+    let full = capacity(battery.energy_full().get::<watt_hour>(), lang);
+    let design = capacity(battery.energy_full_design().get::<watt_hour>(), lang);
 
     // Заряд — тоже частное (`energy / energy_full`) и болеет тем же: при
     // нулевом знаменателе приезжает «100 %» на батарее, о заряде которой
@@ -461,39 +501,53 @@ fn battery_check() -> Check {
     let wear_text = wear.and_then(human_percent);
 
     let rows = vec![
-        CheckRow::maybe("Заряд", charge.clone()),
+        CheckRow::maybe(name_of(Key::HwCharge), charge.clone()),
         CheckRow::new(
-            "Состояние",
-            match battery.state() {
-                starship_battery::State::Charging => "заряжается",
-                starship_battery::State::Discharging => "разряжается",
-                starship_battery::State::Empty => "разряжена",
-                starship_battery::State::Full => "от сети, зарядка не идёт",
+            name_of(Key::HwState),
+            name_of(match battery.state() {
+                starship_battery::State::Charging => Key::HwCharging,
+                starship_battery::State::Discharging => Key::HwDischarging,
+                starship_battery::State::Empty => Key::HwDrained,
+                starship_battery::State::Full => Key::HwOnMains,
                 // `Unknown` — и умолчание крейта, и «драйвер не сказал».
                 // Перечислено полностью, без `_`: enum не помечен
                 // `#[non_exhaustive]`, и новый вариант должен ломать сборку.
-                starship_battery::State::Unknown => "неизвестно",
-            },
+                starship_battery::State::Unknown => Key::HwStateUnknown,
+            }),
         ),
-        CheckRow::maybe("Ёмкость сейчас", full.clone()),
-        CheckRow::maybe("Ёмкость проектная", design.clone()),
-        CheckRow::maybe("Износ", wear_text.clone()),
+        CheckRow::maybe(name_of(Key::HwCapacityNow), full.clone()),
+        CheckRow::maybe(name_of(Key::HwCapacityDesign), design.clone()),
+        CheckRow::maybe(name_of(Key::HwWear), wear_text.clone()),
         // Ноль циклов наружу не выходит никогда: крейт превращает его в
         // `None`. Поэтому прочерк здесь означает «драйвер счётчик не ведёт»,
         // и на большинстве ноутбуков под Windows это обычный случай, а не
         // редкий. Написать «0 циклов» было бы неправдой.
-        CheckRow::maybe("Циклов заряда", battery.cycle_count().map(|n| n.to_string())),
         CheckRow::maybe(
-            "Напряжение",
-            Some(format!("{:.2} В", battery.voltage().get::<volt>())),
+            name_of(Key::HwCycles),
+            battery.cycle_count().map(|n| n.to_string()),
         ),
-        CheckRow::maybe("Отдаёт", Some(format!("{:.1} Вт", battery.energy_rate().get::<watt>()))),
         CheckRow::maybe(
-            "Производитель",
+            name_of(Key::HwVoltage),
+            Some(format!(
+                "{:.2} {}",
+                battery.voltage().get::<volt>(),
+                name_of(Key::UnitVolt)
+            )),
+        ),
+        CheckRow::maybe(
+            name_of(Key::HwPowerDraw),
+            Some(format!(
+                "{:.1} {}",
+                battery.energy_rate().get::<watt>(),
+                name_of(Key::UnitWatt)
+            )),
+        ),
+        CheckRow::maybe(
+            name_of(Key::HwVendor),
             battery.vendor().filter(|s| !s.trim().is_empty()).map(str::to_owned),
         ),
         CheckRow::maybe(
-            "Модель",
+            name_of(Key::HwModel),
             battery.model().filter(|s| !s.trim().is_empty()).map(str::to_owned),
         ),
     ];
@@ -504,8 +558,7 @@ fn battery_check() -> Check {
         return Check {
             name,
             status: CheckStatus::Unknown,
-            summary: "Батарея есть, но ёмкость драйвер не сообщает — износ посчитать не из чего."
-                .to_owned(),
+            summary: name_of(Key::HwBatteryNoCapacity).to_owned(),
             rows,
             advice: None,
         };
@@ -519,17 +572,15 @@ fn battery_check() -> Check {
         } else {
             CheckStatus::Ok
         },
-        summary: format!(
-            "Заряд {}, износ {wear_text}",
-            charge.unwrap_or_else(|| "неизвестен".to_owned())
+        summary: i18n::fill(
+            name_of(Key::HwBatterySummary),
+            &[
+                &charge.unwrap_or_else(|| name_of(Key::HwChargeUnknown).to_owned()),
+                &wear_text,
+            ],
         ),
         rows,
-        advice: worn.then(|| {
-            "Батарея держит меньше четырёх пятых от проектной ёмкости. \
-             Это не поломка, но время работы от неё будет заметно меньше \
-             заявленного, и дальше оно продолжит уменьшаться."
-                .to_owned()
-        }),
+        advice: worn.then(|| name_of(Key::HwBatteryWornAdvice).to_owned()),
     }
 }
 
@@ -540,12 +591,14 @@ fn battery_check() -> Check {
 /// решается, можно ли им верить: результат деления об этом уже не расскажет —
 /// крейт зажимает его в диапазон, превращая бесконечность в правдоподобные
 /// «100 %».
-fn capacity(watt_hours: f32) -> Option<String> {
-    (watt_hours.is_finite() && watt_hours > 0.0).then(|| format!("{watt_hours:.1} Вт·ч"))
+fn capacity(watt_hours: f32, lang: Lang) -> Option<String> {
+    (watt_hours.is_finite() && watt_hours > 0.0)
+        .then(|| format!("{watt_hours:.1} {}", i18n::t(lang, Key::UnitWattHour)))
 }
 
-fn usb_check() -> Check {
-    let name = "USB-устройства".to_owned();
+fn usb_check(lang: Lang) -> Check {
+    let name_of = |key| i18n::t(lang, key);
+    let name = name_of(Key::HwUsb).to_owned();
 
     let devices = match nusb::list_devices().wait() {
         Ok(devices) => devices,
@@ -553,7 +606,7 @@ fn usb_check() -> Check {
             return Check {
                 name,
                 status: CheckStatus::Failed,
-                summary: format!("Не удалось перечислить устройства: {err}"),
+                summary: i18n::fill(name_of(Key::HwUsbListFailed), &[&err.to_string()]),
                 rows: Vec::new(),
                 advice: None,
             };
@@ -580,23 +633,31 @@ fn usb_check() -> Check {
                 .filter(|s| !s.trim().is_empty())
                 .map(str::to_owned)
                 .unwrap_or_else(|| {
-                    format!("Устройство {:04x}:{:04x}", d.vendor_id(), d.product_id())
+                    i18n::fill(
+                        name_of(Key::HwUsbUnnamedDevice),
+                        &[&format!("{:04x}:{:04x}", d.vendor_id(), d.product_id())],
+                    )
                 });
 
+            // Число и единица врозь: «Мбит/с» переводится, а «480» — нет.
             let speed = match d.speed() {
-                Some(nusb::Speed::Low) => Some("1.5 Мбит/с"),
-                Some(nusb::Speed::Full) => Some("12 Мбит/с"),
-                Some(nusb::Speed::High) => Some("480 Мбит/с"),
-                Some(nusb::Speed::Super) => Some("5 Гбит/с"),
-                Some(nusb::Speed::SuperPlus) => Some("10 Гбит/с"),
+                Some(nusb::Speed::Low) => Some(("1.5", Key::UnitMegabitPerSecond)),
+                Some(nusb::Speed::Full) => Some(("12", Key::UnitMegabitPerSecond)),
+                Some(nusb::Speed::High) => Some(("480", Key::UnitMegabitPerSecond)),
+                Some(nusb::Speed::Super) => Some(("5", Key::UnitGigabitPerSecond)),
+                Some(nusb::Speed::SuperPlus) => Some(("10", Key::UnitGigabitPerSecond)),
                 // `Speed` помечен `#[non_exhaustive]`, ветка обязательна.
                 // `None` — скорость не опознана, и это прочерк, а не «медленно».
                 _ => None,
             };
 
+            let version = usb_version(d.usb_version());
             let value = match speed {
-                Some(speed) => format!("USB {}, {speed}", usb_version(d.usb_version())),
-                None => format!("USB {}", usb_version(d.usb_version())),
+                Some((number, unit)) => i18n::fill(
+                    name_of(Key::HwUsbVersionWithSpeed),
+                    &[&version, &format!("{number} {}", name_of(unit))],
+                ),
+                None => i18n::fill(name_of(Key::HwUsbVersion), &[&version]),
             };
             CheckRow::new(label, value)
         })
@@ -604,19 +665,21 @@ fn usb_check() -> Check {
 
     // Обрезали список — говорим об этом. Молча укоротить значит показать
     // неполный перечень как полный.
+    let devices_word = |n: usize| {
+        i18n::plural(
+            lang,
+            n as u64,
+            name_of(Key::HwDeviceOne),
+            name_of(Key::HwDeviceFew),
+            name_of(Key::HwDeviceMany),
+        )
+    };
+
     if total > USB_LIMIT {
+        let rest = total - USB_LIMIT;
         rows.push(CheckRow::new(
-            "И ещё",
-            format!(
-                "{} {}",
-                total - USB_LIMIT,
-                crate::model::plural_ru(
-                    (total - USB_LIMIT) as u64,
-                    "устройство",
-                    "устройства",
-                    "устройств"
-                )
-            ),
+            name_of(Key::HwAndMore),
+            format!("{rest} {}", devices_word(rest)),
         ));
     }
 
@@ -624,7 +687,7 @@ fn usb_check() -> Check {
         return Check {
             name,
             status: CheckStatus::Unknown,
-            summary: "Подключённых устройств не найдено.".to_owned(),
+            summary: name_of(Key::HwNoUsb).to_owned(),
             rows,
             advice: None,
         };
@@ -633,10 +696,7 @@ fn usb_check() -> Check {
     Check {
         name,
         status: CheckStatus::Ok,
-        summary: format!(
-            "{total} {}",
-            crate::model::plural_ru(total as u64, "устройство", "устройства", "устройств")
-        ),
+        summary: format!("{total} {}", devices_word(total)),
         rows,
         advice: None,
     }
@@ -647,18 +707,24 @@ fn usb_check() -> Check {
 /// Второго адаптера не открываем: сведения снимаются с уже готового при
 /// старте приложения, и стоят они ноль. Поэтому здесь только раскладка
 /// по строкам, без единого запроса к системе.
-fn gpu_check(gpu: &GpuInfo) -> Check {
+fn gpu_check(gpu: &GpuInfo, lang: Lang) -> Check {
+    let name_of = |key| i18n::t(lang, key);
     Check {
-        name: "Видеокарта".to_owned(),
+        name: name_of(Key::HwGpu).to_owned(),
         status: CheckStatus::Ok,
-        summary: format!("{} ({})", gpu.name, gpu.kind),
+        summary: i18n::fill(
+            name_of(Key::HwNameAndKind),
+            &[&gpu.name, i18n::t(lang, gpu.kind)],
+        ),
         // Модели и типа среди строк нет: они и есть итог карточки.
         rows: vec![
-            CheckRow::maybe("Производитель", gpu.vendor.clone()),
+            CheckRow::maybe(name_of(Key::HwVendor), gpu.vendor.clone()),
             // Драйвер приходит пустой строкой на Metal и на GL через ANGLE —
             // это штатно, и `app.rs` превращает пустоту в `None` заранее.
-            CheckRow::maybe("Драйвер", gpu.driver.clone()),
-            CheckRow::new("Отрисовка", gpu.backend.clone()),
+            CheckRow::maybe(name_of(Key::HwDriver), gpu.driver.clone()),
+            // Имя движка отрисовки (`dx12`, `vulkan`, `metal`) — не слово,
+            // а название: переводить его нечем.
+            CheckRow::new(name_of(Key::HwRendering), gpu.backend.clone()),
         ],
         advice: None,
     }

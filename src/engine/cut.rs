@@ -15,6 +15,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::Sender;
 
 use super::{Control, wait_and_release};
+use crate::i18n::{self, Key, Lang};
 use crate::model::{Event, Section};
 
 /// Чем кончилась обрезка.
@@ -121,6 +122,7 @@ pub(super) fn cut(
     section: Section,
     control: &Control,
     tx: &Sender<Event>,
+    lang: Lang,
 ) -> Outcome {
     let temp = temp_path(file);
     let args = args(file, &temp, section);
@@ -136,17 +138,22 @@ pub(super) fn cut(
 
     let mut child = match cmd.spawn() {
         Ok(child) => child,
-        Err(err) => return Outcome::Failed(format!("не удалось запустить ffmpeg: {err}")),
+        Err(err) => {
+            return Outcome::Failed(i18n::fill(
+                i18n::t(lang, Key::CutFfmpegLaunch),
+                &[&err.to_string()],
+            ));
+        }
     };
     let Some(stderr) = child.stderr.take() else {
         super::kill_and_reap(&mut child);
-        return Outcome::Failed("у ffmpeg нет stderr".into());
+        return Outcome::Failed(i18n::t(lang, Key::CutNoStderr).into());
     };
 
     // Отменить могли, пока процесс запускался: тогда `adopt` его уже убил.
-    match control.adopt(child) {
+    match control.adopt(child, lang) {
         Ok(true) => {}
-        Ok(false) => return cancelled(file, &temp, tx),
+        Ok(false) => return cancelled(file, &temp, tx, lang),
         Err(err) => return Outcome::Failed(err),
     }
 
@@ -165,22 +172,25 @@ pub(super) fn cut(
     }
 
     let Some(status) = wait_and_release(control) else {
-        return Outcome::Failed("ffmpeg потерян".into());
+        return Outcome::Failed(i18n::t(lang, Key::CutFfmpegLost).into());
     };
 
     // Отмену спрашиваем прежде кода возврата: убитый процесс возвращает
     // ненулевой код и без этой строки выглядел бы неудачей обрезки.
     if control.cancelled() {
-        return cancelled(file, &temp, tx);
+        return cancelled(file, &temp, tx, lang);
     }
 
     if !status.success() {
         let _ = std::fs::remove_file(&temp);
-        let code = status.code().unwrap_or(-1);
+        let code = status.code().unwrap_or(-1).to_string();
         return Outcome::Failed(if errors.is_empty() {
-            format!("ffmpeg завершился с ошибкой (код {code})")
+            i18n::fill(i18n::t(lang, Key::CutFfmpegFailed), &[&code])
         } else {
-            format!("ffmpeg завершился с ошибкой (код {code}):\n{}", errors.join("\n"))
+            i18n::fill(
+                i18n::t(lang, Key::CutFfmpegFailedWithTail),
+                &[&code, &errors.join("\n")],
+            )
         });
     }
 
@@ -190,9 +200,7 @@ pub(super) fn cut(
         Ok(meta) if meta.len() > 0 => {}
         _ => {
             let _ = std::fs::remove_file(&temp);
-            return Outcome::Failed(
-                "ffmpeg отчитался об успехе, а файла с фрагментом не оставил".into(),
-            );
+            return Outcome::Failed(i18n::t(lang, Key::CutNoOutput).into());
         }
     }
 
@@ -201,7 +209,10 @@ pub(super) fn cut(
     // не существует ни одного из двух файлов, тоже не возникает.
     if let Err(err) = std::fs::rename(&temp, file) {
         let _ = std::fs::remove_file(&temp);
-        return Outcome::Failed(format!("не удалось заменить файл вырезанным куском: {err}"));
+        return Outcome::Failed(i18n::fill(
+            i18n::t(lang, Key::CutRenameFailed),
+            &[&err.to_string()],
+        ));
     }
 
     Outcome::Done
@@ -213,14 +224,15 @@ pub(super) fn cut(
 /// ролик — наша внутренняя кухня: человек о нём не просил и в папке его не
 /// ждёт. Оставить его значило бы повторить ровно ту беду, из-за которой
 /// «Отмена» и считается сломанной, — «Отменено» в окне и файл на диске.
-fn cancelled(file: &Path, temp: &Path, tx: &Sender<Event>) -> Outcome {
+fn cancelled(file: &Path, temp: &Path, tx: &Sender<Event>, lang: Lang) -> Outcome {
     let _ = std::fs::remove_file(temp);
     if let Err(err) = std::fs::remove_file(file) {
         // Не беда, о которой стоит поднимать баннер: загрузка отменена,
         // а файл человек увидит и уберёт сам. Но сказать надо — иначе
         // непонятно, откуда он взялся.
-        let _ = tx.send(Event::Log(format!(
-            "Скачанный целиком ролик не удалось убрать после отмены: {err}"
+        let _ = tx.send(Event::Log(i18n::fill(
+            i18n::t(lang, Key::CutLeftoverWholeFile),
+            &[&err.to_string()],
         )));
     }
     Outcome::Cancelled
@@ -344,7 +356,14 @@ mod tests {
 
         let (tx, rx) = std::sync::mpsc::channel();
         let control = Control::default();
-        let outcome = cut(&ffmpeg, &source, section(Some(2), Some(8)), &control, &tx);
+        let outcome = cut(
+            &ffmpeg,
+            &source,
+            section(Some(2), Some(8)),
+            &control,
+            &tx,
+            Lang::Ru,
+        );
         assert!(matches!(outcome, Outcome::Done), "обрезка не удалась");
 
         let cut_length = duration(&source);
@@ -367,7 +386,14 @@ mod tests {
         std::fs::write(&dropped, "ролик").expect("создать файл под отмену");
         let stopped = Control::default();
         stopped.cancelled.store(true, Ordering::Relaxed);
-        let outcome = cut(&ffmpeg, &dropped, section(Some(2), Some(8)), &stopped, &tx);
+        let outcome = cut(
+            &ffmpeg,
+            &dropped,
+            section(Some(2), Some(8)),
+            &stopped,
+            &tx,
+            Lang::Ru,
+        );
         assert!(
             matches!(outcome, Outcome::Cancelled),
             "отмена не распознана"
@@ -380,7 +406,14 @@ mod tests {
         const JUNK: &str = "это не видео";
         let junk = dir.join("Не ролик.mp4");
         std::fs::write(&junk, JUNK).expect("создать посторонний файл");
-        let outcome = cut(&ffmpeg, &junk, section(Some(2), Some(8)), &control, &tx);
+        let outcome = cut(
+            &ffmpeg,
+            &junk,
+            section(Some(2), Some(8)),
+            &control,
+            &tx,
+            Lang::Ru,
+        );
         assert!(
             matches!(outcome, Outcome::Failed(_)),
             "ffmpeg проглотил не видео"

@@ -50,6 +50,7 @@
 
 use std::sync::mpsc::Sender;
 
+use crate::i18n::Lang;
 use crate::model::{Event, NO_DOWNLOAD, PlanId, PowerMode};
 
 /// Что просят переключить.
@@ -79,9 +80,9 @@ pub enum Outcome {
 ///
 /// В `ui()` этому места нет ни в каком виде: чтение идёт в чужую библиотеку,
 /// и сколько времени займёт её ответ, Savio не решает (Правило 1).
-pub fn start(tx: Sender<Event>, notify: impl Fn() + Send + 'static) {
+pub fn start(lang: Lang, tx: Sender<Event>, notify: impl Fn() + Send + 'static) {
     std::thread::spawn(move || {
-        let _ = tx.send(Event::Power(read()));
+        let _ = tx.send(Event::Power(read(lang)));
         notify();
     });
 }
@@ -91,9 +92,14 @@ pub fn start(tx: Sender<Event>, notify: impl Fn() + Send + 'static) {
 /// Событий отправляется два: сначала исход словами, следом свежее состояние.
 /// Порядок важен — состояние приезжает уже проверенным, и переключатель
 /// в окне встаёт туда, где система его действительно оставила.
-pub fn start_change(change: Change, tx: Sender<Event>, notify: impl Fn() + Send + 'static) {
+pub fn start_change(
+    change: Change,
+    lang: Lang,
+    tx: Sender<Event>,
+    notify: impl Fn() + Send + 'static,
+) {
     std::thread::spawn(move || {
-        let _ = tx.send(match apply(change) {
+        let _ = tx.send(match apply(change, lang) {
             Ok(Outcome::Applied(text)) => Event::Notice(text),
             // Не `Failed`: система ответила успехом, ничего не сломалось и
             // повторять нечего — просто её ответ значит не то, чего ждали.
@@ -103,29 +109,32 @@ pub fn start_change(change: Change, tx: Sender<Event>, notify: impl Fn() + Send 
                 message,
             },
         });
-        let _ = tx.send(Event::Power(read()));
+        let _ = tx.send(Event::Power(read(lang)));
         notify();
     });
 }
 
 /// Почему на этой системе переключать нечего.
+///
+/// Полным путём, а не через `use` наверху: на Windows этих двух функций нет,
+/// и импорт оказался бы там неиспользованным — то есть уронил бы сборку
+/// на `clippy -D warnings` ровно у той системы, ради которой модуль и написан.
 #[cfg(not(windows))]
-const FOREIGN_SYSTEM: &str = "Питанием Savio управляет только в Windows: схемы \
-     электропитания и «Режим питания» — её понятия. У Linux и macOS \
-     соответствия им нет: cpufreq, TLP и pmset устроены иначе и меняют \
-     другое, так что показать здесь то же самое не выйдет.";
+fn foreign_system(lang: Lang) -> String {
+    crate::i18n::t(lang, crate::i18n::Key::PowerForeignSystem).to_owned()
+}
 
 #[cfg(not(windows))]
-pub fn read() -> crate::model::PowerState {
+pub fn read(lang: Lang) -> crate::model::PowerState {
     crate::model::PowerState {
-        trouble: Some(FOREIGN_SYSTEM.to_owned()),
+        trouble: Some(foreign_system(lang)),
         ..Default::default()
     }
 }
 
 #[cfg(not(windows))]
-pub fn apply(_change: Change) -> Result<Outcome, String> {
-    Err(FOREIGN_SYSTEM.to_owned())
+pub fn apply(_change: Change, lang: Lang) -> Result<Outcome, String> {
+    Err(foreign_system(lang))
 }
 
 #[cfg(windows)]
@@ -138,6 +147,7 @@ mod windows {
     use std::sync::OnceLock;
 
     use super::{Change, Outcome};
+    use crate::i18n::{self, Key, Lang};
     use crate::model::{PlanId, PowerMode, PowerModes, PowerPlan, PowerState};
 
     /// GUID в том виде, в каком его ждут функции Windows.
@@ -358,14 +368,10 @@ mod windows {
         unsafe { GetProcAddress(module, name.as_ptr()) }
     }
 
-    pub fn read() -> PowerState {
+    pub fn read(lang: Lang) -> PowerState {
         let Some(api) = api() else {
             return PowerState {
-                trouble: Some(
-                    "Windows не отдала powrprof.dll — библиотеку, которая \
-                     заведует питанием. Переключать отсюда нечего."
-                        .to_owned(),
-                ),
+                trouble: Some(i18n::t(lang, Key::PowerNoLibraryRead).to_owned()),
                 ..PowerState::default()
             };
         };
@@ -376,24 +382,19 @@ mod windows {
 
         // Оговорки собираем здесь, а не в кадре отрисовки: строка неизменна,
         // пока не перечитали состояние (Правило 1).
-        let mut trouble = String::new();
+        let mut trouble: Vec<&str> = Vec::new();
         if plans.is_empty() {
-            trouble.push_str(
-                "Список схем электропитания система не отдала — переключать нечего. ",
-            );
+            trouble.push(i18n::t(lang, Key::PowerNoPlans));
         }
         if modes == PowerModes::Unsupported {
-            trouble.push_str(
-                "Режим питания эта Windows не поддерживает: он появился \
-                 в Windows 10 версии 1803.",
-            );
+            trouble.push(i18n::t(lang, Key::PowerModesUnsupported));
         }
 
         PowerState {
             plans,
             active,
             modes,
-            trouble: (!trouble.is_empty()).then(|| trouble.trim_end().to_owned()),
+            trouble: (!trouble.is_empty()).then(|| trouble.join(" ")),
         }
     }
 
@@ -520,27 +521,24 @@ mod windows {
         (rc == ERROR_SUCCESS).then(|| guid.id())
     }
 
-    pub fn apply(change: Change) -> Result<Outcome, String> {
+    pub fn apply(change: Change, lang: Lang) -> Result<Outcome, String> {
         let Some(api) = api() else {
-            return Err(
-                "Windows не отдала powrprof.dll — переключать питание нечем.".to_owned(),
-            );
+            return Err(i18n::t(lang, Key::PowerNoLibraryApply).to_owned());
         };
 
         match change {
-            Change::Plan(id) => apply_plan(api, id),
-            Change::Mode(mode) => apply_mode(api, mode),
+            Change::Plan(id) => apply_plan(api, id, lang),
+            Change::Mode(mode) => apply_mode(api, mode, lang),
         }
     }
 
-    fn apply_plan(api: &Api, id: PlanId) -> Result<Outcome, String> {
+    fn apply_plan(api: &Api, id: PlanId, lang: Lang) -> Result<Outcome, String> {
         let guid = Guid::new(id);
         let rc = unsafe { (api.set_active)(null_mut(), &guid) };
         if rc != ERROR_SUCCESS {
-            return Err(format!(
-                "Windows не переключила схему электропитания (код {rc}). \
-                 Обычно так отвечают на схему, которой больше нет: \
-                 нажмите «Обновить»."
+            return Err(i18n::fill(
+                i18n::t(lang, Key::PowerPlanSetFailed),
+                &[&rc.to_string()],
             ));
         }
 
@@ -548,44 +546,38 @@ mod windows {
         // заново и верим только её ответу.
         let name = friendly_name(api, &guid).unwrap_or_else(|| id.to_string());
         match active_plan(api) {
-            Some(now) if now == id => Ok(Outcome::Applied(format!(
-                "Схема электропитания переключена: «{name}»."
+            Some(now) if now == id => Ok(Outcome::Applied(i18n::fill(
+                i18n::t(lang, Key::PowerPlanApplied),
+                &[&name],
             ))),
-            _ => Err(format!(
-                "Windows ответила успехом, но активной осталась не «{name}». \
-                 Схему могла вернуть назад политика организации."
+            _ => Err(i18n::fill(
+                i18n::t(lang, Key::PowerPlanNotActive),
+                &[&name],
             )),
         }
     }
 
-    fn apply_mode(api: &Api, mode: PowerMode) -> Result<Outcome, String> {
+    fn apply_mode(api: &Api, mode: PowerMode, lang: Lang) -> Result<Outcome, String> {
         let Some(overlay) = &api.overlay else {
-            return Err(
-                "Режим питания эта Windows не поддерживает: он появился \
-                 в Windows 10 версии 1803."
-                    .to_owned(),
-            );
+            return Err(i18n::t(lang, Key::PowerModesUnsupported).to_owned());
         };
 
         let rc = unsafe { (overlay.set)(Guid::new(mode.id())) };
         if rc != ERROR_SUCCESS {
-            return Err(format!(
-                "Windows не переключила режим питания (код {rc})."
+            return Err(i18n::fill(
+                i18n::t(lang, Key::PowerModeSetFailed),
+                &[&rc.to_string()],
             ));
         }
 
         let Some(now) = current_overlay(overlay.effective) else {
-            return Err(
-                "Windows приняла режим питания, но назвать действующий \
-                 отказалась — что стало с машиной, Savio не знает."
-                    .to_owned(),
-            );
+            return Err(i18n::t(lang, Key::PowerModeUnreadable).to_owned());
         };
 
         if now == mode.id() {
-            return Ok(Outcome::Applied(format!(
-                "Режим питания переключён: {}.",
-                mode.label()
+            return Ok(Outcome::Applied(i18n::fill(
+                i18n::t(lang, Key::PowerModeApplied),
+                &[mode.label(lang)],
             )));
         }
 
@@ -597,9 +589,9 @@ mod windows {
         // что теперь делать, видно из состояния, которое уедет следующим
         // событием (`PowerModes::ignored`), — и пересказывать это здесь
         // значило бы поставить в окно два жёлтых абзаца об одном и том же.
-        Ok(Outcome::Ignored(format!(
-            "Режим «{}» Windows запомнила, но не применила.",
-            mode.label()
+        Ok(Outcome::Ignored(i18n::fill(
+            i18n::t(lang, Key::PowerModeIgnored),
+            &[mode.label(lang)],
         )))
     }
 }
@@ -617,7 +609,7 @@ mod tests {
     /// проверить, не изменив состояние машины того, кто гоняет тесты.
     #[test]
     fn reading_power_state_is_self_consistent() {
-        let state = read();
+        let state = read(Lang::Ru);
 
         // Активная схема обязана быть в списке: показать в окне выбранным
         // то, чего в списке нет, нельзя — переключатель окажется пустым.

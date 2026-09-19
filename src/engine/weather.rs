@@ -47,6 +47,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 
 use super::binaries;
+use crate::i18n::{self, Key, Lang};
 use crate::model::{
     AirQuality, DayForecast, Event, HourForecast, NO_DOWNLOAD, Place, WeatherNow, WeatherReport,
     parse_local_time,
@@ -148,13 +149,14 @@ const CACHE_SCHEMA: u64 = 1;
 pub fn start(
     place: Option<Place>,
     saved: bool,
+    lang: Lang,
     tx: Sender<Event>,
     notify: impl Fn() + Send + 'static,
 ) {
     std::thread::spawn(move || {
         if saved
             && let Some(wanted) = &place
-            && let Some(report) = load_cache().filter(|report| report.place.same_as(wanted))
+            && let Some(report) = load_cache(lang).filter(|report| report.place.same_as(wanted))
             && send(&tx, &notify, Event::Weather(Box::new(report))).is_err()
         {
             return;
@@ -164,11 +166,11 @@ pub fn start(
         let place = match place {
             Some(place) => place,
             None => {
-                if send(&tx, &notify, Event::Stage("Определяю место по IP-адресу…".into())).is_err()
-                {
+                let stage = i18n::t(lang, Key::StageLocatingByIp).to_owned();
+                if send(&tx, &notify, Event::Stage(stage)).is_err() {
                     return;
                 }
-                match locate(&agent) {
+                match locate(&agent, lang) {
                     Ok(place) => {
                         if send(&tx, &notify, Event::WeatherPlace(place.clone())).is_err() {
                             return;
@@ -183,10 +185,11 @@ pub fn start(
             }
         };
 
-        if send(&tx, &notify, Event::Stage("Запрашиваю прогноз…".into())).is_err() {
+        let stage = i18n::t(lang, Key::StageFetchingForecast).to_owned();
+        if send(&tx, &notify, Event::Stage(stage)).is_err() {
             return;
         }
-        let event = match fetch(&agent, place) {
+        let event = match fetch(&agent, place, lang) {
             Ok(report) => Event::Weather(Box::new(report)),
             Err(message) => failed(message),
         };
@@ -198,9 +201,15 @@ pub fn start(
 ///
 /// Свой приёмник, отдельный от прогноза: искать другой город, пока грузится
 /// прогноз этого, — законный сценарий.
-pub fn start_search(query: String, tx: Sender<Event>, notify: impl Fn() + Send + 'static) {
+pub fn start_search(
+    query: String,
+    lang: Lang,
+    tx: Sender<Event>,
+    notify: impl Fn() + Send + 'static,
+) {
     std::thread::spawn(move || {
-        let event = match get_json(&agent(), &search_url(query.trim()), Service::Search) {
+        let url = search_url(query.trim(), lang);
+        let event = match get_json(&agent(), &url, Service::Search, lang) {
             Ok(value) => Event::WeatherPlaces(parse_places(&value)),
             Err(message) => failed(message),
         };
@@ -364,12 +373,15 @@ enum Service {
 }
 
 impl Service {
-    fn name(self) -> &'static str {
-        match self {
-            Service::Forecast => "Сервер погоды",
-            Service::Search => "Сервер поиска городов",
-            Service::Locate => "Сервер определения места",
-        }
+    fn name(self, lang: Lang) -> &'static str {
+        i18n::t(
+            lang,
+            match self {
+                Service::Forecast => Key::WeatherServerForecast,
+                Service::Search => Key::WeatherServerSearch,
+                Service::Locate => Key::WeatherServerLocate,
+            },
+        )
     }
 }
 
@@ -383,10 +395,15 @@ struct Failure {
 ///
 /// На `4xx` не повторяем: неверный запрос второй раз не станет верным, а
 /// `429` («слишком часто») повтор через секунду только продлит.
-fn get_json(agent: &ureq::Agent, url: &str, service: Service) -> Result<Value, String> {
+fn get_json(
+    agent: &ureq::Agent,
+    url: &str,
+    service: Service,
+    lang: Lang,
+) -> Result<Value, String> {
     let mut last = String::new();
     for attempt in 1..=ATTEMPTS {
-        match request(agent, url, service) {
+        match request(agent, url, service, lang) {
             Ok(value) => return Ok(value),
             Err(failure) => {
                 last = failure.message;
@@ -402,10 +419,15 @@ fn get_json(agent: &ureq::Agent, url: &str, service: Service) -> Result<Value, S
     Err(last)
 }
 
-fn request(agent: &ureq::Agent, url: &str, service: Service) -> Result<Value, Failure> {
-    let name = service.name();
+fn request(
+    agent: &ureq::Agent,
+    url: &str,
+    service: Service,
+    lang: Lang,
+) -> Result<Value, Failure> {
+    let name = service.name(lang);
     let response = agent.get(url).call().map_err(|err| Failure {
-        message: transport_message(&err, name),
+        message: transport_message(&err, name, lang),
         retry: true,
     })?;
 
@@ -416,14 +438,14 @@ fn request(agent: &ureq::Agent, url: &str, service: Service) -> Result<Value, Fa
         .limit(MAX_BYTES)
         .read_to_string()
         .map_err(|_| Failure {
-            message: format!("{name} прислал ответ, который не удалось дочитать."),
+            message: i18n::fill(i18n::t(lang, Key::WeatherUnreadableAnswer), &[name]),
             retry: true,
         })?;
     let value = serde_json::from_str::<Value>(&text).ok();
 
     if (200..300).contains(&status) {
         return value.ok_or_else(|| Failure {
-            message: format!("{name} прислал ответ в незнакомом виде. Попробуйте позже."),
+            message: i18n::fill(i18n::t(lang, Key::WeatherUnknownShape), &[name]),
             retry: false,
         });
     }
@@ -433,19 +455,18 @@ fn request(agent: &ureq::Agent, url: &str, service: Service) -> Result<Value, Fa
         .and_then(|value| value.get("reason"))
         .and_then(Value::as_str);
     Err(Failure {
-        message: status_message(status, reason, name),
+        message: status_message(status, reason, name, lang),
         retry: status >= 500,
     })
 }
 
 /// Обрыв связи — на человеческий.
-fn transport_message(err: &ureq::Error, name: &str) -> String {
-    match err {
-        ureq::Error::Timeout(_) => {
-            format!("{name} не ответил вовремя. Проверьте подключение к интернету.")
-        }
-        _ => format!("{name} недоступен. Проверьте подключение к интернету."),
-    }
+fn transport_message(err: &ureq::Error, name: &str, lang: Lang) -> String {
+    let key = match err {
+        ureq::Error::Timeout(_) => Key::WeatherTimedOut,
+        _ => Key::WeatherUnreachable,
+    };
+    i18n::fill(i18n::t(lang, key), &[name])
 }
 
 /// Отказ сервера — на человеческий.
@@ -456,21 +477,20 @@ fn transport_message(err: &ureq::Error, name: &str) -> String {
 /// Приметы — фразы Open-Meteo, проверенные вживую 2026-09-14; промах подстроки
 /// не поймает ни компилятор, ни тест, объяснение просто перестанет
 /// появляться — и тогда сработает фолбэк.
-fn status_message(status: u16, reason: Option<&str>, name: &str) -> String {
+fn status_message(status: u16, reason: Option<&str>, name: &str, lang: Lang) -> String {
     if reason.is_some_and(|reason| {
         reason.contains("Latitude must be") || reason.contains("Longitude must be")
     }) {
-        return "У выбранного места неверные координаты. Найдите его заново через поиск."
-            .to_owned();
+        return i18n::t(lang, Key::WeatherBadCoordinates).to_owned();
     }
+    let code = status.to_string();
     match (status, reason) {
-        (429, _) => format!(
-            "{name} просит подождать: с вашего адреса слишком много запросов. \
-             Попробуйте через минуту."
-        ),
-        (500.., _) => format!("{name} сейчас не работает (код {status}). Попробуйте позже."),
-        (_, Some(reason)) if !reason.is_empty() => format!("{name} отказал: {reason}"),
-        _ => format!("{name} ответил кодом {status}."),
+        (429, _) => i18n::fill(i18n::t(lang, Key::WeatherTooManyRequests), &[name]),
+        (500.., _) => i18n::fill(i18n::t(lang, Key::WeatherServerDown), &[name, &code]),
+        (_, Some(reason)) if !reason.is_empty() => {
+            i18n::fill(i18n::t(lang, Key::WeatherRefused), &[name, reason])
+        }
+        _ => i18n::fill(i18n::t(lang, Key::WeatherStatusCode), &[name, &code]),
     }
 }
 
@@ -490,10 +510,17 @@ fn air_url(place: &Place) -> String {
     )
 }
 
-fn search_url(query: &str) -> String {
+/// Язык названий в ответе — тот же, что в окне.
+///
+/// Код уходит как есть: у Open-Meteo набор языков свой, и армянского в нём
+/// может не оказаться. Незнакомый код он не считает ошибкой — просто отдаёт
+/// названия как есть, по-английски или на местном языке. Это и честно:
+/// придуманное название хуже неперевёденного.
+fn search_url(query: &str, lang: Lang) -> String {
     format!(
-        "{SEARCH_URL}?name={}&count={SEARCH_COUNT}&language=ru&format=json",
-        percent_encode(query)
+        "{SEARCH_URL}?name={}&count={SEARCH_COUNT}&language={}&format=json",
+        percent_encode(query),
+        lang.code()
     )
 }
 
@@ -519,14 +546,14 @@ fn percent_encode(text: &str) -> String {
 }
 
 /// Прогноз и воздух для места, с записью на диск.
-fn fetch(agent: &ureq::Agent, place: Place) -> Result<WeatherReport, String> {
-    let forecast = get_json(agent, &forecast_url(&place), Service::Forecast)?;
+fn fetch(agent: &ureq::Agent, place: Place, lang: Lang) -> Result<WeatherReport, String> {
+    let forecast = get_json(agent, &forecast_url(&place), Service::Forecast, lang)?;
     // Воздух — отдельный хост, и его неудача прогноз не роняет: погода
     // показывается, воздух — нет. Об этом скажет вкладка.
-    let air = get_json(agent, &air_url(&place), Service::Forecast).ok();
+    let air = get_json(agent, &air_url(&place), Service::Forecast, lang).ok();
     let fetched_at = now_unix();
 
-    let report = build_report(place, &forecast, air.as_ref(), fetched_at, false)?;
+    let report = build_report(place, &forecast, air.as_ref(), fetched_at, false, lang)?;
     // Сырые ответы, а не собранный отчёт: читать файл будет тот же разбор,
     // что читает сеть, и второго формата, который разойдётся с первым, нет.
     save_cache(&report.place, fetched_at, &forecast, air.as_ref());
@@ -543,6 +570,7 @@ fn build_report(
     air: Option<&Value>,
     fetched_at: Option<i64>,
     saved: bool,
+    lang: Lang,
 ) -> Result<WeatherReport, String> {
     // Без смещения времена в ответе — по Гринвичу: так Open-Meteo отвечает,
     // когда часовой пояс не спрошен. Ноль тут не выдуманное значение, а
@@ -561,7 +589,7 @@ fn build_report(
         .map_or_else(Vec::new, |block| parse_days(block, offset));
 
     if now.is_none() && hours.is_empty() && days.is_empty() {
-        return Err("Сервер погоды прислал ответ без прогноза. Попробуйте обновить позже.".into());
+        return Err(i18n::t(lang, Key::WeatherNoForecast).into());
     }
 
     Ok(WeatherReport {
@@ -782,28 +810,27 @@ fn ip_place(value: &Value, country_key: &str) -> Option<Place> {
     })
 }
 
-/// Место по IP-адресу, с русским названием, если его удалось найти.
-fn locate(agent: &ureq::Agent) -> Result<Place, String> {
+/// Место по IP-адресу, названное на выбранном языке, если такое нашлось.
+fn locate(agent: &ureq::Agent, lang: Lang) -> Result<Place, String> {
     for source in &IP_SOURCES {
-        let Ok(value) = get_json(agent, source.url, Service::Locate) else {
+        let Ok(value) = get_json(agent, source.url, Service::Locate, lang) else {
             continue;
         };
         if let Some(place) = (source.parse)(&value) {
-            return Ok(in_russian(agent, place));
+            return Ok(in_local_language(agent, place, lang));
         }
     }
-    Err(
-        "Не удалось определить место по IP-адресу: серверы определения места не ответили. \
-         Найдите свой город через поиск."
-            .to_owned(),
-    )
+    Err(i18n::t(lang, Key::WeatherLocateFailed).to_owned())
 }
 
-/// То же место, но названное по-русски — если такое нашлось рядом.
+/// То же место, но названное на языке окна — если такое нашлось рядом.
 ///
-/// Любая неудача оставляет английское название: оно хуже русского, но честное.
-fn in_russian(agent: &ureq::Agent, place: Place) -> Place {
-    let Ok(value) = get_json(agent, &search_url(&place.name), Service::Search) else {
+/// Любая неудача оставляет английское название от геолокатора: оно хуже
+/// переведённого, но честное. Так же выходит и на языке, которого у
+/// Open-Meteo нет вовсе.
+fn in_local_language(agent: &ureq::Agent, place: Place, lang: Lang) -> Place {
+    let url = search_url(&place.name, lang);
+    let Ok(value) = get_json(agent, &url, Service::Search, lang) else {
         return place;
     };
     nearest(&parse_places(&value), &place, NAME_MATCH_KM)
@@ -863,16 +890,19 @@ fn cache_path() -> Option<PathBuf> {
 
 /// Последний отчёт с диска. Любая неудача — просто «отчёта нет»: это
 /// удобство, а не данные, и ругаться из-за него незачем.
-fn load_cache() -> Option<WeatherReport> {
-    parse_cache(&std::fs::read_to_string(cache_path()?).ok()?)
+fn load_cache(lang: Lang) -> Option<WeatherReport> {
+    parse_cache(&std::fs::read_to_string(cache_path()?).ok()?, lang)
 }
 
-fn parse_cache(text: &str) -> Option<WeatherReport> {
+fn parse_cache(text: &str, lang: Lang) -> Option<WeatherReport> {
     let value: Value = serde_json::from_str(text).ok()?;
     let place = place_from_json(value.get("place")?)?;
     let fetched_at = value.get("fetched_at").and_then(Value::as_i64);
     let air = value.get("air").filter(|air| !air.is_null());
-    build_report(place, value.get("forecast")?, air, fetched_at, true).ok()
+    // Отчёт с диска разбирается ровно тем же кодом, что и свежий, поэтому
+    // и `lang` ему нужен — на отказ «ответ без прогноза». Язык здесь тот,
+    // который выбран сейчас: читаем-то мы его сейчас.
+    build_report(place, value.get("forecast")?, air, fetched_at, true, lang).ok()
 }
 
 fn cache_json(place: &Place, fetched_at: Option<i64>, forecast: &Value, air: Option<&Value>) -> String {

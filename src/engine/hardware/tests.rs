@@ -35,10 +35,20 @@ fn sample() -> SystemReport {
 
 #[test]
 fn collect_names_every_check_it_returns() {
-    let report = collect(None);
+    let report = collect(None, Lang::Ru);
 
     // Пункты, которые есть на любой машине: без них отчёт бессмысленен.
-    for expected in ["Система", "Процессор", "Память", "Сеть", "Батарея"] {
+    // Сверяемся с ключами, а не с русскими словами: на другом языке такой
+    // тест не работал бы вовсе, а подогнать его под новую подпись — значит
+    // потерять проверку.
+    for key in [
+        Key::HwSystem,
+        Key::HwCpu,
+        Key::HwMemory,
+        Key::HwNetwork,
+        Key::HwBattery,
+    ] {
+        let expected = i18n::t(Lang::Ru, key);
         assert!(
             report.checks.iter().any(|c| c.name == expected),
             "в отчёте нет пункта «{expected}»"
@@ -63,9 +73,11 @@ fn missing_value_never_becomes_a_zero() {
 
     // Ноль частоты — это «не спросили или не ответили», и наружу он выходит
     // прочерком, а не «0 МГц».
-    assert_eq!(human_mhz(0), None);
-    assert_eq!(human_mhz(2400).as_deref(), Some("2.40 ГГц"));
-    assert_eq!(human_mhz(800).as_deref(), Some("800 МГц"));
+    assert_eq!(human_mhz(0, Lang::Ru), None);
+    assert_eq!(human_mhz(2400, Lang::Ru).as_deref(), Some("2.40 ГГц"));
+    assert_eq!(human_mhz(800, Lang::Ru).as_deref(), Some("800 МГц"));
+    // Единица частоты — тоже перевод, и пропустить её легче всего.
+    assert_eq!(human_mhz(800, Lang::En).as_deref(), Some("800 MHz"));
 }
 
 #[test]
@@ -74,9 +86,9 @@ fn worn_out_battery_math_survives_a_driver_that_reports_nothing() {
     // ноль на ноль и отдаёт NaN. В окне это стало бы «NaN%».
     assert_eq!(human_percent(f32::NAN), None);
     // Ёмкость нулевая — значит, её не сообщили, а не «батарея пустая».
-    assert_eq!(capacity(0.0), None);
-    assert_eq!(capacity(f32::NAN), None);
-    assert_eq!(capacity(52.5).as_deref(), Some("52.5 Вт·ч"));
+    assert_eq!(capacity(0.0, Lang::Ru), None);
+    assert_eq!(capacity(f32::NAN, Lang::Ru), None);
+    assert_eq!(capacity(52.5, Lang::Ru).as_deref(), Some("52.5 Вт·ч"));
 }
 
 #[test]
@@ -90,7 +102,9 @@ fn health_is_trusted_only_when_both_capacities_are_real() {
     // ёмкости; при нулевой одной лишь проектной деление даёт `+inf`, а зажим
     // превращает его ровно в 1.0. То есть батарея, о которой ничего не
     // известно, притворяется совершенно исправной.
-    let trust = |full: f32, design: f32| capacity(full).is_some() && capacity(design).is_some();
+    let trust = |full: f32, design: f32| {
+        capacity(full, Lang::Ru).is_some() && capacity(design, Lang::Ru).is_some()
+    };
 
     assert!(trust(45.0, 50.0), "обе ёмкости настоящие — износ считаем");
     assert!(
@@ -134,7 +148,7 @@ fn headline_never_promises_that_nothing_is_wrong() {
         }],
     };
 
-    let text = all_fine.headline();
+    let text = all_fine.headline(Lang::Ru);
     // Отчёт видит малую часть железа, и обещать по нему исправность машины
     // нельзя даже когда все пункты зелёные.
     assert!(
@@ -144,13 +158,13 @@ fn headline_never_promises_that_nothing_is_wrong() {
     assert!(text.contains('1'), "итог должен пересчитывать пункты: {text}");
 
     // А замечания и отсутствие данных обязаны быть названы отдельно.
-    let mixed = sample().headline();
+    let mixed = sample().headline(Lang::Ru);
     assert!(mixed.contains("замечанием"), "{mixed}");
 }
 
 #[test]
 fn saved_report_keeps_the_dash_where_there_was_no_value() {
-    let text = sample().to_text();
+    let text = sample().to_text(Lang::Ru);
 
     // Файл уходит в чужие руки, и «нет данных», ставшее при сохранении
     // пустотой, там уже не восстановить.
@@ -179,16 +193,24 @@ fn usb_version_reads_the_binary_coded_field() {
 fn uptime_is_written_the_way_a_person_reads_it() {
     // Ради этого функция и заведена: `human_duration` напечатала бы
     // «172:04:11», а машина работает днями.
-    assert_eq!(human_uptime(0), "0 минут");
-    assert_eq!(human_uptime(60), "1 минута");
-    assert_eq!(human_uptime(3 * 60), "3 минуты");
-    assert_eq!(human_uptime(3600), "1 час");
-    assert_eq!(human_uptime(3600 + 120), "1 час 2 минуты");
-    assert_eq!(human_uptime(86_400), "1 день");
-    assert_eq!(human_uptime(2 * 86_400 + 4 * 3600), "2 дня 4 часа");
-    assert_eq!(human_uptime(5 * 86_400), "5 дней");
+    let ru = |secs| human_uptime(secs, Lang::Ru);
+    assert_eq!(ru(0), "0 минут");
+    assert_eq!(ru(60), "1 минута");
+    assert_eq!(ru(3 * 60), "3 минуты");
+    assert_eq!(ru(3600), "1 час");
+    assert_eq!(ru(3600 + 120), "1 час 2 минуты");
+    assert_eq!(ru(86_400), "1 день");
+    assert_eq!(ru(2 * 86_400 + 4 * 3600), "2 дня 4 часа");
+    assert_eq!(ru(5 * 86_400), "5 дней");
     // Одиннадцать-четырнадцать — то самое исключение, на котором правило
     // «по последней цифре» ошибается.
-    assert_eq!(human_uptime(11 * 86_400), "11 дней");
-    assert_eq!(human_uptime(21 * 86_400), "21 день");
+    assert_eq!(ru(11 * 86_400), "11 дней");
+    assert_eq!(ru(21 * 86_400), "21 день");
+
+    // У английского форм две, у армянского существительное при числительном
+    // не меняется вовсе — и то и другое считает `i18n::plural`.
+    assert_eq!(human_uptime(86_400, Lang::En), "1 day");
+    assert_eq!(human_uptime(5 * 86_400, Lang::En), "5 days");
+    assert_eq!(human_uptime(86_400, Lang::Am), "1 օր");
+    assert_eq!(human_uptime(5 * 86_400, Lang::Am), "5 օր");
 }

@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::binaries::Tools;
+use crate::i18n::{self, Key, Lang};
 use crate::model::{
     CookieSource, Format, MediaInfo, Progress, Quality, Request, Section, SectionPlan,
     SubtitlePlan, SubtitleTrack,
@@ -90,7 +91,7 @@ const COOKIE_FILE_FLAG: &str = "--cookies";
 ///
 /// Сама строка из журнала не убирается и убрана быть не может: на успехе её
 /// отправки держится проверка живого приёмника в `engine::run`.
-pub fn log_args(args: &[String]) -> String {
+pub fn log_args(args: &[String], lang: Lang) -> String {
     let mut out = String::new();
     let mut hide_next = false;
     for arg in args {
@@ -102,9 +103,9 @@ pub fn log_args(args: &[String]) -> String {
             // `..`, — такого файла не бывает, но подставлять на месте
             // неразобранного пустоту тоже нельзя: строка журнала перестала
             // бы читаться.
-            let name = Path::new(arg)
-                .file_name()
-                .unwrap_or_else(|| std::ffi::OsStr::new("файл cookies"));
+            let name = Path::new(arg).file_name().unwrap_or_else(|| {
+                std::ffi::OsStr::new(i18n::t(lang, Key::LogCookieFilePlaceholder))
+            });
             out.push('…');
             out.push(std::path::MAIN_SEPARATOR);
             out.push_str(&name.to_string_lossy());
@@ -358,7 +359,7 @@ pub enum Line {
     Other(String),
 }
 
-pub fn parse_line(line: &str) -> Line {
+pub fn parse_line(line: &str, lang: Lang) -> Line {
     let line = line.trim();
     if !line.starts_with('{') {
         return Line::Other(if line.is_empty() {
@@ -384,8 +385,11 @@ pub fn parse_line(line: &str) -> Line {
 
     // `pp` есть только у шаблона постобработки.
     if v.get("pp").is_some() {
-        let pp = v.get("pp").and_then(|x| x.as_str()).unwrap_or("обработка");
-        return Line::Stage(format!("Обработка: {pp}"));
+        let pp = v
+            .get("pp")
+            .and_then(|x| x.as_str())
+            .unwrap_or_else(|| i18n::t(lang, Key::StageProcessingUnnamed));
+        return Line::Stage(i18n::fill(i18n::t(lang, Key::StageProcessing), &[pp]));
     }
 
     if v.get("downloaded").is_some() {
@@ -435,7 +439,11 @@ const SUPPORTED_SITES: &str =
 ///
 /// Неподдерживаемого сайта в таблице нет: его объяснение подставляет ссылку
 /// на список сайтов, а в константе форматировать нечем.
-const FAILURE_HINTS: &[(&[&str], &str)] = &[
+///
+/// Приметы английские и остаются английскими на любом языке интерфейса: они
+/// принадлежат yt-dlp, а не Savio. Переводится **правая** половина — и потому
+/// в таблице лежит ключ, а не сама строка.
+const FAILURE_HINTS: &[(&[&str], Key)] = &[
     // Три приметы ниже — про сами cookies, и стоят они выше остальных
     // намеренно: пока браузер не отдал cookies, ни возраста, ни приватности
     // yt-dlp даже не проверял. Все формулировки сняты с живого вывода
@@ -450,38 +458,22 @@ const FAILURE_HINTS: &[(&[&str], &str)] = &[
         // браузер» к ней не подойдёт. С «cookies database» из соседней приметы
         // (браузера нет вовсе) эта не пересекается: там «cookies» с «s».
         &["cookie database"],
-        "Браузер не отдал cookies: файл занят.\n\n\
-         Пока браузер работает, он держит свою базу cookies открытой, и \
-         прочитать её нельзя. Закройте браузер полностью — вместе со значком \
-         в области уведомлений — и попробуйте снова.",
+        Key::FailCookieDbLocked,
     ),
     (
         &["decrypt with dpapi", "failed to decrypt cookie"],
-        "Этот браузер не отдаёт cookies.\n\n\
-         Chrome и браузеры на его основе (Edge, Brave, Opera, Vivaldi) в \
-         свежих версиях шифруют cookies так, что снаружи их не прочитать. \
-         Это защита самого браузера, обойти её Savio не может. Выходов два: \
-         выбрать в списке Mozilla Firefox — его cookies читаются — или \
-         выгрузить cookies из этого же браузера расширением вроде «Get \
-         cookies.txt» и указать в списке «Из файла…» то, что оно сохранит.",
+        Key::FailCookieDpapi,
     ),
     (
         &["cookies database in", "could not find cookies"],
-        "В этом браузере cookies не нашлись.\n\n\
-         Savio не нашёл его базу cookies: скорее всего браузер не установлен \
-         или вы ни разу его не открывали. Выберите тот браузер, в котором \
-         открыт нужный сайт.",
+        Key::FailCookieDbMissing,
     ),
     (
         // Ответ на посторонний файл и, что менее очевидно, на пустой:
         // проверено вживую (yt-dlp 2026.07.04) — оба дают эту же строку
         // и код 1.
         &["does not look like a netscape format cookies file"],
-        "Выбранный файл — не файл cookies.\n\n\
-         Нужен текстовый файл формата Netscape: такой выгружает расширение \
-         браузера, например «Get cookies.txt», кнопкой «Экспорт». Тем же \
-         ответом кончается и пустой файл. Выберите в строке под списком \
-         другой файл — или верните пункт «Не использовать».",
+        Key::FailCookieFileNotNetscape,
     ),
     (
         // Примета — имя модуля из питоновского трейсбека, а не «permission
@@ -490,22 +482,9 @@ const FAILURE_HINTS: &[(&[&str], &str)] = &[
         // (проверено вживую): трейсбек кончается строкой `cookies.py`,
         // самим исключением и сообщением упаковщика.
         &["cookies.py"],
-        "В файл cookies не удалось записать.\n\n\
-         После работы yt-dlp дописывает в этот файл свежие cookies — и не \
-         смог: скорее всего у файла стоит «Только чтение» либо он лежит там, \
-         куда писать нельзя. Ролик при этом, скорее всего, уже скачан — \
-         загляните в папку сохранения. Снимите с файла защиту от записи или \
-         скопируйте его в обычную папку.",
+        Key::FailCookieFileWrite,
     ),
-    (
-        &["not a bot"],
-        "Сайт требует подтвердить, что вы не робот.\n\n\
-         Так отвечают, когда с вашего адреса приходит слишком много запросов. \
-         Нажмите «Обновить движок» и попробуйте снова через несколько минут. \
-         Если включён VPN — выключите его: одним адресом пользуются многие, \
-         и проверка на нём срабатывает чаще. А если вы вошли на этот сайт \
-         в браузере — выберите его в списке «Вход на сайт».",
-    ),
+    (&["not a bot"], Key::FailNotABot),
     (
         &[
             "confirm your age",
@@ -513,19 +492,11 @@ const FAILURE_HINTS: &[(&[&str], &str)] = &[
             "age restricted",
             "inappropriate for some users",
         ],
-        "Видео с возрастным ограничением.\n\n\
-         Сайт отдаёт его только тем, кто вошёл в аккаунт. Выберите в списке \
-         «Вход на сайт» тот браузер, где вы вошли, — Savio возьмёт вход \
-         оттуда. Иногда помогает и «Обновить движок»: свежий yt-dlp обходит \
-         часть таких проверок.",
+        Key::FailAgeRestricted,
     ),
     (
         &["private video", "is private"],
-        "Доступ к видео закрыт.\n\n\
-         Владелец сделал его приватным — оно отдаётся только тем, кому он \
-         открыл доступ. Если доступ открыт вам, выберите в списке «Вход \
-         на сайт» тот браузер, где вы вошли в аккаунт. Иначе остаётся \
-         поискать открытую копию по другой ссылке.",
+        Key::FailPrivateVideo,
     ),
     (
         // «in your country» без отрицания: YouTube строит фразу тремя
@@ -538,17 +509,11 @@ const FAILURE_HINTS: &[(&[&str], &str)] = &[
             "in your country",
             "from your location",
         ],
-        "Видео недоступно в вашей стране.\n\n\
-         Сайт закрыл его по региону — дело не в ссылке и не в Savio. \
-         Помогает только смена региона: VPN или прокси, включённые до \
-         начала загрузки.",
+        Key::FailGeoBlocked,
     ),
     (
         &["http error 403", "403: forbidden"],
-        "Сервер отказал в доступе (ошибка 403).\n\n\
-         Чаще всего это значит, что сайт сменил защиту и движок устарел — \
-         нажмите «Обновить движок». Если не помогло, откройте страницу заново \
-         и скопируйте ссылку: прежняя могла быть одноразовой и уже истечь.",
+        Key::FailForbidden403,
     ),
 ];
 
@@ -568,17 +533,14 @@ const FAILURE_HINTS: &[(&[&str], &str)] = &[
 /// `cookies` нужен ровно одной подсказке и потому в таблицу не убран: пустой
 /// список дорожек значит совершенно разное с cookies и без них, и различить
 /// эти два случая по хвосту stderr нечем.
-pub fn explain_failure(code: i32, tail: &str, cookies: CookieSource) -> String {
+pub fn explain_failure(code: i32, tail: &str, cookies: CookieSource, lang: Lang) -> String {
     // Признак ищем по подстроке, а не по началу строки: yt-dlp печатает
     // `ERROR: Unsupported URL: …`, но перед этим может идти префикс
     // экстрактора, а с `--no-warnings` — и вовсе другая раскладка.
     if tail.contains("Unsupported URL") {
-        return format!(
-            "Этот сайт не поддерживается.\n\n\
-             Savio скачивает через yt-dlp, а он не умеет работать с этим адресом. \
-             Дело не в ссылке и не в приложении — сайта просто нет в списке \
-             поддерживаемых:\n{SUPPORTED_SITES}\n\n\
-             Если сайт там есть, движок устарел — нажмите «Обновить движок»."
+        return i18n::fill(
+            i18n::t(lang, Key::FailUnsupportedSite),
+            &[SUPPORTED_SITES],
         );
     }
 
@@ -606,32 +568,30 @@ pub fn explain_failure(code: i32, tail: &str, cookies: CookieSource) -> String {
         && (lower.contains("requested format is not available")
             || lower.contains("no video formats found"))
     {
-        return "Сайт не отдал ни одной дорожки — похоже, из-за cookies.\n\n\
-                Верните в списке «Вход на сайт» пункт «Не использовать» \
-                и попробуйте снова. YouTube почти всегда отвечает так на запрос \
-                с cookies: он переключается на урезанный ответ, в котором \
-                дорожек нет вовсе. Включать cookies стоит только для тех \
-                роликов, которые без них не скачиваются."
-            .to_owned();
+        return i18n::t(lang, Key::FailEmptyFormatsWithCookies).to_owned();
     }
 
     for (phrases, message) in FAILURE_HINTS {
         if phrases.iter().any(|phrase| lower.contains(phrase)) {
-            return (*message).to_owned();
+            return i18n::t(lang, *message).to_owned();
         }
     }
 
-    let hint = match code {
-        101 => "загрузка остановлена (лимит или файл уже есть)",
-        2 => "yt-dlp не принял аргументы — это баг Savio",
-        _ if tail.is_empty() => "yt-dlp завершился с ошибкой без подробностей",
-        _ => "",
-    };
-
+    // Короткая подсказка нужна только там, где хвоста нет вовсе: при живом
+    // хвосте показываем его — чужая диагностика полнее нашей догадки.
+    let number = code.to_string();
     if tail.is_empty() {
-        format!("Ошибка (код {code}): {hint}")
+        let hint = match code {
+            101 => Key::FailCode101,
+            2 => Key::FailCode2,
+            _ => Key::FailNoDetails,
+        };
+        i18n::fill(
+            i18n::t(lang, Key::FailWithHint),
+            &[&number, i18n::t(lang, hint)],
+        )
     } else {
-        format!("Ошибка (код {code}):\n{tail}")
+        i18n::fill(i18n::t(lang, Key::FailWithTail), &[&number, tail])
     }
 }
 
@@ -874,13 +834,40 @@ mod tests {
 
     const COOKIE_FLAG: &str = "--cookies-from-browser";
 
+    /// Разбор строки на языке по умолчанию: язык на разбор не влияет —
+    /// от него зависят только подписи стадий.
+    fn parsed(line: &str) -> Line {
+        parse_line(line, Lang::Ru)
+    }
+
+    /// Объяснение отказа на русском — тем языком, на котором написаны
+    /// проверки ниже.
+    fn explained(code: i32, tail: &str, cookies: CookieSource) -> String {
+        explain_failure(code, tail, cookies, Lang::Ru)
+    }
+
+    /// Ожидаемое объяснение по ключу — на всех трёх языках сразу.
+    ///
+    /// Сверяться с ключом, а не с куском русского текста, обязательно:
+    /// подогнав такой тест под новую формулировку, проверку теряют целиком,
+    /// а на двух других языках она и вовсе не работала бы.
+    fn assert_explained(code: i32, tail: &str, cookies: CookieSource, key: Key) {
+        for lang in Lang::ALL {
+            assert_eq!(
+                explain_failure(code, tail, cookies, lang),
+                i18n::t(lang, key),
+                "{lang:?}: не то объяснение для хвоста {tail:?}"
+            );
+        }
+    }
+
     /// Строки взяты из реального вывода yt-dlp: префикса `download:` в них
     /// нет — он остаётся в аргументах, а не в потоке.
     const REAL_PROGRESS: &str = r#"{"status":"downloading","downloaded":195633173.000000,"total":712445280.000000,"speed":15943362.460976,"eta":32.000000}"#;
 
     #[test]
     fn progress_is_parsed_without_prefix() {
-        let Line::Progress(p) = parse_line(REAL_PROGRESS) else {
+        let Line::Progress(p) = parsed(REAL_PROGRESS) else {
             panic!("строка прогресса не распознана");
         };
         assert_eq!(p.downloaded, 195_633_173);
@@ -893,7 +880,7 @@ mod tests {
     #[test]
     fn zero_speed_and_eta_become_none() {
         let line = r#"{"status":"downloading","downloaded":10.0,"total":0.0,"speed":0.0,"eta":0.0}"#;
-        let Line::Progress(p) = parse_line(line) else {
+        let Line::Progress(p) = parsed(line) else {
             panic!("строка прогресса не распознана");
         };
         assert_eq!(p.total, 0);
@@ -906,16 +893,23 @@ mod tests {
     #[test]
     fn postprocess_becomes_stage() {
         let line = r#"{"status":"processing","pp":"Merger"}"#;
-        let Line::Stage(stage) = parse_line(line) else {
+        let Line::Stage(stage) = parsed(line) else {
             panic!("постобработка не распознана");
         };
         assert_eq!(stage, "Обработка: Merger");
+
+        // Подпись стадии переводится, а имя постобработчика — нет: его даёт
+        // сам yt-dlp, и переводить чужое имя нам нечем.
+        let Line::Stage(stage) = parse_line(line, Lang::En) else {
+            panic!("постобработка не распознана");
+        };
+        assert_eq!(stage, "Processing: Merger");
     }
 
     #[test]
     fn done_carries_path() {
         let line = r#"{"event":"done","path":"C:\\Users\\me\\video.mp4"}"#;
-        let Line::Done(path) = parse_line(line) else {
+        let Line::Done(path) = parsed(line) else {
             panic!("завершение не распознано");
         };
         assert_eq!(path, PathBuf::from(r"C:\Users\me\video.mp4"));
@@ -923,10 +917,10 @@ mod tests {
 
     #[test]
     fn junk_goes_to_log() {
-        assert!(matches!(parse_line("[youtube] Extracting URL"), Line::Other(s) if !s.is_empty()));
-        assert!(matches!(parse_line("   "), Line::Other(s) if s.is_empty()));
+        assert!(matches!(parsed("[youtube] Extracting URL"), Line::Other(s) if !s.is_empty()));
+        assert!(matches!(parsed("   "), Line::Other(s) if s.is_empty()));
         // Оборванный JSON не должен ронять разбор.
-        assert!(matches!(parse_line(r#"{"status":"#), Line::Other(_)));
+        assert!(matches!(parsed(r#"{"status":"#), Line::Other(_)));
     }
 
     /// Строка ровно та, что yt-dlp напечатал на kinobase.org — сайт, которого
@@ -935,65 +929,65 @@ mod tests {
     #[test]
     fn unsupported_site_is_explained_not_dumped() {
         let tail = "ERROR: Unsupported URL: https://kinobase.org/film/204049-menyu";
-        let message = explain_failure(1, tail, CookieSource::None);
 
-        assert!(
-            message.contains("не поддерживается"),
-            "нет объяснения: {message}"
-        );
-        assert!(
-            message.contains(SUPPORTED_SITES),
-            "нет ссылки на список сайтов: {message}"
-        );
-        // Про обновление сказать надо: сайт мог появиться в свежем выпуске.
-        assert!(message.contains("Обновить движок"), "нет совета: {message}");
-        // Сырую английскую строку показывать больше не нужно.
-        assert!(
-            !message.contains("Unsupported URL"),
-            "утёк сырой вывод: {message}"
-        );
+        for lang in Lang::ALL {
+            let message = explain_failure(1, tail, CookieSource::None, lang);
+            assert_eq!(
+                message,
+                i18n::fill(i18n::t(lang, Key::FailUnsupportedSite), &[SUPPORTED_SITES]),
+                "{lang:?}: не то объяснение"
+            );
+            // Ссылка на список сайтов обязана доехать до текста на каждом
+            // языке: без неё объяснение не говорит, где смотреть.
+            assert!(
+                message.contains(SUPPORTED_SITES),
+                "{lang:?}: нет ссылки на список сайтов"
+            );
+            // Сырую английскую строку показывать больше не нужно.
+            assert!(
+                !message.contains("Unsupported URL"),
+                "{lang:?}: утёк сырой вывод"
+            );
+        }
     }
 
     /// Хвосты — в том виде, в каком их печатает yt-dlp: с префиксом
     /// экстрактора, английским текстом и советом про `--cookies`, которого
     /// в Savio всё равно нет.
     #[test]
-    fn blocked_downloads_are_explained_in_russian() {
+    fn blocked_downloads_are_explained_in_the_chosen_language() {
         let cases = [
             (
                 "ERROR: [youtube] dQw4w9WgXcQ: Sign in to confirm you're not a bot. \
                  Use --cookies-from-browser or --cookies for the authentication.",
-                "не робот",
+                Key::FailNotABot,
             ),
             (
                 "ERROR: [youtube] dQw4w9WgXcQ: Sign in to confirm your age. \
                  This video may be inappropriate for some users.",
-                "возрастным ограничением",
+                Key::FailAgeRestricted,
             ),
             (
                 "ERROR: [youtube] dQw4w9WgXcQ: Private video. \
                  Sign in if you've been granted access to this video",
-                "приватным",
+                Key::FailPrivateVideo,
             ),
             (
                 "ERROR: [youtube] dQw4w9WgXcQ: Video unavailable. The uploader \
                  has not made this video available in your country",
-                "в вашей стране",
+                Key::FailGeoBlocked,
             ),
             (
                 "ERROR: unable to download video data: HTTP Error 403: Forbidden",
-                "403",
+                Key::FailForbidden403,
             ),
         ];
 
-        for (tail, expected) in cases {
-            let message = explain_failure(1, tail, CookieSource::None);
-            assert!(
-                message.contains(expected),
-                "нет объяснения «{expected}»: {message}"
-            );
+        for (tail, key) in cases {
+            assert_explained(1, tail, CookieSource::None, key);
             // Английский хвост в объяснение не подмешивается: он и так уходит
             // в журнал, а в баннере только мешал бы читать.
+            let message = explained(1, tail, CookieSource::None);
             assert!(!message.contains("ERROR"), "утёк сырой вывод: {message}");
             assert!(!message.contains(tail), "утёк сырой вывод: {message}");
         }
@@ -1005,8 +999,13 @@ mod tests {
     #[test]
     fn common_words_do_not_trigger_a_hint() {
         let tail = "ERROR: unable to rename file: Usage message from /page/1";
-        let message = explain_failure(1, tail, CookieSource::None);
-        assert!(message.contains(tail), "подсказка сработала зря: {message}");
+        for lang in Lang::ALL {
+            let message = explain_failure(1, tail, CookieSource::None, lang);
+            assert!(
+                message.contains(tail),
+                "{lang:?}: подсказка сработала зря: {message}"
+            );
+        }
     }
 
     /// Всё, что не опознано, обязано остаться как было: чужую диагностику
@@ -1014,22 +1013,35 @@ mod tests {
     #[test]
     fn other_failures_keep_their_output() {
         let tail = "ERROR: unable to rename file: Permission denied";
-        let message = explain_failure(1, tail, CookieSource::None);
+        let message = explained(1, tail, CookieSource::None);
         assert!(message.contains("код 1"), "{message}");
         assert!(message.contains(tail), "хвост stderr обязан остаться: {message}");
 
+        // Хвост обязан доезжать целиком на любом языке: подменить чужую
+        // диагностику переводом было бы хуже английского текста.
+        for lang in Lang::ALL {
+            assert!(
+                explain_failure(1, tail, CookieSource::None, lang).contains(tail),
+                "{lang:?}: хвост stderr потерялся"
+            );
+        }
+
         // Коды с готовой подсказкой и пустой хвост — поведение прежнее.
         assert_eq!(
-            explain_failure(101, "", CookieSource::None),
+            explained(101, "", CookieSource::None),
             "Ошибка (код 101): загрузка остановлена (лимит или файл уже есть)"
         );
         assert_eq!(
-            explain_failure(2, "", CookieSource::None),
+            explained(2, "", CookieSource::None),
             "Ошибка (код 2): yt-dlp не принял аргументы — это баг Savio"
         );
         assert_eq!(
-            explain_failure(-1, "", CookieSource::None),
+            explained(-1, "", CookieSource::None),
             "Ошибка (код -1): yt-dlp завершился с ошибкой без подробностей"
+        );
+        assert_eq!(
+            explain_failure(101, "", CookieSource::None, Lang::En),
+            "Error (code 101): the download was stopped (a limit, or the file already exists)"
         );
     }
 
@@ -2082,7 +2094,7 @@ mod tests {
             CookieSource::File,
             Some("/home/ivan/секретное/cookies.txt"),
         );
-        let line = log_args(&args);
+        let line = log_args(&args, Lang::Ru);
 
         assert!(!line.contains("ivan"), "имя пользователя утекло: {line}");
         assert!(!line.contains("секретное"), "каталог утёк: {line}");
@@ -2099,40 +2111,37 @@ mod tests {
     #[test]
     fn the_log_is_verbatim_when_there_is_no_cookie_file() {
         let args = args_for(Format::Mp4, Quality::Best);
-        assert_eq!(log_args(&args), args.join(" "));
+        assert_eq!(log_args(&args, Lang::Ru), args.join(" "));
     }
 
     /// Хвосты сняты с живого вывода yt-dlp 2026.07.04 на Windows 11 —
     /// выдумать их нельзя, а промах подстроки не ловится ничем.
     #[test]
-    fn cookie_failures_are_explained_in_russian() {
+    fn cookie_failures_are_explained_in_the_chosen_language() {
         let cases = [
             // Браузер работает и держит базу открытой. Слово «Chrome» в этом
             // сообщении захардкожено: выбран был Edge.
             (
                 "ERROR: Could not copy Chrome cookie database. See  \
                  https://github.com/yt-dlp/yt-dlp/issues/7271  for more info",
-                "Закройте браузер",
+                Key::FailCookieDbLocked,
             ),
             // Chrome со свежим шифрованием cookies.
             (
                 "ERROR: Failed to decrypt with DPAPI. See  \
                  https://github.com/yt-dlp/yt-dlp/issues/10927  for more info",
-                "Firefox",
+                Key::FailCookieDpapi,
             ),
             // Браузер не установлен.
             (
                 r#"ERROR: could not find vivaldi cookies database in "C:\Users\me\AppData\Local\Vivaldi\User Data""#,
-                "не нашлись",
+                Key::FailCookieDbMissing,
             ),
         ];
 
-        for (tail, expected) in cases {
-            let message = explain_failure(1, tail, CookieSource::Edge);
-            assert!(
-                message.contains(expected),
-                "нет объяснения «{expected}»: {message}"
-            );
+        for (tail, key) in cases {
+            assert_explained(1, tail, CookieSource::Edge, key);
+            let message = explained(1, tail, CookieSource::Edge);
             assert!(!message.contains("ERROR"), "утёк сырой вывод: {message}");
         }
     }
@@ -2142,49 +2151,45 @@ mod tests {
     /// а советы противоположные («закройте браузер» против «выберите другой»).
     #[test]
     fn locked_and_missing_cookie_databases_do_not_swap_hints() {
-        let locked = explain_failure(
-            1,
-            "ERROR: Could not copy Chrome cookie database.",
-            CookieSource::Edge,
-        );
-        let missing = explain_failure(
-            1,
-            "ERROR: could not find brave cookies database in \"C:\\x\"",
-            CookieSource::Brave,
-        );
-        assert!(locked.contains("Закройте браузер"), "{locked}");
-        assert!(!locked.contains("не нашлись"), "{locked}");
-        assert!(missing.contains("не нашлись"), "{missing}");
-        assert!(!missing.contains("Закройте браузер"), "{missing}");
+        const LOCKED: &str = "ERROR: Could not copy Chrome cookie database.";
+        const MISSING: &str = "ERROR: could not find brave cookies database in \"C:\\x\"";
+
+        // Проверяем на всех трёх языках: перепутать советы можно и в переводе,
+        // а там это заметить некому.
+        for lang in Lang::ALL {
+            let locked = explain_failure(1, LOCKED, CookieSource::Edge, lang);
+            let missing = explain_failure(1, MISSING, CookieSource::Brave, lang);
+            assert_eq!(locked, i18n::t(lang, Key::FailCookieDbLocked), "{lang:?}");
+            assert_eq!(missing, i18n::t(lang, Key::FailCookieDbMissing), "{lang:?}");
+            assert_ne!(locked, missing, "{lang:?}: советы совпали");
+        }
     }
 
     /// Беды файла cookies объясняются по-русски и не путаются с бедами
     /// браузера: советы у них разные, а приметы сняты с живого вывода
     /// (yt-dlp 2026.07.04, Windows 11).
     #[test]
-    fn cookie_file_failures_are_explained_in_russian() {
+    fn cookie_file_failures_are_explained_distinctly() {
         // Посторонний файл — и точно так же пустой: проверено, ответ тот же.
-        let garbage = explain_failure(
-            1,
-            "ERROR: 'C:/Users/me/скачано/заметки.txt' does not look like a \
-             Netscape format cookies file",
-            CookieSource::File,
-        );
-        assert!(garbage.contains("не файл cookies"), "{garbage}");
-        assert!(garbage.contains("Netscape"), "{garbage}");
-        assert!(!garbage.contains("ERROR"), "утёк сырой вывод: {garbage}");
-
+        const GARBAGE: &str = "ERROR: 'C:/Users/me/скачано/заметки.txt' does not look \
+                               like a Netscape format cookies file";
         // Файл только для чтения. yt-dlp дописывает в него cookies после
         // работы и падает питоновским трейсбеком — уже поверх скачанного
         // ролика, поэтому в объяснении про папку сохранения сказано прямо.
-        let readonly = explain_failure(
-            1,
+        const READONLY: &str =
             "  File \"yt_dlp\\cookies.py\", line 1305, in open\n\
              PermissionError: [Errno 13] Permission denied: 'C:/Users/me/cookies.txt'\n\
-             [PYI-2684:ERROR] Failed to execute script '__main__' due to unhandled exception!",
-            CookieSource::File,
-        );
-        assert!(readonly.contains("не удалось записать"), "{readonly}");
+             [PYI-2684:ERROR] Failed to execute script '__main__' due to unhandled exception!";
+
+        assert_explained(1, GARBAGE, CookieSource::File, Key::FailCookieFileNotNetscape);
+        assert_explained(1, READONLY, CookieSource::File, Key::FailCookieFileWrite);
+
+        let garbage = explained(1, GARBAGE, CookieSource::File);
+        let readonly = explained(1, READONLY, CookieSource::File);
+        // Имя формата — не перевод, а название: без него совет не говорит,
+        // что именно надо выгрузить.
+        assert!(garbage.contains("Netscape"), "{garbage}");
+        assert!(!garbage.contains("ERROR"), "утёк сырой вывод: {garbage}");
         assert!(readonly.contains("папку сохранения"), "{readonly}");
         assert!(
             !readonly.contains("PermissionError"),
@@ -2204,10 +2209,11 @@ mod tests {
     #[test]
     fn the_empty_format_list_hint_knows_about_the_file_login() {
         let tail = "ERROR: [youtube] dQw4w9WgXcQ: Requested format is not available.";
-        let from_file = explain_failure(1, tail, CookieSource::File);
-        assert!(
-            from_file.contains("Не использовать"),
-            "нет совета вернуть список: {from_file}"
+        assert_explained(
+            1,
+            tail,
+            CookieSource::File,
+            Key::FailEmptyFormatsWithCookies,
         );
     }
 
@@ -2226,16 +2232,18 @@ mod tests {
         ];
 
         for tail in tails {
-            let with_cookies = explain_failure(1, tail, CookieSource::Firefox);
-            assert!(
-                with_cookies.contains("Не использовать"),
-                "нет совета вернуть список: {with_cookies}"
+            assert_explained(
+                1,
+                tail,
+                CookieSource::Firefox,
+                Key::FailEmptyFormatsWithCookies,
             );
+            let with_cookies = explained(1, tail, CookieSource::Firefox);
             assert!(!with_cookies.contains("ERROR"), "утёк сырой вывод");
 
             // Без cookies винить их нельзя: причина совсем другая, и уверенное
             // объяснение не про свою беду хуже английского хвоста.
-            let without = explain_failure(1, tail, CookieSource::None);
+            let without = explained(1, tail, CookieSource::None);
             assert!(
                 without.contains(tail),
                 "хвост stderr обязан остаться: {without}"

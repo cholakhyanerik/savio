@@ -10,6 +10,7 @@ use eframe::egui;
 use crate::engine::settings;
 use crate::engine::setup;
 use crate::engine::{self, Handle, MetaTask, metadata};
+use crate::i18n::{self, Key, Lang};
 use crate::engine::monitor;
 use crate::engine::power;
 use crate::engine::share;
@@ -196,14 +197,14 @@ const GPU_TOO_LARGE_MARKS: [&str; 2] = [
 ];
 
 /// Строка для журнала по сообщению wgpu.
-fn gpu_error_line(message: &str) -> String {
+///
+/// Приметы остаются английскими: они принадлежат wgpu и от языка окна
+/// не зависят. Переводится только объяснение.
+fn gpu_error_line(message: &str, lang: Lang) -> String {
     if GPU_TOO_LARGE_MARKS.iter().any(|mark| message.contains(mark)) {
-        "Окно оказалось больше, чем может отрисовать видеокарта (предел — 8192 \
-         точки по стороне). Картинка временно не обновляется; уменьшите окно, \
-         и рисование восстановится. Загрузка при этом не прервана."
-            .to_owned()
+        i18n::t(lang, Key::GpuTooLarge).to_owned()
     } else {
-        format!("Ошибка отрисовки: {message}")
+        i18n::fill(i18n::t(lang, Key::GpuDrawError), &[message])
     }
 }
 
@@ -249,7 +250,7 @@ const COOKIE_LIST_HEIGHT: f32 = CookieSource::ALL.len() as f32 * 28.0 + 12.0;
 /// А вот запомненные настройки — доходят: в `settings.json` может стоять
 /// `"cookies": "file"` без пути, если путь не выразился в UTF-8. Кнопка тогда
 /// приглашает выбрать файл, то есть предлагает ровно то, что делает по нажатию.
-const PICK_COOKIE_FILE: &str = "Выбрать файл…";
+const PICK_COOKIE_FILE: Key = Key::UiPickCookieFile;
 
 
 /// Потолок высоты раскрытого списка языков субтитров.
@@ -284,13 +285,10 @@ const VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 /// `the_about_text_is_the_readme_intro`: два описания одной программы,
 /// правленные в разное время, расходятся молча, и заметить это можно,
 /// только положив их рядом. Правите вступление README — правьте и здесь.
-const ABOUT_TEXT: &str = "Savio — это кроссплатформенное десктопное приложение для \
-    скачивания видео и аудио с популярных онлайн-платформ. Приложение позволяет \
-    быстро загружать контент по ссылке: по умолчанию — в максимально доступном \
-    качестве, а при желании можно выбрать разрешение видео или битрейт звука самому.";
+const ABOUT_TEXT: Key = Key::UiAboutText;
 
 /// Кто сделал Savio.
-const AUTHOR: &str = "Эрик Чолахян";
+const AUTHOR: Key = Key::UiAuthor;
 
 /// Куда писать об ошибках и с идеями.
 ///
@@ -398,11 +396,11 @@ enum TrackItem {
 /// 10 против 16), и таблетка выбора заодно едет на него, когда открыт раздел
 /// из меню: видно, что показан не один из трёх. Держит это
 /// `the_header_fits_the_smallest_window`.
-const TRACK: [(TrackItem, &str); 4] = [
-    (TrackItem::Tab(Tab::Download), "Загрузка"),
-    (TrackItem::Tab(Tab::Metadata), "Метаданные"),
-    (TrackItem::Tab(Tab::Machine), "Машина"),
-    (TrackItem::More, "Ещё"),
+const TRACK: [(TrackItem, Key); 4] = [
+    (TrackItem::Tab(Tab::Download), Key::TabDownload),
+    (TrackItem::Tab(Tab::Metadata), Key::TabMetadata),
+    (TrackItem::Tab(Tab::Machine), Key::TabMachine),
+    (TrackItem::More, Key::TabMore),
 ];
 
 /// Разделы, которые живут в меню «Ещё».
@@ -413,7 +411,7 @@ const TRACK: [(TrackItem, &str); 4] = [
 /// «Телефон», а не «Найти смартфон»: компьютер телефон не ищет и найти не
 /// может — слушает Savio, а подключается телефон (подробности у
 /// `engine::share`). Обещать в подписи невыполнимое нельзя.
-const MORE_TABS: [(Tab, &str); 2] = [(Tab::Weather, "Погода"), (Tab::Phone, "Телефон")];
+const MORE_TABS: [(Tab, Key); 2] = [(Tab::Weather, Key::TabWeather), (Tab::Phone, Key::TabPhone)];
 
 /// Что случилось в шапке за кадр.
 struct HeaderRow {
@@ -426,6 +424,11 @@ struct HeaderRow {
     track: egui::Rect,
     /// Где лёг номер версии.
     version: egui::Rect,
+    /// Где легла таблетка языка. Она левее версии, то есть именно в неё
+    /// упирается дорожка разделов, — её и меряет тест ширины шапки.
+    lang_pill: egui::Rect,
+    /// Выбранный язык окна. `None` — язык не трогали.
+    lang: Option<Lang>,
 }
 
 /// Какая половина вкладки «Машина» показана.
@@ -569,14 +572,17 @@ impl QueueStatus {
 
     /// Слово для строки списка. Статическое: в кадре отрисовки ничего
     /// не собирается и не выделяется.
-    fn label(&self) -> &'static str {
-        match self {
-            QueueStatus::Waiting => "Ожидает",
-            QueueStatus::Running => "Качается",
-            QueueStatus::Done => "Готово",
-            QueueStatus::Failed(_) => "Ошибка",
-            QueueStatus::Cancelled => "Снято",
-        }
+    fn label(&self, lang: Lang) -> &'static str {
+        i18n::t(
+            lang,
+            match self {
+                QueueStatus::Waiting => Key::QueueWaiting,
+                QueueStatus::Running => Key::QueueRunning,
+                QueueStatus::Done => Key::QueueDone,
+                QueueStatus::Failed(_) => Key::QueueFailed,
+                QueueStatus::Cancelled => Key::QueueCancelled,
+            },
+        )
     }
 
     /// Цвет точки и подписи состояния.
@@ -639,15 +645,15 @@ struct QueueItem {
 impl QueueItem {
     /// Пересобирает строки, зависящие от состояния. Зовётся при его смене —
     /// в кадре отрисовки здесь не собирается ничего (Правило 1).
-    fn rebuild_strings(&mut self) {
+    fn rebuild_strings(&mut self, lang: Lang) {
         let format = self.request.format;
         self.detail.clear();
-        self.detail.push_str(self.status.label());
+        self.detail.push_str(self.status.label(lang));
         self.detail.push_str(" · ");
         self.detail.push_str(format.short());
         self.detail.push_str(" · ");
         self.detail
-            .push_str(self.request.quality.label_with_unit(format));
+            .push_str(self.request.quality.label_with_unit(format, lang));
 
         // Причину раскладываем в одну строку, и это не косметика:
         // `explain_failure` отдаёт текст с переносами, а метка с `truncate()`
@@ -686,17 +692,34 @@ struct Queue {
     /// Мест больше нет, и освободить нечем. Считается там же, где сводка:
     /// перебирать полсотни строк 60 раз в секунду ради одного `bool` незачем.
     full: bool,
+    /// На каком языке собраны готовые строки списка.
+    ///
+    /// Полем, а не аргументом каждого вызова: строки пересобираются в десятке
+    /// мест, и язык, забытый в одном из них, оставил бы одну строку списка
+    /// на прежнем языке — молча и только у той ссылки, которую как раз
+    /// переключили.
+    lang: Lang,
 }
 
 impl Queue {
-    fn new() -> Self {
+    fn new(lang: Lang) -> Self {
         Self {
             items: Vec::new(),
             // С единицы, а не с нуля: ноль занят под `NO_DOWNLOAD`.
             next_id: 1,
             summary: String::new(),
             full: false,
+            lang,
         }
+    }
+
+    /// Пересобирает все готовые строки на новом языке.
+    fn relabel(&mut self, lang: Lang) {
+        self.lang = lang;
+        for item in &mut self.items {
+            item.rebuild_strings(lang);
+        }
+        self.rebuild_summary();
     }
 
     /// Ставит ссылку в конец очереди и отдаёт её номер.
@@ -737,7 +760,7 @@ impl Queue {
             known,
             removing_since: None,
         };
-        item.rebuild_strings();
+        item.rebuild_strings(self.lang);
 
         self.items.push(item);
         self.rebuild_summary();
@@ -836,9 +859,10 @@ impl Queue {
     }
 
     fn set_status(&mut self, id: DownloadId, status: QueueStatus) {
+        let lang = self.lang;
         if let Some(item) = self.items.iter_mut().find(|item| item.id == id) {
             item.status = status;
-            item.rebuild_strings();
+            item.rebuild_strings(lang);
         }
         self.rebuild_summary();
     }
@@ -902,12 +926,12 @@ impl Queue {
         // окончание зависит от последней цифры, и «1 ждут» с «2 готово»
         // бросались бы в глаза. Двоеточие снимает вопрос вовсе.
         self.summary.clear();
-        for (name, count) in [
-            ("Идёт", running),
-            ("В очереди", waiting),
-            ("Готово", done),
-            ("Ошибок", failed),
-            ("Снято", cancelled),
+        for (key, count) in [
+            (Key::SummaryRunning, running),
+            (Key::SummaryWaiting, waiting),
+            (Key::SummaryDone, done),
+            (Key::SummaryFailed, failed),
+            (Key::SummaryCancelled, cancelled),
         ] {
             if count == 0 {
                 continue;
@@ -915,7 +939,14 @@ impl Queue {
             if !self.summary.is_empty() {
                 self.summary.push_str(" · ");
             }
-            let _ = write!(self.summary, "{name}: {count}");
+            let _ = write!(
+                self.summary,
+                "{}",
+                i18n::fill(
+                    i18n::t(self.lang, Key::SummaryPair),
+                    &[i18n::t(self.lang, key), &count.to_string()],
+                )
+            );
         }
     }
 }
@@ -946,10 +977,10 @@ struct MetaPanel {
 }
 
 impl MetaPanel {
-    fn new() -> Self {
+    fn new(lang: Lang) -> Self {
         Self {
             path: None,
-            path_display: "файл не выбран".to_owned(),
+            path_display: i18n::t(lang, Key::UiNoFileChosen).to_owned(),
             blocked: None,
             readable: false,
             cleanable: false,
@@ -966,12 +997,27 @@ impl MetaPanel {
     ///
     /// Решение принимается один раз здесь, а не в кадре отрисовки: иначе
     /// расширение разбиралось бы 60 раз в секунду ради двух флагов.
-    fn select(&mut self, path: PathBuf) {
+    /// Пересобирает то, что собрано заранее, на новом языке.
+    ///
+    /// Приглашение выбрать файл и объяснение «с этим форматом работать
+    /// нельзя» — готовые строки, и сами они не обновятся.
+    fn relabel(&mut self, lang: Lang) {
+        if self.path.is_none() {
+            self.path_display = i18n::t(lang, Key::UiNoFileChosen).to_owned();
+        }
+        if let Some(path) = &self.path {
+            let kind = meta_kind(path);
+            self.blocked = (!kind.readable() || !kind.cleanable())
+                .then(|| metadata::unsupported_message(kind, lang));
+        }
+    }
+
+    fn select(&mut self, path: PathBuf, lang: Lang) {
         let kind = meta_kind(&path);
         self.readable = kind.readable();
         self.cleanable = kind.cleanable();
-        self.blocked =
-            (!kind.readable() || !kind.cleanable()).then(|| metadata::unsupported_message(kind));
+        self.blocked = (!kind.readable() || !kind.cleanable())
+            .then(|| metadata::unsupported_message(kind, lang));
         self.path_display = path.display().to_string();
         self.path = Some(path);
         // Результаты относились к прошлому файлу — показывать их рядом
@@ -981,23 +1027,23 @@ impl MetaPanel {
         self.stage.clear();
     }
 
-    fn start(&mut self, task: MetaTask, ctx: &egui::Context) {
+    fn start(&mut self, task: MetaTask, lang: Lang, ctx: &egui::Context) {
         let Some(path) = self.path.clone() else {
             return;
         };
 
         let (tx, rx) = channel();
         let notify_ctx = ctx.clone();
-        engine::start_metadata(path, task, tx, move || notify_ctx.request_repaint());
+        engine::start_metadata(path, task, lang, tx, move || notify_ctx.request_repaint());
 
         self.rx = Some(rx);
         self.busy = true;
         self.tags = None;
         self.outcome = None;
-        self.stage = "Запуск…".to_owned();
+        self.stage = i18n::t(lang, Key::StageStarting).to_owned();
     }
 
-    fn drain(&mut self) {
+    fn drain(&mut self, lang: Lang) {
         let mut events = Vec::new();
         let mut disconnected = false;
 
@@ -1027,12 +1073,15 @@ impl MetaPanel {
                     // выглядит как сломавшаяся операция.
                     self.outcome = Some(if freed == 0 {
                         (
-                            "Удалять было нечего: метаданных в файле нет.".to_owned(),
+                            i18n::t(lang, Key::UiMetaNothingToWipe).to_owned(),
                             theme::TEXT_SECONDARY,
                         )
                     } else {
                         (
-                            format!("Метаданные удалены, освобождено {}", human_bytes(freed)),
+                            i18n::fill(
+                                i18n::t(lang, Key::UiMetaWiped),
+                                &[&human_bytes(freed, lang)],
+                            ),
                             theme::STATE_SUCCESS,
                         )
                     });
@@ -1105,15 +1154,15 @@ impl SystemPanel {
         }
     }
 
-    fn start(&mut self, gpu: Option<GpuInfo>, ctx: &egui::Context) {
+    fn start(&mut self, gpu: Option<GpuInfo>, lang: Lang, ctx: &egui::Context) {
         let (tx, rx) = channel();
         let notify_ctx = ctx.clone();
-        engine::hardware::start(gpu, tx, move || notify_ctx.request_repaint());
+        engine::hardware::start(gpu, lang, tx, move || notify_ctx.request_repaint());
 
         self.rx = Some(rx);
         self.busy = true;
         self.asked = true;
-        self.stage = "Запуск…".to_owned();
+        self.stage = i18n::t(lang, Key::StageStarting).to_owned();
         // Прошлый снимок убираем сразу: показывать вчерашние числа рядом
         // с надписью «опрашиваю» — прямой повод их перепутать.
         self.report = None;
@@ -1229,17 +1278,17 @@ impl PowerPanel {
     /// чтение стоит запуска потока, а меняется питание раз в день. И не
     /// однажды за весь запуск: половину открывают ровно тогда, когда хотят
     /// увидеть, что с машиной сейчас.
-    fn watch(&mut self, open: bool, ctx: &egui::Context) {
+    fn watch(&mut self, open: bool, lang: Lang, ctx: &egui::Context) {
         if open && !self.open {
-            self.start(ctx);
+            self.start(lang, ctx);
         }
         self.open = open;
     }
 
-    fn start(&mut self, ctx: &egui::Context) {
+    fn start(&mut self, lang: Lang, ctx: &egui::Context) {
         let (tx, rx) = channel();
         let notify_ctx = ctx.clone();
-        engine::power::start(tx, move || notify_ctx.request_repaint());
+        engine::power::start(lang, tx, move || notify_ctx.request_repaint());
 
         self.rx = Some(rx);
         self.busy = true;
@@ -1247,10 +1296,10 @@ impl PowerPanel {
     }
 
     /// Просит систему переключиться и перечитать состояние.
-    fn change(&mut self, change: power::Change, ctx: &egui::Context) {
+    fn change(&mut self, change: power::Change, lang: Lang, ctx: &egui::Context) {
         let (tx, rx) = channel();
         let notify_ctx = ctx.clone();
-        engine::power::start_change(change, tx, move || notify_ctx.request_repaint());
+        engine::power::start_change(change, lang, tx, move || notify_ctx.request_repaint());
 
         self.rx = Some(rx);
         self.busy = true;
@@ -1261,12 +1310,18 @@ impl PowerPanel {
     }
 
     /// Принимает свежее состояние и пересобирает оговорку под ним.
-    fn accept(&mut self, state: PowerState) {
-        self.hint = power_hint(&state);
+    fn accept(&mut self, state: PowerState, lang: Lang) {
+        self.hint = power_hint(&state, lang);
         self.state = state;
     }
 
-    fn drain(&mut self) {
+    /// Пересобирает оговорку на новом языке. Исход прошлого переключения
+    /// не трогаем: он пришёл от движка и относится к тому нажатию.
+    fn relabel(&mut self, lang: Lang) {
+        self.hint = power_hint(&self.state, lang);
+    }
+
+    fn drain(&mut self, lang: Lang) {
         let mut events = Vec::new();
         let mut disconnected = false;
 
@@ -1286,7 +1341,7 @@ impl PowerPanel {
         for event in events {
             match event {
                 Event::Power(state) => {
-                    self.accept(state);
+                    self.accept(state, lang);
                     self.busy = false;
                 }
                 // Переключилось и проверено перечитыванием.
@@ -1333,7 +1388,7 @@ impl PowerPanel {
 /// делается строка, и ничего больше. Так её и проверяют тесты — а проверять
 /// её надо, потому что это единственное место, где Savio предупреждает
 /// о молчаливом отказе Windows **до** нажатия, а не после.
-fn power_hint(state: &PowerState) -> String {
+fn power_hint(state: &PowerState, lang: Lang) -> String {
     let PowerModes::Known { effective, ignored } = state.modes else {
         return String::new();
     };
@@ -1341,32 +1396,36 @@ fn power_hint(state: &PowerState) -> String {
     // Название сбалансированной схемы берём из списка, а не пишем своё: на
     // английской Windows она называется «Balanced», и подменять её название
     // значило бы отправить человека искать в системе то, чего там нет.
+    // Своё название — только когда система вовсе не назвала ни одной схемы.
     let balanced = state
         .plan_name(BALANCED_PLAN)
-        .unwrap_or("Сбалансированная");
+        .unwrap_or_else(|| i18n::t(lang, Key::UiPowerBalancedFallback));
     // Как назвать активную схему: по имени, если система его дала, и
     // обезличенно, если нет. Пустое место вместо названия читалось бы как
     // недорисованная строка, а выдуманное имя — как чужая схема.
     let active = match state.active_name() {
         Some(name) => format!("«{name}»"),
-        None => "другая схема".to_owned(),
+        None => i18n::t(lang, Key::UiPowerOtherPlan).to_owned(),
     };
 
     if let Some(stored) = ignored {
-        return format!(
-            "Windows запомнила режим «{}», но машина работает в другом: {}. \
-             Режим питания применяется только при схеме «{balanced}», \
-             а сейчас активна {active}.",
-            stored.label(),
-            effective.map_or("система его не назвала", PowerMode::label),
+        return i18n::fill(
+            i18n::t(lang, Key::UiPowerModeIgnoredHint),
+            &[
+                stored.label(lang),
+                effective.map_or(i18n::t(lang, Key::UiPowerModeUnnamed), |mode| {
+                    mode.label(lang)
+                }),
+                balanced,
+                &active,
+            ],
         );
     }
 
     if state.active.is_some_and(|id| id != BALANCED_PLAN) {
-        return format!(
-            "Сейчас активна {active}, а режим питания Windows применяет только \
-             при «{balanced}»: выбор она запомнит, но машина будет работать \
-             по-прежнему."
+        return i18n::fill(
+            i18n::t(lang, Key::UiPowerWrongPlanHint),
+            &[&active, balanced],
         );
     }
 
@@ -1464,7 +1523,16 @@ impl WeatherPanel {
     /// причине, что и останов опроса монитора: закрытая вкладка не рисуется,
     /// и сверить срок из неё было бы некому. Работы в обычном кадре здесь нет:
     /// пара сравнений.
-    fn watch(&mut self, open: bool, ctx: &egui::Context) {
+    /// Пересобирает прогноз на новом языке.
+    ///
+    /// Название места при этом остаётся прежним: оно пришло от сервера и
+    /// переводу не подлежит — придуманное имя города хуже неперевёденного.
+    /// Свежее название приедет со следующим поиском или определением по IP.
+    fn relabel(&mut self, lang: Lang) {
+        self.rebuild_view(lang);
+    }
+
+    fn watch(&mut self, open: bool, lang: Lang, ctx: &egui::Context) {
         if !open {
             return;
         }
@@ -1475,7 +1543,7 @@ impl WeatherPanel {
             // запускал он загрузчик роликов, а не прогноз погоды.
             self.asked = true;
             let place = self.place.clone();
-            self.start(place, true, ctx);
+            self.start(place, true, lang, ctx);
             return;
         }
 
@@ -1495,34 +1563,34 @@ impl WeatherPanel {
             ctx.request_repaint_after(std::time::Duration::from_secs_f64(left));
         } else {
             let place = place.clone();
-            self.start(Some(place), false, ctx);
+            self.start(Some(place), false, lang, ctx);
         }
     }
 
     /// Идёт за прогнозом. `place` — `None`: сначала определить место по IP.
-    fn start(&mut self, place: Option<Place>, saved: bool, ctx: &egui::Context) {
+    fn start(&mut self, place: Option<Place>, saved: bool, lang: Lang, ctx: &egui::Context) {
         let (tx, rx) = channel();
         let notify_ctx = ctx.clone();
-        weather::start(place, saved, tx, move || notify_ctx.request_repaint());
+        weather::start(place, saved, lang, tx, move || notify_ctx.request_repaint());
 
         // Прежний приёмник бросается здесь, и в этом вся развязка: ответ про
         // прошлое место, пришедший позже нового, лечь в окно уже не сможет.
         self.rx = Some(rx);
         self.busy = true;
         self.error = None;
-        self.stage = "Запуск…".to_owned();
+        self.stage = i18n::t(lang, Key::StageStarting).to_owned();
         self.last_attempt = Some(ctx.input(|i| i.time));
     }
 
     /// Выбирает место: из найденного, из избранного или заново по IP (`None`).
-    fn pick(&mut self, place: Option<Place>, ctx: &egui::Context) {
+    fn pick(&mut self, place: Option<Place>, lang: Lang, ctx: &egui::Context) {
         self.results = None;
         self.result_details.clear();
         self.search_note = None;
         if let Some(place) = &place {
             self.set_place(place.clone(), false);
         }
-        self.start(place, false, ctx);
+        self.start(place, false, lang, ctx);
     }
 
     /// Запоминает место. Прежний прогноз убирается, если место другое:
@@ -1538,14 +1606,14 @@ impl WeatherPanel {
     }
 
     /// Ищет места по тексту из поля.
-    fn search(&mut self, ctx: &egui::Context) {
+    fn search(&mut self, lang: Lang, ctx: &egui::Context) {
         let query = self.query.trim();
         // Однобуквенный запрос сервер оставляет без ответа (проверено вживую),
         // и тратить на него поход в сеть незачем.
         if query.chars().count() < 2 {
             self.results = None;
             self.search_note = Some((
-                "Наберите хотя бы две буквы названия.".to_owned(),
+                i18n::t(lang, Key::UiWeatherTwoLetters).to_owned(),
                 theme::TEXT_MUTED,
             ));
             return;
@@ -1553,7 +1621,7 @@ impl WeatherPanel {
 
         let (tx, rx) = channel();
         let notify_ctx = ctx.clone();
-        weather::start_search(query.to_owned(), tx, move || notify_ctx.request_repaint());
+        weather::start_search(query.to_owned(), lang, tx, move || notify_ctx.request_repaint());
         self.searched_for = query.to_owned();
         self.search_rx = Some(rx);
         self.searching = true;
@@ -1587,12 +1655,12 @@ impl WeatherPanel {
     }
 
     /// Меняет единицы и пересобирает строки. `true` — поменялось.
-    fn set_units(&mut self, units: WeatherUnits) -> bool {
+    fn set_units(&mut self, units: WeatherUnits, lang: Lang) -> bool {
         if units == self.units {
             return false;
         }
         self.units = units;
-        self.rebuild_view();
+        self.rebuild_view(lang);
         true
     }
 
@@ -1602,16 +1670,22 @@ impl WeatherPanel {
     /// сборки, поэтому звать надо и тогда, когда отчёт не менялся, а время
     /// ушло: после неудачной попытки обновления старые числа остаются на
     /// экране, но прошедший час с них уходит.
-    fn rebuild_view(&mut self) {
+    fn rebuild_view(&mut self, lang: Lang) {
         self.view = self.report.as_ref().map(|report| {
             let now = weather::now_unix();
-            weather_view(report, self.units, now, now.and_then(weather::local_offset))
+            weather_view(
+                report,
+                self.units,
+                now,
+                now.and_then(weather::local_offset),
+                lang,
+            )
         });
     }
 
     /// Забирает ответ о прогнозе. `true` — место сменилось, и его надо
     /// запомнить.
-    fn drain(&mut self) -> bool {
+    fn drain(&mut self, lang: Lang) -> bool {
         let mut events = Vec::new();
         let mut disconnected = false;
 
@@ -1674,7 +1748,7 @@ impl WeatherPanel {
         }
 
         if dirty {
-            self.rebuild_view();
+            self.rebuild_view(lang);
         }
         if disconnected {
             self.rx = None;
@@ -1684,7 +1758,7 @@ impl WeatherPanel {
     }
 
     /// Забирает найденное.
-    fn drain_search(&mut self) {
+    fn drain_search(&mut self, lang: Lang) {
         let mut events = Vec::new();
         let mut disconnected = false;
 
@@ -1709,10 +1783,9 @@ impl WeatherPanel {
                         // Пустой список без слов читался бы как «поиск не
                         // сработал» — а он сработал, просто не нашёл.
                         self.search_note = Some((
-                            format!(
-                                "По запросу «{}» ничего не нашлось. Проверьте \
-                                 написание — и ищите город, а не улицу.",
-                                self.searched_for
+                            i18n::fill(
+                                i18n::t(lang, Key::UiWeatherNothingFound),
+                                &[&self.searched_for],
                             ),
                             theme::TEXT_MUTED,
                         ));
@@ -1780,13 +1853,7 @@ const QR_QUIET: usize = 4;
 /// Savio узнать это сам не может: подключение к своему же адресу идёт мимо
 /// брандмауэра, и изнутри раздача видна всегда (см. `engine::share`). Отсюда
 /// слова, а не проверка.
-const SHARE_HELP: &str = "Страница не открывается на телефоне? Проверьте, что телефон \
-    в той же сети Wi-Fi, что и компьютер, — не в мобильном интернете и не в гостевой \
-    сети. Если система спрашивала, пускать ли Savio в сеть, — разрешите (в Windows — \
-    для частных сетей): брандмауэр мог закрыть вход, а в сети с профилем \
-    «Общедоступная» входящие подключения закрыты всегда. В гостевых сетях кафе и \
-    отелей устройства друг друга не видят вовсе — там поможет только другая сеть, \
-    например точка доступа на самом телефоне.";
+const SHARE_HELP: Key = Key::UiShareHelp;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ShareState {
@@ -1810,6 +1877,12 @@ struct TransferRow {
     direction: TransferDirection,
     name: String,
     total: Option<u64>,
+    /// Сколько байт уже прошло.
+    ///
+    /// Полем, хотя рисуется из него только готовая строка: без него строку
+    /// нечем пересобрать при смене языка, и половина списка передач осталась
+    /// бы на прежнем.
+    done: u64,
     /// Доля для полосы. `None` — неизвестна.
     fraction: Option<f32>,
     /// «На компьютер · 12.4 МБ из 1.2 ГБ».
@@ -1818,12 +1891,36 @@ struct TransferRow {
 }
 
 impl TransferRow {
-    fn rebuild(&mut self, done: u64) {
+    fn rebuild(&mut self, done: u64, lang: Lang) {
+        self.done = done;
         self.fraction = self
             .total
             .filter(|total| *total > 0)
             .map(|total| (done as f32 / total as f32).clamp(0.0, 1.0));
-        self.line = format!("{} · {}", self.direction.label(), transfer_line(done, self.total));
+        self.line = format!(
+            "{} · {}",
+            self.direction.label(lang),
+            transfer_line(done, self.total, lang)
+        );
+    }
+
+    /// Помечает передачу дошедшей.
+    ///
+    /// Отдельно от `rebuild`, потому что строка у неё другая: у дошедшего
+    /// файла «12.4 МБ из 12.4 МБ» читается как недосказанность.
+    fn finish(&mut self, lang: Lang) {
+        self.outcome = TransferOutcome::Done;
+        self.fraction = Some(1.0);
+        self.line = i18n::fill(
+            i18n::t(lang, Key::UiShareTransferDone),
+            &[
+                self.direction.label(lang),
+                &self
+                    .total
+                    .map(|total| human_bytes(total, lang))
+                    .unwrap_or_default(),
+            ],
+        );
     }
 }
 
@@ -1885,12 +1982,14 @@ impl SharePanel {
         self.state != ShareState::Off
     }
 
-    fn start(&mut self, dir: PathBuf, ctx: &egui::Context) {
-        self.stop(None);
+    fn start(&mut self, dir: PathBuf, lang: Lang, ctx: &egui::Context) {
+        self.stop(None, lang);
         let (tx, rx) = channel();
         let notify_ctx = ctx.clone();
-        self.serving_display = display_dir(Some(&dir));
-        self.handle = Some(share::start(dir, tx, move || notify_ctx.request_repaint()));
+        self.serving_display = display_dir(Some(&dir), lang);
+        self.handle = Some(share::start(dir, lang, tx, move || {
+            notify_ctx.request_repaint()
+        }));
         self.rx = Some(rx);
         self.state = ShareState::Starting;
         self.note = None;
@@ -1900,7 +1999,7 @@ impl SharePanel {
     }
 
     /// Останавливает раздачу. `why` — что сказать под кнопкой.
-    fn stop(&mut self, why: Option<&str>) {
+    fn stop(&mut self, why: Option<&str>, lang: Lang) {
         if let Some(handle) = self.handle.take() {
             handle.stop();
         }
@@ -1909,7 +2008,9 @@ impl SharePanel {
         self.rx = None;
         for row in &mut self.transfers {
             if matches!(row.outcome, TransferOutcome::Going) {
-                row.outcome = TransferOutcome::Failed("Раздача остановлена — передача не закончена.".to_owned());
+                row.outcome = TransferOutcome::Failed(
+                    i18n::t(lang, Key::UiShareStoppedUnfinished).to_owned(),
+                );
             }
         }
         if self.running() && let Some(why) = why {
@@ -1927,13 +2028,10 @@ impl SharePanel {
     /// Зовётся на каждом кадре из `ui`, а не из экрана, — по той же причине,
     /// что у монитора: закрытый экран не рисуется, и заметить своё закрытие
     /// ему нечем.
-    fn watch(&mut self, open: bool, ctx: &egui::Context) {
+    fn watch(&mut self, open: bool, lang: Lang, ctx: &egui::Context) {
         if !open {
             if self.running() {
-                self.stop(Some(
-                    "Раздача остановлена: вы ушли с экрана «Телефон». Папка больше \
-                     не открыта для сети.",
-                ));
+                self.stop(Some(i18n::t(lang, Key::UiShareLeftScreen)), lang);
             }
             return;
         }
@@ -1977,7 +2075,7 @@ impl SharePanel {
         });
     }
 
-    fn drain(&mut self, ctx: &egui::Context) {
+    fn drain(&mut self, lang: Lang, ctx: &egui::Context) {
         let mut events = Vec::new();
         let mut disconnected = false;
 
@@ -1996,7 +2094,7 @@ impl SharePanel {
 
         for event in events {
             match event {
-                Event::Share(event) => self.accept(event, ctx),
+                Event::Share(event) => self.accept(event, lang, ctx),
                 // Остальное ходит по чужим каналам. Перечислено явно, а не
                 // через `_`, чтобы компилятор и дальше требовал разбирать
                 // новые варианты `Event` во всех приёмниках.
@@ -2026,15 +2124,30 @@ impl SharePanel {
             // Поток кончился сам, не сказав почему. Держать экран в состоянии
             // «раздача идёт» при мёртвом сервере — ровно то враньё, которого
             // здесь быть не должно.
-            self.stop(None);
+            self.stop(None, lang);
             self.note = Some((
-                "Раздача прекратилась. Запустите её заново.".to_owned(),
+                i18n::t(lang, Key::UiShareDied).to_owned(),
                 theme::STATE_WARNING,
             ));
         }
     }
 
-    fn accept(&mut self, event: ShareEvent, ctx: &egui::Context) {
+    /// Пересобирает строки передач на новом языке.
+    ///
+    /// Исходы, пришедшие от движка (`TransferOutcome::Failed`), остаются как
+    /// есть: они про то, что уже случилось, и пересказать их нечем.
+    fn relabel(&mut self, lang: Lang) {
+        for row in &mut self.transfers {
+            let done = row.done;
+            let finished = matches!(row.outcome, TransferOutcome::Done);
+            row.rebuild(done, lang);
+            if finished {
+                row.finish(lang);
+            }
+        }
+    }
+
+    fn accept(&mut self, event: ShareEvent, lang: Lang, ctx: &egui::Context) {
         match event {
             ShareEvent::Ready(addresses) => {
                 self.state = ShareState::On;
@@ -2068,28 +2181,23 @@ impl SharePanel {
                     direction,
                     name,
                     total,
+                    done: 0,
                     fraction: None,
                     line: String::new(),
                     outcome: TransferOutcome::Going,
                 };
-                row.rebuild(0);
+                row.rebuild(0, lang);
                 self.transfers.push(row);
             }
             ShareEvent::Progress { id, done } => {
                 if let Some(row) = self.row(id) {
-                    row.rebuild(done);
+                    row.rebuild(done, lang);
                 }
             }
             ShareEvent::Finished { id, name } => {
                 if let Some(row) = self.row(id) {
                     row.name = name;
-                    row.outcome = TransferOutcome::Done;
-                    row.fraction = Some(1.0);
-                    row.line = format!(
-                        "{} · готово · {}",
-                        row.direction.label(),
-                        row.total.map(human_bytes).unwrap_or_default()
-                    );
+                    row.finish(lang);
                 }
             }
             ShareEvent::Failed { id, message } => match self.row(id) {
@@ -2099,7 +2207,7 @@ impl SharePanel {
                 None => self.note = Some((message, theme::STATE_ERROR)),
             },
             ShareEvent::Stopped(message) => {
-                self.stop(None);
+                self.stop(None, lang);
                 self.note = Some((message, theme::STATE_ERROR));
             }
         }
@@ -2205,21 +2313,23 @@ impl MonitorPanel {
     /// открыта вкладка или включён оверлей — есть кому смотреть; во всех
     /// прочих случаях поток обязан остановиться, иначе загрузчик греет
     /// ноутбук в фоне.
-    fn set_running(&mut self, wanted: bool, ctx: &egui::Context) {
+    fn set_running(&mut self, wanted: bool, lang: Lang, ctx: &egui::Context) {
         if wanted == self.running() {
             return;
         }
         if wanted {
-            self.start(ctx);
+            self.start(lang, ctx);
         } else {
             self.stop();
         }
     }
 
-    fn start(&mut self, ctx: &egui::Context) {
+    fn start(&mut self, lang: Lang, ctx: &egui::Context) {
         let (tx, rx) = channel();
         let notify_ctx = ctx.clone();
-        self.handle = Some(monitor::start(tx, move || notify_ctx.request_repaint()));
+        self.handle = Some(monitor::start(lang, tx, move || {
+            notify_ctx.request_repaint()
+        }));
         self.rx = Some(rx);
 
         // Прошлые числа и графики убираем: между двумя включениями монитора
@@ -2342,7 +2452,7 @@ impl MonitorPanel {
     /// его просят на каждом проходе. Замыкание при этом собирается заново —
     /// так требует API (`Fn + Send + Sync + 'static`), и дешевле этого здесь
     /// ничего нет: сами данные лежат в общей ячейке и не копируются.
-    fn show_overlay(&mut self, ctx: &egui::Context) {
+    fn show_overlay(&mut self, lang: Lang, ctx: &egui::Context) {
         // Закрыли изнутри — гасим галочку и забываем просьбу: иначе окно,
         // открытое заново, тут же закрылось бы старым флагом.
         if self.overlay_closing.swap(false, Ordering::Relaxed) {
@@ -2353,7 +2463,7 @@ impl MonitorPanel {
         }
 
         let builder = egui::ViewportBuilder::default()
-            .with_title("Savio — монитор")
+            .with_title(i18n::t(lang, Key::UiOverlayTitle))
             .with_inner_size(OVERLAY_SIZE)
             // Оба предела равны размеру: окно без рамки всё равно нечем
             // тянуть, а верхний предел заодно закрывает дорогу дефекту 13.
@@ -2373,7 +2483,7 @@ impl MonitorPanel {
         let sample = Arc::clone(&self.overlay_sample);
         let closing = Arc::clone(&self.overlay_closing);
         ctx.show_viewport_deferred(self.overlay_id, builder, move |ui, class| {
-            overlay_ui(ui, class, &sample, &closing);
+            overlay_ui(ui, class, lang, &sample, &closing);
         });
     }
 }
@@ -2584,6 +2694,19 @@ impl Preview {
 }
 
 pub struct SavioApp {
+    /// Язык интерфейса. Запоминается между запусками (`settings::Settings`).
+    ///
+    /// Полем, а не глобалью: ровно по той же причине, по какой `Lang` ездит
+    /// параметром через движок — скрытое состояние, которое читают шестьсот
+    /// раз за кадр, перестаёт быть проверяемым. Стоит он байт и копируется
+    /// бесплатно.
+    ///
+    /// Смена языка — не только новые подписи: готовые строки (`meta_line`,
+    /// `progress_line`, `quality_note`, `subs_note`, сводка очереди, прогноз)
+    /// собраны заранее и сами не обновятся, а идущие потоки движка говорят
+    /// на том языке, с которым их запускали. И то и другое чинит
+    /// [`SavioApp::set_lang`].
+    lang: Lang,
     url: String,
     format: Format,
     /// Выбранная ступень качества. Отдельно от формата, как и в модели:
@@ -2808,6 +2931,8 @@ pub struct SavioApp {
     share: SharePanel,
     /// Открыто ли меню «Ещё» в шапке.
     more_open: bool,
+    /// Открыт ли список языков в шапке.
+    lang_open: bool,
     /// Чем eframe рисует это окно.
     ///
     /// Снимается один раз при создании приложения с того же адаптера, что уже
@@ -2861,7 +2986,9 @@ impl SavioApp {
         let saved = settings::load();
         let out_dir = saved.out_dir.or_else(default_download_dir);
 
+        let lang = saved.lang;
         let mut app = Self {
+            lang,
             url: String::new(),
             format: saved.format,
             quality: saved.quality,
@@ -2883,10 +3010,10 @@ impl SavioApp {
             // «нужен вход» — подсказкой не про ту беду. Про пропажу скажет
             // движок перед загрузкой, назвав файл по имени.
             cookies: saved.cookies,
-            cookie_file_display: display_cookie_file(saved.cookie_file.as_deref()),
+            cookie_file_display: display_cookie_file(saved.cookie_file.as_deref(), lang),
             cookie_file: saved.cookie_file,
             ffmpeg_missing: false,
-            out_dir_display: display_dir(out_dir.as_deref()),
+            out_dir_display: display_dir(out_dir.as_deref(), lang),
             out_dir,
             state: State::Idle,
             progress: Progress::default(),
@@ -2905,7 +3032,7 @@ impl SavioApp {
             progress_line: String::new(),
             done_path_display: String::new(),
             quality_note: String::new(),
-            sub_lang_label: SubLang::ORIGINAL_LABEL.to_owned(),
+            sub_lang_label: SubLang::original_label(lang).to_owned(),
             subs_note: String::new(),
             // Пустая до первого ответа: подвал просто не показывает версий,
             // пока их не спросили, — «неизвестно» там было бы враньём
@@ -2931,7 +3058,7 @@ impl SavioApp {
             // проявляться при запуске окну незачем.
             arrive: 1.0,
             speed: motion::scale(saved.smooth),
-            meta: MetaPanel::new(),
+            meta: MetaPanel::new(lang),
             system: SystemPanel::new(),
             monitor: MonitorPanel::new(),
             power: PowerPanel::new(),
@@ -2949,9 +3076,10 @@ impl SavioApp {
             // назад. По умолчанию — папка сохранения.
             share: SharePanel::new(),
             more_open: false,
+            lang_open: false,
             gpu: None,
             history: History::default(),
-            queue: Queue::new(),
+            queue: Queue::new(lang),
             maximize_pending: true,
             saver: settings::Saver::spawn(),
             gpu_errors: Arc::default(),
@@ -2965,13 +3093,15 @@ impl SavioApp {
         if what.any() {
             let (tx, rx) = channel();
             let notify_ctx = ctx.clone();
-            app.setup_handle = Some(setup::start(what, tx, move || notify_ctx.request_repaint()));
+            app.setup_handle = Some(setup::start(what, lang, tx, move || {
+                notify_ctx.request_repaint()
+            }));
             app.rx = Some(rx);
             app.setup = Setup::Installing;
-            app.stage = "Проверяю, чего не хватает…".into();
+            app.stage = i18n::t(lang, Key::StageCheckingMissing).into();
             app.rebuild_progress_line();
         } else {
-            app.setup_error = engine::discover().err();
+            app.setup_error = engine::discover(lang).err();
         }
 
         // Версии спрашиваем сразу — но в отдельном потоке: это запуск двух
@@ -3028,15 +3158,17 @@ impl SavioApp {
 
         self.gpu = text(info.name.clone()).map(|name| GpuInfo {
             name,
+            // Ключ, а не готовая строка: снимок берётся один раз при старте,
+            // а язык человек волен переключить потом.
             kind: match info.device_type {
-                eframe::wgpu::DeviceType::DiscreteGpu => "дискретная",
-                eframe::wgpu::DeviceType::IntegratedGpu => "встроенная",
-                eframe::wgpu::DeviceType::VirtualGpu => "виртуальная",
+                eframe::wgpu::DeviceType::DiscreteGpu => Key::HwGpuDiscrete,
+                eframe::wgpu::DeviceType::IntegratedGpu => Key::HwGpuIntegrated,
+                eframe::wgpu::DeviceType::VirtualGpu => Key::HwGpuVirtual,
                 // Программный растеризатор: карты нет вовсе или её драйвер
                 // не подошёл. Сказать об этом стоит — рисование в этом
                 // случае заметно медленнее.
-                eframe::wgpu::DeviceType::Cpu => "программная отрисовка",
-                eframe::wgpu::DeviceType::Other => "тип неизвестен",
+                eframe::wgpu::DeviceType::Cpu => Key::HwGpuSoftware,
+                eframe::wgpu::DeviceType::Other => Key::HwGpuUnknownKind,
             },
             // Ноль здесь — «идентификатор неизвестен», и звать по нему
             // разбор вендора незачем: он ответил бы «Unknown».
@@ -3062,7 +3194,7 @@ impl SavioApp {
     /// сам обработчик работает посреди чужого кода.
     fn drain_gpu_errors(&mut self) {
         for message in self.gpu_errors.take() {
-            let line = gpu_error_line(&message);
+            let line = gpu_error_line(&message, self.lang);
             // Повтор гасится здесь, по готовой строке, а не по сообщению
             // wgpu. Иначе в журнале двоится: про один и тот же предел
             // приходят два РАЗНЫХ сообщения (про поверхность и про
@@ -3086,7 +3218,7 @@ impl SavioApp {
         self.setup_handle = None;
         self.rx = None;
         self.handle = None;
-        self.setup_error = engine::discover().err();
+        self.setup_error = engine::discover(self.lang).err();
         // Ради этой строки установка и затевалась: до неё ffmpeg могло не быть.
         self.ffmpeg_missing = !engine::has_ffmpeg();
         self.stage.clear();
@@ -3133,7 +3265,7 @@ impl SavioApp {
             self.setup = Setup::Ready;
         }
 
-        self.setup_handle = Some(setup::start_update(what, tx, move || {
+        self.setup_handle = Some(setup::start_update(what, self.lang, tx, move || {
             notify_ctx.request_repaint()
         }));
         self.rx = Some(rx);
@@ -3143,11 +3275,12 @@ impl SavioApp {
         // Первая стадия у двух веток разная: у yt-dlp следом идёт запрос
         // выпуска, у ffmpeg — сразу загрузка, и «Проверяю версию…» висела бы
         // над полосой, которая на самом деле качает архив.
-        self.stage = match what {
-            setup::Component::Ytdlp => "Проверяю версию…",
-            setup::Component::Ffmpeg => "Готовлюсь скачивать…",
-        }
-        .into();
+        self.stage = self
+            .t(match what {
+                setup::Component::Ytdlp => Key::StageCheckingVersion,
+                setup::Component::Ffmpeg => Key::StageGettingReady,
+            })
+            .into();
         self.rebuild_progress_line();
     }
 
@@ -3197,7 +3330,70 @@ impl SavioApp {
             weather_place: self.weather.place.clone(),
             weather_units: self.weather.units,
             weather_favorites: self.weather.favorites.clone(),
+            lang: self.lang,
         });
+    }
+
+    /// Строка интерфейса на выбранном языке.
+    ///
+    /// Короткий доступ, чтобы `i18n::t(self.lang, …)` не повторялся в каждой
+    /// строке кадра. Звать из `ui()` можно: внутри `match` по ключу, ни одной
+    /// аллокации (Правило 1).
+    fn t(&self, key: Key) -> &'static str {
+        i18n::t(self.lang, key)
+    }
+
+    /// Переключает язык и приводит окно в порядок.
+    ///
+    /// Одних новых подписей мало, и это главная ловушка задачи. Готовые строки
+    /// (`meta_line`, `progress_line`, сводка очереди, прогноз погоды, строки
+    /// передач) собраны заранее — из кадра они не пересобираются, и половина
+    /// экрана осталась бы на прежнем языке до следующего события движка.
+    /// Поэтому здесь их пересобирают **явно**.
+    ///
+    /// Идущие потоки движка перезапускать нельзя: смена языка не должна ни
+    /// останавливать загрузку, ни терять её состояние. Те, что молча говорят
+    /// на старом языке и живут долго, — опрос монитора и раздача — перезапуск
+    /// переживают без потерь: опрос соберёт свежий замер через секунду, а
+    /// раздача у выключенного экрана и не идёт.
+    fn set_lang(&mut self, lang: Lang, ctx: &egui::Context) {
+        if lang == self.lang {
+            return;
+        }
+        self.lang = lang;
+        self.remember();
+
+        // Строки, собранные заранее. Пропусти любую — и она останется
+        // на прежнем языке до следующего события движка, то есть, возможно,
+        // навсегда.
+        self.out_dir_display = display_dir(self.out_dir.as_deref(), lang);
+        self.cookie_file_display = display_cookie_file(self.cookie_file.as_deref(), lang);
+        self.meta.relabel(lang);
+        self.rebuild_progress_line();
+        self.rebuild_meta_line();
+        self.rebuild_quality_note();
+        self.rebuild_subtitles();
+        self.rebuild_advanced_summary();
+        self.queue.relabel(lang);
+        self.weather.relabel(lang);
+        self.share.relabel(lang);
+
+        self.power.relabel(lang);
+
+        // Опрос монитора перезапускаем: подробности замера («8 ядер · 3.2 ГГц»,
+        // «13.1 ГБ из 31.9 ГБ») собирает поток, и сменить их на ходу нечем.
+        // Свежий замер приедет через секунду.
+        if self.monitor.running() {
+            self.monitor.stop();
+            self.monitor.start(lang, ctx);
+        }
+        // Питание — по той же причине: «Питанием Savio управляет только
+        // в Windows» собрано потоком и на месте не переводится. Перечитываем
+        // только то, что уже спрашивали: до первого открытия половины
+        // переводить нечего.
+        if !self.power.state.is_blank() || self.power.state.trouble.is_some() {
+            self.power.start(lang, ctx);
+        }
     }
 }
 
@@ -3211,10 +3407,11 @@ fn default_download_dir() -> Option<PathBuf> {
     downloads.is_dir().then_some(downloads)
 }
 
-fn display_dir(dir: Option<&Path>) -> String {
+fn display_dir(dir: Option<&Path>, lang: Lang) -> String {
     match dir {
         Some(dir) => dir.display().to_string(),
-        None => "не выбрана".to_owned(),
+        // Не пустая строка: пустая кнопка не сказала бы ничего.
+        None => i18n::t(lang, Key::UiNoFolderChosen).to_owned(),
     }
 }
 
@@ -3223,10 +3420,10 @@ fn display_dir(dir: Option<&Path>) -> String {
 /// Отдельной функцией, а не двумя одинаковыми строчками у выбора файла и
 /// у старта: правило показа тут одно, и разъедься оно, кнопка выглядела бы
 /// по-разному в зависимости от того, откуда взялся путь.
-fn display_cookie_file(file: Option<&Path>) -> String {
+fn display_cookie_file(file: Option<&Path>, lang: Lang) -> String {
     match file {
         Some(file) => file.display().to_string(),
-        None => PICK_COOKIE_FILE.to_owned(),
+        None => i18n::t(lang, PICK_COOKIE_FILE).to_owned(),
     }
 }
 
@@ -3340,7 +3537,7 @@ impl SavioApp {
         let (tx, rx) = channel();
         let notify_ctx = ctx.clone();
 
-        match engine::start(id, request, out_dir, known, tx, move || {
+        match engine::start(id, request, out_dir, known, self.lang, tx, move || {
             notify_ctx.request_repaint()
         }) {
             Ok(handle) => {
@@ -3350,7 +3547,7 @@ impl SavioApp {
                 self.state = State::Running;
                 self.progress = Progress::default();
                 self.progress_peak = 0.0;
-                self.stage = "Запуск…".into();
+                self.stage = self.t(Key::StageStarting).into();
                 self.log.clear();
                 self.done_path_display.clear();
                 self.rebuild_progress_line();
@@ -3389,7 +3586,7 @@ impl SavioApp {
             self.queue.set_status(id, QueueStatus::Cancelled);
         }
         self.state = State::Cancelled;
-        self.stage = "Отменено".into();
+        self.stage = self.t(Key::StageCancelled).into();
         self.progress_line.clear();
     }
 
@@ -3399,8 +3596,10 @@ impl SavioApp {
         use std::fmt::Write as _;
 
         let p = self.progress;
-        let line = &mut self.progress_line;
-        line.clear();
+        let lang = self.lang;
+        // Собираем в свою строку, а не в поле: `self.t` — это заём `self`,
+        // и с уже взятым изменяемым заёмом поля он не уживается.
+        let mut line = String::new();
         line.push_str(&self.stage);
 
         let sep = |line: &mut String| {
@@ -3410,26 +3609,32 @@ impl SavioApp {
         };
 
         if let Some(fraction) = p.fraction() {
-            sep(line);
+            sep(&mut line);
             let _ = write!(line, "{:.0}%", fraction * 100.0);
         }
         if p.total > 0 {
-            sep(line);
-            let _ = write!(
-                line,
-                "{} из {}",
-                human_bytes(p.downloaded),
-                human_bytes(p.total)
-            );
+            sep(&mut line);
+            line.push_str(&i18n::fill(
+                i18n::t(lang, Key::AmountOfTotal),
+                &[
+                    &human_bytes(p.downloaded, lang),
+                    &human_bytes(p.total, lang),
+                ],
+            ));
         }
         if let Some(speed) = p.speed_bps {
-            sep(line);
-            line.push_str(&human_speed(speed));
+            sep(&mut line);
+            line.push_str(&human_speed(speed, lang));
         }
         if let Some(eta) = p.eta_secs {
-            sep(line);
-            let _ = write!(line, "осталось {}", human_duration(eta));
+            sep(&mut line);
+            line.push_str(&i18n::fill(
+                i18n::t(lang, Key::UiTimeLeft),
+                &[&human_duration(eta)],
+            ));
         }
+
+        self.progress_line = line;
     }
 
     fn rebuild_meta_line(&mut self) {
@@ -3455,7 +3660,11 @@ impl SavioApp {
             if !self.meta_line.is_empty() {
                 self.meta_line.push_str(" · ");
             }
-            let _ = write!(self.meta_line, "до {height}p");
+            let _ = write!(
+                self.meta_line,
+                "{}",
+                i18n::fill(self.t(Key::UiUpToHeight), &[&height.to_string()])
+            );
         }
     }
 
@@ -3482,9 +3691,11 @@ impl SavioApp {
             return;
         };
         if want > have {
+            let have = have.to_string();
             let _ = write!(
                 self.quality_note,
-                "Выше {have}p этот ролик не отдают — скачается {have}p."
+                "{}",
+                i18n::fill(self.t(Key::UiQualityNote), &[&have, &have])
             );
         }
     }
@@ -3501,7 +3712,9 @@ impl SavioApp {
     fn rebuild_subtitles(&mut self) {
         self.sub_lang_label.clear();
         match &self.sub_lang {
-            SubLang::Original => self.sub_lang_label.push_str(SubLang::ORIGINAL_LABEL),
+            SubLang::Original => self
+                .sub_lang_label
+                .push_str(SubLang::original_label(self.lang)),
             SubLang::Code(code) => {
                 // Подписи может не быть: список остался от прошлой ссылки,
                 // а у нынешней такого языка нет. Показываем тогда сам код —
@@ -3526,7 +3739,7 @@ impl SavioApp {
         let Some(info) = &self.preview.info else {
             return;
         };
-        if let Some(note) = info.subtitle_note(&self.sub_lang, self.options.auto_subs) {
+        if let Some(note) = info.subtitle_note(&self.sub_lang, self.options.auto_subs, self.lang) {
             self.subs_note = note;
         }
     }
@@ -3546,6 +3759,7 @@ impl SavioApp {
             self.section.any(),
             self.cookies.any(),
             &self.sub_lang,
+            self.lang,
         );
     }
 
@@ -3553,12 +3767,12 @@ impl SavioApp {
     /// в кадре отрисовки ничего не выделяется.
     fn status(&self) -> (&'static str, egui::Color32) {
         match self.state {
-            State::Idle => ("Готов к работе", theme::TEXT_SECONDARY),
-            State::Queued => ("В очереди", theme::TEXT_SECONDARY),
-            State::Running => ("Загрузка", theme::ACCENT),
-            State::Done(_) => ("Готово", theme::STATE_SUCCESS),
-            State::Failed(_) => ("Ошибка", theme::STATE_ERROR),
-            State::Cancelled => ("Отменено", theme::TEXT_SECONDARY),
+            State::Idle => (self.t(Key::StateIdle), theme::TEXT_SECONDARY),
+            State::Queued => (self.t(Key::StateQueued), theme::TEXT_SECONDARY),
+            State::Running => (self.t(Key::StateRunning), theme::ACCENT),
+            State::Done(_) => (self.t(Key::StateDone), theme::STATE_SUCCESS),
+            State::Failed(_) => (self.t(Key::StateFailed), theme::STATE_ERROR),
+            State::Cancelled => (self.t(Key::StateCancelled), theme::TEXT_SECONDARY),
         }
     }
 
@@ -3657,7 +3871,7 @@ impl SavioApp {
                     // загрузку могли снять, и «Готово» встало бы рядом
                     // с чужим путём.
                     if self.queue.is_running(id) {
-                        self.stage = "Готово".into();
+                        self.stage = self.t(Key::StageDone).into();
                         self.done_path_display = path.display().to_string();
                         // Единственное место, где пополняется история: другого
                         // признака «файл готов и лежит вот здесь» у UI нет.
@@ -3678,7 +3892,7 @@ impl SavioApp {
                     if self.setup.busy() {
                         self.finish_setup(Setup::Failed(message), ctx);
                     } else if self.queue.is_running(id) {
-                        self.stage = "Ошибка".into();
+                        self.stage = self.t(Key::StageError).into();
                         self.queue
                             .set_status(id, QueueStatus::Failed(message.clone()));
                         self.state = State::Failed(message);
@@ -3839,7 +4053,8 @@ impl SavioApp {
 
         let (tx, rx) = channel();
         let notify_ctx = ctx.clone();
-        let handle = engine::start_probe(request, tx, move || notify_ctx.request_repaint());
+        let handle =
+            engine::start_probe(request, self.lang, tx, move || notify_ctx.request_repaint());
         self.preview.asked(rx, handle);
     }
 
@@ -3902,8 +4117,8 @@ impl SavioApp {
         // меняется она дважды за запуск, а `ui()` зовут 60 раз в секунду.
         self.tools_line = format!(
             "{} · {}",
-            version_line("yt-dlp", &versions.ytdlp),
-            version_line("ffmpeg", &versions.ffmpeg)
+            version_line("yt-dlp", &versions.ytdlp, self.lang),
+            version_line("ffmpeg", &versions.ffmpeg, self.lang)
         );
     }
 }
@@ -3922,24 +4137,25 @@ fn advanced_summary(
     section_broken: bool,
     section_set: bool,
     cookies: bool,
-    lang: &SubLang,
+    subs: &SubLang,
+    lang: Lang,
 ) -> String {
     let section = match (section_broken, section_set) {
-        (true, _) => Some("фрагмент задан неверно".to_owned()),
-        (false, true) => Some("фрагмент".to_owned()),
+        (true, _) => Some(i18n::t(lang, Key::UiSummarySectionBad).to_owned()),
+        (false, true) => Some(i18n::t(lang, Key::UiSummarySection).to_owned()),
         (false, false) => None,
     };
-    let cookies = cookies.then(|| "вход на сайт".to_owned());
+    let cookies = cookies.then(|| i18n::t(lang, Key::UiSummaryLogin).to_owned());
     // Код языка, а не подпись: подпись бывает длинной («Русский
     // (автоматические)»), а места в заголовке ровно одна строка.
-    let subs = match lang {
-        SubLang::Code(code) => Some(format!("субтитры: {code}")),
+    let subs = match subs {
+        SubLang::Code(code) => Some(i18n::fill(i18n::t(lang, Key::UiSummarySubs), &[code])),
         SubLang::Original => None,
     };
 
     let parts: Vec<String> = [section, cookies, subs].into_iter().flatten().collect();
     if parts.is_empty() {
-        "фрагмент, вход на сайт, язык субтитров".to_owned()
+        i18n::t(lang, Key::UiSummaryPlaceholder).to_owned()
     } else {
         parts.join(" · ")
     }
@@ -3952,12 +4168,14 @@ fn advanced_summary(
 /// работает, просто печатает версию не так, как мы ожидали (см.
 /// `setup::parse_version_line`). Сказать «не найден» про рабочую копию —
 /// значит отправить человека решать несуществующую беду.
-fn version_line(name: &str, version: &crate::model::ToolVersion) -> String {
+fn version_line(name: &str, version: &crate::model::ToolVersion, lang: Lang) -> String {
     use crate::model::ToolVersion;
     match version {
-        ToolVersion::Known(version) => format!("{name} — {version}"),
-        ToolVersion::Unknown => format!("{name} — версия неизвестна"),
-        ToolVersion::Missing => format!("{name} — не найден"),
+        ToolVersion::Known(version) => {
+            i18n::fill(i18n::t(lang, Key::UiToolVersion), &[name, version])
+        }
+        ToolVersion::Unknown => i18n::fill(i18n::t(lang, Key::UiToolVersionUnknown), &[name]),
+        ToolVersion::Missing => i18n::fill(i18n::t(lang, Key::UiToolMissing), &[name]),
     }
 }
 
@@ -4007,24 +4225,24 @@ impl eframe::App for SavioApp {
         if let Some(handle) = &self.share.handle {
             handle.stop_and_wait(std::time::Duration::from_secs(1));
         }
-        self.share.stop(None);
+        self.share.stop(None, self.lang);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_events(ui.ctx());
         self.tick_preview(ui.ctx());
-        self.meta.drain();
+        self.meta.drain(self.lang);
         self.system.drain();
         self.monitor.drain(ui.ctx());
-        self.power.drain();
+        self.power.drain(self.lang);
         // Место могло смениться ответом движка (определилось по IP) — тогда
         // его надо запомнить здесь же, иначе при следующем запуске IP-адрес
         // снова ушёл бы геолокатору.
-        if self.weather.drain() {
+        if self.weather.drain(self.lang) {
             self.remember();
         }
-        self.weather.drain_search();
-        self.share.drain(ui.ctx());
+        self.weather.drain_search(self.lang);
+        self.share.drain(self.lang, ui.ctx());
         self.drain_versions();
         self.drain_gpu_errors();
 
@@ -4034,19 +4252,21 @@ impl eframe::App for SavioApp {
         // было бы некому.
         let now_open = self.tab == Tab::Machine && self.machine_tab == MachineTab::Now;
         let watched = now_open || self.monitor.overlay;
-        self.monitor.set_running(watched, ui.ctx());
+        self.monitor.set_running(watched, self.lang, ui.ctx());
         // Питание перечитывается по открытию половины, а не по кадру: оно
         // меняется раз в день, но меняют его и мимо Savio. Место здесь, а не
         // во вкладке, по той же причине, что и у опроса: закрытая половина
         // не рисуется, и заметить её закрытие из неё самой некому.
-        self.power.watch(now_open, ui.ctx());
+        self.power.watch(now_open, self.lang, ui.ctx());
         // Погода — по той же причине здесь: срок обновления надо сверять и
         // тогда, когда вкладка ещё не рисовалась, а закрытая вкладка не
         // должна просить ни кадра.
-        self.weather.watch(self.tab == Tab::Weather, ui.ctx());
+        self.weather
+            .watch(self.tab == Tab::Weather, self.lang, ui.ctx());
         // Раздача — по той же причине и строже: ушли с экрана — папка больше
         // не открыта для сети.
-        self.share.watch(self.tab == Tab::Phone, ui.ctx());
+        self.share
+            .watch(self.tab == Tab::Phone, self.lang, ui.ctx());
 
         if self.maximize_pending {
             self.maximize_pending = false;
@@ -4121,7 +4341,7 @@ impl eframe::App for SavioApp {
         // Оверлей — отдельное окно, и просить его надо на каждом проходе,
         // иначе egui его закроет. Место здесь, а не во вкладке: оверлей живёт
         // и при закрытой вкладке — ради этого он и нужен.
-        self.monitor.show_overlay(ui.ctx());
+        self.monitor.show_overlay(self.lang, ui.ctx());
 
         // Модалки рисуются последними, поверх всего остального.
         let ctx = ui.ctx().clone();
@@ -4281,7 +4501,14 @@ impl SavioApp {
     /// шапки, а не растянута на всё окно, и равные доли растащили бы её
     /// по ширине самого длинного слова.
     fn header(&mut self, ui: &mut egui::Ui) {
-        let row = Self::header_row(ui, self.speed, self.tab, &mut self.more_open);
+        let row = Self::header_row(
+            ui,
+            self.speed,
+            self.tab,
+            self.lang,
+            &mut self.more_open,
+            &mut self.lang_open,
+        );
         if let Some(tab) = row.picked
             && tab != self.tab
         {
@@ -4293,6 +4520,11 @@ impl SavioApp {
         if row.about {
             self.about_open = true;
         }
+        // Смена языка — не присваивание поля: половина экрана собрана
+        // заранее и сама не обновится (см. `set_lang`).
+        if let Some(lang) = row.lang {
+            self.set_lang(lang, ui.ctx());
+        }
     }
 
     /// Содержимое шапки без `self`.
@@ -4301,12 +4533,21 @@ impl SavioApp {
     /// здесь — полтора десятка точек, и следующий раздел в дорожке молча
     /// уедет под номер версии. Меряет это `the_header_fits_the_smallest_window`,
     /// а померить можно только то, что окно и тест берут из одного места.
-    fn header_row(ui: &mut egui::Ui, speed: f32, tab: Tab, more_open: &mut bool) -> HeaderRow {
+    fn header_row(
+        ui: &mut egui::Ui,
+        speed: f32,
+        tab: Tab,
+        lang: Lang,
+        more_open: &mut bool,
+        lang_open: &mut bool,
+    ) -> HeaderRow {
         let mut row = HeaderRow {
             picked: None,
             about: false,
             track: egui::Rect::NOTHING,
             version: egui::Rect::NOTHING,
+            lang_pill: egui::Rect::NOTHING,
+            lang: None,
         };
 
         ui.horizontal(|ui| {
@@ -4328,8 +4569,12 @@ impl SavioApp {
             } else {
                 TrackItem::Tab(tab)
             };
+            let items: Vec<(TrackItem, &str)> = TRACK
+                .iter()
+                .map(|(item, key)| (*item, i18n::t(lang, *key)))
+                .collect();
             let track = ui.scope(|ui| {
-                segment_track(ui, egui::Id::new("track:tab"), speed, current, &TRACK, false)
+                segment_track(ui, egui::Id::new("track:tab"), speed, current, &items, false)
             });
             row.track = track.response.rect;
             match track.inner {
@@ -4360,9 +4605,22 @@ impl SavioApp {
             .gap(6.0)
             .open_bool(more_open)
             .show(|ui| {
-                for (item, label) in MORE_TABS {
-                    if choice_pill(ui, label, item == tab, speed).clicked() {
+                for (item, key) in MORE_TABS {
+                    if choice_pill(ui, i18n::t(lang, key), item == tab, speed).clicked() {
                         row.picked = Some(item);
+                    }
+                }
+
+                // Языки здесь — второй вход, а не основной: он же стоит
+                // подписью справа, рядом с номером версии. Но в окне
+                // минимальной ширины подписи места нет (шапка там занята
+                // целиком, запас — полторы точки), а остаться без выбора
+                // языка нельзя. Ровно так же устроено «О программе»:
+                // кнопка в подвале и щелчок по версии в шапке.
+                ui.separator();
+                for other in Lang::ALL {
+                    if choice_pill(ui, other.label(), other == lang, speed).clicked() {
+                        row.lang = Some(other);
                     }
                 }
             });
@@ -4391,18 +4649,94 @@ impl SavioApp {
                         .sense(egui::Sense::click()),
                     )
                     .on_hover_cursor(egui::CursorIcon::PointingHand)
-                    .on_hover_text(
-                        "О программе: кто сделал Savio и куда писать, если \
-                         что-то не работает.",
-                    );
+                    .on_hover_text(i18n::t(lang, Key::UiAboutVersionHint));
                 row.version = version.rect;
                 if version.clicked() {
                     row.about = true;
+                }
+
+                // Язык — рядом с версией, а не в «Тонких настройках»: это
+                // настройка всего приложения, а не загрузки, и запоминается
+                // между запусками. Спрятанная за щелчком, она была бы
+                // невидима ровно тогда, когда о ней вспоминают (Правило 4);
+                // здесь выбранный язык виден на каждом экране сразу.
+                //
+                // Одна подпись с текущим языком, а не три подряд: в шапке
+                // окна 520 запас — полторы точки, и три подписи уехали бы
+                // под номер версии. Список открывается меню, как у браузеров
+                // во «Входе на сайт».
+                //
+                // Порог — не придирка, а тот же случай, что у «О программе»
+                // в подвале: в окне минимальной ширины дорожка разделов
+                // занимает шапку целиком, и подпись налезла бы на неё.
+                // Выбор при этом не пропадает — он есть и в меню «Ещё».
+                // Число — ширина самой длинной подписи («Eng») с запасом на
+                // промежуток; замерено кадром без окна.
+                const LANG_MIN: f32 = 34.0;
+                if ui.available_width() >= LANG_MIN {
+                    let (picked, rect) = Self::lang_pill(ui, speed, lang, lang_open);
+                    row.lang = row.lang.or(picked);
+                    row.lang_pill = rect;
                 }
             });
         });
 
         row
+    }
+
+    /// Выбор языка в шапке и его меню. Возвращает выбранный язык и место,
+    /// которое подпись заняла.
+    ///
+    /// Подписью, а не таблеткой, и это не экономия ради экономии: в шапке
+    /// окна 520 после дорожки разделов остаётся меньше двух десятков точек,
+    /// а поля и рамка таблетки съедают под тридцать — она не помещалась бы
+    /// вовсе. Подпись устроена как номер версии рядом: светлеет под курсором
+    /// и открывает список щелчком.
+    fn lang_pill(
+        ui: &mut egui::Ui,
+        speed: f32,
+        lang: Lang,
+        open: &mut bool,
+    ) -> (Option<Lang>, egui::Rect) {
+        let mut picked = None;
+        let t = touch_at(ui, ui.next_auto_id(), speed);
+        let pill = ui
+            .add(
+                egui::Label::new(
+                    egui::RichText::new(lang.label())
+                        .small()
+                        .color(motion::mix(theme::TEXT_MUTED, theme::TEXT_PRIMARY, t)),
+                )
+                .selectable(false)
+                .sense(egui::Sense::click()),
+            )
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text(i18n::t(lang, Key::UiLanguageHint));
+        if pill.clicked() {
+            *open = !*open;
+        }
+
+        egui::Popup::new(
+            egui::Id::new("savio-lang"),
+            ui.ctx().clone(),
+            pill.rect,
+            ui.layer_id(),
+        )
+        .kind(egui::PopupKind::Menu)
+        .layout(egui::Layout::top_down_justified(egui::Align::Min))
+        .style(egui::containers::menu::menu_style)
+        .align(egui::RectAlign::BOTTOM_END)
+        .gap(6.0)
+        .open_bool(open)
+        .show(|ui| {
+            for other in Lang::ALL {
+                if choice_pill(ui, other.label(), other == lang, speed).clicked() {
+                    picked = Some(other);
+                }
+            }
+        });
+
+        (picked, pill.rect)
     }
 
     /// Подвал: версии инструментов, их обновление, журнал и «О программе».
@@ -4417,6 +4751,7 @@ impl SavioApp {
         // Пока занят единственный канал событий — обновляться нечем: и
         // загрузка, и установка ходят через тот же `rx`.
         let enabled = !matches!(self.state, State::Running) && !self.setup.busy();
+        let lang = self.lang;
         let mut update = None;
 
         ui.horizontal(|ui| {
@@ -4438,20 +4773,14 @@ impl SavioApp {
 
             let speed = self.speed;
             ui.add_enabled_ui(enabled, |ui| {
-                if pill_button(ui, "Обновить движок", speed)
-                    .on_hover_text(
-                        "Сайты меняются, и старый yt-dlp перестаёт их скачивать. \
-                         Если ссылка вдруг не работает — обновите движок.",
-                    )
+                if pill_button(ui, i18n::t(lang, Key::UiUpdateEngine), speed)
+                    .on_hover_text(i18n::t(lang, Key::UiUpdateEngineHint))
                     .clicked()
                 {
                     update = Some(setup::Component::Ytdlp);
                 }
-                if pill_button(ui, "Обновить ffmpeg", speed)
-                    .on_hover_text(
-                        "Свежая сборка ffmpeg качается целиком — больше сотни \
-                         мегабайт. Обновлять его нужно редко.",
-                    )
+                if pill_button(ui, i18n::t(lang, Key::UiUpdateFfmpeg), speed)
+                    .on_hover_text(i18n::t(lang, Key::UiUpdateFfmpegHint))
                     .clicked()
                 {
                     update = Some(setup::Component::Ffmpeg);
@@ -4463,13 +4792,13 @@ impl SavioApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let has_log = !self.log.is_empty();
                 let response = ui.add_enabled_ui(has_log, |ui| {
-                    toggle_pill(ui, "Журнал", self.log_open, speed)
+                    toggle_pill(ui, self.t(Key::UiLog), self.log_open, speed)
                 });
                 if response.inner.clicked() {
                     self.log_open = !self.log_open;
                 }
                 if !has_log {
-                    response.response.on_hover_text("Пока нечего показывать.");
+                    response.response.on_hover_text(self.t(Key::UiLogEmpty));
                 }
 
                 // «О программе» — сразу за журналом: оба про то, за чем идут,
@@ -4484,11 +4813,8 @@ impl SavioApp {
                 // шапке — см. `header`.
                 const ABOUT_MIN: f32 = 130.0;
                 if ui.available_width() >= ABOUT_MIN
-                    && pill_button(ui, "О программе", speed)
-                        .on_hover_text(
-                            "Кто сделал Savio, куда писать об ошибках и что \
-                             изменилось в новых версиях.",
-                        )
+                    && pill_button(ui, i18n::t(lang, Key::UiAbout), speed)
+                        .on_hover_text(i18n::t(lang, Key::UiAboutHint))
                         .clicked()
                 {
                     self.about_open = true;
@@ -4510,11 +4836,8 @@ impl SavioApp {
                 // открывается развёрнутым, так что до порога доводят вручную.
                 const SWITCH_MIN: f32 = 180.0;
                 if ui.available_width() >= SWITCH_MIN
-                    && checkbox(ui, &mut self.smooth, "Плавные переходы", true)
-                        .on_hover_text(
-                            "Снимите, если движение в окне мешает или машина \
-                             слабая: всё станет переключаться мгновенно.",
-                        )
+                    && checkbox(ui, &mut self.smooth, i18n::t(lang, Key::UiSmooth), true)
+                        .on_hover_text(i18n::t(lang, Key::UiSmoothHint))
                         .changed()
                 {
                     self.speed = motion::scale(self.smooth);
@@ -4663,17 +4986,17 @@ impl SavioApp {
             self.preview_row(ui);
 
             ui.add_space(14.0);
-            labelled_row(ui, "Формат", |ui| self.format_selector(ui));
+            labelled_row(ui, self.t(Key::UiFormat), |ui| self.format_selector(ui));
 
             ui.add_space(12.0);
             // Подпись зависит от формата: у видео ступени — это высота
             // кадра, у звука — килобиты в секунду. Берём её у домена, а не
             // пишем здесь второй раз: две копии одной подписи разъезжаются.
-            let quality_label = self.format.quality_label();
+            let quality_label = self.format.quality_label(self.lang);
             labelled_row(ui, quality_label, |ui| self.quality_selector(ui));
 
             ui.add_space(12.0);
-            labelled_row(ui, "Вшить", |ui| self.embed_options(ui));
+            labelled_row(ui, self.t(Key::UiEmbed), |ui| self.embed_options(ui));
 
             ui.add_space(14.0);
             self.advanced_group(ui);
@@ -4711,8 +5034,12 @@ impl SavioApp {
 
     /// Содержимое «Машины» без оболочки появления.
     fn machine_body(&mut self, ui: &mut egui::Ui) {
-        const HALVES: [(MachineTab, &str); 2] =
-            [(MachineTab::Now, "Сейчас"), (MachineTab::Spec, "Состав")];
+        const HALVES: [(MachineTab, Key); 2] = [
+            (MachineTab::Now, Key::MachineNow),
+            (MachineTab::Spec, Key::MachineSpec),
+        ];
+        let lang = self.lang;
+        let halves = HALVES.map(|(half, key)| (half, i18n::t(lang, key)));
 
         let mut picked = None;
         ui.horizontal(|ui| {
@@ -4722,7 +5049,7 @@ impl SavioApp {
                 egui::Id::new("track:machine"),
                 self.speed,
                 self.machine_tab,
-                &HALVES,
+                &halves,
                 false,
             );
 
@@ -4732,7 +5059,7 @@ impl SavioApp {
             if self.machine_tab == MachineTab::Now {
                 soft_pill(
                     ui,
-                    "Опрос идёт, пока открыт этот раздел",
+                    i18n::t(lang, Key::UiMachinePolling),
                     theme::STATE_SUCCESS,
                     theme::SUCCESS_SOFT,
                 );
@@ -4765,20 +5092,18 @@ impl SavioApp {
         // не собирается и не выделяется.
         let (title, subtitle) = match self.setup {
             Setup::Updating(setup::Component::Ytdlp) => (
-                "Обновление движка",
-                "Savio скачивает свежий yt-dlp. Это занимает несколько секунд.",
+                self.t(Key::UiUpdatingEngineTitle),
+                self.t(Key::UiUpdatingEngineText),
             ),
             // Про объём говорим прямо: ffmpeg весит больше сотни мегабайт, и
             // молчаливое ожидание на медленном канале выглядит зависанием.
             Setup::Updating(setup::Component::Ffmpeg) => (
-                "Обновление ffmpeg",
-                "Savio скачивает свежую сборку ffmpeg целиком — это больше сотни \
-                 мегабайт, на медленном интернете надолго.",
+                self.t(Key::UiUpdatingFfmpegTitle),
+                self.t(Key::UiUpdatingFfmpegText),
             ),
             _ => (
-                "Установка зависимостей",
-                "Savio догружает недостающие программы. \
-                 Это нужно только при первом запуске — пожалуйста, подождите.",
+                self.t(Key::UiInstallingTitle),
+                self.t(Key::UiInstallingText),
             ),
         };
 
@@ -4833,7 +5158,7 @@ impl SavioApp {
                 }
 
                 ui.add_space(18.0);
-                pill_button(ui, "Отменить", speed).clicked()
+                pill_button(ui, self.t(Key::UiCancelButton), speed).clicked()
             });
         arrival.apply(ctx, &modal.response);
         let cancelled = modal.inner;
@@ -4845,6 +5170,7 @@ impl SavioApp {
 
     fn url_field(&mut self, ui: &mut egui::Ui) {
         let invalid = self.url_invalid;
+        let lang = self.lang;
 
         let response = ui
             .scope(|ui| {
@@ -4858,7 +5184,7 @@ impl SavioApp {
                 ui.add_sized(
                     [ui.available_width(), theme::FIELD_HEIGHT],
                     egui::TextEdit::singleline(&mut self.url)
-                        .hint_text("Вставьте ссылку: https://…")
+                        .hint_text(i18n::t(lang, Key::UiUrlHint))
                         .text_color(theme::TEXT_PRIMARY)
                         // Поля широкие: у «таблетки» текст обязан отступать
                         // от полукруглых торцов, иначе он в них упирается.
@@ -4877,7 +5203,7 @@ impl SavioApp {
         if invalid {
             ui.add_space(6.0);
             ui.label(
-                egui::RichText::new("Похоже, это не ссылка. Нужен адрес вида https://…")
+                egui::RichText::new(i18n::t(lang, Key::UiNotALink))
                     .small()
                     .color(theme::STATE_WARNING),
             );
@@ -4897,19 +5223,14 @@ impl SavioApp {
             // запрос», и ждать перестаёт.
             PreviewState::Asking => {
                 ui.add_space(8.0);
-                note(ui, "Смотрю, что это за ролик…", theme::TEXT_MUTED);
+                note(ui, self.t(Key::UiPreviewAsking), theme::TEXT_MUTED);
                 return;
             }
             // Не ошибка и баннера не заслуживает: сведения — украшение,
             // и «Скачать» после этого работает как ни в чём не бывало.
             PreviewState::Failed => {
                 ui.add_space(8.0);
-                note(
-                    ui,
-                    "Что это за ролик, выяснить не вышло: сайт не ответил или \
-                     он незнаком yt-dlp. Скачать всё равно можно — попробуйте.",
-                    theme::TEXT_MUTED,
-                );
+                note(ui, self.t(Key::UiPreviewFailed), theme::TEXT_MUTED);
                 return;
             }
             PreviewState::Ready => {}
@@ -4970,8 +5291,8 @@ impl SavioApp {
 
     fn format_selector(&mut self, ui: &mut egui::Ui) {
         let items = [
-            (Format::Mp4, Format::Mp4.label()),
-            (Format::Mp3, Format::Mp3.label()),
+            (Format::Mp4, Format::Mp4.label(self.lang)),
+            (Format::Mp3, Format::Mp3.label(self.lang)),
         ];
         let picked = segment_track(
             ui,
@@ -5003,9 +5324,10 @@ impl SavioApp {
     /// что осталось.
     fn quality_selector(&mut self, ui: &mut egui::Ui) {
         let format = self.format;
+        let lang = self.lang;
         // Массив на стеке, а не сборка списка: шесть пар «ступень + подпись»
         // ничего не выделяют, а подписи у `Quality` статические.
-        let items = Quality::ALL.map(|quality| (quality, quality.label(format)));
+        let items = Quality::ALL.map(|quality| (quality, quality.label(format, lang)));
 
         let picked = segment_track(
             ui,
@@ -5036,6 +5358,7 @@ impl SavioApp {
     fn section_row(&mut self, ui: &mut egui::Ui) {
         let error = self.section_error;
         let mut changed = false;
+        let lang = self.lang;
 
         ui.horizontal(|ui| {
             // Ширину делим между двумя полями и тире между ними, а второму
@@ -5049,7 +5372,7 @@ impl SavioApp {
             changed |= time_field(
                 ui,
                 &mut self.section_start,
-                "с 0:00",
+                i18n::t(lang, Key::UiSectionFrom),
                 error.is_some_and(SectionError::at_start),
                 width,
             );
@@ -5061,7 +5384,7 @@ impl SavioApp {
             changed |= time_field(
                 ui,
                 &mut self.section_end,
-                "до конца",
+                i18n::t(lang, Key::UiSectionTo),
                 error.is_some_and(SectionError::at_end),
                 rest,
             );
@@ -5091,20 +5414,11 @@ impl SavioApp {
         // обычной загрузки. Все строки статические.
         ui.add_space(6.0);
         if let Some(err) = self.section_error {
-            note(ui, err.message(), theme::STATE_ERROR);
+            note(ui, err.message(self.lang), theme::STATE_ERROR);
         } else if !self.section.any() {
-            note(
-                ui,
-                "Пусто — ролик скачается целиком. Время можно писать как «90», \
-                 «1:30» или «1:02:03».",
-                theme::TEXT_MUTED,
-            );
+            note(ui, self.t(Key::UiSectionHint), theme::TEXT_MUTED);
         } else if self.ffmpeg_missing {
-            note(
-                ui,
-                "Вырезать нечем: ffmpeg не найден. Ролик скачается целиком.",
-                theme::STATE_WARNING,
-            );
+            note(ui, self.t(Key::UiSectionNoFfmpeg), theme::STATE_WARNING);
         } else {
             note(ui, self.section_hint(), theme::TEXT_MUTED);
         }
@@ -5136,21 +5450,8 @@ impl SavioApp {
             // а без границ плана «резать» не бывает. Ветка выписана вместе
             // со `Stream`, а не через `_`, чтобы новый вариант `SectionPlan`
             // компилятор потребовал разобрать и здесь.
-            SectionPlan::Stream | SectionPlan::Whole => {
-                "Фрагмент вырезает ffmpeg прямо по ходу загрузки: она идёт \
-                 заметно медленнее обычной, а проценты и скорость при этом \
-                 не показываются. У MP4 начало сдвигается к ближайшему \
-                 ключевому кадру — файл может начаться на секунду-другую \
-                 раньше запрошенного."
-            }
-            SectionPlan::CutAfter => {
-                "Фрагмент занимает больше половины ролика, и Savio возьмёт его \
-                 быстрым путём: скачает ролик целиком, вырежет кусок и оставит \
-                 на диске только его. Проценты и скорость при этом видны, зато \
-                 из сети придёт целый ролик. У MP4 начало сдвигается к \
-                 ближайшему ключевому кадру — файл может начаться на \
-                 секунду-другую раньше запрошенного."
-            }
+            SectionPlan::Stream | SectionPlan::Whole => self.t(Key::UiSectionStreamNote),
+            SectionPlan::CutAfter => self.t(Key::UiSectionCutAfterNote),
         }
     }
 
@@ -5178,6 +5479,7 @@ impl SavioApp {
         // Копией, а не `self.speed` по месту: внутри замыкания `self` занят
         // изменяемо — там же правятся сами галочки.
         let speed = self.speed;
+        let lang = self.lang;
 
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
@@ -5185,29 +5487,29 @@ impl SavioApp {
             any_changed |= chip(
                 ui,
                 &mut self.options.embed_metadata,
-                "Метаданные",
+                i18n::t(lang, Key::UiEmbedMetadata),
                 true,
                 speed,
             )
-            .on_hover_text("Название, автор и дата уедут в сам файл.")
+            .on_hover_text(i18n::t(lang, Key::UiEmbedMetadataHint))
             .changed();
             any_changed |= chip(
                 ui,
                 &mut self.options.embed_thumbnail,
-                "Обложку",
+                i18n::t(lang, Key::UiEmbedThumbnail),
                 true,
                 speed,
             )
-            .on_hover_text("Картинка ролика станет обложкой файла.")
+            .on_hover_text(i18n::t(lang, Key::UiEmbedThumbnailHint))
             .changed();
             subs_changed |= chip(
                 ui,
                 &mut self.options.embed_subs,
-                "Субтитры",
+                i18n::t(lang, Key::UiEmbedSubs),
                 subs_enabled,
                 speed,
             )
-            .on_disabled_hover_text("Субтитры бывают только у видео — выберите MP4.")
+            .on_disabled_hover_text(i18n::t(lang, Key::UiEmbedSubsDisabled))
             .changed();
 
             // Подчинённый чип появляется вместе с субтитрами, а не висит
@@ -5216,14 +5518,11 @@ impl SavioApp {
                 subs_changed |= chip(
                     ui,
                     &mut self.options.auto_subs,
-                    "Можно автоматические",
+                    i18n::t(lang, Key::UiAutoSubs),
                     true,
                     speed,
                 )
-                .on_hover_text(
-                    "Распознанные роботом субтитры лучше, чем никаких, но \
-                     опечатки и слипшиеся слова там обычное дело.",
-                )
+                .on_hover_text(i18n::t(lang, Key::UiAutoSubsHint))
                 .changed();
             }
         });
@@ -5231,12 +5530,7 @@ impl SavioApp {
         // Оговорка про ffmpeg — статическая строка: в кадре ничего не собирается.
         if self.ffmpeg_missing && self.options.any() {
             ui.add_space(8.0);
-            note(
-                ui,
-                "Вшивать нечем: ffmpeg не найден. Файл скачается, но без \
-                 метаданных, обложки и субтитров.",
-                theme::STATE_WARNING,
-            );
+            note(ui, i18n::t(lang, Key::UiEmbedNoFfmpeg), theme::STATE_WARNING);
         }
 
         if subs_changed {
@@ -5262,6 +5556,7 @@ impl SavioApp {
     fn advanced_group(&mut self, ui: &mut egui::Ui) {
         let open = self.advanced;
         let speed = self.speed;
+        let lang = self.lang;
         let mut toggled = false;
 
         egui::Frame::new()
@@ -5271,8 +5566,13 @@ impl SavioApp {
             .inner_margin(egui::Margin::same(4))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                toggled =
-                    disclosure_row(ui, open, "Тонкие настройки", &self.advanced_summary, speed);
+                toggled = disclosure_row(
+                    ui,
+                    open,
+                    i18n::t(lang, Key::UiAdvanced),
+                    &self.advanced_summary,
+                    speed,
+                );
 
                 collapsing_body(ui, egui::Id::new("advanced-body"), open, speed, |ui| {
                     egui::Frame::new()
@@ -5285,18 +5585,18 @@ impl SavioApp {
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
 
-                            field_label(ui, "Фрагмент");
+                            field_label(ui, i18n::t(lang, Key::UiSectionField));
                             self.section_row(ui);
 
                             ui.add_space(14.0);
-                            field_label(ui, "Вход на сайт");
+                            field_label(ui, i18n::t(lang, Key::UiSiteLogin));
                             self.cookie_selector(ui);
 
                             // Список языков нужен, только если субтитры просят:
                             // в остальное время он не значит ничего.
                             if self.format == Format::Mp4 && self.options.embed_subs {
                                 ui.add_space(14.0);
-                                field_label(ui, "Язык субтитров");
+                                field_label(ui, i18n::t(lang, Key::UiSubtitleLanguage));
                                 if self.sub_lang_selector(ui) {
                                     self.rebuild_subtitles();
                                     self.rebuild_advanced_summary();
@@ -5326,6 +5626,12 @@ impl SavioApp {
         let width = ui.available_width();
         let allow_auto = self.options.auto_subs;
         let mut changed = false;
+        // Подписи берём до замыкания: внутри `self` занят по частям, и позвать
+        // `self.t` там уже нечем.
+        let ui_lang = self.lang;
+        let original = SubLang::original_label(ui_lang);
+        let automatic = i18n::t(ui_lang, Key::UiSubsAutomatic);
+        let own = i18n::t(ui_lang, Key::UiSubsOwn);
 
         ui.scope(|ui| {
             let v = ui.visuals_mut();
@@ -5355,7 +5661,7 @@ impl SavioApp {
                     // пункт, который есть до первого `probe`.
                     let selected = matches!(lang, SubLang::Original);
                     if ui
-                        .selectable_label(selected, SubLang::ORIGINAL_LABEL)
+                        .selectable_label(selected, original)
                         .clicked()
                         && !selected
                     {
@@ -5372,13 +5678,9 @@ impl SavioApp {
                         if group != Some(track.auto) {
                             group = Some(track.auto);
                             ui.label(
-                                egui::RichText::new(if track.auto {
-                                    "Автоматические"
-                                } else {
-                                    "Свои"
-                                })
-                                .small()
-                                .color(theme::TEXT_MUTED),
+                                egui::RichText::new(if track.auto { automatic } else { own })
+                                    .small()
+                                    .color(theme::TEXT_MUTED),
                             );
                         }
 
@@ -5404,24 +5706,12 @@ impl SavioApp {
         }
         // Обе строки статические, и обе нужны: про качество робота человек
         // должен узнать здесь, а не по готовому файлу.
-        if allow_auto {
-            note(
-                ui,
-                "Автоматические субтитры распознаёт робот: опечатки, слипшиеся \
-                 слова и пропущенные знаки препинания там обычное дело. \
-                 «Язык ролика» берёт распознанный оригинал, любой другой \
-                 язык — машинный перевод с него, и он ещё хуже.",
-                theme::TEXT_MUTED,
-            );
+        let hint = if allow_auto {
+            Key::UiSubsAutomaticHint
         } else {
-            note(
-                ui,
-                "Свои субтитры выкладывает автор ролика, и они точные — но \
-                 есть далеко не у всех. Список языков заполняется сам, \
-                 через секунду после того, как вы вставите ссылку.",
-                theme::TEXT_MUTED,
-            );
-        }
+            Key::UiSubsOwnHint
+        };
+        note(ui, i18n::t(ui_lang, hint), theme::TEXT_MUTED);
 
         changed
     }
@@ -5442,6 +5732,7 @@ impl SavioApp {
         // и без них отличается вплоть до пустого списка дорожек. Сменили
         // браузер — прежнее превью уже не про этот запрос.
         let before = self.cookies;
+        let lang = self.lang;
 
         ui.scope(|ui| {
             let v = ui.visuals_mut();
@@ -5457,7 +5748,7 @@ impl SavioApp {
             v.widgets.hovered.weak_bg_fill = theme::INPUT_FILL;
 
             egui::ComboBox::from_id_salt("savio-cookies")
-                .selected_text(self.cookies.label())
+                .selected_text(self.cookies.label(lang))
                 .width(width)
                 // Список обязан помещаться целиком. У egui потолок раскрытого
                 // списка — `combo_height`, то есть 200 точек: при штатной
@@ -5476,7 +5767,7 @@ impl SavioApp {
                     spacing.item_spacing.y = 2.0;
 
                     for source in CookieSource::ALL {
-                        ui.selectable_value(&mut self.cookies, source, source.label());
+                        ui.selectable_value(&mut self.cookies, source, source.label(lang));
                     }
                 });
         });
@@ -5508,28 +5799,15 @@ impl SavioApp {
 
         ui.add_space(6.0);
         match self.cookies {
-            CookieSource::None => note(
-                ui,
-                "Для возрастных, приватных и «подтвердите, что вы не робот» \
-                 роликов: Savio возьмёт ваш вход на сайт из браузера или из \
-                 файла. Обычные ссылки скачиваются и без этого.",
-                theme::TEXT_MUTED,
-            ),
+            CookieSource::None => note(ui, i18n::t(lang, Key::UiCookiesWhy), theme::TEXT_MUTED),
             CookieSource::File => note(
                 ui,
-                "Нужен файл формата Netscape — такой выгружает расширение \
-                 браузера вроде «Get cookies.txt». После загрузки yt-dlp \
-                 допишет в него свежие cookies. И то же, что с браузером: \
-                 у YouTube cookies чаще мешают — перестало скачиваться, \
-                 верните «Не использовать».",
+                i18n::t(lang, Key::UiCookieFileWhy),
                 theme::STATE_WARNING,
             ),
             _ => note(
                 ui,
-                "Закройте браузер перед загрузкой: пока он открыт, файл cookies \
-                 занят и не читается. И учтите: у YouTube cookies чаще мешают — \
-                 сайт отвечает пустым списком дорожек. Перестало скачиваться — \
-                 верните «Не использовать».",
+                i18n::t(lang, Key::UiCookieCloseBrowser),
                 theme::STATE_WARNING,
             ),
         }
@@ -5558,7 +5836,7 @@ impl SavioApp {
                 )
                 .truncate(),
             )
-            .on_hover_text("Откуда взять вход на сайт. Нажмите, чтобы выбрать другой файл.")
+            .on_hover_text(self.t(Key::UiCookieSourceHint))
             .clicked();
 
         if clicked {
@@ -5581,14 +5859,14 @@ impl SavioApp {
             // Фильтр по расширению, но не единственный: расширения у выгрузки
             // разные, и запереть человека в `*.txt` значило бы не дать
             // выбрать свой же файл.
-            .add_filter("Файлы cookies", &["txt"])
-            .add_filter("Все файлы", &["*"])
+            .add_filter(self.t(Key::FilterCookieFiles), &["txt"])
+            .add_filter(self.t(Key::FilterAllFiles), &["*"])
             .pick_file()
         else {
             return;
         };
 
-        self.cookie_file_display = display_cookie_file(Some(&file));
+        self.cookie_file_display = display_cookie_file(Some(&file), self.lang);
         self.cookie_file = Some(file);
     }
 
@@ -5619,11 +5897,11 @@ impl SavioApp {
                 )
             },
         )
-        .on_hover_text("Куда сохранять готовые файлы. Нажмите, чтобы выбрать другую папку.")
+        .on_hover_text(self.t(Key::UiOutDirHint))
         .clicked();
 
         if clicked && let Some(dir) = rfd::FileDialog::new().pick_folder() {
-            self.out_dir_display = display_dir(Some(&dir));
+            self.out_dir_display = display_dir(Some(&dir), self.lang);
             self.out_dir = Some(dir);
             self.remember();
         }
@@ -5638,18 +5916,19 @@ impl SavioApp {
     fn action_button(&mut self, ui: &mut egui::Ui) {
         // Подсказку выключенной кнопки выбираем по первой же причине, а не
         // по всем сразу: человеку нужно знать, что сделать сейчас.
-        let add_hint = if self.queue.full {
-            "Очередь заполнена: дождитесь, пока что-нибудь скачается."
+        let add_hint = self.t(if self.queue.full {
+            Key::UiQueueFull
         } else if self.url.trim().is_empty() {
-            "Вставьте ссылку — она встанет в конец очереди."
+            Key::UiPasteLinkForQueue
         } else if self.section_error.is_some() {
-            "Поправьте границы фрагмента."
+            Key::UiFixSection
         } else if self.out_dir.is_none() {
-            "Сначала выберите папку сохранения."
+            Key::UiPickFolderFirst
         } else {
-            "Сначала нужен yt-dlp."
-        };
+            Key::UiNeedYtdlp
+        });
         let can_enqueue = self.can_enqueue();
+        let lang = self.lang;
 
         let mut enqueue_clicked = false;
         let mut primary_clicked = false;
@@ -5665,13 +5944,10 @@ impl SavioApp {
             enqueue_clicked = ui
                 .add_enabled(
                     can_enqueue,
-                    egui::Button::new("В очередь")
+                    egui::Button::new(i18n::t(lang, Key::UiEnqueue))
                         .min_size(egui::vec2(secondary, theme::CTA_HEIGHT)),
                 )
-                .on_hover_text(
-                    "Ссылка встанет в конец очереди, а поле освободится под \
-                     следующую. Качаются они по одной, сверху вниз.",
-                )
+                .on_hover_text(i18n::t(lang, Key::UiEnqueueHint))
                 .on_disabled_hover_text(add_hint)
                 .clicked();
 
@@ -5696,40 +5972,39 @@ impl SavioApp {
 
         if self.queue.full {
             ui.add_space(6.0);
-            note(
-                ui,
-                "В очереди больше некуда: полсотни ссылок ещё ждут. Как только \
-                 хоть одна скачается, место освободится само.",
-                theme::STATE_WARNING,
-            );
+            note(ui, i18n::t(lang, Key::UiQueueFullNote), theme::STATE_WARNING);
         }
     }
 
     /// Главная кнопка ряда: «Отмена» во время загрузки, «Скачать» в остальное
     /// время. Возвращает `true`, когда её нажали.
     fn primary_button(&mut self, ui: &mut egui::Ui, width: f32) -> bool {
+        let lang = self.lang;
         if matches!(self.state, State::Running) {
             return ui
-                .add_sized([width, theme::CTA_HEIGHT], egui::Button::new("Отмена"))
-                .on_hover_text(
-                    "Остановит идущую загрузку. Остальные ссылки останутся \
-                     в очереди — «Скачать» продолжит с того же места.",
+                .add_sized(
+                    [width, theme::CTA_HEIGHT],
+                    egui::Button::new(i18n::t(lang, Key::UiCancel)),
                 )
+                .on_hover_text(i18n::t(lang, Key::UiCancelHint))
                 .clicked();
         }
 
         let enabled = self.can_start();
         // Подсказка выключенной кнопке нужна не меньше, чем соседней: до
         // очереди она молча гасла, и понять почему было неоткуда.
-        let hint = if self.setup_error.is_some() {
-            "Сначала нужен yt-dlp."
-        } else if self.section_error.is_some() {
-            "Поправьте границы фрагмента."
-        } else if self.out_dir.is_none() {
-            "Сначала выберите папку сохранения."
-        } else {
-            "Вставьте ссылку или поставьте что-нибудь в очередь."
-        };
+        let hint = i18n::t(
+            lang,
+            if self.setup_error.is_some() {
+                Key::UiNeedYtdlp
+            } else if self.section_error.is_some() {
+                Key::UiFixSection
+            } else if self.out_dir.is_none() {
+                Key::UiPickFolderFirst
+            } else {
+                Key::UiPasteOrQueue
+            },
+        );
 
         ui.scope(|ui| {
             let v = ui.visuals_mut();
@@ -5771,7 +6046,7 @@ impl SavioApp {
             ui.add_enabled(
                 enabled,
                 egui::Button::new(
-                    egui::RichText::new("Скачать")
+                    egui::RichText::new(i18n::t(lang, Key::UiDownload))
                         .font(theme::display(17.0))
                         .color(theme::TEXT_ON_ACCENT),
                 )
@@ -5792,6 +6067,7 @@ impl SavioApp {
     fn status_section(&mut self, ui: &mut egui::Ui) {
         let (label, color) = self.status();
         let speed = self.speed;
+        let lang = self.lang;
         // Куда открывать папку, решаем после карточки: внутри замыкания
         // `self` занят целиком, а `open_dir` запускает процесс.
         let mut open_at: Option<PathBuf> = None;
@@ -5890,24 +6166,23 @@ impl SavioApp {
                         ui.add_space(10.0);
                     }
                     if let Some(dir) = path.parent()
-                        && pill_button(ui, "Открыть папку", speed).clicked()
+                        && pill_button(ui, i18n::t(lang, Key::UiOpenFolder), speed).clicked()
                     {
                         open_at = Some(dir.to_path_buf());
                     }
                 }
                 State::Failed(err) => banner(ui, err, theme::STATE_ERROR),
-                State::Cancelled => note(ui, "Загрузка отменена.", theme::TEXT_SECONDARY),
+                State::Cancelled => note(
+                    ui,
+                    i18n::t(lang, Key::UiCancelledNote),
+                    theme::TEXT_SECONDARY,
+                ),
                 State::Queued => note(
                     ui,
-                    "Ссылки ждут в очереди. Нажмите «Скачать» — они пойдут \
-                     по одной, сверху вниз.",
+                    i18n::t(lang, Key::UiQueuedNote),
                     theme::TEXT_SECONDARY,
                 ),
-                State::Idle => note(
-                    ui,
-                    "Вставьте ссылку и нажмите «Скачать».",
-                    theme::TEXT_SECONDARY,
-                ),
+                State::Idle => note(ui, i18n::t(lang, Key::UiIdleNote), theme::TEXT_SECONDARY),
             }
         });
 
@@ -5931,6 +6206,7 @@ impl SavioApp {
         let mut picked = None;
         let mut open_at: Option<PathBuf> = None;
         let speed = self.speed;
+        let lang = self.lang;
 
         theme::card_rising(ui, self.appear(2), |ui| {
             ui.horizontal(|ui| {
@@ -5939,7 +6215,10 @@ impl SavioApp {
                     egui::Id::new("track:rail"),
                     self.speed,
                     self.rail_tab,
-                    &[(RailTab::Queue, "Очередь"), (RailTab::History, "История")],
+                    &[
+                        (RailTab::Queue, i18n::t(lang, Key::RailQueue)),
+                        (RailTab::History, i18n::t(lang, Key::RailHistory)),
+                    ],
                     false,
                 );
 
@@ -5948,12 +6227,8 @@ impl SavioApp {
                 // легло, и стирать её кнопкой рядом со списком опасно.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if self.rail_tab == RailTab::Queue && !self.queue.items.is_empty() {
-                        clear = pill_button(ui, "Очистить", speed)
-                            .on_hover_text(
-                                "Список опустеет: уйдут и скачанные, и те, что ещё \
-                                 ждут. Идущая загрузка не прервётся — её \
-                                 останавливает «Отмена».",
-                            )
+                        clear = pill_button(ui, i18n::t(lang, Key::UiClear), speed)
+                            .on_hover_text(i18n::t(lang, Key::UiClearHint))
                             .clicked();
                     }
                 });
@@ -6000,13 +6275,9 @@ impl SavioApp {
     /// Содержимое половины «Очередь». Возвращает строку, которую убрали.
     fn queue_list(&self, ui: &mut egui::Ui) -> Option<DownloadId> {
         let speed = self.speed;
+        let lang = self.lang;
         if self.queue.items.is_empty() {
-            note(
-                ui,
-                "Пока пусто. «В очередь» кладёт сюда ссылку из поля и \
-                 освобождает поле под следующую.",
-                theme::TEXT_MUTED,
-            );
+            note(ui, i18n::t(lang, Key::UiQueueEmptyNote), theme::TEXT_MUTED);
             return None;
         }
 
@@ -6035,19 +6306,13 @@ impl SavioApp {
             if index > 0 {
                 ui.add_space(8.0);
             }
-            if queue_row(ui, item, speed) {
+            if queue_row(ui, item, lang, speed) {
                 remove = Some(item.id);
             }
         }
 
         ui.add_space(10.0);
-        note(
-            ui,
-            "Качаются по одной, сверху вниз. Сорвавшаяся не останавливает \
-             остальные. На диск список не пишется и при закрытии Savio \
-             исчезает.",
-            theme::TEXT_MUTED,
-        );
+        note(ui, i18n::t(lang, Key::UiQueueNote), theme::TEXT_MUTED);
 
         remove
     }
@@ -6059,13 +6324,7 @@ impl SavioApp {
             // Пустой экран без объяснения читается как поломка. Про то, что
             // список не переживает закрытие окна, говорим здесь же: иначе
             // после перезапуска пустая история выглядит потерянными данными.
-            note(
-                ui,
-                "Пока пусто. Сюда попадёт всё, что вы скачаете за этот \
-                 запуск, — с кнопкой, открывающей папку файла. На диск \
-                 список не пишется и при закрытии Savio очищается.",
-                theme::TEXT_MUTED,
-            );
+            note(ui, self.t(Key::UiHistoryEmptyNote), theme::TEXT_MUTED);
             return None;
         };
 
@@ -6124,14 +6383,12 @@ impl SavioApp {
     /// и не запускает — берёт уже готовые строки, поэтому и работы с потоками
     /// здесь нет.
     fn log_copy_row(&mut self, ui: &mut egui::Ui) {
+        let lang = self.lang;
         ui.horizontal(|ui| {
             let now = ui.input(|i| i.time);
 
-            let copied = pill_button(ui, "Скопировать", self.speed)
-                .on_hover_text(
-                    "Журнал уйдёт в буфер обмена — его можно вставить \
-                     в сообщение о проблеме.",
-                )
+            let copied = pill_button(ui, i18n::t(lang, Key::UiCopy), self.speed)
+                .on_hover_text(i18n::t(lang, Key::UiCopyHint))
                 .clicked();
 
             if copied {
@@ -6148,7 +6405,7 @@ impl SavioApp {
                 if left > 0.0 {
                     // 10.7:1 на `BG_ROOT` — порог 4.5:1 проходит с запасом.
                     ui.label(
-                        egui::RichText::new("Скопировано")
+                        egui::RichText::new(i18n::t(lang, Key::UiCopied))
                             .small()
                             .color(theme::STATE_SUCCESS),
                     );
@@ -6180,7 +6437,7 @@ impl SavioApp {
         if ui.available_width() < theme::TWO_COLUMN_MIN {
             self.metadata_main(ui);
             ui.add_space(GAP);
-            metadata_rail(ui, self.appear(1), self.appear(2));
+            metadata_rail(ui, self.lang, self.appear(1), self.appear(2));
             return;
         }
 
@@ -6205,7 +6462,7 @@ impl SavioApp {
                 |ui| {
                     ui.set_min_width(rail);
                     ui.set_max_width(rail);
-                    metadata_rail(ui, self.appear(1), self.appear(2));
+                    metadata_rail(ui, self.lang, self.appear(1), self.appear(2));
                 },
             );
         });
@@ -6213,20 +6470,15 @@ impl SavioApp {
 
     /// Главная колонка вкладки: файл, кнопки и итог.
     fn metadata_main(&mut self, ui: &mut egui::Ui) {
+        let lang = self.lang;
         theme::card_rising(ui, self.appear(0), |ui| {
             ui.label(
-                egui::RichText::new("Что файл рассказывает о вас")
+                egui::RichText::new(i18n::t(lang, Key::UiMetaTitle))
                     .font(theme::display(21.0))
                     .color(theme::TEXT_PRIMARY),
             );
             ui.add_space(6.0);
-            note(
-                ui,
-                "Модель камеры, дата съёмки, координаты места, автор, обложка \
-                 альбома. Savio читает это и стирает, не пересжимая ни \
-                 картинку, ни звук.",
-                theme::TEXT_MUTED,
-            );
+            note(ui, i18n::t(lang, Key::UiMetaNote), theme::TEXT_MUTED);
 
             ui.add_space(16.0);
             self.meta_file_row(ui);
@@ -6262,19 +6514,19 @@ impl SavioApp {
                     .min_size(egui::vec2(width, theme::FIELD_HEIGHT)),
             )
         })
-        .on_hover_text("Нажмите, чтобы выбрать MP3 или изображение.")
+        .on_hover_text(self.t(Key::UiMetaPickHint))
         .clicked();
 
         if clicked
             && let Some(path) = rfd::FileDialog::new()
                 .add_filter(
-                    "Поддерживаемые файлы",
+                    self.t(Key::FilterSupported),
                     &["mp3", "jpg", "jpeg", "png", "webp", "gif", "tif", "tiff"],
                 )
-                .add_filter("Все файлы", &["*"])
+                .add_filter(self.t(Key::FilterAllFiles), &["*"])
                 .pick_file()
         {
-            self.meta.select(path);
+            self.meta.select(path, self.lang);
         }
     }
 
@@ -6282,7 +6534,7 @@ impl SavioApp {
         // Пока файл не выбран, подсказка должна объяснять именно это, а не
         // молча выключенную кнопку.
         let hint = match (&self.meta.path, &self.meta.blocked) {
-            (None, _) => Some("Сначала выберите файл."),
+            (None, _) => Some(self.t(Key::UiMetaPickFirst)),
             (Some(_), Some(_)) => None, // причина уже показана баннером выше
             _ => None,
         };
@@ -6299,7 +6551,8 @@ impl SavioApp {
 
             let read = ui.add_enabled(
                 read_on,
-                egui::Button::new("Прочитать").min_size(egui::vec2(width, theme::CTA_HEIGHT)),
+                egui::Button::new(i18n::t(self.lang, Key::UiMetaRead))
+                    .min_size(egui::vec2(width, theme::CTA_HEIGHT)),
             );
             let read = match hint {
                 Some(text) => read.on_disabled_hover_text(text),
@@ -6307,12 +6560,12 @@ impl SavioApp {
                     self.meta
                         .blocked
                         .as_deref()
-                        .unwrap_or("Сначала выберите файл."),
+                        .unwrap_or(i18n::t(self.lang, Key::UiMetaPickFirst)),
                 ),
             };
             if read.clicked() {
                 let ctx = ui.ctx().clone();
-                self.meta.start(MetaTask::Read, &ctx);
+                self.meta.start(MetaTask::Read, self.lang, &ctx);
             }
 
             // «Удалить» — главное действие вкладки, поэтому акцентная заливка.
@@ -6347,7 +6600,7 @@ impl SavioApp {
                     ui.add_enabled(
                         clean_on,
                         egui::Button::new(
-                            egui::RichText::new("Стереть всё")
+                            egui::RichText::new(i18n::t(self.lang, Key::UiMetaWipe))
                                 .font(theme::display(17.0))
                                 .color(theme::TEXT_ON_ACCENT),
                         )
@@ -6357,7 +6610,7 @@ impl SavioApp {
                         self.meta
                             .blocked
                             .as_deref()
-                            .unwrap_or("Сначала выберите файл."),
+                            .unwrap_or(i18n::t(self.lang, Key::UiMetaPickFirst)),
                     )
                     .clicked()
                 })
@@ -6401,19 +6654,16 @@ impl SavioApp {
         }
 
         ui.label(
-            egui::RichText::new(
-                "Выберите MP3 или изображение. «Прочитать» покажет, что \
-                 записано в файле, «Стереть всё» — уберёт теги, геометку \
-                 и обложку, не трогая само содержимое.",
-            )
-            .small()
-            .color(theme::TEXT_MUTED),
+            egui::RichText::new(self.t(Key::UiMetaHowTo))
+                .small()
+                .color(theme::TEXT_MUTED),
         );
     }
 
     /// Окно со списком прочитанных метаданных.
     fn tags_modal(&mut self, ctx: &egui::Context, arrival: ModalArrival) {
         let speed = self.speed;
+        let lang = self.lang;
         arrival.veil(ctx, "tags");
         let Some(tags) = &self.meta.tags else {
             return;
@@ -6442,7 +6692,7 @@ impl SavioApp {
                 ui.set_width(width);
 
                 ui.label(
-                    egui::RichText::new("Метаданные файла")
+                    egui::RichText::new(i18n::t(lang, Key::UiMetaFileTags))
                         .heading()
                         .strong()
                         .color(theme::TEXT_PRIMARY),
@@ -6451,7 +6701,8 @@ impl SavioApp {
 
                 if tags.is_empty() {
                     ui.label(
-                        egui::RichText::new("Метаданные не найдены.").color(theme::TEXT_SECONDARY),
+                        egui::RichText::new(i18n::t(lang, Key::UiMetaNothingFound))
+                            .color(theme::TEXT_SECONDARY),
                     );
                 } else {
                     // Список может быть длинным (у снимка с телефона легко
@@ -6503,7 +6754,7 @@ impl SavioApp {
                 }
 
                 ui.add_space(18.0);
-                pill_button(ui, "Закрыть", speed).clicked()
+                pill_button(ui, i18n::t(lang, Key::UiClose), speed).clicked()
             });
         arrival.apply(ctx, &close.response);
 
@@ -6538,18 +6789,15 @@ impl SavioApp {
                 ui.set_width(400.0_f32.min(ctx.content_rect().width() - 48.0));
 
                 ui.label(
-                    egui::RichText::new("Перезаписать файл?")
+                    egui::RichText::new(self.t(Key::UiMetaOverwriteTitle))
                         .heading()
                         .strong()
                         .color(theme::TEXT_PRIMARY),
                 );
                 ui.add_space(8.0);
                 ui.label(
-                    egui::RichText::new(
-                        "Метаданные будут стёрты из самого файла, копия не создаётся. \
-                         Вернуть их обратно будет нельзя.",
-                    )
-                    .color(theme::TEXT_SECONDARY),
+                    egui::RichText::new(self.t(Key::UiMetaOverwriteText))
+                        .color(theme::TEXT_SECONDARY),
                 );
                 ui.add_space(8.0);
                 ui.add(
@@ -6569,7 +6817,7 @@ impl SavioApp {
 
                     if ui
                         .add(
-                            egui::Button::new("Отмена")
+                            egui::Button::new(self.t(Key::UiCancel))
                                 .min_size(egui::vec2(width, theme::CONTROL_HEIGHT)),
                         )
                         .clicked()
@@ -6578,7 +6826,7 @@ impl SavioApp {
                     }
                     if ui
                         .add(
-                            egui::Button::new("Удалить")
+                            egui::Button::new(self.t(Key::UiDelete))
                                 .min_size(egui::vec2(width, theme::CONTROL_HEIGHT)),
                         )
                         .clicked()
@@ -6597,7 +6845,7 @@ impl SavioApp {
         match answer.inner {
             Answer::Yes => {
                 self.meta.confirming = false;
-                self.meta.start(MetaTask::Clean, ctx);
+                self.meta.start(MetaTask::Clean, self.lang, ctx);
             }
             Answer::No => self.meta.confirming = false,
             Answer::None if dismissed => self.meta.confirming = false,
@@ -6623,7 +6871,7 @@ impl SavioApp {
             None => self.about_copied_at = None,
         }
 
-        let window = about_window(ctx, self.speed, copied_left.is_some());
+        let window = about_window(ctx, self.lang, self.speed, copied_left.is_some());
         arrival.apply(ctx, &window.response);
 
         // Как у списка метаданных: окно ничего не делает и запереть в нём
@@ -6669,6 +6917,7 @@ enum AboutAction {
 /// «Скопировано».
 fn about_window(
     ctx: &egui::Context,
+    lang: Lang,
     speed: f32,
     copied: bool,
 ) -> egui::ModalResponse<Option<AboutAction>> {
@@ -6690,21 +6939,31 @@ fn about_window(
             let mut action = None;
 
             ui.label(
-                egui::RichText::new("О программе")
+                egui::RichText::new(i18n::t(lang, Key::UiAbout))
                     .heading()
                     .strong()
                     .color(theme::TEXT_PRIMARY),
             );
             ui.add_space(8.0);
-            note(ui, ABOUT_TEXT, theme::TEXT_SECONDARY);
+            note(ui, i18n::t(lang, ABOUT_TEXT), theme::TEXT_SECONDARY);
             ui.add_space(14.0);
 
             // Строки те же, что в карточках «Машины»: одинаковые по смыслу
             // таблицы должны и выглядеть одинаково.
-            stat_row(ui, "Версия", Some(VERSION));
-            stat_row(ui, "Разработчик", Some(AUTHOR));
-            stat_row(ui, "Лицензия", Some(LICENSE));
-            stat_row(ui, "Отзывы и ошибки", Some(FEEDBACK_EMAIL));
+            stat_row(ui, lang, i18n::t(lang, Key::UiVersion), Some(VERSION));
+            stat_row(
+                ui,
+                lang,
+                i18n::t(lang, Key::UiDeveloper),
+                Some(i18n::t(lang, AUTHOR)),
+            );
+            stat_row(ui, lang, i18n::t(lang, Key::UiLicense), Some(LICENSE));
+            stat_row(
+                ui,
+                lang,
+                i18n::t(lang, Key::UiFeedback),
+                Some(FEEDBACK_EMAIL),
+            );
 
             ui.add_space(10.0);
             ui.horizontal(|ui| {
@@ -6715,21 +6974,18 @@ fn about_window(
                 // `xdg-open` может и промолчать (Правило 6) — Savio об этом
                 // не узнает. Скопированный адрес работает везде: в веб-почте,
                 // на телефоне.
-                if pill_button(ui, "Написать", speed)
-                    .on_hover_text(
-                        "Откроет почтовую программу — с версией Savio в теме \
-                         письма. Нет почтовой программы — скопируйте адрес.",
-                    )
+                if pill_button(ui, i18n::t(lang, Key::UiWrite), speed)
+                    .on_hover_text(i18n::t(lang, Key::UiWriteHint))
                     .clicked()
                 {
                     action = Some(AboutAction::Write);
                 }
-                if pill_button(ui, "Скопировать адрес", speed).clicked() {
+                if pill_button(ui, i18n::t(lang, Key::UiCopyAddress), speed).clicked() {
                     action = Some(AboutAction::Copy);
                 }
                 if copied {
                     ui.label(
-                        egui::RichText::new("Скопировано")
+                        egui::RichText::new(i18n::t(lang, Key::UiCopied))
                             .small()
                             .color(theme::STATE_SUCCESS),
                     );
@@ -6741,20 +6997,20 @@ fn about_window(
                 ui.spacing_mut().item_spacing.x = 10.0;
                 // Полный адрес — в подсказке: куда ведёт кнопка, лучше знать
                 // до щелчка, а не по открывшемуся браузеру.
-                if pill_button(ui, "Страница проекта", speed)
+                if pill_button(ui, i18n::t(lang, Key::UiProjectPage), speed)
                     .on_hover_text(PROJECT_URL)
                     .clicked()
                 {
                     action = Some(AboutAction::Project);
                 }
-                if pill_button(ui, "Что изменилось", speed)
+                if pill_button(ui, i18n::t(lang, Key::UiWhatChanged), speed)
                     .on_hover_text(CHANGELOG_URL)
                     .clicked()
                 {
                     action = Some(AboutAction::Changelog);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if pill_button(ui, "Закрыть", speed).clicked() {
+                    if pill_button(ui, i18n::t(lang, Key::UiClose), speed).clicked() {
                         action = Some(AboutAction::Close);
                     }
                 });
@@ -6789,7 +7045,7 @@ impl SavioApp {
         if !self.system.asked {
             let ctx = ui.ctx().clone();
             let gpu = self.gpu.clone();
-            self.system.start(gpu, &ctx);
+            self.system.start(gpu, self.lang, &ctx);
         }
 
         self.system_header(ui);
@@ -6800,19 +7056,18 @@ impl SavioApp {
             return;
         }
 
+        // Язык снимаем до заимствования отчёта: `self.t` — это заём `self`
+        // целиком, а он уже занят ссылкой на отчёт.
+        let lang = self.lang;
         let Some(report) = &self.system.report else {
             // Приёмник умер, а отчёт не приехал: поток сорвался, не отправив
             // ничего. Показать «в порядке» тут нельзя — мы ничего не узнали.
-            note(
-                ui,
-                "Опрос не дал ответа. Попробуйте «Проверить снова».",
-                theme::TEXT_MUTED,
-            );
+            note(ui, i18n::t(lang, Key::UiSystemNoAnswer), theme::TEXT_MUTED);
             return;
         };
 
         for check in &report.checks {
-            check_card(ui, check);
+            check_card(ui, check, lang);
             ui.add_space(8.0);
         }
     }
@@ -6821,14 +7076,15 @@ impl SavioApp {
     fn system_header(&mut self, ui: &mut egui::Ui) {
         let mut again = false;
         let mut save = false;
+        let lang = self.lang;
 
         theme::card(ui, |ui| {
             // Итог — обычной строкой с переносом: он длинный, а в
             // горизонтальной раскладке egui положил бы его в одну строку
             // любой длины и срезал кромкой окна.
             match &self.system.report {
-                Some(report) => note(ui, &report.headline(), theme::TEXT_SECONDARY),
-                None => note(ui, "Сведения о железе этой машины.", theme::TEXT_SECONDARY),
+                Some(report) => note(ui, &report.headline(lang), theme::TEXT_SECONDARY),
+                None => note(ui, i18n::t(lang, Key::UiSystemAbout), theme::TEXT_SECONDARY),
             }
 
             ui.add_space(6.0);
@@ -6836,28 +7092,20 @@ impl SavioApp {
             // у половины пунктов выглядит поломкой Savio, а не отказом
             // системы: человеку неоткуда узнать, что температуры и SMART
             // без прав администратора недоступны в принципе.
-            note(
-                ui,
-                "Показано то, что система отдаёт без прав администратора. \
-                 Температуры, обороты вентиляторов и SMART накопителей \
-                 сюда не входят: без элевации их нельзя прочитать честно, \
-                 а показывать выдуманные значения хуже, чем не показывать \
-                 ничего.",
-                theme::TEXT_MUTED,
-            );
+            note(ui, i18n::t(lang, Key::UiSystemNote), theme::TEXT_MUTED);
 
             ui.add_space(14.0);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
                 again = ui
-                    .add_enabled(!self.system.busy, pill("Проверить снова"))
+                    .add_enabled(!self.system.busy, pill(i18n::t(lang, Key::UiCheckAgain)))
                     .clicked();
                 save = ui
                     .add_enabled(
                         !self.system.busy && self.system.report.is_some(),
-                        pill("Сохранить отчёт…"),
+                        pill(i18n::t(lang, Key::UiSaveReport)),
                     )
-                    .on_disabled_hover_text("Сначала дождитесь опроса.")
+                    .on_disabled_hover_text(i18n::t(lang, Key::UiWaitForPoll))
                     .clicked();
             });
 
@@ -6870,7 +7118,7 @@ impl SavioApp {
         if again {
             let ctx = ui.ctx().clone();
             let gpu = self.gpu.clone();
-            self.system.start(gpu, &ctx);
+            self.system.start(gpu, lang, &ctx);
         }
         if save {
             self.save_report();
@@ -6884,26 +7132,33 @@ impl SavioApp {
     /// своего показа, а сам отчёт — несколько килобайт текста. Заводить ради
     /// него поток значило бы усложнить код там, где выигрыша нет.
     fn save_report(&mut self) {
+        let lang = self.lang;
         let Some(report) = &self.system.report else {
             return;
         };
 
         let Some(path) = rfd::FileDialog::new()
-            .set_file_name("savio-система.txt")
-            .add_filter("Текстовый файл", &["txt"])
+            .set_file_name(i18n::t(lang, Key::UiReportFileName))
+            .add_filter(i18n::t(lang, Key::FilterTextFile), &["txt"])
             .save_file()
         else {
             // Диалог закрыли — это не отказ и не ошибка, говорить не о чем.
             return;
         };
 
-        self.system.saved = Some(match std::fs::write(&path, report.to_text()) {
+        self.system.saved = Some(match std::fs::write(&path, report.to_text(lang)) {
             Ok(()) => (
-                format!("Отчёт сохранён: {}", path.display()),
+                i18n::fill(
+                    i18n::t(lang, Key::UiReportSaved),
+                    &[&path.display().to_string()],
+                ),
                 theme::STATE_SUCCESS,
             ),
             Err(err) => (
-                format!("Не удалось сохранить отчёт: {err}"),
+                i18n::fill(
+                    i18n::t(lang, Key::UiReportSaveFailed),
+                    &[&err.to_string()],
+                ),
                 theme::STATE_ERROR,
             ),
         });
@@ -6922,6 +7177,7 @@ impl SavioApp {
         ui.add_space(14.0);
 
         let speed = self.speed;
+        let lang = self.lang;
         // Фаза считается один раз на вкладку: карточек с графиком две, и
         // разъехавшись на кадр они ехали бы вразнобой.
         let phase = self.monitor.trace_phase(ui.ctx(), speed);
@@ -6929,12 +7185,14 @@ impl SavioApp {
         let Some(sample) = &self.monitor.sample else {
             note(
                 ui,
-                "Замеряю… Первые числа появятся через секунду: загрузка — это \
-                 разница между двумя замерами, и одной точки для неё мало.",
+                i18n::t(lang, Key::UiMonitorWarmingUp),
                 theme::TEXT_SECONDARY,
             );
             return;
         };
+
+        let cpu = i18n::t(lang, Key::HwCpu);
+        let memory = i18n::t(lang, Key::HwMemory);
 
         // Процессор и память рядом, когда есть место: это два одинаковых по
         // устройству показателя, и читать их проще парой, чем лестницей.
@@ -6942,7 +7200,7 @@ impl SavioApp {
             ui.columns(2, |columns| {
                 metric_card(
                     &mut columns[0],
-                    "Процессор",
+                    cpu,
                     &sample.cpu,
                     &self.monitor.cpu_trace,
                     theme::ACCENT,
@@ -6951,7 +7209,7 @@ impl SavioApp {
                 );
                 metric_card(
                     &mut columns[1],
-                    "Память",
+                    memory,
                     &sample.mem,
                     &self.monitor.mem_trace,
                     theme::STATE_SUCCESS,
@@ -6962,7 +7220,7 @@ impl SavioApp {
         } else {
             metric_card(
                 ui,
-                "Процессор",
+                cpu,
                 &sample.cpu,
                 &self.monitor.cpu_trace,
                 theme::ACCENT,
@@ -6972,7 +7230,7 @@ impl SavioApp {
             ui.add_space(12.0);
             metric_card(
                 ui,
-                "Память",
+                memory,
                 &sample.mem,
                 &self.monitor.mem_trace,
                 theme::STATE_SUCCESS,
@@ -6982,10 +7240,10 @@ impl SavioApp {
         }
         ui.add_space(12.0);
 
-        io_card(ui, sample, self.gpu.as_ref());
+        io_card(ui, sample, self.gpu.as_ref(), lang);
         ui.add_space(12.0);
 
-        process_card(ui, &sample.procs);
+        process_card(ui, &sample.procs, lang);
     }
 
     /// Карточка «Питание»: чем машина питается сейчас и как это переключить.
@@ -7000,6 +7258,7 @@ impl SavioApp {
         let mut refresh = false;
         let mut change = None;
         let speed = self.speed;
+        let lang = self.lang;
 
         theme::card(ui, |ui| {
             // Ряду задаётся высота, и это не украшение вёрстки. `with_layout`
@@ -7021,13 +7280,13 @@ impl SavioApp {
                 egui::Layout::right_to_left(egui::Align::Center),
                 |ui| {
                     refresh = ui
-                        .add_enabled(!busy, pill("Обновить"))
-                        .on_disabled_hover_text("Сначала дождитесь ответа системы.")
+                        .add_enabled(!busy, pill(i18n::t(lang, Key::UiRefresh)))
+                        .on_disabled_hover_text(i18n::t(lang, Key::UiWaitForSystem))
                         .clicked();
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         ui.add(
                             egui::Label::new(
-                                egui::RichText::new("Питание")
+                                egui::RichText::new(i18n::t(lang, Key::UiPower))
                                     .font(theme::display(17.0))
                                     .color(theme::TEXT_PRIMARY),
                             )
@@ -7046,12 +7305,12 @@ impl SavioApp {
             // заголовком выглядит поломкой, а не ожиданием.
             if self.power.state.is_blank() && self.power.state.trouble.is_none() {
                 ui.add_space(6.0);
-                note(ui, "Спрашиваю систему…", theme::TEXT_SECONDARY);
+                note(ui, i18n::t(lang, Key::UiPowerAsking), theme::TEXT_SECONDARY);
             }
 
             if !self.power.state.plans.is_empty() {
                 ui.add_space(14.0);
-                field_label(ui, "Схема электропитания");
+                field_label(ui, i18n::t(lang, Key::UiPowerPlan));
                 // Раскладка с переносом, а не дорожка сегментов: названий
                 // бывает и шесть (вендорские схемы), длина у них любая, а
                 // в окне шириной 520 даже три не встают в строку.
@@ -7076,7 +7335,7 @@ impl SavioApp {
 
             if let PowerModes::Known { effective, .. } = self.power.state.modes {
                 ui.add_space(14.0);
-                field_label(ui, "Режим питания");
+                field_label(ui, i18n::t(lang, Key::UiPowerMode));
                 ui.add_enabled_ui(!busy, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
@@ -7091,7 +7350,7 @@ impl SavioApp {
                             if !mode.offered() && !on {
                                 continue;
                             }
-                            if choice_pill(ui, mode.label(), on, speed).clicked() && !on {
+                            if choice_pill(ui, mode.label(lang), on, speed).clicked() && !on {
                                 change = Some(power::Change::Mode(mode));
                             }
                         }
@@ -7102,13 +7361,7 @@ impl SavioApp {
                 // выглядит сломанным.
                 if effective.is_none() {
                     ui.add_space(8.0);
-                    note(
-                        ui,
-                        "Машина работает в режиме, которого Savio не знает, — \
-                         поэтому ни одна кнопка не выбрана. Нажатие любой \
-                         переключит машину в неё.",
-                        theme::TEXT_MUTED,
-                    );
+                    note(ui, i18n::t(lang, Key::UiPowerUnknownMode), theme::TEXT_MUTED);
                 }
 
                 if !self.power.hint.is_empty() {
@@ -7130,43 +7383,31 @@ impl SavioApp {
         // одолжен на чтение, и завести оттуда поток не выйдет.
         if refresh {
             let ctx = ui.ctx().clone();
-            self.power.start(&ctx);
+            self.power.start(lang, &ctx);
         }
         if let Some(change) = change {
             let ctx = ui.ctx().clone();
-            self.power.change(change, &ctx);
+            self.power.change(change, lang, &ctx);
         }
     }
 
     /// Шапка половины: чем монитор занят и как включить оверлей.
     fn monitor_header(&mut self, ui: &mut egui::Ui) {
+        let lang = self.lang;
         theme::card(ui, |ui| {
-            note(
-                ui,
-                "Показания снимаются раз в секунду, пока открыта эта половина \
-                 или включён оверлей. В остальное время Savio ничего не \
-                 опрашивает и не тратит ни кадра.",
-                theme::TEXT_SECONDARY,
-            );
+            note(ui, i18n::t(lang, Key::UiMonitorNote), theme::TEXT_SECONDARY);
 
             ui.add_space(6.0);
             // Та же оговорка, что и в «Составе», и по той же причине: без неё
             // отсутствие видеокарты в списке выглядит недоделкой Savio,
             // а не отказом системы.
-            note(
-                ui,
-                "Загрузки видеокарты здесь нет: система отдаёт её только \
-                 через счётчики производительности, своих у каждой ОС и \
-                 у каждого производителя, — а показывать выдуманное число \
-                 хуже, чем не показывать ничего.",
-                theme::TEXT_MUTED,
-            );
+            note(ui, i18n::t(lang, Key::UiMonitorNoGpuLoad), theme::TEXT_MUTED);
 
             ui.add_space(14.0);
             checkbox(
                 ui,
                 &mut self.monitor.overlay,
-                "Оверлей поверх других окон",
+                i18n::t(lang, Key::UiOverlay),
                 true,
             );
 
@@ -7174,21 +7415,13 @@ impl SavioApp {
             let passthrough = checkbox(
                 ui,
                 &mut self.monitor.passthrough,
-                "Пропускать щелчки мыши сквозь оверлей",
+                i18n::t(lang, Key::UiOverlayPassthrough),
                 self.monitor.overlay,
             );
-            passthrough.on_disabled_hover_text("Сначала включите оверлей.");
+            passthrough.on_disabled_hover_text(i18n::t(lang, Key::UiOverlayFirst));
 
             ui.add_space(10.0);
-            note(
-                ui,
-                "Оверлей — обычное окно поверх остальных, и виден он только \
-                 в оконных и безрамочных играх. В полноэкранном режиме его \
-                 не будет: туда не пускают ни одно чужое окно. С пропуском \
-                 щелчков оверлей нельзя ни передвинуть, ни закрыть его же \
-                 кнопкой — только этой галочкой.",
-                theme::TEXT_MUTED,
-            );
+            note(ui, i18n::t(lang, Key::UiOverlayNote), theme::TEXT_MUTED);
         });
     }
 
@@ -7251,7 +7484,7 @@ impl SavioApp {
                     // Папку могли переименовать или унести вместе с флешкой —
                     // тогда об этом скажет проводник, и это честнее
                     // выключенной без объяснения кнопки.
-                    if pill_button(ui, "Открыть папку", self.speed).clicked() {
+                    if pill_button(ui, self.t(Key::UiOpenFolder), self.speed).clicked() {
                         open_at = Some(dir.clone());
                     }
                     // Вложенная раскладка обязательна: в `right_to_left` метка
@@ -7285,6 +7518,7 @@ impl SavioApp {
 /// состояния приложения — обе карточки статические.
 fn metadata_rail(
     ui: &mut egui::Ui,
+    lang: Lang,
     warning: Option<theme::Appear>,
     kinds: Option<theme::Appear>,
 ) {
@@ -7296,7 +7530,7 @@ fn metadata_rail(
                 .circle_filled(dot.center(), 4.5, theme::STATE_WARNING);
             ui.add(
                 egui::Label::new(
-                    egui::RichText::new("Файл перезапишется")
+                    egui::RichText::new(i18n::t(lang, Key::UiMetaWillOverwrite))
                         .font(theme::display(17.0))
                         .color(theme::TEXT_PRIMARY),
                 )
@@ -7306,10 +7540,7 @@ fn metadata_rail(
         ui.add_space(8.0);
         note(
             ui,
-            "Копия рядом не создаётся, вернуть стёртое будет нельзя — поэтому \
-             Savio переспросит. Пиксели и звуковые кадры при этом не \
-             трогаются: вырезаются только служебные блоки, и на большом файле \
-             это мгновенно.",
+            i18n::t(lang, Key::UiMetaWillOverwriteText),
             theme::TEXT_SECONDARY,
         );
     });
@@ -7317,24 +7548,20 @@ fn metadata_rail(
     ui.add_space(14.0);
 
     theme::card_rising(ui, kinds, |ui| {
-        field_label(ui, "Что поддерживается");
+        field_label(ui, i18n::t(lang, Key::UiMetaSupported));
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(7.0, 7.0);
             for name in ["MP3", "JPG", "PNG", "WebP", "GIF"] {
                 soft_pill(ui, name, theme::STATE_SUCCESS, theme::SUCCESS_SOFT);
             }
-            soft_pill(
-                ui,
-                "TIFF — только чтение",
-                theme::TEXT_MUTED,
-                egui::Color32::TRANSPARENT,
-            );
-            soft_pill(
-                ui,
-                "видео — пока нет",
-                theme::TEXT_MUTED,
-                egui::Color32::TRANSPARENT,
-            );
+            for key in [Key::UiMetaTiffReadOnly, Key::UiMetaVideoNotYet] {
+                soft_pill(
+                    ui,
+                    i18n::t(lang, key),
+                    theme::TEXT_MUTED,
+                    egui::Color32::TRANSPARENT,
+                );
+            }
         });
     });
 }
@@ -7430,6 +7657,7 @@ impl SavioApp {
         let mut search = false;
         let mut favorite = false;
         let mut picked: Option<Place> = None;
+        let lang = self.lang;
 
         theme::card_rising(ui, self.appear(0), |ui| {
             let panel = &mut self.weather;
@@ -7441,19 +7669,25 @@ impl SavioApp {
                 egui::Layout::right_to_left(egui::Align::Center),
                 |ui| {
                     refresh = ui
-                        .add_enabled(panel.place.is_some() && !panel.busy, pill("Обновить"))
-                        .on_disabled_hover_text(if panel.busy {
-                            "Сначала дождитесь ответа."
-                        } else {
-                            "Сначала выберите место."
-                        })
+                        .add_enabled(
+                            panel.place.is_some() && !panel.busy,
+                            pill(i18n::t(lang, Key::UiRefresh)),
+                        )
+                        .on_disabled_hover_text(i18n::t(
+                            lang,
+                            if panel.busy {
+                                Key::UiWaitForAnswer
+                            } else {
+                                Key::UiPickPlaceFirst
+                            },
+                        ))
                         .clicked();
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         // Полное название показывает сама обрезанная метка
                         // (`show_tooltip_when_elided`) — своя подсказка стала
                         // бы второй коробкой (дефект 22).
                         let title = if panel.place_title.is_empty() {
-                            "Место не выбрано"
+                            i18n::t(lang, Key::UiWeatherNoPlace)
                         } else {
                             panel.place_title.as_str()
                         };
@@ -7480,8 +7714,7 @@ impl SavioApp {
             } else if panel.place.is_none() && panel.error.is_none() {
                 note(
                     ui,
-                    "Место ещё не определено. Найдите свой город поиском ниже \
-                     или нажмите «Определить по IP».",
+                    i18n::t(lang, Key::UiWeatherNoPlaceNote),
                     theme::TEXT_MUTED,
                 );
             }
@@ -7491,9 +7724,7 @@ impl SavioApp {
                 // взялось, сказано прямо.
                 note(
                     ui,
-                    "Место определено по IP-адресу — с точностью до города. \
-                     Через VPN это может оказаться чужой город: тогда найдите \
-                     свой поиском ниже.",
+                    i18n::t(lang, Key::UiWeatherLocatedNote),
                     theme::TEXT_MUTED,
                 );
             }
@@ -7511,18 +7742,18 @@ impl SavioApp {
             }
 
             ui.add_space(14.0);
-            field_label(ui, "Найти город");
+            field_label(ui, i18n::t(lang, Key::UiWeatherFindCity));
             ui.allocate_ui_with_layout(
                 egui::vec2(ui.available_width(), theme::CONTROL_HEIGHT),
                 egui::Layout::right_to_left(egui::Align::Center),
                 |ui| {
                     search |= ui
-                        .add_enabled(!panel.searching, pill("Найти"))
+                        .add_enabled(!panel.searching, pill(i18n::t(lang, Key::UiWeatherFind)))
                         .clicked();
                     let field = ui.add_sized(
                         [ui.available_width(), theme::CONTROL_HEIGHT],
                         egui::TextEdit::singleline(&mut panel.query)
-                            .hint_text("Например, Ереван")
+                            .hint_text(i18n::t(lang, Key::UiWeatherSearchHint))
                             .text_color(theme::TEXT_PRIMARY)
                             .margin(egui::Margin::symmetric(14, 6)),
                     );
@@ -7535,7 +7766,7 @@ impl SavioApp {
 
             if panel.searching {
                 ui.add_space(8.0);
-                note(ui, "Ищу…", theme::TEXT_SECONDARY);
+                note(ui, i18n::t(lang, Key::UiWeatherSearching), theme::TEXT_SECONDARY);
             }
             if let Some((text, color)) = &panel.search_note {
                 ui.add_space(8.0);
@@ -7555,13 +7786,9 @@ impl SavioApp {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
                 locate = ui
-                    .add_enabled(!panel.busy, pill("Определить по IP"))
-                    .on_hover_text(
-                        "Спросит у ipwho.is (запасной — ipapi.co), где находится \
-                         ваш IP-адрес, с точностью до города. Этим серверам уйдёт \
-                         ваш IP-адрес.",
-                    )
-                    .on_disabled_hover_text("Сначала дождитесь ответа.")
+                    .add_enabled(!panel.busy, pill(i18n::t(lang, Key::UiWeatherLocateByIp)))
+                    .on_hover_text(i18n::t(lang, Key::UiWeatherLocateHint))
+                    .on_disabled_hover_text(i18n::t(lang, Key::UiWaitForAnswer))
                     .clicked();
 
                 let on = panel.is_favorite();
@@ -7569,26 +7796,35 @@ impl SavioApp {
                 let response = ui.add_enabled_ui(panel.place.is_some() && !full, |ui| {
                     toggle_pill(
                         ui,
-                        if on { "В избранном" } else { "В избранное" },
+                        i18n::t(
+                            lang,
+                            if on {
+                                Key::UiWeatherInFavorites
+                            } else {
+                                Key::UiWeatherToFavorites
+                            },
+                        ),
                         on,
                         speed,
                     )
                 });
                 favorite = response.inner.clicked();
-                let hint = if full {
-                    "В избранном нет места: уберите оттуда одно из мест ниже."
-                } else if on {
-                    "Нажмите, чтобы убрать это место из избранного."
-                } else {
-                    "Место появится в списке ниже: переключаться между ними — \
-                     одним щелчком."
-                };
+                let hint = i18n::t(
+                    lang,
+                    if full {
+                        Key::UiWeatherFavoritesFull
+                    } else if on {
+                        Key::UiWeatherRemoveFavorite
+                    } else {
+                        Key::UiWeatherAddFavorite
+                    },
+                );
                 response.response.on_hover_text(hint);
             });
 
             if !panel.favorites.is_empty() {
                 ui.add_space(14.0);
-                field_label(ui, "Избранное");
+                field_label(ui, i18n::t(lang, Key::UiWeatherFavorites));
                 // Своими таблетками с переносом, а не дорожкой: названий бывает
                 // десяток, и в строку окна 520 не встают даже три (см.
                 // `choice_pill` про перенос).
@@ -7610,18 +7846,19 @@ impl SavioApp {
         // Всё исполняем после карточки: внутри замыкания `self` одолжен,
         // и завести оттуда поток или записать настройки не выйдет.
         let ctx = ui.ctx().clone();
+        let lang = self.lang;
         if refresh {
             let place = self.weather.place.clone();
-            self.weather.start(place, false, &ctx);
+            self.weather.start(place, false, lang, &ctx);
         }
         if locate {
-            self.weather.pick(None, &ctx);
+            self.weather.pick(None, lang, &ctx);
         }
         if search {
-            self.weather.search(&ctx);
+            self.weather.search(lang, &ctx);
         }
         if let Some(place) = picked {
-            self.weather.pick(Some(place), &ctx);
+            self.weather.pick(Some(place), lang, &ctx);
             self.remember();
         }
         if favorite && self.weather.toggle_favorite() {
@@ -7631,6 +7868,8 @@ impl SavioApp {
 
     /// Карточка «сейчас»: значок, температура и подробности.
     fn weather_now_card(&self, ui: &mut egui::Ui) {
+        let lang = self.lang;
+        let missing = i18n::t(lang, WEATHER_MISSING);
         let Some(view) = &self.weather.view else {
             return;
         };
@@ -7674,23 +7913,18 @@ impl SavioApp {
 
             ui.add_space(12.0);
             for (label, value) in &view.rows {
-                stat_row_with(ui, label, value.as_deref(), WEATHER_MISSING);
+                stat_row_with(ui, label, value.as_deref(), missing);
             }
 
             ui.add_space(10.0);
             if view.air.is_empty() {
                 // Частичный успех говорит о себе сам: пропавшие строки без
                 // объяснения выглядели бы недоделкой вкладки.
-                note(
-                    ui,
-                    "Сведения о качестве воздуха не пришли — на прогноз это не \
-                     повлияло.",
-                    theme::TEXT_MUTED,
-                );
+                note(ui, i18n::t(lang, Key::UiWeatherNoAir), theme::TEXT_MUTED);
             } else {
-                field_label(ui, "Качество воздуха");
+                field_label(ui, i18n::t(lang, Key::UiWeatherAirQuality));
                 for (label, value) in &view.air {
-                    stat_row_with(ui, label, value.as_deref(), WEATHER_MISSING);
+                    stat_row_with(ui, label, value.as_deref(), missing);
                 }
             }
         });
@@ -7698,24 +7932,21 @@ impl SavioApp {
 
     /// Карточка почасового прогноза.
     fn weather_hours_card(&self, ui: &mut egui::Ui) {
+        let lang = self.lang;
         let Some(view) = &self.weather.view else {
             return;
         };
 
         theme::card_rising(ui, self.appear(2), |ui| {
             ui.label(
-                egui::RichText::new("Ближайшие двое суток")
+                egui::RichText::new(i18n::t(lang, Key::UiWeatherTwoDays))
                     .font(theme::display(17.0))
                     .color(theme::TEXT_PRIMARY),
             );
             ui.add_space(10.0);
 
             if view.hours.is_empty() {
-                note(
-                    ui,
-                    "Почасового прогноза в ответе сервера нет.",
-                    theme::TEXT_MUTED,
-                );
+                note(ui, i18n::t(lang, Key::UiWeatherNoHours), theme::TEXT_MUTED);
                 return;
             }
 
@@ -7739,24 +7970,21 @@ impl SavioApp {
 
     /// Карточка недельного прогноза.
     fn weather_days_card(&self, ui: &mut egui::Ui) {
+        let lang = self.lang;
         let Some(view) = &self.weather.view else {
             return;
         };
 
         theme::card_rising(ui, self.appear(1), |ui| {
             ui.label(
-                egui::RichText::new("Неделя")
+                egui::RichText::new(i18n::t(lang, Key::UiWeatherWeek))
                     .font(theme::display(17.0))
                     .color(theme::TEXT_PRIMARY),
             );
             ui.add_space(8.0);
 
             if view.days.is_empty() {
-                note(
-                    ui,
-                    "Прогноза по дням в ответе сервера нет.",
-                    theme::TEXT_MUTED,
-                );
+                note(ui, i18n::t(lang, Key::UiWeatherNoDays), theme::TEXT_MUTED);
                 return;
             }
             for day in &view.days {
@@ -7774,10 +8002,11 @@ impl SavioApp {
         let speed = self.speed;
         let mut units = self.weather.units;
         let step = if self.weather.view.is_some() { 2 } else { 1 };
+        let lang = self.lang;
 
         theme::card_rising(ui, self.appear(step), |ui| {
             ui.label(
-                egui::RichText::new("Единицы")
+                egui::RichText::new(i18n::t(lang, Key::UiWeatherUnits))
                     .font(theme::display(17.0))
                     .color(theme::TEXT_PRIMARY),
             );
@@ -7785,7 +8014,7 @@ impl SavioApp {
 
             // Подписи сегментов берутся у домена: две копии «мм рт. ст.»
             // разъехались бы. `map` у массива не выделяет памяти.
-            labelled_row(ui, "Температура", |ui| {
+            labelled_row(ui, i18n::t(lang, Key::UiWeatherTemperature), |ui| {
                 if let Some(temp) = segment_track(
                     ui,
                     egui::Id::new("track:weather-temp"),
@@ -7798,26 +8027,26 @@ impl SavioApp {
                 }
             });
             ui.add_space(10.0);
-            labelled_row(ui, "Ветер", |ui| {
+            labelled_row(ui, i18n::t(lang, Key::WeatherWind), |ui| {
                 if let Some(wind) = segment_track(
                     ui,
                     egui::Id::new("track:weather-wind"),
                     speed,
                     units.wind,
-                    &WindUnit::ALL.map(|unit| (unit, unit.label())),
+                    &WindUnit::ALL.map(|unit| (unit, unit.label(lang))),
                     false,
                 ) {
                     units.wind = wind;
                 }
             });
             ui.add_space(10.0);
-            labelled_row(ui, "Давление", |ui| {
+            labelled_row(ui, i18n::t(lang, Key::WeatherPressure), |ui| {
                 if let Some(pressure) = segment_track(
                     ui,
                     egui::Id::new("track:weather-pressure"),
                     speed,
                     units.pressure,
-                    &PressureUnit::ALL.map(|unit| (unit, unit.label())),
+                    &PressureUnit::ALL.map(|unit| (unit, unit.label(lang))),
                     false,
                 ) {
                     units.pressure = pressure;
@@ -7825,7 +8054,7 @@ impl SavioApp {
             });
         });
 
-        if self.weather.set_units(units) {
+        if self.weather.set_units(units, lang) {
             self.remember();
         }
     }
@@ -7881,6 +8110,7 @@ impl SavioApp {
         let mut open_dir_clicked = false;
         let mut picked: Option<usize> = None;
         let mut copy = false;
+        let lang = self.lang;
 
         // Какая папка будет раздана, если нажать сейчас.
         let dir = self.share.own_dir.clone().or_else(|| self.out_dir.clone());
@@ -7895,16 +8125,16 @@ impl SavioApp {
                 egui::vec2(ui.available_width(), theme::CONTROL_HEIGHT),
                 egui::Layout::right_to_left(egui::Align::Center),
                 |ui| {
-                    let (label, color) = match panel.state {
-                        ShareState::Off => ("Выключена", theme::TEXT_MUTED),
-                        ShareState::Starting => ("Запускается", theme::TEXT_SECONDARY),
-                        ShareState::On => ("Раздача идёт", theme::STATE_SUCCESS),
+                    let (key, color) = match panel.state {
+                        ShareState::Off => (Key::UiShareOff, theme::TEXT_MUTED),
+                        ShareState::Starting => (Key::UiShareStarting, theme::TEXT_SECONDARY),
+                        ShareState::On => (Key::UiShareOn, theme::STATE_SUCCESS),
                     };
-                    status_pill(ui, label, color);
+                    status_pill(ui, i18n::t(lang, key), color);
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         ui.add(
                             egui::Label::new(
-                                egui::RichText::new("Телефон")
+                                egui::RichText::new(i18n::t(lang, Key::TabPhone))
                                     .font(theme::display(21.0))
                                     .color(theme::TEXT_PRIMARY),
                             )
@@ -7914,23 +8144,17 @@ impl SavioApp {
                 },
             );
             ui.add_space(4.0);
-            note(
-                ui,
-                "Телефон и компьютер — в одной сети Wi-Fi. Savio откроет страницу, \
-                 на которую телефон зайдёт браузером, и файлы пойдут напрямую: \
-                 без облака, без провода и без пережатия.",
-                theme::TEXT_SECONDARY,
-            );
+            note(ui, i18n::t(lang, Key::UiShareNote), theme::TEXT_SECONDARY);
 
             ui.add_space(14.0);
-            field_label(ui, "Папка раздачи");
+            field_label(ui, i18n::t(lang, Key::UiShareFolder));
             ui.allocate_ui_with_layout(
                 egui::vec2(ui.available_width(), theme::CONTROL_HEIGHT),
                 egui::Layout::right_to_left(egui::Align::Center),
                 |ui| {
                     open_dir_clicked = ui
-                        .add_enabled(dir.is_some(), pill("Открыть"))
-                        .on_hover_text("Показать папку раздачи в проводнике.")
+                        .add_enabled(dir.is_some(), pill(i18n::t(lang, Key::UiOpen)))
+                        .on_hover_text(i18n::t(lang, Key::UiShareOpenFolderHint))
                         .clicked();
 
                     let display = if running {
@@ -7956,23 +8180,22 @@ impl SavioApp {
                             })
                         })
                         .inner
-                        .on_hover_text("Нажмите, чтобы раздать другую папку.")
-                        .on_disabled_hover_text(
-                            "Папку раздачи меняют, когда раздача остановлена.",
-                        )
+                        .on_hover_text(i18n::t(lang, Key::UiSharePickFolderHint))
+                        .on_disabled_hover_text(i18n::t(lang, Key::UiShareFolderLocked))
                         .clicked();
                 },
             );
             ui.add_space(6.0);
             note(
                 ui,
-                if panel.own_dir.is_some() || running {
-                    "Отсюда телефон забирает файлы, сюда же кладёт свои. Вложенные \
-                     папки не раздаются."
-                } else {
-                    "Сейчас это папка сохранения загрузок. Отсюда телефон забирает \
-                     файлы, сюда же кладёт свои."
-                },
+                i18n::t(
+                    lang,
+                    if panel.own_dir.is_some() || running {
+                        Key::UiShareOwnFolderNote
+                    } else {
+                        Key::UiShareDefaultFolderNote
+                    },
+                ),
                 theme::TEXT_MUTED,
             );
 
@@ -7980,26 +8203,25 @@ impl SavioApp {
             let width = ui.available_width();
             if running {
                 toggle = ui
-                    .add_sized([width, theme::CTA_HEIGHT], egui::Button::new("Остановить"))
-                    .on_hover_text("Закроет страницу для телефона и оборвёт идущие передачи.")
+                    .add_sized(
+                        [width, theme::CTA_HEIGHT],
+                        egui::Button::new(i18n::t(lang, Key::UiShareStop)),
+                    )
+                    .on_hover_text(i18n::t(lang, Key::UiShareStopHint))
                     .clicked();
             } else {
                 toggle = accent_button(
                     ui,
-                    "Раздать файлы",
+                    i18n::t(lang, Key::UiShareStart),
                     width,
                     dir.is_some(),
-                    "Сначала выберите папку раздачи.",
+                    i18n::t(lang, Key::UiSharePickFolderFirst),
                 );
             }
             ui.add_space(6.0);
             // Видно без единого щелчка: остановка при уходе с экрана — не
             // оговорка на всякий случай, а поведение, о которое споткнутся.
-            note(
-                ui,
-                "Раздача остановится сама, если уйти с этого экрана или закрыть Savio.",
-                theme::TEXT_MUTED,
-            );
+            note(ui, i18n::t(lang, Key::UiShareAutoStop), theme::TEXT_MUTED);
 
             if let Some((text, color)) = &panel.note {
                 ui.add_space(10.0);
@@ -8008,7 +8230,7 @@ impl SavioApp {
 
             if panel.state == ShareState::Starting {
                 ui.add_space(12.0);
-                note(ui, "Открываю порт и ищу адрес компьютера…", theme::TEXT_SECONDARY);
+                note(ui, i18n::t(lang, Key::UiShareOpening), theme::TEXT_SECONDARY);
             }
 
             let Some(address) = panel.addresses.get(panel.picked) else {
@@ -8023,7 +8245,7 @@ impl SavioApp {
             // и было при пороге в 240 — проверено глазами в окне 520.
             let beside = ui.available_width() >= QR_SIDE + 350.0;
             let address_block = |ui: &mut egui::Ui, copy: &mut bool| {
-                field_label(ui, "Адрес для телефона");
+                field_label(ui, i18n::t(lang, Key::UiShareAddressForPhone));
                 ui.add(
                     egui::Label::new(
                         egui::RichText::new(&address.url)
@@ -8033,22 +8255,16 @@ impl SavioApp {
                     .wrap(),
                 );
                 ui.add_space(6.0);
-                note(
-                    ui,
-                    "Наведите камеру телефона на код или наберите адрес в браузере \
-                     телефона. Браузер напишет «не защищено» — для своей сети это \
-                     нормально.",
-                    theme::TEXT_MUTED,
-                );
+                note(ui, i18n::t(lang, Key::UiShareQrHint), theme::TEXT_MUTED);
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 10.0;
-                    *copy = pill_button(ui, "Скопировать адрес", speed).clicked();
+                    *copy = pill_button(ui, i18n::t(lang, Key::UiCopyAddress), speed).clicked();
                     if let Some(at) = panel.copied_at {
                         let left = COPIED_NOTICE_SECS - (now - at);
                         if left > 0.0 {
                             ui.label(
-                                egui::RichText::new("Скопировано")
+                                egui::RichText::new(i18n::t(lang, Key::UiCopied))
                                     .small()
                                     .color(theme::STATE_SUCCESS),
                             );
@@ -8073,7 +8289,7 @@ impl SavioApp {
 
             if panel.addresses.len() > 1 {
                 ui.add_space(14.0);
-                field_label(ui, "Адрес компьютера");
+                field_label(ui, i18n::t(lang, Key::UiShareComputerAddress));
                 // Таблетки с переносом, а не дорожка: подписи с именем сети
                 // длинные, и в строку окна 520 не встают и две.
                 ui.horizontal_wrapped(|ui| {
@@ -8085,27 +8301,21 @@ impl SavioApp {
                     }
                 });
                 ui.add_space(6.0);
-                note(
-                    ui,
-                    "Адресов несколько: VPN, WSL и виртуальные машины заводят свои \
-                     сети. Первым стоит самый вероятный; если страница не открывается, \
-                     попробуйте другой.",
-                    theme::TEXT_MUTED,
-                );
+                note(ui, i18n::t(lang, Key::UiShareAddressesHint), theme::TEXT_MUTED);
             }
 
             ui.add_space(14.0);
             if panel.visitors.is_empty() {
                 if now - panel.started_at < SHARE_QUIET_SECS {
-                    note(ui, "Ждём телефон…", theme::TEXT_SECONDARY);
+                    note(ui, i18n::t(lang, Key::UiShareWaiting), theme::TEXT_SECONDARY);
                     ui.add_space(6.0);
-                    note(ui, SHARE_HELP, theme::TEXT_MUTED);
+                    note(ui, i18n::t(lang, SHARE_HELP), theme::TEXT_MUTED);
                 } else {
                     // Та же подсказка, но жёлтым: полминуты тишины — уже повод.
-                    banner(ui, SHARE_HELP, theme::STATE_WARNING);
+                    banner(ui, i18n::t(lang, SHARE_HELP), theme::STATE_WARNING);
                 }
             } else {
-                field_label(ui, "Подключились");
+                field_label(ui, i18n::t(lang, Key::UiShareVisitors));
                 note(ui, &panel.visitors_line, theme::STATE_SUCCESS);
             }
         });
@@ -8116,14 +8326,14 @@ impl SavioApp {
             open_dir(dir);
         }
         if choose_dir && let Some(picked_dir) = rfd::FileDialog::new().pick_folder() {
-            self.share.own_dir_display = display_dir(Some(&picked_dir));
+            self.share.own_dir_display = display_dir(Some(&picked_dir), self.lang);
             self.share.own_dir = Some(picked_dir);
         }
         if toggle {
             if self.share.running() {
-                self.share.stop(None);
+                self.share.stop(None, lang);
             } else if let Some(dir) = dir {
-                self.share.start(dir, &ctx);
+                self.share.start(dir, lang, &ctx);
             }
         }
         if let Some(index) = picked {
@@ -8137,21 +8347,17 @@ impl SavioApp {
 
     /// Карточка передач: что идёт, что дошло, что оборвалось.
     fn transfers_card(&self, ui: &mut egui::Ui) {
+        let lang = self.lang;
         theme::card_rising(ui, self.appear(1), |ui| {
             ui.label(
-                egui::RichText::new("Передачи")
+                egui::RichText::new(i18n::t(lang, Key::UiShareTransfers))
                     .font(theme::display(17.0))
                     .color(theme::TEXT_PRIMARY),
             );
             ui.add_space(8.0);
 
             if self.share.transfers.is_empty() {
-                note(
-                    ui,
-                    "Пока ничего не передавалось. Здесь появится каждый файл: куда \
-                     он идёт и сколько осталось.",
-                    theme::TEXT_MUTED,
-                );
+                note(ui, i18n::t(lang, Key::UiShareNoTransfers), theme::TEXT_MUTED);
                 return;
             }
 
@@ -8256,7 +8462,7 @@ fn accent_button(ui: &mut egui::Ui, label: &str, width: f32, enabled: bool, hint
 /// Своя строка, а не общая «Система не сообщила»: числа здесь присылает
 /// не система, а сервер погоды, и отправить человека искать беду в своём
 /// компьютере значило бы соврать.
-const WEATHER_MISSING: &str = "Сервер погоды не сообщил это значение.";
+const WEATHER_MISSING: Key = Key::UiWeatherValueMissing;
 
 /// Строка найденного места: название и «область, страна». Щелчок выбирает.
 ///
@@ -8714,8 +8920,9 @@ fn segment_button(
 ) -> Segment {
     ui.scope(|ui| {
         // Поля сегмента урезаем против штатных 16: шесть ступеней качества
-        // («2160p») в окне шириной 520 иначе вылезли бы за кромку.
-        ui.spacing_mut().button_padding.x = 10.0;
+        // («2160p») в окне шириной 520 иначе вылезли бы за кромку. Число —
+        // в теме, чтобы проверка ширины считала по тому же.
+        ui.spacing_mut().button_padding.x = theme::SEGMENT_PADDING;
 
         let id = ui.next_auto_id();
         let touch = touch_at(ui, id, speed);
@@ -8794,7 +9001,7 @@ fn segment_track<T: Copy + PartialEq>(
     items: &[(T, &str)],
     stretch: bool,
 ) -> Option<T> {
-    const GAP: f32 = 2.0;
+    const GAP: f32 = theme::SEGMENT_GAP;
 
     let mut picked = None;
     theme::track_frame().show(ui, |ui| {
@@ -9290,6 +9497,28 @@ fn disclosure_row(
         .clicked()
 }
 
+/// Ширина колонки подписей в [`labelled_row`].
+///
+/// Отдельной константой, а не числом внутри: по ней считает проверка
+/// `the_field_labels_fit_their_column`, а своя копия в тесте разъехалась бы
+/// с раскладкой при первой же правке и перестала бы что-либо ловить.
+const LABEL_COLUMN: f32 = 96.0;
+
+/// Подписи полей, которые кладутся в эту колонку.
+///
+/// Списком, а не «все ключи подряд»: в колонку попадают ровно эти, и
+/// проверке ширины надо знать, какие именно. Забыть дописать сюда новую
+/// подпись — та же беда, что и перевести её слишком длинно, так что список
+/// стоит рядом с самой колонкой.
+#[cfg(test)]
+const LABEL_KEYS: [Key; 5] = [
+    Key::UiFormat,
+    Key::QualityFieldVideo,
+    Key::QualityFieldAudio,
+    Key::UiEmbed,
+    Key::UiWeatherTemperature,
+];
+
 /// Ряд «подпись слева, элемент управления справа».
 ///
 /// В узком окне подпись уезжает НАД элементом: колонка в 78 точек съела бы
@@ -9299,7 +9528,12 @@ fn labelled_row<R>(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::U
     // Ширина колонки подписи — под самую длинную из них, «Битрейт, кбит/с».
     // При 78 она обрезалась в «Битрейт, кб…», а обрезанная подпись у
     // переключателя — это ровно та частая беда, о которой Правило 2.
-    const LABEL_WIDTH: f32 = 96.0;
+    //
+    // Шире её сделать нельзя: колонка отнимает ширину у дорожки качества,
+    // а у той шесть ступеней и запас в десяток точек. Поэтому подписи полей
+    // на всех трёх языках обязаны укладываться в это число — держит это
+    // `the_field_labels_fit_their_column`.
+    const LABEL_WIDTH: f32 = LABEL_COLUMN;
     const GAP: f32 = 12.0;
     // Порог, ниже которого подпись уезжает НАД элементом. Считан от
     // переключателя качества: шесть ступеней («2160p» — самая широкая)
@@ -9388,7 +9622,7 @@ fn log_scroll() -> egui::ScrollArea {
 ///
 /// Свободная функция, а не метод: строке нужен только сам элемент, и от
 /// заимствования всего `SavioApp` внутри цикла по списку это избавляет.
-fn queue_row(ui: &mut egui::Ui, item: &QueueItem, speed: f32) -> bool {
+fn queue_row(ui: &mut egui::Ui, item: &QueueItem, lang: Lang, speed: f32) -> bool {
     let mut remove = false;
     let id = egui::Id::new("queue-row").with(item.id);
 
@@ -9405,13 +9639,19 @@ fn queue_row(ui: &mut egui::Ui, item: &QueueItem, speed: f32) -> bool {
     }
 
     clipped(ui, id, t, t, |ui| {
-        queue_row_body(ui, item, speed, &mut remove);
+        queue_row_body(ui, item, lang, speed, &mut remove);
     });
     remove
 }
 
 /// Внутренность строки очереди, без оболочки появления.
-fn queue_row_body(ui: &mut egui::Ui, item: &QueueItem, speed: f32, remove: &mut bool) {
+fn queue_row_body(
+    ui: &mut egui::Ui,
+    item: &QueueItem,
+    lang: Lang,
+    speed: f32,
+    remove: &mut bool,
+) {
     theme::inner_frame()
         .show(ui, |ui| {
             // Иначе строка сжалась бы по ширине своего названия: у короткого
@@ -9493,7 +9733,7 @@ fn queue_row_body(ui: &mut egui::Ui, item: &QueueItem, speed: f32, remove: &mut 
                             // этого не видят.
                             ui.spacing_mut().button_padding.x = 6.0;
                             ui.add(egui::Button::new("×").min_size(egui::vec2(BUTTON, BUTTON)))
-                                .on_hover_text("Убрать из очереди")
+                                .on_hover_text(i18n::t(lang, Key::UiRemoveFromQueue))
                                 .clicked()
                         })
                         .inner;
@@ -9731,7 +9971,7 @@ fn check_color(status: CheckStatus) -> egui::Color32 {
 }
 
 /// Карточка одного пункта отчёта.
-fn check_card(ui: &mut egui::Ui, check: &crate::model::Check) {
+fn check_card(ui: &mut egui::Ui, check: &crate::model::Check, lang: Lang) {
     theme::card(ui, |ui| {
             // Плашка прижата к правому краю: так статусы всех карточек
             // стоят в одну колонку и читаются сверху вниз, не завися от
@@ -9749,7 +9989,7 @@ fn check_card(ui: &mut egui::Ui, check: &crate::model::Check) {
                 egui::vec2(ui.available_width(), theme::CONTROL_HEIGHT),
                 egui::Layout::right_to_left(egui::Align::Center),
                 |ui| {
-                    status_pill(ui, check.status.label(), check_color(check.status));
+                    status_pill(ui, check.status.label(lang), check_color(check.status));
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         ui.add(
                             egui::Label::new(
@@ -9769,7 +10009,7 @@ fn check_card(ui: &mut egui::Ui, check: &crate::model::Check) {
             if !check.rows.is_empty() {
                 ui.add_space(10.0);
                 for row in &check.rows {
-                    check_row(ui, row);
+                    check_row(ui, row, lang);
                 }
             }
 
@@ -9781,8 +10021,8 @@ fn check_card(ui: &mut egui::Ui, check: &crate::model::Check) {
 }
 
 /// Строка «подпись — значение» внутри карточки.
-fn check_row(ui: &mut egui::Ui, row: &crate::model::CheckRow) {
-    stat_row(ui, &row.label, row.value.as_deref());
+fn check_row(ui: &mut egui::Ui, row: &crate::model::CheckRow, lang: Lang) {
+    stat_row(ui, lang, &row.label, row.value.as_deref());
 }
 
 /// Строка «подпись — значение» в колонку.
@@ -9793,8 +10033,8 @@ fn check_row(ui: &mut egui::Ui, row: &crate::model::CheckRow) {
 /// ровно там, где Правило 1 этого и не велит. Вид у строк при этом обязан
 /// остаться общим: две одинаковые на вид таблицы, разъехавшиеся по вёрстке,
 /// выглядят небрежностью.
-fn stat_row(ui: &mut egui::Ui, label: &str, value: Option<&str>) {
-    stat_row_with(ui, label, value, "Система не сообщила это значение.");
+fn stat_row(ui: &mut egui::Ui, lang: Lang, label: &str, value: Option<&str>) {
+    stat_row_with(ui, label, value, i18n::t(lang, Key::UiSystemValueMissing));
 }
 
 /// Та же строка, но со своим объяснением прочерка.
@@ -10106,11 +10346,11 @@ fn trace_plot(ui: &mut egui::Ui, trace: &Trace, color: egui::Color32, phase: f32
 /// Втроём в одной карточке, потому что у всех троих одна беда: показать
 /// про них можно строку, а не график. Своя карточка на строку превратила бы
 /// вкладку в лестницу из рамок.
-fn io_card(ui: &mut egui::Ui, sample: &PerfSample, gpu: Option<&GpuInfo>) {
+fn io_card(ui: &mut egui::Ui, sample: &PerfSample, gpu: Option<&GpuInfo>, lang: Lang) {
     theme::card(ui, |ui| {
             ui.add(
                 egui::Label::new(
-                    egui::RichText::new("Ввод-вывод")
+                    egui::RichText::new(i18n::t(lang, Key::UiIo))
                         .small()
                         .color(theme::TEXT_MUTED),
                 )
@@ -10118,21 +10358,31 @@ fn io_card(ui: &mut egui::Ui, sample: &PerfSample, gpu: Option<&GpuInfo>) {
             );
 
             ui.add_space(8.0);
-            stat_row(ui, "Сеть", sample.net.as_deref());
-            stat_row(ui, "Диски", sample.disk.as_deref());
-            stat_row(ui, "Подкачка", sample.swap.detail.as_deref());
+            stat_row(ui, lang, i18n::t(lang, Key::UiNetwork), sample.net.as_deref());
+            stat_row(ui, lang, i18n::t(lang, Key::UiDisks), sample.disk.as_deref());
+            stat_row(
+                ui,
+                lang,
+                i18n::t(lang, Key::HwSwap),
+                sample.swap.detail.as_deref(),
+            );
             // Видеокарта здесь только именем: загрузку у неё не спросить,
             // а имя уже снято с адаптера, которым eframe рисует окно.
-            stat_row(ui, "Видеокарта", gpu.map(|gpu| gpu.name.as_str()));
+            stat_row(
+                ui,
+                lang,
+                i18n::t(lang, Key::HwGpu),
+                gpu.map(|gpu| gpu.name.as_str()),
+            );
         });
 }
 
 /// Карточка со списком процессов.
-fn process_card(ui: &mut egui::Ui, procs: &[crate::model::ProcRow]) {
+fn process_card(ui: &mut egui::Ui, procs: &[crate::model::ProcRow], lang: Lang) {
     theme::card(ui, |ui| {
             ui.add(
                 egui::Label::new(
-                    egui::RichText::new("Процессы")
+                    egui::RichText::new(i18n::t(lang, Key::UiProcesses))
                         .small()
                         .color(theme::TEXT_MUTED),
                 )
@@ -10141,20 +10391,11 @@ fn process_card(ui: &mut egui::Ui, procs: &[crate::model::ProcRow]) {
 
             ui.add_space(4.0);
             if procs.is_empty() {
-                note(
-                    ui,
-                    "Список процессов система не отдала.",
-                    theme::TEXT_MUTED,
-                );
+                note(ui, i18n::t(lang, Key::UiNoProcesses), theme::TEXT_MUTED);
                 return;
             }
 
-            note(
-                ui,
-                "Сверху те, кто занимает процессор. Доля уже поделена на \
-                 число ядер, поэтому сумма по списку не превышает ста.",
-                theme::TEXT_MUTED,
-            );
+            note(ui, i18n::t(lang, Key::UiProcessesNote), theme::TEXT_MUTED);
             ui.add_space(8.0);
 
             // Своей прокрутки здесь нет: вкладка целиком лежит в общей, а
@@ -10245,6 +10486,7 @@ fn process_row(ui: &mut egui::Ui, row: &crate::model::ProcRow) {
 fn overlay_ui(
     ui: &mut egui::Ui,
     class: egui::ViewportClass,
+    lang: Lang,
     sample: &Mutex<Option<PerfSample>>,
     closing: &AtomicBool,
 ) {
@@ -10325,8 +10567,9 @@ fn overlay_ui(
                     // подключает, а в тех, что кладёт eframe, знаки вроде
                     // `✕` рисуются пустым прямоугольником — ровно так уже
                     // вышло со стрелкой `→` (Правило 4).
-                    let close =
-                        ui.add(egui::Button::new(egui::RichText::new("Закрыть").small()));
+                    let close = ui.add(egui::Button::new(
+                        egui::RichText::new(i18n::t(lang, Key::UiClose)).small(),
+                    ));
                     if close.clicked() {
                         closing.store(true, Ordering::Relaxed);
                     }
@@ -10339,14 +10582,15 @@ fn overlay_ui(
                 return;
             };
             let Some(sample) = slot.as_ref() else {
-                note(ui, "Замеряю…", theme::TEXT_MUTED);
+                note(ui, i18n::t(lang, Key::UiMonitorMeasuring), theme::TEXT_MUTED);
                 return;
             };
 
-            overlay_row(ui, "ЦП", sample.cpu.percent_text.as_deref());
-            overlay_row(ui, "ОЗУ", sample.mem.percent_text.as_deref());
-            overlay_row(ui, "Сеть", sample.net.as_deref());
-            overlay_row(ui, "Диск", sample.disk.as_deref());
+            let row = |ui: &mut egui::Ui, key, value| overlay_row(ui, i18n::t(lang, key), value);
+            row(ui, Key::UiOverlayCpu, sample.cpu.percent_text.as_deref());
+            row(ui, Key::UiOverlayRam, sample.mem.percent_text.as_deref());
+            row(ui, Key::UiNetwork, sample.net.as_deref());
+            row(ui, Key::UiOverlayDisk, sample.disk.as_deref());
         });
 }
 
@@ -10471,7 +10715,7 @@ mod tests {
 
     /// Очередь из `count` одинаковых ожидающих ссылок.
     fn queue_with(count: usize) -> Queue {
-        let mut queue = Queue::new();
+        let mut queue = Queue::new(Lang::Ru);
         for i in 0..count {
             let url = format!("https://site/{i}");
             assert!(
@@ -10658,7 +10902,7 @@ mod tests {
     /// дойдёт очередь: название уже спрошено предпросмотром.
     #[test]
     fn a_queued_row_is_named_by_the_preview_right_away() {
-        let mut queue = Queue::new();
+        let mut queue = Queue::new(Lang::Ru);
         queue
             .push(
                 request("https://site/watch?v=abc", Format::Mp4, Quality::Best),
@@ -10675,7 +10919,7 @@ mod tests {
     /// пометил бы её ошибкой.
     #[test]
     fn numbering_never_hands_out_the_reserved_zero() {
-        let mut queue = Queue::new();
+        let mut queue = Queue::new(Lang::Ru);
         assert_ne!(queue.next_id, NO_DOWNLOAD);
 
         // Четыре миллиарда ссылок за запуск недостижимы, но проверить обход
@@ -10773,7 +11017,7 @@ mod tests {
     /// отношения не имеют.
     #[test]
     fn a_row_says_what_it_will_download_and_in_what_state() {
-        let mut queue = Queue::new();
+        let mut queue = Queue::new(Lang::Ru);
         let id = queue
             .push(
                 request("https://site/a", Format::Mp3, Quality::P1080),
@@ -10825,7 +11069,7 @@ mod tests {
     /// тремя символами в конце.
     #[test]
     fn the_link_gives_way_to_the_title_when_it_arrives() {
-        let mut queue = Queue::new();
+        let mut queue = Queue::new(Lang::Ru);
         let id = queue
             .push(
                 request("https://site/watch?v=abc", Format::Mp4, Quality::Best),
@@ -10855,7 +11099,7 @@ mod tests {
 
         // Пустых пар в сводке быть не должно: «Ошибок: 0» рядом с готовым
         // выглядит как доклад о беде, которой не было.
-        let empty = Queue::new();
+        let empty = Queue::new(Lang::Ru);
         assert!(empty.summary.is_empty());
     }
 
@@ -10934,12 +11178,23 @@ mod tests {
             QueueStatus::Cancelled,
         ];
 
-        let mut seen: Vec<&str> = Vec::new();
-        for status in &all {
-            let label = status.label();
-            assert!(!label.trim().is_empty(), "{status:?}: пустая подпись");
-            assert!(!seen.contains(&label), "{label}: подпись повторяется");
-            seen.push(label);
+        // Каждый язык проверяется отдельно: подписи, различимые по-русски,
+        // в переводе легко слипаются («Готово» и «Отменено» — Done и
+        // Cancelled, а вот «Ждёт» и «В очереди» уже спорят).
+        for lang in Lang::ALL {
+            let mut seen: Vec<&str> = Vec::new();
+            for status in &all {
+                let label = status.label(lang);
+                assert!(
+                    !label.trim().is_empty(),
+                    "{lang:?} {status:?}: пустая подпись"
+                );
+                assert!(
+                    !seen.contains(&label),
+                    "{lang:?} {label}: подпись повторяется"
+                );
+                seen.push(label);
+            }
         }
 
         // Освобождать место можно только за счёт отработавших.
@@ -11029,7 +11284,7 @@ mod tests {
 
     #[test]
     fn oversized_window_is_explained_in_russian() {
-        let line = gpu_error_line(TOO_LARGE);
+        let line = gpu_error_line(TOO_LARGE, Lang::Ru);
         assert!(line.contains("больше, чем может отрисовать"), "{line}");
         // Английский текст wgpu пользователю не показываем: он про текстуру,
         // а человек видит окно.
@@ -11041,7 +11296,7 @@ mod tests {
     /// потерять подсказку терпимо, потерять сообщение целиком — нет.
     #[test]
     fn unknown_gpu_error_keeps_its_own_text() {
-        let line = gpu_error_line("Validation Error: something else entirely");
+        let line = gpu_error_line("Validation Error: something else entirely", Lang::Ru);
         assert!(line.starts_with("Ошибка отрисовки: "), "{line}");
         assert!(line.contains("something else entirely"), "{line}");
     }
@@ -11072,36 +11327,56 @@ mod tests {
         let viewport = "Validation Error\n\nCaused by:\n  In a CommandEncoder, label = 'encoder'\n    \
              In a set_viewport command\n      Viewport size { w: 9984, h: 381 } greater than \
              device's requested `max_texture_dimension_2d` limit 8192, or less than zero";
-        assert_eq!(gpu_error_line(TOO_LARGE), gpu_error_line(viewport));
+        assert_eq!(gpu_error_line(TOO_LARGE, Lang::Ru), gpu_error_line(viewport, Lang::Ru));
     }
 
     /// Кадр без ошибок не должен ничего забирать: `ui()` зовут 60 раз
     /// в секунду, и пустой разбор обязан оставаться пустым.
     #[test]
     fn a_folded_group_admits_what_it_hides() {
+        // Язык назван явно, а не взят по умолчанию: проверка сравнивает
+        // с русским текстом, и молча сменившееся умолчание превратило бы
+        // её в проверку перевода вместо проверки сводки.
+        let ru = Lang::Ru;
         // Заданный фрагмент обязан быть виден в заголовке: свёрнутая группа —
         // единственное место, где о нём вообще можно узнать, а скачанный
         // кусок вместо ролика человек заметит уже в плеере.
         assert_eq!(
-            advanced_summary(false, true, false, &SubLang::Original),
+            advanced_summary(false, true, false, &SubLang::Original, ru),
             "фрагмент"
         );
         assert_eq!(
-            advanced_summary(true, false, false, &SubLang::Original),
+            advanced_summary(true, false, false, &SubLang::Original, ru),
             "фрагмент задан неверно"
         );
         assert_eq!(
-            advanced_summary(false, false, true, &SubLang::Original),
+            advanced_summary(false, false, true, &SubLang::Original, ru),
             "вход на сайт"
         );
         assert_eq!(
-            advanced_summary(false, false, false, &SubLang::Code("ru".to_owned())),
+            advanced_summary(false, false, false, &SubLang::Code("ru".to_owned()), ru),
             "субтитры: ru"
         );
         assert_eq!(
-            advanced_summary(false, true, true, &SubLang::Code("de".to_owned())),
+            advanced_summary(false, true, true, &SubLang::Code("de".to_owned()), ru),
             "фрагмент · вход на сайт · субтитры: de"
         );
+    }
+
+    /// Сводка не пустеет ни на одном языке.
+    ///
+    /// Сравнивать перевод с записанной строкой незачем — это проверяло бы
+    /// саму таблицу, — а вот «собралось хоть что-то» ловит забытую подстановку:
+    /// пустой заголовок группы выглядит исправным.
+    #[test]
+    fn the_folded_group_speaks_in_every_language() {
+        for lang in Lang::ALL {
+            for state in [(false, false, false), (false, true, true), (true, false, false)] {
+                let summary =
+                    advanced_summary(state.0, state.1, state.2, &SubLang::Original, lang);
+                assert!(!summary.trim().is_empty(), "{lang:?} {state:?}: пусто");
+            }
+        }
     }
 
     #[test]
@@ -11109,7 +11384,7 @@ mod tests {
         // Ничего не включено — перечисляем содержимое, а не «ничего не
         // задано»: заголовок обязан объяснять, зачем группу вообще открывать.
         assert_eq!(
-            advanced_summary(false, false, false, &SubLang::Original),
+            advanced_summary(false, false, false, &SubLang::Original, Lang::Ru),
             "фрагмент, вход на сайт, язык субтитров"
         );
     }
@@ -11159,7 +11434,7 @@ mod tests {
             },
             trouble: None,
         };
-        assert_eq!(power_hint(&state), "");
+        assert_eq!(power_hint(&state, Lang::Ru), "");
     }
 
     /// Оговорка обязана появиться ДО нажатия: это единственное место, где
@@ -11176,7 +11451,7 @@ mod tests {
             trouble: None,
         };
 
-        let hint = power_hint(&state);
+        let hint = power_hint(&state, Lang::Ru);
         // Названа и та схема, что мешает, и та, что нужна: без первой
         // непонятно, что менять, без второй — на что.
         assert!(hint.contains("Высокая производительность"), "{hint}");
@@ -11197,9 +11472,9 @@ mod tests {
             trouble: None,
         };
 
-        let hint = power_hint(&state);
-        assert!(hint.contains(PowerMode::Max.label()), "{hint}");
-        assert!(hint.contains(PowerMode::Balanced.label()), "{hint}");
+        let hint = power_hint(&state, Lang::Ru);
+        assert!(hint.contains(PowerMode::Max.label(Lang::Ru)), "{hint}");
+        assert!(hint.contains(PowerMode::Balanced.label(Lang::Ru)), "{hint}");
     }
 
     /// Схему система назвать может и не суметь. Выдуманного имени в оговорке
@@ -11216,7 +11491,7 @@ mod tests {
             trouble: None,
         };
 
-        let hint = power_hint(&state);
+        let hint = power_hint(&state, Lang::Ru);
         assert!(!hint.is_empty(), "предупредить всё равно надо");
         assert!(!hint.contains("Высокая производительность"), "{hint}");
     }
@@ -11230,7 +11505,7 @@ mod tests {
             modes: PowerModes::Unsupported,
             trouble: Some("режимов нет".to_owned()),
         };
-        assert_eq!(power_hint(&state), "");
+        assert_eq!(power_hint(&state, Lang::Ru), "");
     }
 
     /// Высота тела журнала после трёх кадров в окне 520×420.
@@ -11367,6 +11642,135 @@ mod tests {
         height
     }
 
+    /// Дорожки формата и качества не вылезают за кромку ни на одном языке.
+    ///
+    /// Самое узкое место всей задачи про три языка. Сегмент просит `min_size`,
+    /// а это только нижняя граница: подпись шире отведённой доли раздвигает
+    /// кнопку, и дорожка из шести ступеней уезжает за кромку окна, утаскивая
+    /// за собой карточку. По-русски ступени подогнаны под окно 520 впритык
+    /// (поля сегмента ради этого урезаны с 16 до 10 — см. `segment_button`),
+    /// так что любой перевод длиннее русского ломает раскладку молча: ни
+    /// сборка, ни `clippy` ширин не знают, а глазной прогон идёт на одном
+    /// языке из трёх.
+    ///
+    /// Меряется при этом разложенная подпись, а не сама дорожка: дорожка
+    /// лежит во `Frame` и сжимается до доступной ширины всегда, то есть
+    /// равна ей и на сломанной раскладке — проверяла бы сама себя. Вылезает
+    /// же за кромку то, что внутри: подпись, не влезшая в свою долю,
+    /// раздвигает кнопку, а кнопка — дорожку.
+    ///
+    /// Проверено красным: с полями сегмента 16 вместо 10 не влезают армянские
+    /// ступени MP3, и проверка падает.
+    #[test]
+    fn the_segment_tracks_fit_the_smallest_window() {
+        for lang in Lang::ALL {
+            for format in [Format::Mp4, Format::Mp3] {
+                let quality: Vec<&str> = Quality::ALL
+                    .iter()
+                    .map(|step| step.label(format, lang))
+                    .collect();
+                let formats = [Format::Mp4.label(lang), Format::Mp3.label(lang)];
+
+                for (name, labels) in [("качество", &quality[..]), ("формат", &formats[..])] {
+                    let (widest, slot) = widest_segment(labels);
+                    assert!(
+                        widest <= slot,
+                        "{lang:?}/{format:?}: подпись дорожки «{name}» не влезает \
+                         в свою долю: {widest} при {slot}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Раскладывает подписи дорожки в карточке окна 520 и отдаёт пару
+    /// «самая широкая подпись с полями — сколько отведено одному сегменту».
+    ///
+    /// Поля и промежуток берутся из тех же мест, что и в `segment_button`
+    /// с `segment_track`: числа, списанные сюда руками, разъехались бы
+    /// с раскладкой при первой же правке темы.
+    fn widest_segment(labels: &[&str]) -> (f32, f32) {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let (mut widest, mut slot) = (0.0_f32, 0.0_f32);
+
+        for _ in 0..3 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(520.0, 420.0),
+                )),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    theme::card(ui, |ui| {
+                        // Доля одного сегмента: ширина дорожки за вычетом
+                        // промежутков, поделённая на число сегментов.
+                        let n = labels.len() as f32;
+                        let inner =
+                            ui.available_width() - theme::track_frame().total_margin().sum().x;
+                        slot = (inner - theme::SEGMENT_GAP * (n - 1.0)) / n;
+
+                        let font = egui::TextStyle::Button.resolve(ui.style());
+                        widest = labels
+                            .iter()
+                            .map(|label| {
+                                let text = ui.painter().layout_no_wrap(
+                                    (*label).to_owned(),
+                                    font.clone(),
+                                    theme::TEXT_PRIMARY,
+                                );
+                                text.size().x + theme::SEGMENT_PADDING * 2.0
+                            })
+                            .fold(0.0_f32, f32::max);
+                    });
+                });
+            });
+            output.textures_delta.clear();
+        }
+
+        (widest, slot)
+    }
+
+    /// Подписи полей укладываются в свою колонку на всех трёх языках.
+    ///
+    /// Колонка узкая и расширить её нечем: она отнимает ширину у дорожки
+    /// качества, а там шесть ступеней. Не влезшая подпись не ломается
+    /// заметно — она молча обрезается в «Բիթրեյթ, կբիթ…», и увидеть это
+    /// можно только глазами и только на том языке, который сейчас выбран.
+    ///
+    /// Проверено красным: с «Բիթրեյթ, կբիթ/վ» (первый перевод) проверка
+    /// падает на армянском битрейте.
+    #[test]
+    fn the_field_labels_fit_their_column() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            // `.small()`, как у самой подписи (`labelled_row`, `field_label`):
+            // с обычным начертанием проверка мерила бы не тот текст и падала
+            // бы уже на русском, который на экране влезает.
+            let font = egui::TextStyle::Small.resolve(ui.style());
+            for lang in Lang::ALL {
+                for key in LABEL_KEYS {
+                    let label = i18n::t(lang, key);
+                    let width = ui
+                        .painter()
+                        .layout_no_wrap(label.to_owned(), font.clone(), theme::TEXT_MUTED)
+                        .size()
+                        .x;
+                    assert!(
+                        width <= LABEL_COLUMN,
+                        "{lang:?}/{key:?}: подпись «{label}» не влезает в колонку: \
+                         {width} при {LABEL_COLUMN}"
+                    );
+                }
+            }
+        });
+        output.textures_delta.clear();
+    }
+
     /// Плашка состояния просит ровно свою ширину — и справа налево тоже.
     ///
     /// Вторая половина дефекта 42, и от первой она не зависит: у области,
@@ -11443,7 +11847,7 @@ mod tests {
     /// оно выше кнопки, и `CONTROL_HEIGHT` ему мал.
     #[test]
     fn a_machine_card_does_not_stretch_to_the_whole_window() {
-        let checked = card_height(|ui| check_card(ui, &sample_check()));
+        let checked = card_height(|ui| check_card(ui, &sample_check(), Lang::Ru));
         assert!(checked > 60.0, "карточка пункта обрезана: {checked}");
         assert!(checked < 160.0, "карточка пункта во весь экран: {checked}");
 
@@ -11509,9 +11913,12 @@ mod tests {
             .take_while(|line| !line.trim().is_empty())
             .map(str::trim)
             .collect();
+        // README один и по-русски, так что и сверять его есть с чем только
+        // по-русски. Переводы этой строки проверяет таблица (у каждого ключа
+        // есть текст на всех трёх языках), а не README.
         assert_eq!(
             intro.join(" ").replace("**", ""),
-            ABOUT_TEXT,
+            i18n::t(Lang::Ru, ABOUT_TEXT),
             "вступление README разошлось с окном «О программе» — поправьте ABOUT_TEXT"
         );
     }
@@ -11562,30 +11969,39 @@ mod tests {
     ///
     /// Три кадра — по той же причине, что у [`log_body_height`]: модалка —
     /// это `Area`, и свой размер она узнаёт по прошлому кадру.
+    ///
+    /// Все три языка, а не один: перевод длиннее оригинала — обычное дело,
+    /// и окно, влезающее по-русски, по-английски вылезает за кромку. Ловится
+    /// это только здесь: глазной прогон идёт на том языке, что выбран.
     #[test]
     fn the_about_window_fits_the_smallest_window() {
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(520.0, 420.0));
-        let ctx = egui::Context::default();
-        theme::apply(&ctx);
-        let mut rect = egui::Rect::NOTHING;
 
-        for _ in 0..3 {
-            let input = egui::RawInput {
-                screen_rect: Some(screen),
-                ..Default::default()
-            };
-            let mut output = ctx.run_ui(input, |ui| {
-                // «Скопировано» горит: так ряд с адресом самый широкий.
-                rect = about_window(ui.ctx(), 1.0, true).response.rect;
-            });
-            output.textures_delta.clear();
+        for lang in Lang::ALL {
+            // Свой контекст на язык: у модалки есть память между кадрами,
+            // и размер от прошлого языка исказил бы первый кадр следующего.
+            let ctx = egui::Context::default();
+            theme::apply(&ctx);
+            let mut rect = egui::Rect::NOTHING;
+
+            for _ in 0..3 {
+                let input = egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                };
+                let mut output = ctx.run_ui(input, |ui| {
+                    // «Скопировано» горит: так ряд с адресом самый широкий.
+                    rect = about_window(ui.ctx(), lang, 1.0, true).response.rect;
+                });
+                output.textures_delta.clear();
+            }
+
+            assert!(rect.height() > 200.0, "{lang:?}: окно схлопнулось: {rect:?}");
+            assert!(
+                screen.contains_rect(rect),
+                "{lang:?}: окно «О программе» не влезает в 520×420: {rect:?}"
+            );
         }
-
-        assert!(rect.height() > 200.0, "окно схлопнулось: {rect:?}");
-        assert!(
-            screen.contains_rect(rect),
-            "окно «О программе» не влезает в 520×420: {rect:?}"
-        );
     }
 
     /// Шапка с сегментом «Ещё» помещается в окно минимальной ширины.
@@ -11597,8 +12013,81 @@ mod tests {
     ///
     /// Проверено красным: с подписью «Ещё разделы» вместо «Ещё» дорожка
     /// налезает на номер версии, и проверка падает.
+    ///
+    /// Все три языка, а не один: подписи разделов в переводе длиннее русских,
+    /// а запас тут меньше пары точек — «влезло по-русски» ничего не говорит
+    /// об остальных двух.
+    ///
+    /// Подпись языка при такой ширине не показывается вовсе (`LANG_MIN`),
+    /// и проверка это учитывает: она требует не наличия подписи, а того,
+    /// чтобы показанная подпись не налезала ни на дорожку, ни на версию.
+    /// Что выбор языка при этом остаётся достижим, держит
+    /// `the_narrow_header_keeps_the_language_reachable`.
     #[test]
     fn the_header_fits_the_smallest_window() {
+        for lang in Lang::ALL {
+            let row = header_at(520.0, lang);
+            assert!(
+                row.track.width() > 200.0,
+                "{lang:?}: дорожка схлопнулась: {:?}",
+                row.track
+            );
+            assert!(
+                row.version.width() > 20.0,
+                "{lang:?}: номер версии пропал: {:?}",
+                row.version
+            );
+            // Правый край, в который упирается дорожка: подпись языка, если
+            // она показана, иначе номер версии. Сверять всегда с версией
+            // нельзя — подпись стоит левее, и наложение на неё прошло бы мимо.
+            let right = if row.lang_pill.is_positive() {
+                assert!(
+                    row.lang_pill.right() <= row.version.left(),
+                    "{lang:?}: выбор языка налезает на номер версии: {:?} и {:?}",
+                    row.lang_pill,
+                    row.version
+                );
+                row.lang_pill.left()
+            } else {
+                row.version.left()
+            };
+            assert!(
+                row.track.right() + 10.0 <= right,
+                "{lang:?}: дорожка налезает на то, что справа: {:?} и {right}",
+                row.track
+            );
+        }
+    }
+
+    /// Подпись языка прячется только в узком окне, а в широком стоит на месте.
+    ///
+    /// Порог `LANG_MIN` легко превратить в «языка в шапке нет никогда»:
+    /// достаточно переоценить число, и соседний тест ширины этого не заметит —
+    /// он как раз разрешает подписи отсутствовать. Сравниваем два окна:
+    /// в 520 подписи быть не должно (дорожка разделов занимает шапку
+    /// целиком), в 900 — должна.
+    #[test]
+    fn the_language_label_hides_only_where_there_is_no_room() {
+        for lang in Lang::ALL {
+            assert!(
+                !header_at(520.0, lang).lang_pill.is_positive(),
+                "{lang:?}: подпись языка втиснулась в окно 520 — \
+                 значит, она налезла на дорожку разделов"
+            );
+            assert!(
+                header_at(900.0, lang).lang_pill.is_positive(),
+                "{lang:?}: в широком окне подписи языка нет — порог LANG_MIN \
+                 спрятал её везде, и выбор языка остался только в меню «Ещё»"
+            );
+        }
+    }
+
+    /// Рисует шапку в окне заданной ширины и отдаёт, что в ней где легло.
+    ///
+    /// Три кадра: и дорожка разделов, и панель узнают свой размер по прошлому
+    /// кадру. Свой контекст на вызов — иначе размер от прошлого языка
+    /// исказил бы первый кадр следующего.
+    fn header_at(width: f32, lang: Lang) -> HeaderRow {
         let ctx = egui::Context::default();
         theme::apply(&ctx);
         let mut row = None;
@@ -11607,7 +12096,7 @@ mod tests {
             let input = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
-                    egui::vec2(520.0, 420.0),
+                    egui::vec2(width, 420.0),
                 )),
                 ..Default::default()
             };
@@ -11616,21 +12105,21 @@ mod tests {
                     .frame(theme::bar_frame())
                     .show(ui, |ui| {
                         let mut open = false;
-                        row = Some(SavioApp::header_row(ui, 1.0, Tab::Weather, &mut open));
+                        let mut lang_open = false;
+                        row = Some(SavioApp::header_row(
+                            ui,
+                            1.0,
+                            Tab::Weather,
+                            lang,
+                            &mut open,
+                            &mut lang_open,
+                        ));
                     });
             });
             output.textures_delta.clear();
         }
 
-        let row = row.expect("шапка нарисована");
-        assert!(row.track.width() > 200.0, "дорожка схлопнулась: {:?}", row.track);
-        assert!(row.version.width() > 20.0, "номер версии пропал: {:?}", row.version);
-        assert!(
-            row.track.right() + 10.0 <= row.version.left(),
-            "дорожка налезает на номер версии: {:?} и {:?}",
-            row.track,
-            row.version
-        );
+        row.expect("шапка нарисована")
     }
 
     /// Строка недельного прогноза занимает свою высоту, а не весь экран.

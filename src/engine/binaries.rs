@@ -14,6 +14,8 @@
 
 use std::path::PathBuf;
 
+use crate::i18n::{self, Key, Lang};
+
 #[cfg(windows)]
 pub const YTDLP_NAME: &str = "yt-dlp.exe";
 #[cfg(not(windows))]
@@ -166,12 +168,9 @@ pub fn locate_with_origin(name: &str) -> Option<(PathBuf, Origin)> {
         .then_some((candidate, Origin::Owned))
 }
 
-pub fn discover() -> Result<Tools, String> {
+pub fn discover(lang: Lang) -> Result<Tools, String> {
     let ytdlp = locate(YTDLP_NAME).ok_or_else(|| {
-        format!(
-            "Не найден {YTDLP_NAME}. Положите его рядом с Savio \
-             или установите так, чтобы он был доступен в PATH."
-        )
+        i18n::fill(i18n::t(lang, Key::ToolYtdlpMissing), &[YTDLP_NAME])
     })?;
 
     Ok(Tools {

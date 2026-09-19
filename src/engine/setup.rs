@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use super::binaries::{self, FFMPEG_NAME, FFPROBE_NAME, Origin, YTDLP_NAME};
 use super::sha256::{self, Sha256};
+use crate::i18n::{self, Key, Lang};
 use crate::model::{Event, NO_DOWNLOAD, Progress, ToolVersion, ToolVersions};
 
 // ---------------------------------------------------------------------------
@@ -242,6 +243,7 @@ impl Handle {
 /// общение идёт событиями.
 pub fn start(
     what: Missing,
+    lang: Lang,
     tx: Sender<Event>,
     notify: impl Fn() + Send + 'static,
 ) -> Handle {
@@ -251,7 +253,7 @@ pub fn start(
     };
 
     std::thread::spawn(move || {
-        match run(what, &tx, &notify, &cancelled) {
+        match run(what, lang, &tx, &notify, &cancelled) {
             Ok(()) => {
                 let _ = tx.send(Event::Ready);
             }
@@ -271,38 +273,52 @@ pub fn start(
     handle
 }
 
+/// Папка под инструменты, созданная и готовая к записи.
+///
+/// Общая у установки и обновления: и там и там неудача звучит одинаково,
+/// а расходиться двум одинаковым сообщениям незачем.
+fn tools_dir(lang: Lang) -> Result<PathBuf, String> {
+    let dir = binaries::data_dir()
+        .ok_or_else(|| i18n::t(lang, Key::SetupNoToolsDir).to_owned())?;
+    // `-C` в несуществующий каталог tar не создаёт, а падает с `could not chdir`.
+    fs::create_dir_all(&dir).map_err(|e| {
+        i18n::fill(
+            i18n::t(lang, Key::SetupMkdirFailed),
+            &[&dir.display().to_string(), &e.to_string()],
+        )
+    })?;
+    Ok(dir)
+}
+
 fn run(
     what: Missing,
+    lang: Lang,
     tx: &Sender<Event>,
     notify: &impl Fn(),
     cancelled: &AtomicBool,
 ) -> Result<(), String> {
-    let dir = binaries::data_dir()
-        .ok_or("Не удалось определить папку для инструментов: не задана домашняя папка.")?;
-    // `-C` в несуществующий каталог tar не создаёт, а падает с `could not chdir`.
-    fs::create_dir_all(&dir)
-        .map_err(|e| format!("Не удалось создать папку {}: {e}", dir.display()))?;
+    let dir = tools_dir(lang)?;
 
     let agent = agent();
 
     if what.ytdlp {
-        install_ytdlp(&agent, &dir, tx, notify, cancelled)?;
+        install_ytdlp(&agent, &dir, lang, tx, notify, cancelled)?;
     }
 
     if what.ffmpeg {
         // Сбой ffmpeg не срывает установку: без него Savio работает и просто
         // предупреждает, как и раньше. Источники сборок под macOS — сайты
         // энтузиастов без стабильных ссылок, ронять из-за них запуск нельзя.
-        if let Err(err) = install_ffmpeg(&agent, &dir, tx, notify, cancelled) {
+        if let Err(err) = install_ffmpeg(&agent, &dir, lang, tx, notify, cancelled) {
             if cancelled.load(Ordering::Relaxed) {
                 return Err(err);
             }
             // Не только в журнал: он свёрнут, а перед первой же загрузкой
             // очищается — то есть исчезает ровно тогда, когда понадобится.
             // Причину видно на экране, а `Warning` не мешает `Ready`.
-            let _ = tx.send(Event::Warning(format!(
-                "Не удалось установить ffmpeg: {err}. \
-                 Склейка видео со звуком и конвертация в MP3 работать не будут."
+            let _ = tx.send(Event::Warning(i18n::fill(
+                i18n::t(lang, Key::SetupFfmpegFailed),
+                &[&err],
             )));
             notify();
         }
@@ -314,14 +330,18 @@ fn run(
 fn install_ytdlp(
     agent: &ureq::Agent,
     dir: &Path,
+    lang: Lang,
     tx: &Sender<Event>,
     notify: &impl Fn(),
     cancelled: &AtomicBool,
 ) -> Result<(), String> {
-    stage(tx, notify, "Ищу свежий выпуск yt-dlp…");
-    let tag = latest_ytdlp_tag(agent)?;
-    let _ = tx.send(Event::Log(format!("yt-dlp: выпуск {tag}")));
-    install_ytdlp_tag(agent, dir, &tag, tx, notify, cancelled)
+    stage(tx, notify, i18n::t(lang, Key::StageFindingYtdlp));
+    let tag = latest_ytdlp_tag(agent, lang)?;
+    let _ = tx.send(Event::Log(i18n::fill(
+        i18n::t(lang, Key::LogYtdlpRelease),
+        &[&tag],
+    )));
+    install_ytdlp_tag(agent, dir, &tag, lang, tx, notify, cancelled)
 }
 
 /// Ставит заранее известный выпуск.
@@ -333,6 +353,7 @@ fn install_ytdlp_tag(
     agent: &ureq::Agent,
     dir: &Path,
     tag: &str,
+    lang: Lang,
     tx: &Sender<Event>,
     notify: &impl Fn(),
     cancelled: &AtomicBool,
@@ -340,18 +361,19 @@ fn install_ytdlp_tag(
     let base = format!("https://github.com/yt-dlp/yt-dlp/releases/download/{tag}");
 
     // Суммы тянем из того же выпуска, что и бинарник.
-    let sums = fetch_text(agent, &format!("{base}/{YTDLP_SUMS}"))
-        .map_err(|e| format!("Не удалось получить контрольные суммы yt-dlp: {e}"))?;
+    let sums = fetch_text(agent, &format!("{base}/{YTDLP_SUMS}"), lang)
+        .map_err(|e| i18n::fill(i18n::t(lang, Key::SetupYtdlpSumsFailed), &[&e]))?;
     let expected = sha256::find_sum(&sums, YTDLP_ASSET).ok_or_else(|| {
-        format!("В списке контрольных сумм yt-dlp нет строки для {YTDLP_ASSET}.")
+        i18n::fill(i18n::t(lang, Key::SetupYtdlpNoSumLine), &[YTDLP_ASSET])
     })?;
 
-    stage(tx, notify, "Скачиваю yt-dlp…");
+    stage(tx, notify, i18n::t(lang, Key::StageDownloadingYtdlp));
     let tmp = dir.join(binary_tmp_name("ytdlp"));
     let digest = download(
         agent,
         &format!("{base}/{YTDLP_ASSET}"),
         &tmp,
+        lang,
         tx,
         notify,
         cancelled,
@@ -360,17 +382,16 @@ fn install_ytdlp_tag(
     let actual = sha256::hex(&digest);
     if actual != expected {
         let _ = fs::remove_file(&tmp);
-        return Err(
-            "Скачанный yt-dlp повреждён: контрольная сумма не совпала. \
-             Попробуйте запустить Savio ещё раз."
-                .into(),
-        );
+        return Err(i18n::t(lang, Key::SetupYtdlpCorrupt).into());
     }
 
-    make_executable(&tmp)?;
+    make_executable(&tmp, lang)?;
     let target = dir.join(YTDLP_NAME);
-    replace(&tmp, &target)?;
-    let _ = tx.send(Event::Log(format!("yt-dlp установлен: {}", target.display())));
+    replace(&tmp, &target, lang)?;
+    let _ = tx.send(Event::Log(i18n::fill(
+        i18n::t(lang, Key::LogYtdlpInstalled),
+        &[&target.display().to_string()],
+    )));
     notify();
     Ok(())
 }
@@ -387,6 +408,7 @@ fn install_ytdlp_tag(
 fn install_ffmpeg(
     agent: &ureq::Agent,
     dir: &Path,
+    lang: Lang,
     tx: &Sender<Event>,
     notify: &impl Fn(),
     cancelled: &AtomicBool,
@@ -394,11 +416,11 @@ fn install_ffmpeg(
     let mut last = String::new();
 
     for (index, source) in FFMPEG_SOURCES.iter().enumerate() {
-        match install_ffmpeg_from(source, agent, dir, tx, notify, cancelled) {
+        match install_ffmpeg_from(source, agent, dir, lang, tx, notify, cancelled) {
             Ok(()) => {
-                let _ = tx.send(Event::Log(format!(
-                    "ffmpeg установлен: {}",
-                    dir.join(FFMPEG_NAME).display()
+                let _ = tx.send(Event::Log(i18n::fill(
+                    i18n::t(lang, Key::LogFfmpegInstalled),
+                    &[&dir.join(FFMPEG_NAME).display().to_string()],
                 )));
                 notify();
                 return Ok(());
@@ -414,9 +436,9 @@ fn install_ffmpeg(
                 for name in [FFMPEG_NAME, FFPROBE_NAME] {
                     let _ = fs::remove_file(dir.join(name));
                 }
-                let _ = tx.send(Event::Log(format!(
-                    "Источник ffmpeg №{} не сработал: {err}",
-                    index + 1
+                let _ = tx.send(Event::Log(i18n::fill(
+                    i18n::t(lang, Key::LogFfmpegSourceFailed),
+                    &[&(index + 1).to_string(), &err],
                 )));
                 notify();
                 last = err;
@@ -425,13 +447,13 @@ fn install_ffmpeg(
     }
 
     Err(if last.is_empty() {
-        "не задан ни один источник ffmpeg".into()
+        i18n::t(lang, Key::SetupNoFfmpegSources).into()
     } else {
         // Число источников важно в сообщении: без него «не удалось скачать»
         // читается как «сайт полежал минуту», хотя перепробовано было всё.
-        format!(
-            "перепробованы все источники ({}), последняя ошибка — {last}",
-            FFMPEG_SOURCES.len()
+        i18n::fill(
+            i18n::t(lang, Key::SetupAllSourcesFailed),
+            &[&FFMPEG_SOURCES.len().to_string(), &last],
         )
     })
 }
@@ -450,15 +472,17 @@ fn expected_sum(
     agent: &ureq::Agent,
     sums: &str,
     url: &str,
+    lang: Lang,
     tx: &Sender<Event>,
 ) -> Option<String> {
     let asset = url.rsplit('/').next().unwrap_or_default();
 
-    let list = match fetch_text(agent, sums) {
+    let list = match fetch_text(agent, sums, lang) {
         Ok(list) => list,
         Err(err) => {
-            let _ = tx.send(Event::Log(format!(
-                "Список контрольных сумм ffmpeg недоступен ({err}) — ставлю без сверки."
+            let _ = tx.send(Event::Log(i18n::fill(
+                i18n::t(lang, Key::LogSumsUnavailable),
+                &[&err],
             )));
             return None;
         }
@@ -469,8 +493,9 @@ fn expected_sum(
     // `find_sum` сравнивает имена на равенство — на это и опираемся.
     let found = sha256::find_sum(&list, asset).map(str::to_owned);
     if found.is_none() {
-        let _ = tx.send(Event::Log(format!(
-            "В списке контрольных сумм ffmpeg нет строки для {asset} — ставлю без сверки."
+        let _ = tx.send(Event::Log(i18n::fill(
+            i18n::t(lang, Key::LogNoSumLine),
+            &[asset],
         )));
     }
     found
@@ -480,20 +505,21 @@ fn install_ffmpeg_from(
     source: &FfmpegSource,
     agent: &ureq::Agent,
     dir: &Path,
+    lang: Lang,
     tx: &Sender<Event>,
     notify: &impl Fn(),
     cancelled: &AtomicBool,
 ) -> Result<(), String> {
-    stage(tx, notify, "Скачиваю ffmpeg…");
+    stage(tx, notify, i18n::t(lang, Key::StageDownloadingFfmpeg));
 
     match *source {
         FfmpegSource::Bundle { url, sums } => {
             // Сумму спрашиваем до загрузки: качать сто с лишним мегабайт,
             // чтобы потом выяснить, что сверять их не с чем, незачем.
-            let expected = expected_sum(agent, sums, url, tx);
+            let expected = expected_sum(agent, sums, url, lang, tx);
 
             let name = archive_tmp_name(url);
-            let digest = download(agent, url, &dir.join(&name), tx, notify, cancelled)?;
+            let digest = download(agent, url, &dir.join(&name), lang, tx, notify, cancelled)?;
 
             // Несовпадение — отказ этого источника, а не всей установки:
             // выше по стеку `install_ffmpeg` возьмётся за следующий.
@@ -501,12 +527,10 @@ fn install_ffmpeg_from(
                 && sha256::hex(&digest) != expected
             {
                 let _ = fs::remove_file(dir.join(&name));
-                return Err(
-                    "скачанный архив ffmpeg повреждён: контрольная сумма не совпала".into(),
-                );
+                return Err(i18n::t(lang, Key::SetupFfmpegCorrupt).into());
             }
 
-            stage(tx, notify, "Распаковываю ffmpeg…");
+            stage(tx, notify, i18n::t(lang, Key::StageExtractingFfmpeg));
             // Внутри архива путь вида `ffmpeg-master-latest-win64-gpl/bin/ffmpeg`,
             // поэтому снимаем два уровня и забираем только нужную пару.
             let members = [
@@ -514,19 +538,19 @@ fn install_ffmpeg_from(
                 format!("*/bin/{FFPROBE_NAME}"),
             ];
             let refs: Vec<&str> = members.iter().map(String::as_str).collect();
-            let result = extract(dir, &name, 2, &refs);
+            let result = extract(dir, &name, 2, &refs, lang);
             let _ = fs::remove_file(dir.join(&name));
             result?;
         }
         FfmpegSource::Split { ffmpeg, ffprobe } => {
             for (url, member) in [(ffmpeg, FFMPEG_NAME), (ffprobe, FFPROBE_NAME)] {
                 let name = archive_tmp_name(url);
-                download(agent, url, &dir.join(&name), tx, notify, cancelled)?;
+                download(agent, url, &dir.join(&name), lang, tx, notify, cancelled)?;
 
-                stage(tx, notify, "Распаковываю ffmpeg…");
+                stage(tx, notify, i18n::t(lang, Key::StageExtractingFfmpeg));
                 // Эти архивы плоские: `--strip-components` здесь не нужен, а
                 // явное имя отсекает служебный мусор вроде `__MACOSX/._ffmpeg`.
-                let result = extract(dir, &name, 0, &[member]);
+                let result = extract(dir, &name, 0, &[member], lang);
                 let _ = fs::remove_file(dir.join(&name));
                 result?;
             }
@@ -540,11 +564,12 @@ fn install_ffmpeg_from(
     for name in [FFMPEG_NAME, FFPROBE_NAME] {
         let path = dir.join(name);
         if !path.is_file() {
-            return Err(format!(
-                "после распаковки не найден {name}: содержимое архива отличается от ожидаемого"
+            return Err(i18n::fill(
+                i18n::t(lang, Key::SetupMissingAfterExtract),
+                &[name],
             ));
         }
-        make_executable(&path)?;
+        make_executable(&path, lang)?;
     }
 
     Ok(())
@@ -680,19 +705,32 @@ fn ytdlp_version(path: &Path) -> Option<String> {
 
 /// Чем пользователю обновлять чужую копию. У каждой ОС свой менеджер, и
 /// совет «обновите пакет» без имени команды бесполезен.
+///
+/// Команда — не текст, а то, что человек наберёт дословно: `winget upgrade
+/// yt-dlp` одинаков на любом языке интерфейса, и переводить его нельзя.
+/// Перевода просит только общий случай, где готовой команды нет.
 #[cfg(windows)]
-const YTDLP_SYSTEM_HINT: &str = "winget upgrade yt-dlp";
+const YTDLP_SYSTEM_HINT: Option<&str> = Some("winget upgrade yt-dlp");
 #[cfg(target_os = "macos")]
-const YTDLP_SYSTEM_HINT: &str = "brew upgrade yt-dlp";
+const YTDLP_SYSTEM_HINT: Option<&str> = Some("brew upgrade yt-dlp");
 #[cfg(all(unix, not(target_os = "macos")))]
-const YTDLP_SYSTEM_HINT: &str = "менеджером пакетов вашей системы";
+const YTDLP_SYSTEM_HINT: Option<&str> = None;
 
 #[cfg(windows)]
-const FFMPEG_SYSTEM_HINT: &str = "winget upgrade ffmpeg";
+const FFMPEG_SYSTEM_HINT: Option<&str> = Some("winget upgrade ffmpeg");
 #[cfg(target_os = "macos")]
-const FFMPEG_SYSTEM_HINT: &str = "brew upgrade ffmpeg";
+const FFMPEG_SYSTEM_HINT: Option<&str> = Some("brew upgrade ffmpeg");
 #[cfg(all(unix, not(target_os = "macos")))]
-const FFMPEG_SYSTEM_HINT: &str = "менеджером пакетов вашей системы";
+const FFMPEG_SYSTEM_HINT: Option<&str> = None;
+
+/// Чем обновлять чужую копию, словами для человека.
+fn system_hint(what: Component, lang: Lang) -> &'static str {
+    let hint = match what {
+        Component::Ytdlp => YTDLP_SYSTEM_HINT,
+        Component::Ffmpeg => FFMPEG_SYSTEM_HINT,
+    };
+    hint.unwrap_or_else(|| i18n::t(lang, Key::SetupSystemPackageManager))
+}
 
 /// Что обновляем по кнопке.
 ///
@@ -728,6 +766,7 @@ impl Component {
 /// и кнопка стала бы ровно той молчаливой пустышкой, ради которой её и завели.
 pub fn start_update(
     what: Component,
+    lang: Lang,
     tx: Sender<Event>,
     notify: impl Fn() + Send + 'static,
 ) -> Handle {
@@ -737,7 +776,7 @@ pub fn start_update(
     };
 
     std::thread::spawn(move || {
-        match run_update(what, &tx, &notify, &cancelled) {
+        match run_update(what, lang, &tx, &notify, &cancelled) {
             Ok(Outcome::Updated(text)) => {
                 let _ = tx.send(Event::Notice(text));
                 let _ = tx.send(Event::Ready);
@@ -773,13 +812,11 @@ enum Outcome {
 
 fn run_update(
     what: Component,
+    lang: Lang,
     tx: &Sender<Event>,
     notify: &impl Fn(),
     cancelled: &AtomicBool,
 ) -> Result<Outcome, String> {
-    let dir = binaries::data_dir()
-        .ok_or("Не удалось определить папку для инструментов: не задана домашняя папка.")?;
-
     // Смотрим на ту программу, которую и обновляем: у ffmpeg своё
     // происхождение, и системный ffmpeg при своём yt-dlp — обычное дело.
     let name = match what {
@@ -789,19 +826,19 @@ fn run_update(
     let found = binaries::locate_with_origin(name);
 
     // Чужую копию не трогаем — объясняем, откуда она и чем её обновить.
+    // Спрашиваем до создания папки: своей копии тут нет и не будет.
     if let Some((path, origin @ (Origin::System | Origin::Portable))) = &found {
-        return Ok(Outcome::Declined(declined(what, path, *origin)));
+        return Ok(Outcome::Declined(declined(what, path, *origin, lang)));
     }
 
-    fs::create_dir_all(&dir)
-        .map_err(|e| format!("Не удалось создать папку {}: {e}", dir.display()))?;
+    let dir = tools_dir(lang)?;
 
     let agent = agent();
     let installed = found.as_ref().map(|(path, _)| path.as_path());
 
     match what {
-        Component::Ytdlp => update_ytdlp(&agent, &dir, installed, tx, notify, cancelled),
-        Component::Ffmpeg => update_ffmpeg(&agent, &dir, installed, tx, notify, cancelled),
+        Component::Ytdlp => update_ytdlp(&agent, &dir, installed, lang, tx, notify, cancelled),
+        Component::Ffmpeg => update_ffmpeg(&agent, &dir, installed, lang, tx, notify, cancelled),
     }
 }
 
@@ -810,27 +847,17 @@ fn run_update(
 /// Общий на оба инструмента: беда одна и та же, меняются только имя и совет.
 /// Путь в сообщении обязателен — без него «установлен в системе» проверить
 /// нечем, а человек как раз и хочет понять, какой именно файл у него работает.
-fn declined(what: Component, path: &Path, origin: Origin) -> String {
+fn declined(what: Component, path: &Path, origin: Origin, lang: Lang) -> String {
     let name = what.name();
+    let where_ = path.display().to_string();
     match origin {
-        Origin::System => {
-            let hint = match what {
-                Component::Ytdlp => YTDLP_SYSTEM_HINT,
-                Component::Ffmpeg => FFMPEG_SYSTEM_HINT,
-            };
-            format!(
-                "{name} установлен в системе, а не Savio:\n{}\n\n\
-                 Обновите его так же, как ставили: {hint}. \
-                 Savio подменять чужой файл не станет — иначе он разойдётся \
-                 с пакетным менеджером.",
-                path.display()
-            )
-        }
-        Origin::Portable => format!(
-            "{name} лежит рядом с Savio:\n{}\n\n\
-             Это портативная поставка — обновите её целиком или замените \
-             этот файл вручную. Savio его не трогает, чтобы не сломать сборку.",
-            path.display()
+        Origin::System => i18n::fill(
+            i18n::t(lang, Key::SetupDeclinedSystem),
+            &[name, &where_, system_hint(what, lang)],
+        ),
+        Origin::Portable => i18n::fill(
+            i18n::t(lang, Key::SetupDeclinedPortable),
+            &[name, &where_],
         ),
         Origin::Owned => unreachable!("своя копия обновляется, а не объясняется"),
     }
@@ -854,6 +881,7 @@ fn update_ffmpeg(
     agent: &ureq::Agent,
     dir: &Path,
     installed: Option<&Path>,
+    lang: Lang,
     tx: &Sender<Event>,
     notify: &impl Fn(),
     cancelled: &AtomicBool,
@@ -862,8 +890,8 @@ fn update_ffmpeg(
     let current = installed.and_then(ffmpeg_version);
 
     // Стадию «Скачиваю ffmpeg…» ставит сам `install_ffmpeg`.
-    install_ffmpeg(agent, dir, tx, notify, cancelled)
-        .map_err(|err| format!("Не удалось обновить ffmpeg: {err}."))?;
+    install_ffmpeg(agent, dir, lang, tx, notify, cancelled)
+        .map_err(|err| i18n::fill(i18n::t(lang, Key::SetupFfmpegUpdateFailed), &[&err]))?;
 
     let fresh = ffmpeg_version(&dir.join(FFMPEG_NAME));
 
@@ -874,12 +902,13 @@ fn update_ffmpeg(
             &fresh,
             // После перекачки сотни мегабайт одно «уже последней версии»
             // читается как «мы проверили и качать не стали» — а качали.
-            " На сервере лежит та же сборка.",
+            i18n::t(lang, Key::SetupSameBuildNote),
+            lang,
         ),
         // Версию не прочитали — но файлы на месте: `install_ffmpeg` проверяет
         // это существованием, а не кодом возврата. Обещать номер, которого мы
         // не знаем, нельзя, а промолчать после нажатия кнопки — тем более.
-        None => "ffmpeg скачан заново. Версию узнать не вышло.".to_owned(),
+        None => i18n::t(lang, Key::SetupFfmpegRedownloaded).to_owned(),
     }))
 }
 
@@ -892,15 +921,25 @@ fn update_ffmpeg(
 /// не видят, а показывается это только после удачного обновления, то есть
 /// в сценарии, который вручную повторяют редко. Стрелка тут напрашивается
 /// сама, поэтому и предупреждение, и тест ниже.
-fn update_summary(name: &str, current: Option<&str>, fresh: &str, unchanged: &str) -> String {
+fn update_summary(
+    name: &str,
+    current: Option<&str>,
+    fresh: &str,
+    unchanged: &str,
+    lang: Lang,
+) -> String {
     match current {
-        Some(current) if current == fresh => {
-            format!("{name} уже последней версии ({fresh}).{unchanged}")
-        }
-        Some(current) => format!("{name} обновлён: было {current}, стало {fresh}."),
+        Some(current) if current == fresh => i18n::fill(
+            i18n::t(lang, Key::SetupAlreadyLatest),
+            &[name, fresh, unchanged],
+        ),
+        Some(current) => i18n::fill(
+            i18n::t(lang, Key::SetupUpdated),
+            &[name, current, fresh],
+        ),
         // Версии до обновления не было — значит, это первая установка своей
         // копии, а не обновление. Обещать «обновлено с …» здесь нечестно.
-        None => format!("{name} установлен, версия {fresh}."),
+        None => i18n::fill(i18n::t(lang, Key::SetupInstalledVersion), &[name, fresh]),
     }
 }
 
@@ -908,12 +947,13 @@ fn update_ytdlp(
     agent: &ureq::Agent,
     dir: &Path,
     installed: Option<&Path>,
+    lang: Lang,
     tx: &Sender<Event>,
     notify: &impl Fn(),
     cancelled: &AtomicBool,
 ) -> Result<Outcome, String> {
-    stage(tx, notify, "Ищу свежий выпуск yt-dlp…");
-    let tag = latest_ytdlp_tag(agent)?;
+    stage(tx, notify, i18n::t(lang, Key::StageFindingYtdlp));
+    let tag = latest_ytdlp_tag(agent, lang)?;
 
     // Версию спрашиваем у самого бинарника, а не запоминаем при установке:
     // запомненная разъехалась бы с настоящей, если файл подменили снаружи.
@@ -934,19 +974,24 @@ fn update_ytdlp(
             Some(current),
             &tag,
             "",
+            lang,
         )));
     }
 
     // Стадию «Скачиваю yt-dlp…» ставит сам `install_ytdlp_tag` — здесь её
     // дублировать не надо.
-    let _ = tx.send(Event::Log(format!("yt-dlp: выпуск {tag}")));
-    install_ytdlp_tag(agent, dir, &tag, tx, notify, cancelled)?;
+    let _ = tx.send(Event::Log(i18n::fill(
+        i18n::t(lang, Key::LogYtdlpRelease),
+        &[&tag],
+    )));
+    install_ytdlp_tag(agent, dir, &tag, lang, tx, notify, cancelled)?;
 
     Ok(Outcome::Updated(update_summary(
         "yt-dlp",
         current.as_deref(),
         &tag,
         "",
+        lang,
     )))
 }
 
@@ -979,18 +1024,18 @@ fn agent() -> ureq::Agent {
         .into()
 }
 
-fn latest_ytdlp_tag(agent: &ureq::Agent) -> Result<String, String> {
-    let body = fetch_text(agent, YTDLP_RELEASE_API)
-        .map_err(|e| format!("Не удалось узнать свежий выпуск yt-dlp: {e}"))?;
+fn latest_ytdlp_tag(agent: &ureq::Agent, lang: Lang) -> Result<String, String> {
+    let body = fetch_text(agent, YTDLP_RELEASE_API, lang)
+        .map_err(|e| i18n::fill(i18n::t(lang, Key::SetupTagFailed), &[&e]))?;
     let value: serde_json::Value = serde_json::from_str(&body)
-        .map_err(|_| "GitHub вернул неожиданный ответ о выпуске yt-dlp.".to_string())?;
+        .map_err(|_| i18n::t(lang, Key::SetupGithubUnexpected).to_owned())?;
 
     value
         .get("tag_name")
         .and_then(|v| v.as_str())
         .filter(|tag| !tag.is_empty())
         .map(str::to_owned)
-        .ok_or_else(|| "В ответе GitHub нет номера выпуска yt-dlp.".to_string())
+        .ok_or_else(|| i18n::t(lang, Key::SetupGithubNoTag).to_owned())
 }
 
 /// GET с повтором при неудаче.
@@ -1007,19 +1052,20 @@ fn latest_ytdlp_tag(agent: &ureq::Agent) -> Result<String, String> {
 fn get_with_retry(
     agent: &ureq::Agent,
     url: &str,
+    lang: Lang,
     cancelled: Option<&AtomicBool>,
 ) -> Result<ureq::http::Response<ureq::Body>, String> {
     let mut last = String::new();
 
     for attempt in 1..=REQUEST_ATTEMPTS {
         if cancelled.is_some_and(|c| c.load(Ordering::Relaxed)) {
-            return Err("Установка отменена.".into());
+            return Err(i18n::t(lang, Key::SetupCancelled).into());
         }
 
         match agent.get(url).call() {
             Ok(response) => return Ok(response),
             Err(err) => {
-                last = human_net_error(&err);
+                last = human_net_error(&err, lang);
                 if attempt < REQUEST_ATTEMPTS {
                     std::thread::sleep(RETRY_PAUSE);
                 }
@@ -1030,10 +1076,10 @@ fn get_with_retry(
     Err(last)
 }
 
-fn fetch_text(agent: &ureq::Agent, url: &str) -> Result<String, String> {
-    let mut body = get_with_retry(agent, url, None)?.into_body();
+fn fetch_text(agent: &ureq::Agent, url: &str, lang: Lang) -> Result<String, String> {
+    let mut body = get_with_retry(agent, url, lang, None)?.into_body();
     body.read_to_string()
-        .map_err(|e| format!("не удалось прочитать ответ: {e}"))
+        .map_err(|e| i18n::fill(i18n::t(lang, Key::NetReadFailed), &[&e.to_string()]))
 }
 
 /// Качает `url` в `dest`, попутно считая SHA-256 и отдавая прогресс.
@@ -1047,11 +1093,12 @@ fn download(
     agent: &ureq::Agent,
     url: &str,
     dest: &Path,
+    lang: Lang,
     tx: &Sender<Event>,
     notify: &impl Fn(),
     cancelled: &AtomicBool,
 ) -> Result<[u8; 32], String> {
-    let result = download_inner(agent, url, dest, tx, notify, cancelled);
+    let result = download_inner(agent, url, dest, lang, tx, notify, cancelled);
     if result.is_err() {
         let _ = fs::remove_file(dest);
     }
@@ -1062,6 +1109,7 @@ fn download_inner(
     agent: &ureq::Agent,
     url: &str,
     dest: &Path,
+    lang: Lang,
     tx: &Sender<Event>,
     notify: &impl Fn(),
     cancelled: &AtomicBool,
@@ -1074,13 +1122,17 @@ fn download_inner(
     let _ = tx.send(Event::Progress(Progress::default()));
     notify();
 
-    let response = get_with_retry(agent, url, Some(cancelled))?;
+    let response = get_with_retry(agent, url, lang, Some(cancelled))?;
     // Размер снимаем до того, как тело поглощено читателем.
     let total = response.body().content_length().unwrap_or(0);
     let mut reader = response.into_body().into_reader();
 
-    let mut file = fs::File::create(dest)
-        .map_err(|e| format!("не удалось создать файл {}: {e}", dest.display()))?;
+    let mut file = fs::File::create(dest).map_err(|e| {
+        i18n::fill(
+            i18n::t(lang, Key::SetupCreateFileFailed),
+            &[&dest.display().to_string(), &e.to_string()],
+        )
+    })?;
 
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; CHUNK];
@@ -1091,18 +1143,19 @@ fn download_inner(
     loop {
         // Недокачанный файл удалит обёртка `download`.
         if cancelled.load(Ordering::Relaxed) {
-            return Err("Установка отменена.".into());
+            return Err(i18n::t(lang, Key::SetupCancelled).into());
         }
 
-        let read = reader
-            .read(&mut buf)
-            .map_err(|e| format!("обрыв загрузки: {e}"))?;
+        let read = reader.read(&mut buf).map_err(|e| {
+            i18n::fill(i18n::t(lang, Key::SetupDownloadBroken), &[&e.to_string()])
+        })?;
         if read == 0 {
             break;
         }
 
-        file.write_all(&buf[..read])
-            .map_err(|e| format!("не удалось записать файл: {e}"))?;
+        file.write_all(&buf[..read]).map_err(|e| {
+            i18n::fill(i18n::t(lang, Key::SetupWriteFileFailed), &[&e.to_string()])
+        })?;
         hasher.update(&buf[..read]);
         done += read as u64;
 
@@ -1114,7 +1167,7 @@ fn download_inner(
     }
 
     file.flush()
-        .map_err(|e| format!("не удалось дописать файл: {e}"))?;
+        .map_err(|e| i18n::fill(i18n::t(lang, Key::SetupFlushFailed), &[&e.to_string()]))?;
     send_progress(tx, notify, done, total, started);
 
     Ok(hasher.finish())
@@ -1139,16 +1192,17 @@ fn send_progress(tx: &Sender<Event>, notify: &impl Fn(), done: u64, total: u64, 
 }
 
 /// Сообщения ureq рассчитаны на разработчика — переводим на человеческий.
-fn human_net_error(err: &ureq::Error) -> String {
-    let detail = err.to_string();
+fn human_net_error(err: &ureq::Error, lang: Lang) -> String {
     match err {
-        ureq::Error::StatusCode(code) => {
-            format!("сервер ответил кодом {code}")
-        }
-        ureq::Error::Timeout(_) => {
-            "истекло время ожидания. Проверьте подключение к интернету".into()
-        }
-        _ => format!("нет связи с сервером ({detail})"),
+        ureq::Error::StatusCode(code) => i18n::fill(
+            i18n::t(lang, Key::NetStatusCode),
+            &[&code.to_string()],
+        ),
+        ureq::Error::Timeout(_) => i18n::t(lang, Key::NetTimeout).to_owned(),
+        _ => i18n::fill(
+            i18n::t(lang, Key::NetNoConnection),
+            &[&err.to_string()],
+        ),
     }
 }
 
@@ -1179,7 +1233,13 @@ fn human_net_error(err: &ureq::Error) -> String {
 ///
 /// На русской Windows (кодовая страница 1251) ошибка не воспроизводится,
 /// поэтому руками её не поймать — только тестом ниже.
-fn extract(dir: &Path, archive_name: &str, strip: u8, members: &[&str]) -> Result<(), String> {
+fn extract(
+    dir: &Path,
+    archive_name: &str,
+    strip: u8,
+    members: &[&str],
+    lang: Lang,
+) -> Result<(), String> {
     let mut cmd = Command::new(tar_program());
     cmd.current_dir(dir)
         .arg("-xf")
@@ -1202,9 +1262,9 @@ fn extract(dir: &Path, archive_name: &str, strip: u8, members: &[&str]) -> Resul
     crate::engine::ytdlp::hide_console(&mut cmd);
 
     let output = cmd.output().map_err(|e| {
-        format!(
-            "не удалось запустить {} для распаковки: {e}",
-            tar_program().display()
+        i18n::fill(
+            i18n::t(lang, Key::TarLaunchFailed),
+            &[&tar_program().display().to_string(), &e.to_string()],
         )
     })?;
 
@@ -1213,15 +1273,13 @@ fn extract(dir: &Path, archive_name: &str, strip: u8, members: &[&str]) -> Resul
         // Самая частая поломка на минимальных сборках Linux: GNU tar зовёт
         // внешний xz, а пакета с ним в системе нет.
         if stderr.contains("xz") && stderr.contains("Cannot exec") {
-            return Err(
-                "не найдена программа xz, нужная для распаковки. Установите пакет xz-utils".into(),
-            );
+            return Err(i18n::t(lang, Key::TarNoXz).into());
         }
         let tail = stderr.lines().next_back().unwrap_or("").trim();
         return Err(if tail.is_empty() {
-            "tar не смог распаковать архив".into()
+            i18n::t(lang, Key::TarFailed).into()
         } else {
-            format!("tar не смог распаковать архив: {tail}")
+            i18n::fill(i18n::t(lang, Key::TarFailedWithTail), &[tail])
         });
     }
 
@@ -1278,28 +1336,32 @@ fn binary_tmp_name(name: &str) -> String {
 /// Качаем во временный файл и переименовываем: оборванная на середине
 /// загрузка иначе оставила бы обрубок, который `locate()` нашёл бы как
 /// готовый инструмент — `is_file()` не отличает целый файл от битого.
-fn replace(from: &Path, to: &Path) -> Result<(), String> {
+fn replace(from: &Path, to: &Path, lang: Lang) -> Result<(), String> {
     if to.exists() {
         let _ = fs::remove_file(to);
     }
     fs::rename(from, to).map_err(|e| {
-        format!(
-            "не удалось переместить файл в {}: {e}",
-            to.display()
+        i18n::fill(
+            i18n::t(lang, Key::SetupMoveFailed),
+            &[&to.display().to_string(), &e.to_string()],
         )
     })
 }
 
 #[cfg(unix)]
-fn make_executable(path: &Path) -> Result<(), String> {
+fn make_executable(path: &Path, lang: Lang) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o755))
-        .map_err(|e| format!("не удалось сделать файл исполняемым: {e}"))
+        .map_err(|e| i18n::fill(i18n::t(lang, Key::SetupChmodFailed), &[&e.to_string()]))
 }
 
 /// На Windows бит исполняемости не нужен — право на запуск определяется ACL.
+///
+/// `lang` здесь не нужен и потому подчёркнут: у пары `#[cfg]` обязаны
+/// совпадать сигнатуры, иначе вызывающая сторона перестанет собираться
+/// на одной из систем — а проверит это только CI.
 #[cfg(windows)]
-fn make_executable(_path: &Path) -> Result<(), String> {
+fn make_executable(_path: &Path, _lang: Lang) -> Result<(), String> {
     Ok(())
 }
 
@@ -1434,8 +1496,14 @@ mod tests {
         fs::create_dir_all(&out).expect("создать каталог назначения");
         fs::rename(ascii_root.join(ARCHIVE), out.join(ARCHIVE)).expect("перенести архив");
 
-        extract(&out, ARCHIVE, 2, &["*/bin/ffmpeg-test", "*/bin/ffprobe-test"])
-            .expect("распаковка обязана пройти");
+        extract(
+            &out,
+            ARCHIVE,
+            2,
+            &["*/bin/ffmpeg-test", "*/bin/ffprobe-test"],
+            Lang::Ru,
+        )
+        .expect("распаковка обязана пройти");
 
         assert!(out.join("ffmpeg-test").is_file(), "ffmpeg не распакован");
         assert!(out.join("ffprobe-test").is_file(), "ffprobe не распакован");
@@ -1464,7 +1532,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let cancelled = AtomicBool::new(false);
 
-        let result = install_ytdlp(&agent(), &dir, &tx, &|| {}, &cancelled);
+        let result = install_ytdlp(&agent(), &dir, Lang::Ru, &tx, &|| {}, &cancelled);
         drop(tx);
         for event in rx.iter() {
             if let Event::Log(line) = event {
@@ -1502,7 +1570,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let cancelled = AtomicBool::new(false);
 
-        let result = install_ffmpeg(&agent(), &dir, &tx, &|| {}, &cancelled);
+        let result = install_ffmpeg(&agent(), &dir, Lang::Ru, &tx, &|| {}, &cancelled);
         drop(tx);
         let mut log = Vec::new();
         for event in rx.iter() {
@@ -1620,26 +1688,36 @@ mod tests {
     fn decline_names_the_right_tool() {
         let path = Path::new("/usr/bin/tool");
 
-        let ytdlp = declined(Component::Ytdlp, path, Origin::System);
-        assert!(ytdlp.contains("yt-dlp"), "не назван yt-dlp: {ytdlp}");
-        assert!(!ytdlp.contains("ffmpeg"), "совет про чужую программу: {ytdlp}");
-        assert!(ytdlp.contains(YTDLP_SYSTEM_HINT), "нет команды обновления");
+        // На всех трёх языках: перепутать программы можно и в переводе,
+        // а там это заметить некому.
+        for lang in Lang::ALL {
+            let ytdlp = declined(Component::Ytdlp, path, Origin::System, lang);
+            assert!(ytdlp.contains("yt-dlp"), "не назван yt-dlp: {ytdlp}");
+            assert!(!ytdlp.contains("ffmpeg"), "совет про чужую программу: {ytdlp}");
+            assert!(
+                ytdlp.contains(system_hint(Component::Ytdlp, lang)),
+                "{lang:?}: нет команды обновления"
+            );
 
-        let ffmpeg = declined(Component::Ffmpeg, path, Origin::System);
-        assert!(ffmpeg.contains("ffmpeg"), "не назван ffmpeg: {ffmpeg}");
-        assert!(
-            !ffmpeg.contains("yt-dlp"),
-            "совет про чужую программу: {ffmpeg}"
-        );
-        assert!(ffmpeg.contains(FFMPEG_SYSTEM_HINT), "нет команды обновления");
+            let ffmpeg = declined(Component::Ffmpeg, path, Origin::System, lang);
+            assert!(ffmpeg.contains("ffmpeg"), "не назван ffmpeg: {ffmpeg}");
+            assert!(
+                !ffmpeg.contains("yt-dlp"),
+                "совет про чужую программу: {ffmpeg}"
+            );
+            assert!(
+                ffmpeg.contains(system_hint(Component::Ffmpeg, lang)),
+                "{lang:?}: нет команды обновления"
+            );
 
-        // Путь обязателен в обоих случаях: без него «установлен в системе»
-        // проверить нечем.
-        for text in [
-            declined(Component::Ytdlp, path, Origin::Portable),
-            declined(Component::Ffmpeg, path, Origin::Portable),
-        ] {
-            assert!(text.contains("tool"), "потерян путь к файлу: {text}");
+            // Путь обязателен в обоих случаях: без него «установлен в системе»
+            // проверить нечем.
+            for text in [
+                declined(Component::Ytdlp, path, Origin::Portable, lang),
+                declined(Component::Ffmpeg, path, Origin::Portable, lang),
+            ] {
+                assert!(text.contains("tool"), "потерян путь к файлу: {text}");
+            }
         }
     }
 
@@ -1651,16 +1729,23 @@ mod tests {
     /// только после удачного обновления. Отсюда проверка машинно.
     #[test]
     fn update_summary_names_both_versions_without_an_arrow() {
-        let updated = update_summary("ffmpeg", Some("8.1.2"), "N-125829", "");
+        let updated = update_summary("ffmpeg", Some("8.1.2"), "N-125829", "", Lang::Ru);
         assert!(updated.contains("8.1.2"), "потеряна прежняя версия");
         assert!(updated.contains("N-125829"), "потеряна новая версия");
 
-        let same = update_summary("ffmpeg", Some("N-125829"), "N-125829", " Оговорка.");
+        let same = update_summary("ffmpeg", Some("N-125829"), "N-125829", " Оговорка.", Lang::Ru);
         assert!(same.contains("уже последней"), "не сказано, что менять нечего");
         assert!(same.contains("Оговорка."), "потеряна оговорка");
 
+        // Обе версии обязаны доезжать до текста на любом языке: потерянный
+        // номер превращает итог обновления в «что-то произошло».
+        for lang in Lang::ALL {
+            let text = update_summary("ffmpeg", Some("8.1.2"), "N-125829", "", lang);
+            assert!(text.contains("8.1.2") && text.contains("N-125829"), "{lang:?}: {text}");
+        }
+
         // Первая установка своей копии — обещать «обновлено с …» нечестно.
-        let first = update_summary("yt-dlp", None, "2026.07.04", "");
+        let first = update_summary("yt-dlp", None, "2026.07.04", "", Lang::Ru);
         assert!(first.contains("установлен"), "первая установка названа обновлением");
         assert!(first.contains("2026.07.04"), "потеряна версия");
 

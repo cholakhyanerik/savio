@@ -47,6 +47,7 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::i18n::{self, Key, Lang};
 use crate::model::{Event, ShareAddress, ShareEvent, TransferDirection};
 
 /// Страница для телефона. Одна, со встроенными стилями и скриптом: всё,
@@ -223,9 +224,21 @@ struct Server {
     dir: PathBuf,
     tx: Sender<Event>,
     notify: Arc<dyn Fn() + Send + Sync>,
+    /// На каком языке говорить и с окном, и с телефоном.
+    ///
+    /// Телефон отвечает тем же языком, что и окно, намеренно: это один и тот
+    /// же человек, и разводить его устройства по языкам было бы странностью
+    /// без причины. Поле, а не аргумент: язык у идущей раздачи не меняется —
+    /// `SavioApp` перезапускает её при смене языка.
+    lang: Lang,
 }
 
 impl Server {
+    /// Короткий доступ к строке на языке раздачи.
+    fn text(&self, key: Key) -> &'static str {
+        i18n::t(self.lang, key)
+    }
+
     fn send(&self, event: ShareEvent) {
         // Приёмник умер — экран закрыли. Работать больше не на кого, но
         // решает это не отправка, а флаг остановки: `on_exit` и уход с экрана
@@ -239,7 +252,12 @@ impl Server {
 /// Запускает раздачу папки `dir` в отдельном потоке.
 ///
 /// Первым событием приходит `Ready` с адресами или `Stopped` с причиной.
-pub fn start(dir: PathBuf, tx: Sender<Event>, notify: impl Fn() + Send + Sync + 'static) -> Handle {
+pub fn start(
+    dir: PathBuf,
+    lang: Lang,
+    tx: Sender<Event>,
+    notify: impl Fn() + Send + Sync + 'static,
+) -> Handle {
     start_with(
         Listen {
             bind: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
@@ -247,6 +265,7 @@ pub fn start(dir: PathBuf, tx: Sender<Event>, notify: impl Fn() + Send + Sync + 
             find: find_addresses,
         },
         dir,
+        lang,
         tx,
         notify,
     )
@@ -263,6 +282,7 @@ struct Listen {
 fn start_with(
     listen: Listen,
     dir: PathBuf,
+    lang: Lang,
     tx: Sender<Event>,
     notify: impl Fn() + Send + Sync + 'static,
 ) -> Handle {
@@ -272,6 +292,7 @@ fn start_with(
         dir,
         tx,
         notify: Arc::new(notify),
+        lang,
     });
 
     std::thread::spawn(move || serve(&server, &listen));
@@ -282,9 +303,7 @@ fn start_with(
 fn serve(server: &Arc<Server>, listen: &Listen) {
     let Some((listener, port)) = bind(listen.bind, listen.ports) else {
         server.send(ShareEvent::Stopped(
-            "Не удалось открыть порт для раздачи: все подходящие заняты другими \
-             программами. Закройте лишнее и попробуйте ещё раз."
-                .to_owned(),
+            server.text(Key::SharePortsBusy).to_owned(),
         ));
         return;
     };
@@ -305,10 +324,7 @@ fn serve(server: &Arc<Server>, listen: &Listen) {
     let addresses = (listen.find)(port, &server.shared.key);
     if addresses.is_empty() {
         server.send(ShareEvent::Stopped(
-            "У компьютера нет адреса в локальной сети — телефону некуда \
-             подключаться. Проверьте, что компьютер подключён к Wi-Fi или \
-             кабелем к роутеру."
-                .to_owned(),
+            server.text(Key::ShareNoLocalAddress).to_owned(),
         ));
         return;
     }
@@ -332,7 +348,12 @@ fn serve(server: &Arc<Server>, listen: &Listen) {
         if server.shared.active.load(Ordering::SeqCst) >= CONNECTION_LIMIT {
             let mut stream = stream;
             let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-            let _ = respond_text(&mut stream, 503, "Слишком много подключений. Попробуйте через минуту.", false);
+            let _ = respond_text(
+                &mut stream,
+                503,
+                i18n::t(server.lang, Key::ShareTooManyConnections),
+                false,
+            );
             continue;
         }
         server.shared.active.fetch_add(1, Ordering::SeqCst);
@@ -382,14 +403,14 @@ fn connection(server: &Server, stream: TcpStream) {
         Ok(Some(text)) => match parse_head(&text) {
             Ok(head) => route(server, &head, &mut reader, &mut writer, peer),
             Err(status) => {
-                let _ = respond_text(&mut writer, status, "Запрос не разобран.", false);
+                let _ = respond_text(&mut writer, status, server.text(Key::ShareBadRequest), false);
             }
         },
         // Подключились и ушли, ничего не спросив. Так ведут себя браузеры,
         // заранее открывающие подключение «про запас», и наш же будильник.
         Ok(None) => return,
         Err(status) => {
-            let _ = respond_text(&mut writer, status, "Запрос не разобран.", false);
+            let _ = respond_text(&mut writer, status, server.text(Key::ShareBadRequest), false);
         }
     }
 
@@ -453,7 +474,7 @@ fn route(
 ) {
     let (raw_path, query) = split_target(&head.target);
     let Some(path) = percent_decode(raw_path) else {
-        let _ = respond_text(writer, 400, "Адрес не разобран.", false);
+        let _ = respond_text(writer, 400, server.text(Key::ShareBadPath), false);
         return;
     };
     let head_only = head.method == "HEAD";
@@ -462,7 +483,7 @@ fn route(
     // Значок вкладки браузер просит сам и без ключа. Отвечать на это отказом
     // «ссылка устарела» было бы неправдой.
     if path == "/favicon.ico" {
-        let _ = respond_text(writer, 404, "Нет.", head_only);
+        let _ = respond_text(writer, 404, server.text(Key::ShareNothingHere), head_only);
         return;
     }
 
@@ -471,18 +492,18 @@ fn route(
         let _ = respond(
             writer,
             Reply::new(403, "text/html; charset=utf-8", head_only),
-            STALE_PAGE.as_bytes(),
+            stale_page(server.lang).as_bytes(),
         );
         return;
     }
 
     if path == "/" {
         if !reading {
-            let _ = respond_text(writer, 405, "Так нельзя.", head_only);
+            let _ = respond_text(writer, 405, server.text(Key::ShareMethodNotAllowed), head_only);
             return;
         }
         if let Some(peer) = peer {
-            let device = device_name(head.header("user-agent").unwrap_or_default());
+            let device = device_name(head.header("user-agent").unwrap_or_default(), server.lang);
             server.send(ShareEvent::Visitor(format!("{device} · {}", peer.ip())));
         }
         let reply = Reply::new(200, "text/html; charset=utf-8", head_only).header(
@@ -490,10 +511,10 @@ fn route(
             "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; \
              img-src 'self' blob:; media-src 'self'",
         );
-        let _ = respond(writer, reply, PAGE.as_bytes());
+        let _ = respond(writer, reply, page(server.lang).as_bytes());
     } else if path == "/api/files" {
         if !reading {
-            let _ = respond_text(writer, 405, "Так нельзя.", head_only);
+            let _ = respond_text(writer, 405, server.text(Key::ShareMethodNotAllowed), head_only);
             return;
         }
         let body = list_files(&server.dir).to_string();
@@ -504,29 +525,89 @@ fn route(
         );
     } else if let Some(name) = path.strip_prefix("/files/") {
         if !reading {
-            let _ = respond_text(writer, 405, "Так нельзя.", head_only);
+            let _ = respond_text(writer, 405, server.text(Key::ShareMethodNotAllowed), head_only);
             return;
         }
         let download = query_param(query, "dl").is_some();
         send_file(server, head, name, download, head_only, writer);
     } else if let Some(name) = path.strip_prefix("/upload/") {
         if head.method != "PUT" {
-            let _ = respond_text(writer, 405, "Так нельзя.", head_only);
+            let _ = respond_text(writer, 405, server.text(Key::ShareMethodNotAllowed), head_only);
             return;
         }
         receive_file(server, head, name, reader, writer);
     } else {
-        let _ = respond_text(writer, 404, "Такой страницы нет.", head_only);
+        let _ = respond_text(writer, 404, server.text(Key::ShareNoSuchPage), head_only);
     }
 }
 
 /// Что показать тому, кто пришёл без ключа или со старым.
-const STALE_PAGE: &str = "<!doctype html><meta charset=utf-8>\
-<meta name=viewport content=\"width=device-width,initial-scale=1\">\
-<title>Savio</title>\
-<body style=\"font:17px system-ui,sans-serif;background:#100e0c;color:#f9f4ed;padding:24px\">\
-<h1 style=\"font-size:22px\">Ссылка устарела</h1>\
-<p>Откройте адрес заново из окна Savio — ключ в нём меняется при каждом запуске раздачи.</p>";
+///
+/// Своя крошечная разметка, а не `PAGE`: на той странице живёт скрипт, а
+/// объяснять человеку тут нечего, кроме двух строк.
+fn stale_page(lang: Lang) -> String {
+    format!(
+        "<!doctype html><html lang=\"{}\"><meta charset=utf-8>\
+         <meta name=viewport content=\"width=device-width,initial-scale=1\">\
+         <title>Savio</title>\
+         <body style=\"font:17px system-ui,sans-serif;background:#100e0c;\
+         color:#f9f4ed;padding:24px\">\
+         <h1 style=\"font-size:22px\">{}</h1><p>{}</p>",
+        i18n::t(lang, Key::PageLangTag),
+        i18n::t(lang, Key::ShareStaleTitle),
+        i18n::t(lang, Key::ShareStaleNote),
+    )
+}
+
+/// Места подстановки в [`PAGE`] и что в них кладётся.
+///
+/// Подстановка, а не три файла разметки: страница одна, а разъехаться трём
+/// её копиям — вопрос первой же правки вёрстки. Токены вида `{{Имя}}`
+/// в самой разметке больше нигде не встречаются, и это проверяет тест:
+/// забытый токен виден на телефоне как `{{Имя}}` — молча и только у того,
+/// кто открыл страницу.
+const PAGE_SLOTS: [(&str, Key); 31] = [
+    ("{{LangTag}}", Key::PageLangTag),
+    ("{{LocaleTag}}", Key::PageLocaleTag),
+    ("{{Title}}", Key::PageTitle),
+    ("{{Subtitle}}", Key::PageSubtitle),
+    ("{{StaleTitle}}", Key::ShareStaleTitle),
+    ("{{StaleNote}}", Key::ShareStaleNote),
+    ("{{ToComputer}}", Key::TransferToComputer),
+    ("{{UploadNote}}", Key::PageUploadNote),
+    ("{{PickFiles}}", Key::PagePickFiles),
+    ("{{IosNote}}", Key::PageIosNote),
+    ("{{AwakeNote}}", Key::PageAwakeNote),
+    ("{{FromComputer}}", Key::PageFromComputer),
+    ("{{Refresh}}", Key::PageRefresh),
+    ("{{LoadingList}}", Key::PageLoadingList),
+    ("{{Offline}}", Key::PageOffline),
+    ("{{ByteUnits}}", Key::PageByteUnits),
+    ("{{PerSecond}}", Key::UnitPerSecond),
+    ("{{AmountOfTotal}}", Key::AmountOfTotal),
+    ("{{Queued}}", Key::PageQueued),
+    ("{{Sending}}", Key::PageSending),
+    ("{{DoneWithSize}}", Key::PageDoneWithSize),
+    ("{{SavedAs}}", Key::PageSavedAs),
+    ("{{NotAccepted}}", Key::PageNotAccepted),
+    ("{{TransferBroke}}", Key::PageTransferBroke),
+    ("{{SendAgain}}", Key::PageSendAgain),
+    ("{{ListFailedRetry}}", Key::PageListFailedRetry),
+    ("{{ListFailed}}", Key::PageListFailed),
+    ("{{FolderContents}}", Key::PageFolderContents),
+    ("{{FolderEmpty}}", Key::PageFolderEmpty),
+    ("{{Open}}", Key::PageOpen),
+    ("{{Download}}", Key::PageDownload),
+];
+
+/// Страница для телефона на выбранном языке.
+fn page(lang: Lang) -> String {
+    let mut out = PAGE.to_owned();
+    for (slot, key) in PAGE_SLOTS {
+        out = out.replace(slot, i18n::t(lang, key));
+    }
+    out
+}
 
 // ---------------------------------------------------------------------------
 // Список, отдача и приём файлов
@@ -612,15 +693,15 @@ fn send_file(
     writer: &mut TcpStream,
 ) {
     let Some(path) = resolve(&server.dir, name) else {
-        let _ = respond_text(writer, 404, "Такого файла в папке раздачи нет.", head_only);
+        let _ = respond_text(writer, 404, server.text(Key::ShareNoSuchFile), head_only);
         return;
     };
     let Ok(mut file) = File::open(&path) else {
-        let _ = respond_text(writer, 404, "Файл не открылся.", head_only);
+        let _ = respond_text(writer, 404, server.text(Key::ShareFileNotOpened), head_only);
         return;
     };
     let Ok(len) = file.metadata().map(|meta| meta.len()) else {
-        let _ = respond_text(writer, 500, "Размер файла не узнать.", head_only);
+        let _ = respond_text(writer, 500, server.text(Key::ShareSizeUnknown), head_only);
         return;
     };
 
@@ -678,18 +759,15 @@ fn send_file(
         }
         Err(broken) => {
             if reported {
-                let message = if server.shared.stopped() {
-                    format!("Раздача остановлена — «{name}» не передан до конца.")
+                let key = if server.shared.stopped() {
+                    Key::ShareStoppedSending
                 } else {
                     match broken {
-                        Broken::Read | Broken::Short => {
-                            format!("«{name}» не прочитался с диска до конца.")
-                        }
-                        Broken::Write(_) | Broken::Stopped => {
-                            format!("Передача «{name}» на телефон оборвалась: телефон перестал принимать.")
-                        }
+                        Broken::Read | Broken::Short => Key::ShareReadFailed,
+                        Broken::Write(_) | Broken::Stopped => Key::SharePhoneStoppedReceiving,
                     }
                 };
+                let message = i18n::fill(server.text(key), &[name]);
                 server.send(ShareEvent::Failed { id, message });
             }
         }
@@ -704,19 +782,19 @@ fn receive_file(
     writer: &mut TcpStream,
 ) {
     let Some(name) = clean_name(raw_name) else {
-        let _ = respond_text(writer, 400, "У файла нет имени.", false);
+        let _ = respond_text(writer, 400, server.text(Key::ShareNoFileName), false);
         return;
     };
     // Кусочную передачу браузер для файла с известным размером не выбирает,
     // а принимать тело неизвестной длины — значит не знать, дошло ли оно.
     if head.header("transfer-encoding").is_some() {
-        let _ = respond_text(writer, 411, "Нужна длина файла.", false);
+        let _ = respond_text(writer, 411, server.text(Key::ShareNeedLength), false);
         return;
     }
     let len = match head.content_length {
         Some(len) => len,
         None => {
-            let _ = respond_text(writer, 411, "Нужна длина файла.", false);
+            let _ = respond_text(writer, 411, server.text(Key::ShareNeedLength), false);
             return;
         }
     };
@@ -726,12 +804,12 @@ fn receive_file(
     let mut file = match OpenOptions::new().write(true).create_new(true).open(&temp) {
         Ok(file) => file,
         Err(error) => {
-            let message = format!(
-                "Не удалось принять «{name}»: в папку раздачи нельзя записать ({error}). \
-                 Выберите другую папку."
+            let message = i18n::fill(
+                server.text(Key::ShareCannotAcceptDir),
+                &[&name, &error.to_string()],
             );
             server.send(ShareEvent::Failed { id, message });
-            let _ = respond_text(writer, 500, "Компьютер не может записать файл в папку.", false);
+            let _ = respond_text(writer, 500, server.text(Key::ShareCannotWriteDir), false);
             return;
         }
     };
@@ -751,25 +829,27 @@ fn receive_file(
     if let Err(broken) = pumped {
         let _ = fs::remove_file(&temp);
         let message = if server.shared.stopped() {
-            format!("Раздача остановлена — «{name}» не принят и не сохранён.")
+            i18n::fill(server.text(Key::ShareStoppedReceiving), &[&name])
         } else {
             match broken {
                 Broken::Write(error) if error.kind() == io::ErrorKind::StorageFull => {
-                    format!("Не хватило места на диске — «{name}» не сохранён.")
+                    i18n::fill(server.text(Key::ShareDiskFull), &[&name])
                 }
-                Broken::Write(error) => format!("Не удалось записать «{name}»: {error}."),
-                Broken::Read | Broken::Short | Broken::Stopped => format!(
-                    "Передача «{name}» оборвалась: телефон перестал отправлять. \
-                     Файл не сохранён — отправьте его ещё раз."
+                Broken::Write(error) => i18n::fill(
+                    server.text(Key::ShareWriteFailed),
+                    &[&name, &error.to_string()],
                 ),
+                Broken::Read | Broken::Short | Broken::Stopped => {
+                    i18n::fill(server.text(Key::SharePhoneStoppedSending), &[&name])
+                }
             }
         };
         server.send(ShareEvent::Failed { id, message });
-        let _ = respond_text(writer, 500, "Файл не принят.", false);
+        let _ = respond_text(writer, 500, server.text(Key::ShareFileRejected), false);
         return;
     }
 
-    match place(&server.dir, &name, &temp) {
+    match place(&server.dir, &name, &temp, server.lang) {
         Ok(saved) => {
             server.send(ShareEvent::Finished { id, name: saved.clone() });
             let body = serde_json::json!({ "name": saved }).to_string();
@@ -783,9 +863,12 @@ fn receive_file(
             let _ = fs::remove_file(&temp);
             server.send(ShareEvent::Failed {
                 id,
-                message: format!("«{name}» принят, но не лёг в папку: {error}."),
+                message: i18n::fill(
+                    server.text(Key::ShareNotMoved),
+                    &[&name, &error.to_string()],
+                ),
             });
-            let _ = respond_text(writer, 500, "Файл не сохранён.", false);
+            let _ = respond_text(writer, 500, server.text(Key::ShareFileNotSaved), false);
         }
     }
 }
@@ -796,7 +879,7 @@ fn receive_file(
 /// два телефона, одновременно отправившие «IMG_0001.jpg», получат «(2)»
 /// и «(3)», а не затрут друг друга. Потом временный файл переезжает поверх
 /// занятого места: `rename` заменяет файл и на Windows, и на Unix.
-fn place(dir: &Path, name: &str, temp: &Path) -> io::Result<String> {
+fn place(dir: &Path, name: &str, temp: &Path, lang: Lang) -> io::Result<String> {
     for n in 1..=999 {
         let candidate = numbered(name, n);
         let target = dir.join(&candidate);
@@ -814,7 +897,7 @@ fn place(dir: &Path, name: &str, temp: &Path) -> io::Result<String> {
             Err(error) => return Err(error),
         }
     }
-    Err(io::Error::other("все имена от «(2)» до «(999)» уже заняты"))
+    Err(io::Error::other(i18n::t(lang, Key::ShareNamesExhausted)))
 }
 
 /// Удаляет недопринятые файлы, оставшиеся от прошлой раздачи.
@@ -1359,7 +1442,9 @@ fn generate_key() -> String {
 
 /// Что за устройство, по `User-Agent`. Порядок важен: у iPad в строке есть
 /// «Mac», у Android — «Linux».
-fn device_name(agent: &str) -> &'static str {
+/// Имена систем — названия, а не слова: «Android» и «Windows» одинаковы на
+/// любом языке. Перевода просит только подпись «неизвестно какое».
+fn device_name(agent: &str, lang: Lang) -> &'static str {
     const KNOWN: [(&str, &str); 7] = [
         ("iPhone", "iPhone"),
         ("iPad", "iPad"),
@@ -1372,7 +1457,10 @@ fn device_name(agent: &str) -> &'static str {
     KNOWN
         .iter()
         .find(|(mark, _)| agent.contains(mark))
-        .map_or("Устройство", |(_, name)| name)
+        .map_or_else(
+            || i18n::t(lang, Key::ShareUnknownDevice),
+            |(_, name)| *name,
+        )
 }
 
 /// Адреса компьютера в своей сети, самый вероятный первым.

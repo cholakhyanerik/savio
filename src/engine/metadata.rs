@@ -31,6 +31,7 @@ use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use crate::i18n::{self, Key, Lang};
 use crate::model::{MetaKind, Tag, meta_kind};
 
 /// Сколько байт значения показываем. XMP-пакет занимает килобайты, и целиком
@@ -51,44 +52,47 @@ const IFD_ENTRY_LIMIT: usize = 512;
 /// `ffprobe` нужен только для MP3: у него мы спрашиваем битрейт и длительность,
 /// которых в самих тегах нет. Без него теги всё равно прочитаются — разбором
 /// ID3 напрямую, просто без технической справки.
-pub fn read(path: &Path, ffprobe: Option<&Path>) -> Result<Vec<Tag>, String> {
+pub fn read(path: &Path, ffprobe: Option<&Path>, lang: Lang) -> Result<Vec<Tag>, String> {
     let kind = meta_kind(path);
     if !kind.readable() {
-        return Err(unsupported_message(kind));
+        return Err(unsupported_message(kind, lang));
     }
 
     match kind {
-        MetaKind::Mp3 => read_mp3(path, ffprobe),
+        MetaKind::Mp3 => read_mp3(path, ffprobe, lang),
         _ => {
-            let data = read_file(path)?;
+            let data = read_file(path, lang)?;
             match kind {
-                MetaKind::Jpeg => read_jpeg(&data),
-                MetaKind::Png => read_png(&data),
-                MetaKind::WebP => read_webp(&data),
-                MetaKind::Gif => read_gif(&data),
-                MetaKind::Tiff => Ok(read_tiff(&data)),
+                MetaKind::Jpeg => read_jpeg(&data, lang),
+                MetaKind::Png => read_png(&data, lang),
+                MetaKind::WebP => read_webp(&data, lang),
+                MetaKind::Gif => read_gif(&data, lang),
+                MetaKind::Tiff => Ok(read_tiff(&data, lang)),
                 MetaKind::Mp3 | MetaKind::Video | MetaKind::Unsupported => unreachable!(),
             }
         }
     }
 }
 
-pub fn unsupported_message(kind: MetaKind) -> String {
-    match kind {
-        MetaKind::Video => "Очистка видео временно не поддерживается.".into(),
-        MetaKind::Tiff => {
-            "Для TIFF доступно только чтение: удалить теги, не пересобрав файл целиком, \
-             нельзя, а пересборка рискует испортить снимок."
-                .into()
-        }
-        _ => "Этот формат не поддерживается. Выберите MP3 или изображение \
-              (JPG, PNG, WebP, GIF)."
-            .into(),
-    }
+pub fn unsupported_message(kind: MetaKind, lang: Lang) -> String {
+    i18n::t(
+        lang,
+        match kind {
+            MetaKind::Video => Key::MetaVideoUnsupported,
+            MetaKind::Tiff => Key::MetaTiffReadOnly,
+            _ => Key::MetaFormatUnsupported,
+        },
+    )
+    .to_owned()
 }
 
-fn read_file(path: &Path) -> Result<Vec<u8>, String> {
-    std::fs::read(path).map_err(|e| format!("Не удалось прочитать файл: {e}"))
+/// Ошибка от системы, пересказанная человеку: `{}` — её собственный текст.
+fn trouble(key: Key, lang: Lang, err: impl std::fmt::Display) -> String {
+    i18n::fill(i18n::t(lang, key), &[&err.to_string()])
+}
+
+fn read_file(path: &Path, lang: Lang) -> Result<Vec<u8>, String> {
+    std::fs::read(path).map_err(|e| trouble(Key::MetaReadFileFailed, lang, e))
 }
 
 // ---------------------------------------------------------------------------
@@ -109,9 +113,10 @@ struct Segment {
 /// Возвращает список сегментов и смещение, с которого начинается `SOS`
 /// (сжатое изображение). Всё от `SOS` и до конца файла при очистке копируется
 /// дословно: там лежат сами пиксели, и разбирать их нам незачем.
-fn jpeg_segments(data: &[u8]) -> Result<(Vec<Segment>, usize), String> {
+fn jpeg_segments(data: &[u8], lang: Lang) -> Result<(Vec<Segment>, usize), String> {
+    let broken = |key| i18n::t(lang, key).to_owned();
     if data.len() < 4 || data[0] != 0xFF || data[1] != 0xD8 {
-        return Err("Это не JPEG: файл не начинается с сигнатуры JPEG.".into());
+        return Err(broken(Key::MetaNotJpeg));
     }
 
     let mut segments = Vec::new();
@@ -140,14 +145,15 @@ fn jpeg_segments(data: &[u8]) -> Result<(Vec<Segment>, usize), String> {
             return Ok((segments, pos));
         }
 
-        let len = be_u16(data, pos + 2).ok_or("JPEG повреждён: обрыв на длине сегмента.")? as usize;
+        let len =
+            be_u16(data, pos + 2).ok_or_else(|| broken(Key::MetaJpegLengthBroken))? as usize;
         if len < 2 {
-            return Err("JPEG повреждён: сегмент нулевой длины.".into());
+            return Err(broken(Key::MetaJpegZeroSegment));
         }
         let body = pos + 4;
         let end = pos + 2 + len;
         if end > data.len() {
-            return Err("JPEG повреждён: сегмент выходит за конец файла.".into());
+            return Err(broken(Key::MetaJpegSegmentOverrun));
         }
 
         segments.push(Segment {
@@ -174,8 +180,8 @@ fn jpeg_is_metadata(marker: u8) -> bool {
     marker == 0xE1 || (0xE3..=0xED).contains(&marker) || marker == 0xEF || marker == 0xFE
 }
 
-fn read_jpeg(data: &[u8]) -> Result<Vec<Tag>, String> {
-    let (segments, _) = jpeg_segments(data)?;
+fn read_jpeg(data: &[u8], lang: Lang) -> Result<Vec<Tag>, String> {
+    let (segments, _) = jpeg_segments(data, lang)?;
     let mut tags = Vec::new();
 
     for seg in &segments {
@@ -183,16 +189,21 @@ fn read_jpeg(data: &[u8]) -> Result<Vec<Tag>, String> {
         match seg.marker {
             0xE1 => {
                 if let Some(exif) = body.strip_prefix(b"Exif\x00\x00") {
-                    tags.extend(read_tiff(exif));
+                    tags.extend(read_tiff(exif, lang));
                 } else if body.starts_with(b"http://ns.adobe.com/xap/1.0/\x00") {
-                    tags.push(Tag::new("XMP", format!("присутствует, {} Б", body.len())));
+                    tags.push(Tag::new("XMP", present_bytes(body.len(), lang)));
                 }
             }
+            // «IPTC / Photoshop» — названия форматов, а не слова: переводу
+            // они не подлежат.
             0xED => tags.push(Tag::new(
                 "IPTC / Photoshop",
-                format!("присутствует, {} Б", body.len()),
+                present_bytes(body.len(), lang),
             )),
-            0xFE => tags.push(Tag::new("Комментарий", text_value(body))),
+            0xFE => tags.push(Tag::new(
+                i18n::t(lang, Key::TagComment),
+                text_value(body),
+            )),
             _ => {}
         }
     }
@@ -200,8 +211,14 @@ fn read_jpeg(data: &[u8]) -> Result<Vec<Tag>, String> {
     Ok(tags)
 }
 
-fn strip_jpeg(data: &[u8]) -> Result<Vec<u8>, String> {
-    let (segments, sos) = jpeg_segments(data)?;
+/// «присутствует, 4096 Б» — общее для XMP, IPTC и прочих блоков, которые
+/// показываются фактом наличия, а не содержимым.
+fn present_bytes(len: usize, lang: Lang) -> String {
+    i18n::fill(i18n::t(lang, Key::MetaPresentBytes), &[&len.to_string()])
+}
+
+fn strip_jpeg(data: &[u8], lang: Lang) -> Result<Vec<u8>, String> {
+    let (segments, sos) = jpeg_segments(data, lang)?;
 
     let mut out = Vec::with_capacity(data.len());
     out.extend_from_slice(&data[..2]); // SOI
@@ -244,26 +261,28 @@ const PNG_KEEP: [&[u8; 4]; 14] = [
 /// Обходит чанки PNG, отдавая каждому наблюдателю тип и границы.
 fn png_chunks(
     data: &[u8],
+    lang: Lang,
     mut visit: impl FnMut(&[u8; 4], &[u8], std::ops::Range<usize>),
 ) -> Result<(), String> {
+    let broken = |key| i18n::t(lang, key).to_owned();
     if data.len() < 8 || data[..8] != PNG_SIGNATURE {
-        return Err("Это не PNG: файл не начинается с сигнатуры PNG.".into());
+        return Err(broken(Key::MetaNotPng));
     }
 
     let mut pos = 8;
     while pos + 8 <= data.len() {
-        let len = be_u32(data, pos).ok_or("PNG повреждён: обрыв на длине чанка.")? as usize;
+        let len = be_u32(data, pos).ok_or_else(|| broken(Key::MetaPngLengthBroken))? as usize;
         let kind: [u8; 4] = data[pos + 4..pos + 8]
             .try_into()
-            .map_err(|_| "PNG повреждён: обрыв на типе чанка.")?;
+            .map_err(|_| broken(Key::MetaPngTypeBroken))?;
         let body = pos + 8;
         // 4 байта контрольной суммы после тела.
         let end = body
             .checked_add(len)
             .and_then(|e| e.checked_add(4))
-            .ok_or("PNG повреждён: неправдоподобная длина чанка.")?;
+            .ok_or_else(|| broken(Key::MetaPngImplausibleLength))?;
         if end > data.len() {
-            return Err("PNG повреждён: чанк выходит за конец файла.".into());
+            return Err(broken(Key::MetaPngChunkOverrun));
         }
 
         visit(&kind, &data[body..body + len], pos..end);
@@ -276,9 +295,9 @@ fn png_chunks(
     Ok(())
 }
 
-fn read_png(data: &[u8]) -> Result<Vec<Tag>, String> {
+fn read_png(data: &[u8], lang: Lang) -> Result<Vec<Tag>, String> {
     let mut tags = Vec::new();
-    png_chunks(data, |kind, body, _| match kind {
+    png_chunks(data, lang, |kind, body, _| match kind {
         // tEXt: ключ, ноль, значение — обе части в Latin-1.
         b"tEXt" => {
             let mut parts = body.splitn(2, |b| *b == 0);
@@ -290,17 +309,20 @@ fn read_png(data: &[u8]) -> Result<Vec<Tag>, String> {
         // Распаковывать ради показа незачем — важно, что запись есть.
         b"zTXt" => {
             let key = body.split(|b| *b == 0).next().unwrap_or_default();
-            tags.push(Tag::new(text_value(key), "текст (сжатый)"));
+            tags.push(Tag::new(
+                text_value(key),
+                i18n::t(lang, Key::MetaTextCompressed),
+            ));
         }
         b"iTXt" => {
             let key = body.split(|b| *b == 0).next().unwrap_or_default();
-            tags.push(Tag::new(text_value(key), "текст (UTF-8)"));
+            tags.push(Tag::new(text_value(key), i18n::t(lang, Key::MetaTextUtf8)));
         }
-        b"eXIf" => tags.extend(read_tiff(body)),
+        b"eXIf" => tags.extend(read_tiff(body, lang)),
         b"tIME" if body.len() >= 7 => {
             let y = be_u16(body, 0).unwrap_or(0);
             tags.push(Tag::new(
-                "Изменён",
+                i18n::t(lang, Key::TagModified),
                 format!(
                     "{y:04}-{:02}-{:02} {:02}:{:02}:{:02}",
                     body[2], body[3], body[4], body[5], body[6]
@@ -312,11 +334,11 @@ fn read_png(data: &[u8]) -> Result<Vec<Tag>, String> {
     Ok(tags)
 }
 
-fn strip_png(data: &[u8]) -> Result<Vec<u8>, String> {
+fn strip_png(data: &[u8], lang: Lang) -> Result<Vec<u8>, String> {
     let mut out = Vec::with_capacity(data.len());
     out.extend_from_slice(&PNG_SIGNATURE);
 
-    png_chunks(data, |kind, _, whole| {
+    png_chunks(data, lang, |kind, _, whole| {
         // fdAT — кадры APNG. В списке их нет отдельной строкой только потому,
         // что проверять префикс дешевле, чем держать оба варианта.
         if PNG_KEEP.contains(&kind) || kind == b"fdAT" {
@@ -331,12 +353,12 @@ fn strip_png(data: &[u8]) -> Result<Vec<u8>, String> {
 // WebP (RIFF)
 // ---------------------------------------------------------------------------
 
-fn read_webp(data: &[u8]) -> Result<Vec<Tag>, String> {
+fn read_webp(data: &[u8], lang: Lang) -> Result<Vec<Tag>, String> {
     let mut tags = Vec::new();
-    riff_chunks(data, |kind, body| {
+    riff_chunks(data, lang, |kind, body| {
         match kind {
-            b"EXIF" => tags.extend(read_tiff(body)),
-            b"XMP " => tags.push(Tag::new("XMP", format!("присутствует, {} Б", body.len()))),
+            b"EXIF" => tags.extend(read_tiff(body, lang)),
+            b"XMP " => tags.push(Tag::new("XMP", present_bytes(body.len(), lang))),
             _ => {}
         }
         true
@@ -344,10 +366,10 @@ fn read_webp(data: &[u8]) -> Result<Vec<Tag>, String> {
     Ok(tags)
 }
 
-fn strip_webp(data: &[u8]) -> Result<Vec<u8>, String> {
+fn strip_webp(data: &[u8], lang: Lang) -> Result<Vec<u8>, String> {
     let mut body = Vec::with_capacity(data.len());
 
-    riff_chunks(data, |kind, chunk| {
+    riff_chunks(data, lang, |kind, chunk| {
         if kind == b"EXIF" || kind == b"XMP " {
             return true;
         }
@@ -381,23 +403,29 @@ fn strip_webp(data: &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-fn riff_chunks(data: &[u8], mut visit: impl FnMut(&[u8; 4], &[u8]) -> bool) -> Result<(), String> {
+fn riff_chunks(
+    data: &[u8],
+    lang: Lang,
+    mut visit: impl FnMut(&[u8; 4], &[u8]) -> bool,
+) -> Result<(), String> {
+    let broken = |key| i18n::t(lang, key).to_owned();
     if data.len() < 12 || &data[..4] != b"RIFF" || &data[8..12] != b"WEBP" {
-        return Err("Это не WebP: файл не начинается с сигнатуры RIFF/WEBP.".into());
+        return Err(broken(Key::MetaNotWebp));
     }
 
     let mut pos = 12;
     while pos + 8 <= data.len() {
         let kind: [u8; 4] = data[pos..pos + 4]
             .try_into()
-            .map_err(|_| "WebP повреждён: обрыв на типе чанка.")?;
-        let len = le_u32(data, pos + 4).ok_or("WebP повреждён: обрыв на длине чанка.")? as usize;
+            .map_err(|_| broken(Key::MetaWebpTypeBroken))?;
+        let len =
+            le_u32(data, pos + 4).ok_or_else(|| broken(Key::MetaWebpLengthBroken))? as usize;
         let body = pos + 8;
         let end = body
             .checked_add(len)
-            .ok_or("WebP повреждён: неправдоподобная длина чанка.")?;
+            .ok_or_else(|| broken(Key::MetaWebpImplausibleLength))?;
         if end > data.len() {
-            return Err("WebP повреждён: чанк выходит за конец файла.".into());
+            return Err(broken(Key::MetaWebpChunkOverrun));
         }
 
         if !visit(&kind, &data[body..end]) {
@@ -417,10 +445,12 @@ fn riff_chunks(data: &[u8], mut visit: impl FnMut(&[u8; 4], &[u8]) -> bool) -> R
 /// `visit` получает метку расширения (или `None` для кадра) и границы блока.
 fn gif_blocks(
     data: &[u8],
+    lang: Lang,
     mut visit: impl FnMut(Option<u8>, &[u8], std::ops::Range<usize>),
 ) -> Result<(), String> {
+    let broken = |key| i18n::t(lang, key).to_owned();
     if data.len() < 13 || (&data[..6] != b"GIF87a" && &data[..6] != b"GIF89a") {
-        return Err("Это не GIF: файл не начинается с сигнатуры GIF.".into());
+        return Err(broken(Key::MetaNotGif));
     }
 
     let mut pos = 13;
@@ -436,7 +466,7 @@ fn gif_blocks(
                 // Расширение: метка, затем цепочка подблоков.
                 let label = *data
                     .get(pos + 1)
-                    .ok_or("GIF повреждён: обрыв на расширении.")?;
+                    .ok_or_else(|| broken(Key::MetaGifExtensionBroken))?;
                 let start = pos;
                 let mut p = pos + 2;
                 let body_start = p;
@@ -447,7 +477,7 @@ fn gif_blocks(
                     }
                 }
                 if p > data.len() {
-                    return Err("GIF повреждён: расширение выходит за конец файла.".into());
+                    return Err(broken(Key::MetaGifExtensionOverrun));
                 }
                 visit(Some(label), &data[body_start.min(p)..p], start..p);
                 pos = p;
@@ -455,7 +485,9 @@ fn gif_blocks(
             0x2C => {
                 // Дескриптор кадра: 10 байт, затем таблица цветов и данные.
                 let start = pos;
-                let flags = *data.get(pos + 9).ok_or("GIF повреждён: обрыв на кадре.")?;
+                let flags = *data
+                    .get(pos + 9)
+                    .ok_or_else(|| broken(Key::MetaGifFrameBroken))?;
                 let mut p = pos + 10;
                 if flags & 0x80 != 0 {
                     p += 3 * (1 << ((flags & 0x07) + 1));
@@ -468,33 +500,39 @@ fn gif_blocks(
                     }
                 }
                 if p > data.len() {
-                    return Err("GIF повреждён: кадр выходит за конец файла.".into());
+                    return Err(broken(Key::MetaGifFrameOverrun));
                 }
                 visit(None, &[], start..p);
                 pos = p;
             }
-            _ => return Err("GIF повреждён: неизвестный блок.".into()),
+            _ => return Err(broken(Key::MetaGifUnknownBlock)),
         }
     }
     Ok(())
 }
 
-fn read_gif(data: &[u8]) -> Result<Vec<Tag>, String> {
+fn read_gif(data: &[u8], lang: Lang) -> Result<Vec<Tag>, String> {
     let mut tags = Vec::new();
-    gif_blocks(data, |label, body, _| match label {
+    gif_blocks(data, lang, |label, body, _| match label {
         // Подблоки идут с байтом длины перед каждым — для показа его убираем.
-        Some(0xFE) => tags.push(Tag::new("Комментарий", text_value(&unblock(body)))),
+        Some(0xFE) => tags.push(Tag::new(
+            i18n::t(lang, Key::TagComment),
+            text_value(&unblock(body)),
+        )),
         Some(0xFF) => tags.push(Tag::new(
-            "Расширение приложения",
+            i18n::t(lang, Key::TagAppExtension),
             text_value(body.get(1..12).unwrap_or_default()),
         )),
-        Some(0x01) => tags.push(Tag::new("Текстовый блок", "присутствует")),
+        Some(0x01) => tags.push(Tag::new(
+            i18n::t(lang, Key::TagTextBlock),
+            i18n::t(lang, Key::WordPresent),
+        )),
         _ => {}
     })?;
     Ok(tags)
 }
 
-fn strip_gif(data: &[u8]) -> Result<Vec<u8>, String> {
+fn strip_gif(data: &[u8], lang: Lang) -> Result<Vec<u8>, String> {
     let mut out = Vec::with_capacity(data.len());
     // Заголовок и глобальная таблица цветов — до первого блока.
     let mut header_end = 13;
@@ -502,11 +540,11 @@ fn strip_gif(data: &[u8]) -> Result<Vec<u8>, String> {
         header_end += 3 * (1 << ((data[10] & 0x07) + 1));
     }
     if header_end > data.len() {
-        return Err("GIF повреждён: обрыв на таблице цветов.".into());
+        return Err(i18n::t(lang, Key::MetaGifPaletteBroken).to_owned());
     }
     out.extend_from_slice(&data[..header_end]);
 
-    gif_blocks(data, |label, _, whole| {
+    gif_blocks(data, lang, |label, _, whole| {
         // Выбрасываем комментарий, текстовый блок и расширения приложения
         // (в них живёт XMP). Управляющее расширение 0xF9 оставляем: в нём
         // задержка кадра и прозрачность — без него анимация встанет.
@@ -543,7 +581,7 @@ fn unblock(body: &[u8]) -> Vec<u8> {
 ///
 /// Ошибки не возвращает намеренно: испорченный EXIF — не повод отказать в
 /// показе остального. Что разобралось, то и покажем.
-fn read_tiff(data: &[u8]) -> Vec<Tag> {
+fn read_tiff(data: &[u8], lang: Lang) -> Vec<Tag> {
     let Some(be) = tiff_endian(data) else {
         return Vec::new();
     };
@@ -553,7 +591,7 @@ fn read_tiff(data: &[u8]) -> Vec<Tag> {
 
     let mut tags = Vec::new();
     let mut seen = Vec::new();
-    read_ifd(data, ifd0 as usize, be, &mut tags, &mut seen, 0);
+    read_ifd(data, ifd0 as usize, be, &mut tags, &mut seen, 0, lang);
     tags
 }
 
@@ -577,6 +615,7 @@ fn read_ifd(
     tags: &mut Vec<Tag>,
     seen: &mut Vec<usize>,
     depth: usize,
+    lang: Lang,
 ) {
     // Каталог, ссылающийся на уже пройденный, — верный признак битого файла.
     // Без этой проверки разбор ушёл бы в бесконечный цикл.
@@ -606,15 +645,15 @@ fn read_ifd(
         // Вложенные каталоги: собственно EXIF и GPS.
         if tag == 0x8769 || tag == 0x8825 {
             if let Some(sub) = read_u32(data, entry + 8, be) {
-                read_ifd(data, sub as usize, be, tags, seen, depth + 1);
+                read_ifd(data, sub as usize, be, tags, seen, depth + 1, lang);
             }
             continue;
         }
 
-        let Some(name) = tag_name(tag, depth > 0) else {
+        let Some(name) = tag_name(tag, depth > 0, lang) else {
             continue;
         };
-        if let Some(value) = tiff_value(data, entry + 8, format, components as usize, be) {
+        if let Some(value) = tiff_value(data, entry + 8, format, components as usize, be, lang) {
             tags.push(Tag::new(name, value));
         }
     }
@@ -624,7 +663,7 @@ fn read_ifd(
     if let Some(link) = read_u32(data, next, be)
         && link != 0
     {
-        read_ifd(data, link as usize, be, tags, seen, depth + 1);
+        read_ifd(data, link as usize, be, tags, seen, depth + 1, lang);
     }
 }
 
@@ -645,6 +684,7 @@ fn tiff_value(
     format: u16,
     components: usize,
     be: bool,
+    lang: Lang,
 ) -> Option<String> {
     let unit = tiff_unit(format);
     if unit == 0 || components == 0 || components > 1_000_000 {
@@ -687,7 +727,7 @@ fn tiff_value(
             .filter_map(|i| read_u32(bytes, i * 4, be).map(|v| v.to_string()))
             .collect::<Vec<_>>()
             .join(", "),
-        _ => format!("{total} Б"),
+        _ => i18n::fill(i18n::t(lang, Key::MetaRawBytes), &[&total.to_string()]),
     })
 }
 
@@ -696,48 +736,53 @@ fn tiff_value(
 /// Список намеренно неполный: показываем то, ради чего инструмент и открывают, —
 /// кто снимал, чем, когда и где. Полный справочник EXIF насчитывает сотни
 /// записей, и вываливать их пользователю смысла нет.
-fn tag_name(tag: u16, nested: bool) -> Option<&'static str> {
+fn tag_name(tag: u16, nested: bool, lang: Lang) -> Option<&'static str> {
     // Номера тегов GPS пересекаются с номерами основного каталога, поэтому
     // вложенные каталоги разбираем по отдельной таблице.
     if nested
-        && let Some(name) = match tag {
-            0x0001 => Some("GPS: широта (полушарие)"),
-            0x0002 => Some("GPS: широта"),
-            0x0003 => Some("GPS: долгота (полушарие)"),
-            0x0004 => Some("GPS: долгота"),
-            0x0006 => Some("GPS: высота"),
-            0x0007 => Some("GPS: время съёмки (UTC)"),
-            0x001D => Some("GPS: дата"),
+        && let Some(key) = match tag {
+            0x0001 => Some(Key::TagGpsLatitudeRef),
+            0x0002 => Some(Key::TagGpsLatitude),
+            0x0003 => Some(Key::TagGpsLongitudeRef),
+            0x0004 => Some(Key::TagGpsLongitude),
+            0x0006 => Some(Key::TagGpsAltitude),
+            0x0007 => Some(Key::TagGpsTime),
+            0x001D => Some(Key::TagGpsDate),
             _ => None,
         }
     {
-        return Some(name);
+        return Some(i18n::t(lang, key));
     }
 
-    match tag {
-        0x010E => Some("Описание"),
-        0x010F => Some("Производитель"),
-        0x0110 => Some("Модель камеры"),
-        0x0112 => Some("Ориентация"),
-        0x0131 => Some("Программа"),
-        0x0132 => Some("Дата изменения"),
-        0x013B => Some("Автор"),
-        0x8298 => Some("Авторские права"),
-        0x829A => Some("Выдержка"),
-        0x829D => Some("Диафрагма"),
-        0x8827 => Some("ISO"),
-        0x9003 => Some("Дата съёмки"),
-        0x9004 => Some("Дата оцифровки"),
-        0x920A => Some("Фокусное расстояние"),
-        0xA002 => Some("Ширина"),
-        0xA003 => Some("Высота"),
-        0xA430 => Some("Владелец камеры"),
-        0xA433 => Some("Производитель объектива"),
-        0xA434 => Some("Модель объектива"),
-        0xA435 => Some("Серийный номер объектива"),
-        0xC62F => Some("Серийный номер камеры"),
-        _ => None,
+    // «ISO» — обозначение из стандарта, а не слово: переводу не подлежит.
+    if tag == 0x8827 {
+        return Some("ISO");
     }
+
+    let key = match tag {
+        0x010E => Key::TagDescription,
+        0x010F => Key::TagMaker,
+        0x0110 => Key::TagCameraModel,
+        0x0112 => Key::TagOrientation,
+        0x0131 => Key::TagSoftware,
+        0x0132 => Key::TagDateModified,
+        0x013B => Key::TagAuthor,
+        0x8298 => Key::TagCopyright,
+        0x829A => Key::TagExposure,
+        0x829D => Key::TagAperture,
+        0x9003 => Key::TagDateTaken,
+        0x9004 => Key::TagDateDigitized,
+        0x920A => Key::TagFocalLength,
+        0xA002 => Key::TagWidth,
+        0xA003 => Key::TagHeight,
+        0xA430 => Key::TagCameraOwner,
+        0xA433 => Key::TagLensMaker,
+        0xA434 => Key::TagLensModel,
+        0xA435 => Key::TagLensSerial,
+        0xC62F => Key::TagCameraSerial,
+        _ => return None,
+    };
+    Some(i18n::t(lang, key))
 }
 
 // ---------------------------------------------------------------------------
@@ -827,23 +872,23 @@ fn tail_at(tail: &[u8], size: usize, at: usize, len: usize) -> Option<&[u8]> {
 /// а размер мы читаем оттуда же — так что хватает небольшого окна.
 const MP3_TAIL_WINDOW: u64 = 512;
 
-fn mp3_read_edges(path: &Path) -> Result<(Vec<u8>, Vec<u8>, u64), String> {
-    let mut file = File::open(path).map_err(|e| format!("Не удалось открыть файл: {e}"))?;
+fn mp3_read_edges(path: &Path, lang: Lang) -> Result<(Vec<u8>, Vec<u8>, u64), String> {
+    let mut file = File::open(path).map_err(|e| trouble(Key::MetaOpenFileFailed, lang, e))?;
     let size = file
         .metadata()
-        .map_err(|e| format!("Не удалось прочитать размер файла: {e}"))?
+        .map_err(|e| trouble(Key::MetaReadSizeFailed, lang, e))?
         .len();
 
     let mut head = vec![0u8; 10.min(size as usize)];
     file.read_exact(&mut head)
-        .map_err(|e| format!("Не удалось прочитать начало файла: {e}"))?;
+        .map_err(|e| trouble(Key::MetaReadHeadFailed, lang, e))?;
 
     let tail_len = MP3_TAIL_WINDOW.min(size);
     let mut tail = vec![0u8; tail_len as usize];
     file.seek(SeekFrom::Start(size - tail_len))
-        .map_err(|e| format!("Не удалось перейти к концу файла: {e}"))?;
+        .map_err(|e| trouble(Key::MetaSeekEndFailed, lang, e))?;
     file.read_exact(&mut tail)
-        .map_err(|e| format!("Не удалось прочитать конец файла: {e}"))?;
+        .map_err(|e| trouble(Key::MetaReadTailFailed, lang, e))?;
 
     Ok((head, tail, size))
 }
@@ -854,29 +899,32 @@ fn mp3_read_edges(path: &Path) -> Result<(Vec<u8>, Vec<u8>, u64), String> {
 /// ID3 и заодно отдаёт битрейт с длительностью, которых в тегах нет. Если его
 /// нет на месте, честно говорим об этом — но факт наличия тегов всё равно
 /// показываем, он виден по одним только границам блоков.
-fn read_mp3(path: &Path, ffprobe: Option<&Path>) -> Result<Vec<Tag>, String> {
+fn read_mp3(path: &Path, ffprobe: Option<&Path>, lang: Lang) -> Result<Vec<Tag>, String> {
     let mut tags = Vec::new();
 
     if let Some(ffprobe) = ffprobe {
-        tags.extend(ffprobe_tags(path, ffprobe)?);
+        tags.extend(ffprobe_tags(path, ffprobe, lang)?);
     }
 
     // Обложка в ID3v2 занимает основную часть тега и в списке ffprobe
     // отдельной строкой не видна — показываем её по размеру блока.
-    let (head, tail, size) = mp3_read_edges(path)?;
+    let (head, tail, size) = mp3_read_edges(path, lang)?;
     let bounds = mp3_bounds(&head, &tail, size as usize);
     let tag_bytes = bounds.start as u64 + (size - bounds.end as u64);
     if tag_bytes > 0 {
         tags.push(Tag::new(
-            "Объём тегов",
-            format!("{} Б (включая обложку, если она есть)", tag_bytes),
+            i18n::t(lang, Key::MetaTagBytes),
+            i18n::fill(
+                i18n::t(lang, Key::MetaTagBytesValue),
+                &[&tag_bytes.to_string()],
+            ),
         ));
     }
 
     if ffprobe.is_none() && tags.is_empty() && tag_bytes > 0 {
         tags.push(Tag::new(
-            "Теги",
-            "присутствуют, но прочитать их нечем: не найден ffprobe",
+            i18n::t(lang, Key::TagTags),
+            i18n::t(lang, Key::MetaTagsUnreadable),
         ));
     }
 
@@ -884,7 +932,7 @@ fn read_mp3(path: &Path, ffprobe: Option<&Path>) -> Result<Vec<Tag>, String> {
 }
 
 /// Спрашивает у ffprobe теги, битрейт и длительность.
-fn ffprobe_tags(path: &Path, ffprobe: &Path) -> Result<Vec<Tag>, String> {
+fn ffprobe_tags(path: &Path, ffprobe: &Path, lang: Lang) -> Result<Vec<Tag>, String> {
     let mut cmd = Command::new(ffprobe);
     cmd.args([
         "-v",
@@ -902,14 +950,14 @@ fn ffprobe_tags(path: &Path, ffprobe: &Path) -> Result<Vec<Tag>, String> {
 
     let output = cmd
         .output()
-        .map_err(|e| format!("Не удалось запустить ffprobe: {e}"))?;
+        .map_err(|e| trouble(Key::MetaFfprobeLaunchFailed, lang, e))?;
     if !output.status.success() {
-        return Err("ffprobe не смог прочитать файл.".into());
+        return Err(i18n::t(lang, Key::MetaFfprobeFailed).to_owned());
     }
 
     let text = String::from_utf8_lossy(&output.stdout);
-    let json: serde_json::Value =
-        serde_json::from_str(&text).map_err(|_| "ffprobe вернул неразборчивый ответ.")?;
+    let json: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|_| i18n::t(lang, Key::MetaFfprobeGarbage).to_owned())?;
 
     let mut tags = Vec::new();
 
@@ -918,14 +966,20 @@ fn ffprobe_tags(path: &Path, ffprobe: &Path) -> Result<Vec<Tag>, String> {
             && let Ok(secs) = duration.parse::<f64>()
         {
             tags.push(Tag::new(
-                "Длительность",
+                i18n::t(lang, Key::TagDuration),
                 crate::model::human_duration(secs as u64),
             ));
         }
         if let Some(rate) = format.get("bit_rate").and_then(|v| v.as_str())
             && let Ok(bps) = rate.parse::<u64>()
         {
-            tags.push(Tag::new("Битрейт", format!("{} кбит/с", bps / 1000)));
+            tags.push(Tag::new(
+                i18n::t(lang, Key::TagBitrate),
+                i18n::fill(
+                    i18n::t(lang, Key::MetaKbpsValue),
+                    &[&(bps / 1000).to_string()],
+                ),
+            ));
         }
         if let Some(map) = format.get("tags").and_then(|v| v.as_object()) {
             for (key, value) in map {
@@ -933,7 +987,7 @@ fn ffprobe_tags(path: &Path, ffprobe: &Path) -> Result<Vec<Tag>, String> {
                     serde_json::Value::String(s) => s.clone(),
                     other => other.to_string(),
                 };
-                tags.push(Tag::new(id3_name(key), truncate(&text)));
+                tags.push(Tag::new(id3_name(key, lang), truncate(&text)));
             }
         }
     }
@@ -944,33 +998,36 @@ fn ffprobe_tags(path: &Path, ffprobe: &Path) -> Result<Vec<Tag>, String> {
             .iter()
             .any(|s| s.get("codec_type").and_then(|v| v.as_str()) == Some("video"))
     {
-        tags.push(Tag::new("Обложка", "встроена в файл"));
+        tags.push(Tag::new(
+            i18n::t(lang, Key::TagCover),
+            i18n::t(lang, Key::MetaCoverEmbedded),
+        ));
     }
 
     Ok(tags)
 }
 
-/// Переводит имена тегов ID3 на русский. Незнакомые оставляем как есть:
-/// произвольные пользовательские поля тоже надо показать.
-fn id3_name(key: &str) -> String {
-    match key.to_ascii_lowercase().as_str() {
-        "title" => "Название",
-        "artist" => "Исполнитель",
-        "album" => "Альбом",
-        "album_artist" => "Исполнитель альбома",
-        "date" => "Год",
-        "track" => "Трек",
-        "genre" => "Жанр",
-        "comment" => "Комментарий",
-        "composer" => "Композитор",
-        "encoder" => "Кодировщик",
-        "copyright" => "Авторские права",
-        "publisher" => "Издатель",
-        "language" => "Язык",
-        "lyrics" => "Текст песни",
+/// Переводит имена тегов ID3. Незнакомые оставляем как есть: произвольные
+/// пользовательские поля тоже надо показать, а перевода у них нет.
+fn id3_name(key: &str, lang: Lang) -> String {
+    let key = match key.to_ascii_lowercase().as_str() {
+        "title" => Key::TagTitle,
+        "artist" => Key::TagArtist,
+        "album" => Key::TagAlbum,
+        "album_artist" => Key::TagAlbumArtist,
+        "date" => Key::TagYear,
+        "track" => Key::TagTrack,
+        "genre" => Key::TagGenre,
+        "comment" => Key::TagComment,
+        "composer" => Key::TagComposer,
+        "encoder" => Key::TagEncoder,
+        "copyright" => Key::TagCopyright,
+        "publisher" => Key::TagPublisher,
+        "language" => Key::TagLanguage,
+        "lyrics" => Key::TagLyrics,
         other => return other.to_owned(),
-    }
-    .to_owned()
+    };
+    i18n::t(lang, key).to_owned()
 }
 
 // ---------------------------------------------------------------------------
@@ -981,13 +1038,13 @@ fn id3_name(key: &str) -> String {
 ///
 /// Возвращает, сколько байт освободилось. Ноль означает, что чистить было
 /// нечего — файл при этом не переписывается вовсе.
-pub fn strip(path: &Path) -> Result<u64, String> {
+pub fn strip(path: &Path, lang: Lang) -> Result<u64, String> {
     let kind = meta_kind(path);
     if !kind.cleanable() {
-        return Err(unsupported_message(kind));
+        return Err(unsupported_message(kind, lang));
     }
 
-    let before = file_size(path)?;
+    let before = file_size(path, lang)?;
 
     // MP3 обрабатываем потоком: он бывает в сотню мегабайт, а всё, что нужно
     // сделать, — скопировать середину файла. Держать её целиком в памяти
@@ -995,21 +1052,22 @@ pub fn strip(path: &Path) -> Result<u64, String> {
     // произвольного доступа, а снимок на пару десятков мегабайт — разовый
     // буфер в рабочем потоке, а не накопитель.
     if kind == MetaKind::Mp3 {
-        let (head, tail, size) = mp3_read_edges(path)?;
+        let (head, tail, size) = mp3_read_edges(path, lang)?;
         let bounds = mp3_bounds(&head, &tail, size as usize);
         if bounds.start == 0 && bounds.end as u64 == size {
             return Ok(0);
         }
-        let written = replace_atomically(path, |out| copy_range(path, &bounds, out))?;
+        let written =
+            replace_atomically(path, lang, |out| copy_range(path, &bounds, out, lang))?;
         return Ok(before.saturating_sub(written));
     }
 
-    let data = read_file(path)?;
+    let data = read_file(path, lang)?;
     let cleaned = match kind {
-        MetaKind::Jpeg => strip_jpeg(&data)?,
-        MetaKind::Png => strip_png(&data)?,
-        MetaKind::WebP => strip_webp(&data)?,
-        MetaKind::Gif => strip_gif(&data)?,
+        MetaKind::Jpeg => strip_jpeg(&data, lang)?,
+        MetaKind::Png => strip_png(&data, lang)?,
+        MetaKind::WebP => strip_webp(&data, lang)?,
+        MetaKind::Gif => strip_gif(&data, lang)?,
         MetaKind::Mp3 | MetaKind::Tiff | MetaKind::Video | MetaKind::Unsupported => unreachable!(),
     };
 
@@ -1017,33 +1075,38 @@ pub fn strip(path: &Path) -> Result<u64, String> {
         return Ok(0);
     }
     if cleaned.is_empty() {
-        return Err("Внутренняя ошибка: очистка дала пустой файл, исходный не тронут.".into());
+        return Err(i18n::t(lang, Key::MetaEmptyResultKeepsOriginal).to_owned());
     }
 
-    let written = replace_atomically(path, |out| {
+    let written = replace_atomically(path, lang, |out| {
         out.write_all(&cleaned)
-            .map_err(|e| format!("Не удалось записать файл: {e}"))?;
+            .map_err(|e| trouble(Key::MetaWriteFileFailed, lang, e))?;
         Ok(cleaned.len() as u64)
     })?;
     Ok(before.saturating_sub(written))
 }
 
-fn file_size(path: &Path) -> Result<u64, String> {
+fn file_size(path: &Path, lang: Lang) -> Result<u64, String> {
     std::fs::metadata(path)
         .map(|m| m.len())
-        .map_err(|e| format!("Не удалось прочитать размер файла: {e}"))
+        .map_err(|e| trouble(Key::MetaReadSizeFailed, lang, e))
 }
 
-fn copy_range(path: &Path, bounds: &Mp3Bounds, out: &mut impl Write) -> Result<u64, String> {
-    let file = File::open(path).map_err(|e| format!("Не удалось открыть файл: {e}"))?;
+fn copy_range(
+    path: &Path,
+    bounds: &Mp3Bounds,
+    out: &mut impl Write,
+    lang: Lang,
+) -> Result<u64, String> {
+    let file = File::open(path).map_err(|e| trouble(Key::MetaOpenFileFailed, lang, e))?;
     let mut reader = BufReader::new(file);
     reader
         .seek(SeekFrom::Start(bounds.start as u64))
-        .map_err(|e| format!("Не удалось перейти к началу звука: {e}"))?;
+        .map_err(|e| trouble(Key::MetaSeekAudioFailed, lang, e))?;
 
     let length = (bounds.end - bounds.start) as u64;
     std::io::copy(&mut reader.take(length), out)
-        .map_err(|e| format!("Не удалось скопировать звук: {e}"))
+        .map_err(|e| trouble(Key::MetaCopyAudioFailed, lang, e))
 }
 
 /// Записывает результат во временный файл рядом с исходным и подменяет его.
@@ -1057,42 +1120,43 @@ fn copy_range(path: &Path, bounds: &Mp3Bounds, out: &mut impl Write) -> Result<u
 /// При любой ошибке временный файл удаляется, а исходный остаётся нетронутым.
 fn replace_atomically(
     path: &Path,
+    lang: Lang,
     write: impl FnOnce(&mut BufWriter<File>) -> Result<u64, String>,
 ) -> Result<u64, String> {
     let tmp = temp_path(path);
 
     let result = (|| {
         let file =
-            File::create(&tmp).map_err(|e| format!("Не удалось создать временный файл: {e}"))?;
+            File::create(&tmp).map_err(|e| trouble(Key::MetaTempCreateFailed, lang, e))?;
         let mut writer = BufWriter::new(file);
         let written = write(&mut writer)?;
 
         if written == 0 {
-            return Err("Внутренняя ошибка: очистка дала пустой файл.".into());
+            return Err(i18n::t(lang, Key::MetaEmptyResult).to_owned());
         }
 
         let file = writer
             .into_inner()
-            .map_err(|e| format!("Не удалось дописать временный файл: {e}"))?;
+            .map_err(|e| trouble(Key::MetaTempFlushFailed, lang, e))?;
         // Без sync_all содержимое может остаться в кеше ОС: при отключении
         // питания сразу после переименования на диске оказался бы пустой файл
         // на месте исходного.
         file.sync_all()
-            .map_err(|e| format!("Не удалось сохранить временный файл: {e}"))?;
+            .map_err(|e| trouble(Key::MetaTempSyncFailed, lang, e))?;
         drop(file);
 
         // Проверяем то, что реально легло на диск, а не то, что мы намеревались
         // записать: «столько-то байт отправлено в буфер» доказательством не
         // является (Правило 6).
-        let actual = file_size(&tmp)?;
+        let actual = file_size(&tmp, lang)?;
         if actual == 0 {
-            return Err("Внутренняя ошибка: временный файл пуст.".into());
+            return Err(i18n::t(lang, Key::MetaTempEmpty).to_owned());
         }
 
         // rename в пределах тома атомарен и на Windows тоже заменяет
         // существующий файл — отдельного удаления не требуется.
         std::fs::rename(&tmp, path)
-            .map_err(|e| format!("Не удалось заменить исходный файл: {e}"))?;
+            .map_err(|e| trouble(Key::MetaReplaceFailed, lang, e))?;
         Ok(actual)
     })();
 

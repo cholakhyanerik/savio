@@ -1,6 +1,12 @@
 //! Доменные типы. Ничего не знают ни про UI, ни про yt-dlp.
+//!
+//! Язык интерфейса ездит сюда **параметром** (`lang: Lang`), а не лежит
+//! глобалью: домен обязан оставаться чистым и проверяемым, а `Lang` — `Copy`
+//! размером в байт, так что лишний аргумент ничего не стоит.
 
 use std::path::PathBuf;
+
+use crate::i18n::{self, Key, Lang};
 
 /// Что именно скачиваем.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -15,11 +21,14 @@ pub enum Format {
 }
 
 impl Format {
-    pub fn label(self) -> &'static str {
-        match self {
-            Format::Mp4 => "MP4 — видео",
-            Format::Mp3 => "MP3 — аудио",
-        }
+    pub fn label(self, lang: Lang) -> &'static str {
+        i18n::t(
+            lang,
+            match self {
+                Format::Mp4 => Key::FormatMp4,
+                Format::Mp3 => Key::FormatMp3,
+            },
+        )
     }
 
     /// Имя формата без пояснения — для тесных мест.
@@ -40,11 +49,14 @@ impl Format {
     /// Ступени качества у видео и звука общие, а единицы у них разные, и
     /// назвать единицу можно только здесь: на самом сегменте для неё места
     /// нет — их шесть, и в окне шириной 520 каждому достаётся около 70 точек.
-    pub fn quality_label(self) -> &'static str {
-        match self {
-            Format::Mp4 => "Качество",
-            Format::Mp3 => "Битрейт, кбит/с",
-        }
+    pub fn quality_label(self, lang: Lang) -> &'static str {
+        i18n::t(
+            lang,
+            match self {
+                Format::Mp4 => Key::QualityFieldVideo,
+                Format::Mp3 => Key::QualityFieldAudio,
+            },
+        )
     }
 }
 
@@ -119,24 +131,25 @@ impl Quality {
     /// Подписи короткие намеренно: шесть сегментов делят ширину окна, а окно
     /// бывает шириной 520 — «Максимум» и «320 кбит/с» распёрли бы дорожку
     /// шире окна. Единицу называет `Format::quality_label` над переключателем.
-    pub fn label(self, format: Format) -> &'static str {
-        match format {
-            Format::Mp4 => match self {
-                Quality::Best => "Макс.",
-                Quality::P2160 => "2160p",
-                Quality::P1440 => "1440p",
-                Quality::P1080 => "1080p",
-                Quality::P720 => "720p",
-                Quality::P480 => "480p",
-            },
-            Format::Mp3 => match self {
-                Quality::Best => "Макс.",
-                Quality::P2160 => "320",
-                Quality::P1440 => "256",
-                Quality::P1080 => "192",
-                Quality::P720 => "128",
-                Quality::P480 => "96",
-            },
+    pub fn label(self, format: Format, lang: Lang) -> &'static str {
+        // Ступени — числа, и переводить в них нечего: «1080p» и «320» читаются
+        // одинаково на любом языке. Перевода просит одно только «Макс.», и
+        // оно же одно не зависит от формата — отсюда `_` в первой позиции.
+        // Исчерпывающей проверки это не отменяет: появись третий формат,
+        // остальные десять пар перестанут покрывать `(Новый, P2160)`, и
+        // компилятор скажет об этом.
+        match (format, self) {
+            (_, Quality::Best) => i18n::t(lang, Key::QualityMax),
+            (Format::Mp4, Quality::P2160) => "2160p",
+            (Format::Mp4, Quality::P1440) => "1440p",
+            (Format::Mp4, Quality::P1080) => "1080p",
+            (Format::Mp4, Quality::P720) => "720p",
+            (Format::Mp4, Quality::P480) => "480p",
+            (Format::Mp3, Quality::P2160) => "320",
+            (Format::Mp3, Quality::P1440) => "256",
+            (Format::Mp3, Quality::P1080) => "192",
+            (Format::Mp3, Quality::P720) => "128",
+            (Format::Mp3, Quality::P480) => "96",
         }
     }
 
@@ -150,18 +163,21 @@ impl Quality {
     /// Возвращает статическую строку, а не собирает её: строки очереди
     /// пересобираются на каждое изменение состояния, и аллокация ради
     /// пяти символов там ни к чему.
-    pub fn label_with_unit(self, format: Format) -> &'static str {
+    pub fn label_with_unit(self, format: Format, lang: Lang) -> &'static str {
         match format {
             // У видео единица уже внутри подписи: «1080p».
-            Format::Mp4 => self.label(format),
-            Format::Mp3 => match self {
-                Quality::Best => "Макс.",
-                Quality::P2160 => "320 кбит/с",
-                Quality::P1440 => "256 кбит/с",
-                Quality::P1080 => "192 кбит/с",
-                Quality::P720 => "128 кбит/с",
-                Quality::P480 => "96 кбит/с",
-            },
+            Format::Mp4 => self.label(format, lang),
+            Format::Mp3 => i18n::t(
+                lang,
+                match self {
+                    Quality::Best => Key::QualityMax,
+                    Quality::P2160 => Key::Kbps320,
+                    Quality::P1440 => Key::Kbps256,
+                    Quality::P1080 => Key::Kbps192,
+                    Quality::P720 => Key::Kbps128,
+                    Quality::P480 => Key::Kbps96,
+                },
+            ),
         }
     }
 }
@@ -344,9 +360,12 @@ impl CookieSource {
     /// Подпись в списке. Полные имена, а не токены yt-dlp: в списке человек
     /// ищет свой браузер глазами, и «Mozilla Firefox» узнаётся быстрее, чем
     /// «firefox».
-    pub fn label(self) -> &'static str {
+    /// Имена браузеров не переводятся и переводиться не могут: это названия
+    /// чужих продуктов, одинаковые на любом языке системы. Перевода просят
+    /// только два пункта, которые браузерами не являются.
+    pub fn label(self, lang: Lang) -> &'static str {
         match self {
-            CookieSource::None => "Не использовать",
+            CookieSource::None => i18n::t(lang, Key::CookieNone),
             CookieSource::Chrome => "Google Chrome",
             CookieSource::Edge => "Microsoft Edge",
             CookieSource::Firefox => "Mozilla Firefox",
@@ -356,7 +375,7 @@ impl CookieSource {
             CookieSource::Chromium => "Chromium",
             // С многоточием, как принято у пунктов, открывающих диалог:
             // выбрать этот пункт мало, следом придётся назвать файл.
-            CookieSource::File => "Из файла…",
+            CookieSource::File => i18n::t(lang, Key::CookieFile),
         }
     }
 }
@@ -425,7 +444,11 @@ pub enum SubLang {
 impl SubLang {
     /// Подпись первого пункта списка. Здесь же, а не в UI, потому что
     /// её называет и объяснение про недоступный язык.
-    pub const ORIGINAL_LABEL: &'static str = "Язык ролика";
+    ///
+    /// Функция, а не константа: у константы нет места для языка.
+    pub fn original_label(lang: Lang) -> &'static str {
+        i18n::t(lang, Key::SubLangOriginal)
+    }
 }
 
 /// Что решено про субтитры этой загрузки.
@@ -630,16 +653,15 @@ pub enum SectionError {
 
 impl SectionError {
     /// Что показать под полями.
-    pub fn message(self) -> &'static str {
-        match self {
-            SectionError::Start => {
-                "Начало не похоже на время. Нужно «1:30», «1:02:03» или число секунд."
-            }
-            SectionError::End => {
-                "Конец не похож на время. Нужно «4:00», «1:02:03» или число секунд."
-            }
-            SectionError::Order => "Конец должен быть позже начала.",
-        }
+    pub fn message(self, lang: Lang) -> &'static str {
+        i18n::t(
+            lang,
+            match self {
+                SectionError::Start => Key::SectionErrStart,
+                SectionError::End => Key::SectionErrEnd,
+                SectionError::Order => Key::SectionErrOrder,
+            },
+        )
     }
 
     /// Подсвечивать ли поле начала.
@@ -925,19 +947,15 @@ impl MediaInfo {
     ///
     /// Собирает строку, поэтому зовётся не из кадра отрисовки, а из
     /// обработчиков (`rebuild_subs_note`) — как и всё остальное в UI.
-    pub fn subtitle_note(&self, want: &SubLang, allow_auto: bool) -> Option<String> {
+    pub fn subtitle_note(&self, want: &SubLang, allow_auto: bool, lang: Lang) -> Option<String> {
         // Подходящих дорожек нет вовсе — язык тут ни при чём.
         if self.subtitle_tracks(allow_auto).next().is_none() {
-            return Some(if self.subtitles.is_empty() {
-                "Субтитров у этого ролика нет вовсе — ни своих, ни \
-                 автоматических. Вшивать нечего."
-                    .to_owned()
+            let key = if self.subtitles.is_empty() {
+                Key::SubsNoneAtAll
             } else {
-                "Своих субтитров у этого ролика нет, зато есть автоматические. \
-                 Поставьте «Можно автоматические» — только учтите, что их \
-                 пишет робот и ошибки в них обычное дело."
-                    .to_owned()
-            });
+                Key::SubsOnlyAuto
+            };
+            return Some(i18n::t(lang, key).to_owned());
         }
 
         // Язык не определился: ключа в командной строке не будет, yt-dlp
@@ -949,10 +967,7 @@ impl MediaInfo {
         }
 
         let name = self.subtitle_label(code).unwrap_or(code);
-        Some(format!(
-            "Субтитров на этом языке ({name}) у ролика нет — файл сохранится \
-             без них. Выберите другой язык из списка."
-        ))
+        Some(i18n::fill(i18n::t(lang, Key::SubsNoSuchLang), &[name]))
     }
 }
 
@@ -1222,7 +1237,15 @@ pub fn looks_like_url(text: &str) -> bool {
 /// плейлист целиком, за него выходят уже сегодня, а без верхней единицы
 /// такой размер показывался бы как «5120.0 ГБ» — число, которое глазами
 /// не читается.
-const BYTE_UNITS: [&str; 5] = ["Б", "КБ", "МБ", "ГБ", "ТБ"];
+fn byte_units(lang: Lang) -> [&'static str; 5] {
+    [
+        i18n::t(lang, Key::UnitByte),
+        i18n::t(lang, Key::UnitKilobyte),
+        i18n::t(lang, Key::UnitMegabyte),
+        i18n::t(lang, Key::UnitGigabyte),
+        i18n::t(lang, Key::UnitTerabyte),
+    ]
+}
 
 /// Подбирает единицу под значение: делит на 1024, пока влезает.
 ///
@@ -1241,19 +1264,20 @@ fn scale_bytes(value: f64) -> (f64, usize) {
         0.0
     };
     let mut unit = 0;
-    while value >= 1024.0 && unit < BYTE_UNITS.len() - 1 {
+    while value >= 1024.0 && unit < 4 {
         value /= 1024.0;
         unit += 1;
     }
     (value, unit)
 }
 
-pub fn human_bytes(bytes: u64) -> String {
+pub fn human_bytes(bytes: u64, lang: Lang) -> String {
     let (value, unit) = scale_bytes(bytes as f64);
+    let units = byte_units(lang);
     if unit == 0 {
-        format!("{bytes} {}", BYTE_UNITS[0])
+        format!("{bytes} {}", units[0])
     } else {
-        format!("{value:.1} {}", BYTE_UNITS[unit])
+        format!("{value:.1} {}", units[unit])
     }
 }
 
@@ -1264,12 +1288,14 @@ pub fn human_bytes(bytes: u64) -> String {
 /// незачем. Плюс `as`-приведение отбрасывает дробную часть, и на медленном
 /// соединении 0.9 Б/с превращались в «0 Б/с» — то есть в «встало», хотя
 /// загрузка идёт.
-pub fn human_speed(bytes_per_sec: f64) -> String {
+pub fn human_speed(bytes_per_sec: f64, lang: Lang) -> String {
     let (value, unit) = scale_bytes(bytes_per_sec);
+    let units = byte_units(lang);
+    let per_sec = i18n::t(lang, Key::UnitPerSecond);
     if unit == 0 {
-        format!("{value:.0} {}/с", BYTE_UNITS[0])
+        format!("{value:.0} {}{per_sec}", units[0])
     } else {
-        format!("{value:.1} {}/с", BYTE_UNITS[unit])
+        format!("{value:.1} {}{per_sec}", units[unit])
     }
 }
 
@@ -1323,13 +1349,16 @@ pub enum CheckStatus {
 
 impl CheckStatus {
     /// Подпись для плашки статуса.
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Ok => "В порядке",
-            Self::Warning => "Внимание",
-            Self::Failed => "Не удалось",
-            Self::Unknown => "Нет данных",
-        }
+    pub fn label(self, lang: Lang) -> &'static str {
+        i18n::t(
+            lang,
+            match self {
+                Self::Ok => Key::CheckOk,
+                Self::Warning => Key::CheckWarning,
+                Self::Failed => Key::CheckFailed,
+                Self::Unknown => Key::CheckUnknown,
+            },
+        )
     }
 }
 
@@ -1424,25 +1453,24 @@ impl SystemReport {
     /// отсутствие датчика и исправная машина дают одинаково пустой ответ —
     /// обещать по такому основанию отсутствие проблем нельзя. Поэтому итог
     /// пересказывает пересчёт, а не выносит приговор.
-    pub fn headline(&self) -> String {
-        let t = self.tally();
+    pub fn headline(&self, lang: Lang) -> String {
+        let tally = self.tally();
         if self.checks.is_empty() {
-            return "Отчёт пуст.".to_owned();
+            return i18n::t(lang, Key::ReportEmpty).to_owned();
         }
 
-        let mut parts = vec![format!(
-            "Пунктов: {} — {} в порядке",
-            self.checks.len(),
-            t.ok
+        let mut parts = vec![i18n::fill(
+            i18n::t(lang, Key::ReportCounted),
+            &[&self.checks.len().to_string(), &tally.ok.to_string()],
         )];
-        if t.warning > 0 {
-            parts.push(format!("{} с замечанием", t.warning));
-        }
-        if t.failed > 0 {
-            parts.push(format!("{} не удалось", t.failed));
-        }
-        if t.unknown > 0 {
-            parts.push(format!("{} без данных", t.unknown));
+        for (count, key) in [
+            (tally.warning, Key::ReportWarned),
+            (tally.failed, Key::ReportFailed),
+            (tally.unknown, Key::ReportUnknown),
+        ] {
+            if count > 0 {
+                parts.push(i18n::fill(i18n::t(lang, key), &[&count.to_string()]));
+            }
         }
         format!("{}.", parts.join(", "))
     }
@@ -1452,14 +1480,16 @@ impl SystemReport {
     /// Прочерк на месте отсутствующего значения ставится и здесь: файл
     /// человек отправляет в чужие руки, и «нет данных», превратившееся при
     /// сохранении в пустоту, там уже не восстановить.
-    pub fn to_text(&self) -> String {
-        let mut out = String::from("Отчёт Savio о системе\n");
-        out.push_str(&format!("{}\n", self.headline()));
+    pub fn to_text(&self, lang: Lang) -> String {
+        let mut out = String::new();
+        out.push_str(i18n::t(lang, Key::ReportFileTitle));
+        out.push('\n');
+        out.push_str(&format!("{}\n", self.headline(lang)));
 
         for check in &self.checks {
             out.push_str(&format!(
                 "\n[{}] {}\n  {}\n",
-                check.status.label(),
+                check.status.label(lang),
                 check.name,
                 check.summary
             ));
@@ -1468,7 +1498,7 @@ impl SystemReport {
                 out.push_str(&format!("  {}: {}\n", row.label, value));
             }
             if let Some(advice) = &check.advice {
-                out.push_str(&format!("  Совет: {advice}\n"));
+                out.push_str(&format!("  {}: {advice}\n", i18n::t(lang, Key::ReportAdvice)));
             }
         }
         out
@@ -1486,26 +1516,16 @@ pub struct GpuInfo {
     /// пустое, — у `AdapterInfo` это `String`, и «нет данных» выглядит как `""`.
     pub name: String,
     /// «дискретная», «встроенная», «программная отрисовка».
-    pub kind: &'static str,
+    ///
+    /// Ключ, а не готовая строка: снимок собирается при старте, один раз на
+    /// всё время работы, а язык человек волен переключить потом — и тогда
+    /// запомненная строка осталась бы на прежнем языке посреди переведённой
+    /// карточки.
+    pub kind: Key,
     pub vendor: Option<String>,
     pub driver: Option<String>,
     /// Кто рисует: `dx12`, `vulkan`, `metal`, `gl`.
     pub backend: String,
-}
-
-/// Русское склонение при числительном: 1 день, 2 дня, 5 дней.
-pub fn plural_ru(n: u64, one: &'static str, few: &'static str, many: &'static str) -> &'static str {
-    // Одиннадцать-четырнадцать — исключение: «11 дней», а не «11 день».
-    // Без этой проверки правило по последней цифре ошибается на каждом
-    // втором десятке.
-    if (11..=14).contains(&(n % 100)) {
-        return many;
-    }
-    match n % 10 {
-        1 => one,
-        2..=4 => few,
-        _ => many,
-    }
 }
 
 /// Время работы системы словами: «3 дня 4 часа».
@@ -1514,26 +1534,50 @@ pub fn plural_ru(n: u64, one: &'static str, few: &'static str, many: &'static st
 /// работает днями — «172:04:11» человек не прочитает. Показываем две старшие
 /// единицы: с точностью до секунды аптайм никому не нужен, а строка от неё
 /// растёт и перестаёт влезать в карточку.
-pub fn human_uptime(secs: u64) -> String {
+///
+/// Склонение при числительном у каждого языка своё, и считает его
+/// [`i18n::plural`]: у русского форм три, у английского две, а в армянском
+/// существительное при числительном не меняется вовсе.
+pub fn human_uptime(secs: u64, lang: Lang) -> String {
     let (d, h, m) = (secs / 86_400, (secs % 86_400) / 3600, (secs % 3600) / 60);
 
+    let unit = |n: u64, one, few, many| {
+        i18n::plural(
+            lang,
+            n,
+            i18n::t(lang, one),
+            i18n::t(lang, few),
+            i18n::t(lang, many),
+        )
+    };
+    let days = |n: u64| unit(n, Key::UptimeDayOne, Key::UptimeDayFew, Key::UptimeDayMany);
+    let hours = |n: u64| unit(n, Key::UptimeHourOne, Key::UptimeHourFew, Key::UptimeHourMany);
+    let minutes = |n: u64| {
+        unit(
+            n,
+            Key::UptimeMinuteOne,
+            Key::UptimeMinuteFew,
+            Key::UptimeMinuteMany,
+        )
+    };
+
     if d > 0 {
-        let days = format!("{d} {}", plural_ru(d, "день", "дня", "дней"));
+        let text = format!("{d} {}", days(d));
         if h == 0 {
-            return days;
+            return text;
         }
-        return format!("{days} {h} {}", plural_ru(h, "час", "часа", "часов"));
+        return format!("{text} {h} {}", hours(h));
     }
     if h > 0 {
-        let hours = format!("{h} {}", plural_ru(h, "час", "часа", "часов"));
+        let text = format!("{h} {}", hours(h));
         if m == 0 {
-            return hours;
+            return text;
         }
-        return format!("{hours} {m} {}", plural_ru(m, "минута", "минуты", "минут"));
+        return format!("{text} {m} {}", minutes(m));
     }
     // Меньше часа — минуты, и «0 минут» здесь законно: машину только что
     // включили.
-    format!("{m} {}", plural_ru(m, "минута", "минуты", "минут"))
+    format!("{m} {}", minutes(m))
 }
 
 /// Частота процессора. `None` при нуле.
@@ -1543,14 +1587,18 @@ pub fn human_uptime(secs: u64) -> String {
 /// (`CallNtPowerInformation` на Windows заполняет вектор нулями), а «0 МГц»
 /// в окне читается как остановившийся процессор. Отличить два случая
 /// нельзя — значит, оба «нет данных».
-pub fn human_mhz(mhz: u64) -> Option<String> {
+pub fn human_mhz(mhz: u64, lang: Lang) -> Option<String> {
     if mhz == 0 {
         return None;
     }
     if mhz >= 1000 {
-        Some(format!("{:.2} ГГц", mhz as f64 / 1000.0))
+        Some(format!(
+            "{:.2} {}",
+            mhz as f64 / 1000.0,
+            i18n::t(lang, Key::UnitGigahertz)
+        ))
     } else {
-        Some(format!("{mhz} МГц"))
+        Some(format!("{mhz} {}", i18n::t(lang, Key::UnitMegahertz)))
     }
 }
 
@@ -1890,13 +1938,16 @@ impl PowerMode {
         !matches!(self, Self::High)
     }
 
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Saver => "Наилучшая энергоэффективность",
-            Self::Balanced => "Сбалансированный",
-            Self::High => "Высокая производительность",
-            Self::Max => "Максимальная производительность",
-        }
+    pub const fn label(self, lang: Lang) -> &'static str {
+        i18n::t(
+            lang,
+            match self {
+                Self::Saver => Key::PowerModeSaver,
+                Self::Balanced => Key::PowerModeBalanced,
+                Self::High => Key::PowerModeHigh,
+                Self::Max => Key::PowerModeMax,
+            },
+        )
     }
 }
 
@@ -2092,11 +2143,14 @@ pub enum WindUnit {
 impl WindUnit {
     pub const ALL: [WindUnit; 2] = [WindUnit::MetersPerSecond, WindUnit::KilometersPerHour];
 
-    pub fn label(self) -> &'static str {
-        match self {
-            WindUnit::MetersPerSecond => "м/с",
-            WindUnit::KilometersPerHour => "км/ч",
-        }
+    pub fn label(self, lang: Lang) -> &'static str {
+        i18n::t(
+            lang,
+            match self {
+                WindUnit::MetersPerSecond => Key::WindMetersPerSecond,
+                WindUnit::KilometersPerHour => Key::WindKilometersPerHour,
+            },
+        )
     }
 
     fn convert(self, kmh: f64) -> f64 {
@@ -2120,11 +2174,14 @@ pub enum PressureUnit {
 impl PressureUnit {
     pub const ALL: [PressureUnit; 2] = [PressureUnit::MmHg, PressureUnit::Hectopascal];
 
-    pub fn label(self) -> &'static str {
-        match self {
-            PressureUnit::MmHg => "мм рт. ст.",
-            PressureUnit::Hectopascal => "гПа",
-        }
+    pub fn label(self, lang: Lang) -> &'static str {
+        i18n::t(
+            lang,
+            match self {
+                PressureUnit::MmHg => Key::PressureMmHg,
+                PressureUnit::Hectopascal => Key::PressureHectopascal,
+            },
+        )
     }
 
     fn convert(self, hpa: f64) -> f64 {
@@ -2189,41 +2246,46 @@ pub fn wmo_sky(code: u16) -> Sky {
 ///
 /// Общее описание, а не пустая строка и не паника: источник вправе завести
 /// новый код, и вкладка не должна из-за этого белеть.
-pub const WMO_UNKNOWN: &str = "Погода без описания";
+pub fn wmo_unknown(lang: Lang) -> &'static str {
+    i18n::t(lang, Key::WmoUnknown)
+}
 
 /// Описание погоды по коду WMO.
-pub fn wmo_description(code: u16) -> &'static str {
-    match code {
-        0 => "Ясно",
-        1 => "Преимущественно ясно",
-        2 => "Переменная облачность",
-        3 => "Пасмурно",
-        45 => "Туман",
-        48 => "Туман с изморозью",
-        51 => "Слабая морось",
-        53 => "Морось",
-        55 => "Сильная морось",
-        56 => "Слабая ледяная морось",
-        57 => "Ледяная морось",
-        61 => "Слабый дождь",
-        63 => "Дождь",
-        65 => "Сильный дождь",
-        66 => "Слабый ледяной дождь",
-        67 => "Ледяной дождь",
-        71 => "Слабый снег",
-        73 => "Снег",
-        75 => "Сильный снег",
-        77 => "Снежные зёрна",
-        80 => "Слабый ливень",
-        81 => "Ливень",
-        82 => "Сильный ливень",
-        85 => "Слабый снегопад",
-        86 => "Сильный снегопад",
-        95 => "Гроза",
-        96 => "Гроза с небольшим градом",
-        99 => "Гроза с сильным градом",
-        _ => WMO_UNKNOWN,
-    }
+pub fn wmo_description(code: u16, lang: Lang) -> &'static str {
+    i18n::t(
+        lang,
+        match code {
+            0 => Key::WmoClear,
+            1 => Key::WmoMostlyClear,
+            2 => Key::WmoPartlyCloudy,
+            3 => Key::WmoOvercast,
+            45 => Key::WmoFog,
+            48 => Key::WmoRimeFog,
+            51 => Key::WmoLightDrizzle,
+            53 => Key::WmoDrizzle,
+            55 => Key::WmoHeavyDrizzle,
+            56 => Key::WmoLightFreezingDrizzle,
+            57 => Key::WmoFreezingDrizzle,
+            61 => Key::WmoLightRain,
+            63 => Key::WmoRain,
+            65 => Key::WmoHeavyRain,
+            66 => Key::WmoLightFreezingRain,
+            67 => Key::WmoFreezingRain,
+            71 => Key::WmoLightSnow,
+            73 => Key::WmoSnow,
+            75 => Key::WmoHeavySnow,
+            77 => Key::WmoSnowGrains,
+            80 => Key::WmoLightShowers,
+            81 => Key::WmoShowers,
+            82 => Key::WmoHeavyShowers,
+            85 => Key::WmoLightSnowShowers,
+            86 => Key::WmoHeavySnowShowers,
+            95 => Key::WmoThunder,
+            96 => Key::WmoThunderSmallHail,
+            99 => Key::WmoThunderHeavyHail,
+            _ => Key::WmoUnknown,
+        },
+    )
 }
 
 /// Погода прямо сейчас, в единицах сервера: °C, %, мм, гПа, км/ч, градусы.
@@ -2393,24 +2455,56 @@ pub fn local_day(unix: i64, offset: i64) -> i64 {
     (unix + offset).div_euclid(DAY_SECS)
 }
 
-const WEEKDAYS: [&str; 7] = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"];
-const MONTHS: [&str; 12] = [
-    "янв", "фев", "мар", "апр", "мая", "июн", "июл", "авг", "сен", "окт", "ноя", "дек",
+const WEEKDAYS: [Key; 7] = [
+    Key::WeekdayMon,
+    Key::WeekdayTue,
+    Key::WeekdayWed,
+    Key::WeekdayThu,
+    Key::WeekdayFri,
+    Key::WeekdaySat,
+    Key::WeekdaySun,
+];
+const MONTHS: [Key; 12] = [
+    Key::MonthJan,
+    Key::MonthFeb,
+    Key::MonthMar,
+    Key::MonthApr,
+    Key::MonthMay,
+    Key::MonthJun,
+    Key::MonthJul,
+    Key::MonthAug,
+    Key::MonthSep,
+    Key::MonthOct,
+    Key::MonthNov,
+    Key::MonthDec,
 ];
 
 /// «16 сен» по номеру дня.
-fn day_month(day: i64) -> String {
+///
+/// Число и месяц ставит шаблон, а не склейка: по-английски дата пишется
+/// «Sep 16», и зашитый здесь русский порядок пришлось бы обходить в переводе.
+fn day_month(day: i64, lang: Lang) -> String {
     let (_, month, date) = civil_from_days(day);
-    format!("{date} {}", MONTHS[(month - 1).clamp(0, 11) as usize])
+    let month = i18n::t(lang, MONTHS[(month - 1).clamp(0, 11) as usize]);
+    i18n::fill(
+        i18n::t(lang, Key::DateDayMonth),
+        &[&date.to_string(), month],
+    )
 }
 
 /// «Сегодня», «Завтра» или «ср, 16 сен».
-fn day_label(day: i64, today: i64) -> String {
+fn day_label(day: i64, today: i64, lang: Lang) -> String {
     match day - today {
-        0 => "Сегодня".to_owned(),
-        1 => "Завтра".to_owned(),
+        0 => i18n::t(lang, Key::DayToday).to_owned(),
+        1 => i18n::t(lang, Key::DayTomorrow).to_owned(),
         // Первое января 1970 года — четверг, отсюда сдвиг на три.
-        _ => format!("{}, {}", WEEKDAYS[(day + 3).rem_euclid(7) as usize], day_month(day)),
+        _ => i18n::fill(
+            i18n::t(lang, Key::DateWeekdayAndDay),
+            &[
+                i18n::t(lang, WEEKDAYS[(day + 3).rem_euclid(7) as usize]),
+                &day_month(day, lang),
+            ],
+        ),
     }
 }
 
@@ -2438,6 +2532,9 @@ pub fn temp_short(celsius: Option<f64>, unit: TempUnit) -> String {
 }
 
 /// «26 °C» — для крупного числа, стоящего отдельно.
+///
+/// `°C` и `°F` — обозначения, одинаковые на любом языке, и ключа в таблице
+/// переводов им не нужно.
 pub fn temp_full(celsius: Option<f64>, unit: TempUnit) -> String {
     match celsius {
         Some(value) => format!("{} {}", signed(unit.convert(value)), unit.label()),
@@ -2450,18 +2547,21 @@ pub fn temp_full(celsius: Option<f64>, unit: TempUnit) -> String {
 /// Словами, а не буквами «СВ» и не стрелкой: в сводке «ветер северо-восточный»
 /// однозначно значит «с северо-востока», а у стрелки направление приходится
 /// угадывать — куда она показывает, откуда или куда дует.
-fn wind_from(degrees: f64) -> &'static str {
-    const POINTS: [&str; 8] = [
-        "северный",
-        "северо-восточный",
-        "восточный",
-        "юго-восточный",
-        "южный",
-        "юго-западный",
-        "западный",
-        "северо-западный",
+fn wind_from(degrees: f64, lang: Lang) -> &'static str {
+    const POINTS: [Key; 8] = [
+        Key::WindNorth,
+        Key::WindNorthEast,
+        Key::WindEast,
+        Key::WindSouthEast,
+        Key::WindSouth,
+        Key::WindSouthWest,
+        Key::WindWest,
+        Key::WindNorthWest,
     ];
-    POINTS[((degrees / 45.0).round() as i64).rem_euclid(8) as usize]
+    i18n::t(
+        lang,
+        POINTS[((degrees / 45.0).round() as i64).rem_euclid(8) as usize],
+    )
 }
 
 /// «3 м/с, северо-восточный · порывы до 6 м/с».
@@ -2470,16 +2570,17 @@ pub fn wind_text(
     gusts_kmh: Option<f64>,
     direction: Option<f64>,
     unit: WindUnit,
+    lang: Lang,
 ) -> Option<String> {
     let speed = unit.convert(speed_kmh?).round();
     let mut text = if speed <= 0.0 {
-        "штиль".to_owned()
+        i18n::t(lang, Key::WindCalm).to_owned()
     } else {
-        let mut text = format!("{} {}", speed as i64, unit.label());
+        let mut text = format!("{} {}", speed as i64, unit.label(lang));
         // В штиль направления нет, и называть его незачем.
         if let Some(direction) = direction {
             text.push_str(", ");
-            text.push_str(wind_from(direction));
+            text.push_str(wind_from(direction, lang));
         }
         text
     };
@@ -2488,14 +2589,18 @@ pub fn wind_text(
     if let Some(gusts) = gusts_kmh.map(|gusts| unit.convert(gusts).round())
         && gusts > speed
     {
-        text.push_str(&format!(" · порывы до {} {}", gusts as i64, unit.label()));
+        text.push_str(" · ");
+        text.push_str(&i18n::fill(
+            i18n::t(lang, Key::WindGusts),
+            &[&(gusts as i64).to_string(), unit.label(lang)],
+        ));
     }
     Some(text)
 }
 
 /// «680 мм рт. ст.»
-pub fn pressure_text(hpa: f64, unit: PressureUnit) -> String {
-    format!("{} {}", unit.convert(hpa).round() as i64, unit.label())
+pub fn pressure_text(hpa: f64, unit: PressureUnit, lang: Lang) -> String {
+    format!("{} {}", unit.convert(hpa).round() as i64, unit.label(lang))
 }
 
 /// «37%»
@@ -2504,47 +2609,56 @@ pub fn percent_text(value: f64) -> String {
 }
 
 /// «0 мм» или «1.2 мм»: десятые — только когда они есть.
-pub fn precipitation_text(mm: f64) -> String {
+pub fn precipitation_text(mm: f64, lang: Lang) -> String {
     let tenths = (mm * 10.0).round() / 10.0;
+    let unit = i18n::t(lang, Key::UnitMillimetre);
     if tenths.fract() == 0.0 {
-        format!("{} мм", tenths as i64)
+        format!("{} {unit}", tenths as i64)
     } else {
-        format!("{tenths:.1} мм")
+        format!("{tenths:.1} {unit}")
     }
 }
 
+/// Число и словесная оценка рядом: «7 — высокий».
+fn with_level(value: i64, level: Key, lang: Lang) -> String {
+    i18n::fill(
+        i18n::t(lang, Key::ValueWithLevel),
+        &[&value.to_string(), i18n::t(lang, level)],
+    )
+}
+
 /// «7 — высокий»: УФ-индекс со шкалой ВОЗ.
-pub fn uv_text(index: f64) -> String {
+pub fn uv_text(index: f64, lang: Lang) -> String {
     let rounded = index.round().max(0.0);
     let level = match rounded as i64 {
-        0..=2 => "низкий",
-        3..=5 => "умеренный",
-        6..=7 => "высокий",
-        8..=10 => "очень высокий",
-        _ => "экстремальный",
+        0..=2 => Key::UvLow,
+        3..=5 => Key::UvModerate,
+        6..=7 => Key::UvHigh,
+        8..=10 => Key::UvVeryHigh,
+        _ => Key::UvExtreme,
     };
-    format!("{} — {level}", rounded as i64)
+    with_level(rounded as i64, level, lang)
 }
 
 /// «33 — удовлетворительное»: европейский индекс качества воздуха.
 ///
 /// Границы — шкала EAQI, как её описывает Open-Meteo: через каждые двадцать
 /// пунктов до сотни и «крайне плохое» выше.
-pub fn aqi_text(index: f64) -> String {
+pub fn aqi_text(index: f64, lang: Lang) -> String {
     let level = match index {
-        i if i <= 20.0 => "хорошее",
-        i if i <= 40.0 => "удовлетворительное",
-        i if i <= 60.0 => "умеренное",
-        i if i <= 80.0 => "плохое",
-        i if i <= 100.0 => "очень плохое",
-        _ => "крайне плохое",
+        i if i <= 20.0 => Key::AqiGood,
+        i if i <= 40.0 => Key::AqiFair,
+        i if i <= 60.0 => Key::AqiModerate,
+        i if i <= 80.0 => Key::AqiPoor,
+        i if i <= 100.0 => Key::AqiVeryPoor,
+        _ => Key::AqiExtreme,
     };
-    format!("{} — {level}", index.round() as i64)
+    with_level(index.round() as i64, level, lang)
 }
 
 /// «4.9 мкг/м³»
-pub fn particles_text(value: f64) -> String {
-    format!("{value:.1} мкг/м³")
+pub fn particles_text(value: f64, lang: Lang) -> String {
+    format!("{value:.1} {}", i18n::t(lang, Key::UnitMicrogram))
 }
 
 /// Один столбик почасового прогноза, готовый к показу.
@@ -2611,6 +2725,7 @@ pub fn weather_view(
     units: WeatherUnits,
     now: Option<i64>,
     local_offset: Option<i64>,
+    lang: Lang,
 ) -> WeatherView {
     let offset = report.utc_offset;
     let today = now
@@ -2622,55 +2737,77 @@ pub fn weather_view(
         .find(|day| Some(day.day) == today)
         .or_else(|| report.days.first());
 
-    let prefix = if report.saved {
-        "Сохранённый отчёт"
-    } else {
-        "Обновлено"
-    };
+    let prefix = i18n::t(
+        lang,
+        if report.saved {
+            Key::WeatherSavedReport
+        } else {
+            Key::WeatherUpdated
+        },
+    );
     let updated = match (report.fetched_at, local_offset) {
-        (None, _) => "Когда получен прогноз, неизвестно: часы компьютера показывают \
-                      дату раньше 1970 года."
-            .to_owned(),
+        (None, _) => i18n::t(lang, Key::WeatherClockBroken).to_owned(),
         (Some(at), Some(mine)) => {
             let same_day = now.is_some_and(|now| local_day(now, mine) == local_day(at, mine));
             if same_day {
-                format!("{prefix} в {}", clock(at, mine))
+                i18n::fill(
+                    i18n::t(lang, Key::WeatherUpdatedAt),
+                    &[prefix, &clock(at, mine)],
+                )
             } else {
-                format!(
-                    "{prefix} {} в {}",
-                    day_month(local_day(at, mine)),
-                    clock(at, mine)
+                i18n::fill(
+                    i18n::t(lang, Key::WeatherUpdatedOn),
+                    &[
+                        prefix,
+                        &day_month(local_day(at, mine), lang),
+                        &clock(at, mine),
+                    ],
                 )
             }
         }
         // Часовой пояс машины система не назвала — честнее сказать время по
         // UTC, чем выдать чужие часы за местные.
-        (Some(at), None) => format!("{prefix} в {} UTC", clock(at, 0)),
+        (Some(at), None) => i18n::fill(
+            i18n::t(lang, Key::WeatherUpdatedUtc),
+            &[prefix, &clock(at, 0)],
+        ),
     };
 
     let current = report.now.as_ref();
     let field = |pick: fn(&WeatherNow) -> Option<f64>| current.and_then(pick);
+    let name = |key| i18n::t(lang, key);
     let rows = vec![
-        ("Влажность", field(|n| n.humidity).map(percent_text)),
+        (name(Key::WeatherHumidity), field(|n| n.humidity).map(percent_text)),
         (
-            "Ветер",
-            current.and_then(|n| wind_text(n.wind_speed, n.wind_gusts, n.wind_direction, units.wind)),
+            name(Key::WeatherWind),
+            current.and_then(|n| {
+                wind_text(n.wind_speed, n.wind_gusts, n.wind_direction, units.wind, lang)
+            }),
         ),
         (
-            "Давление",
-            field(|n| n.pressure).map(|hpa| pressure_text(hpa, units.pressure)),
+            name(Key::WeatherPressure),
+            field(|n| n.pressure).map(|hpa| pressure_text(hpa, units.pressure, lang)),
         ),
-        ("Облачность", field(|n| n.cloud_cover).map(percent_text)),
-        ("Осадки", field(|n| n.precipitation).map(precipitation_text)),
-        ("УФ-индекс", field(|n| n.uv_index).map(uv_text)),
         (
-            "Восход",
+            name(Key::WeatherCloudCover),
+            field(|n| n.cloud_cover).map(percent_text),
+        ),
+        (
+            name(Key::WeatherPrecipitation),
+            field(|n| n.precipitation).map(|mm| precipitation_text(mm, lang)),
+        ),
+        (
+            name(Key::WeatherUvIndex),
+            field(|n| n.uv_index).map(|uv| uv_text(uv, lang)),
+        ),
+        (
+            name(Key::WeatherSunrise),
             today_forecast
                 .and_then(|day| day.sunrise)
                 .map(|at| clock(at, offset)),
         ),
         (
-            "Закат",
+            name(Key::WeatherSunset),
             today_forecast
                 .and_then(|day| day.sunset)
                 .map(|at| clock(at, offset)),
@@ -2678,10 +2815,15 @@ pub fn weather_view(
     ];
 
     let air = match &report.air {
+        // «PM2.5» и «PM10» — обозначения из шкалы, а не слова: переводить
+        // в них нечего.
         Some(air) => vec![
-            ("Воздух", air.european_aqi.map(aqi_text)),
-            ("PM2.5", air.pm2_5.map(particles_text)),
-            ("PM10", air.pm10.map(particles_text)),
+            (
+                name(Key::WeatherAir),
+                air.european_aqi.map(|aqi| aqi_text(aqi, lang)),
+            ),
+            ("PM2.5", air.pm2_5.map(|v| particles_text(v, lang))),
+            ("PM10", air.pm10.map(|v| particles_text(v, lang))),
         ],
         None => Vec::new(),
     };
@@ -2697,7 +2839,7 @@ pub fn weather_view(
             let is_now = now.is_some_and(|now| hour.at <= now);
             HourView {
                 time: if is_now {
-                    "Сейчас".to_owned()
+                    i18n::t(lang, Key::WeatherNow).to_owned()
                 } else {
                     clock(hour.at, offset)
                 },
@@ -2715,7 +2857,7 @@ pub fn weather_view(
         .iter()
         .filter(|day| today.is_none_or(|today| day.day >= today))
         .map(|day| DayView {
-            label: day_label(day.day, today.unwrap_or(day.day)),
+            label: day_label(day.day, today.unwrap_or(day.day), lang),
             temperatures: format!(
                 "{} … {}",
                 temp_short(day.temperature_min, units.temp),
@@ -2723,7 +2865,9 @@ pub fn weather_view(
             ),
             chance: chance(day.precipitation_chance),
             sky: day.code.map_or(Sky::Unknown, wmo_sky),
-            description: day.code.map_or(WMO_UNKNOWN, wmo_description),
+            description: day
+                .code
+                .map_or(wmo_unknown(lang), |code| wmo_description(code, lang)),
         })
         .collect();
 
@@ -2731,9 +2875,15 @@ pub fn weather_view(
         title: report.place.title(),
         updated,
         temperature: temp_full(field(|n| n.temperature), units.temp),
-        feels_like: field(|n| n.feels_like)
-            .map(|value| format!("ощущается как {}", temp_short(Some(value), units.temp))),
-        description: current.and_then(|n| n.code).map(wmo_description),
+        feels_like: field(|n| n.feels_like).map(|value| {
+            i18n::fill(
+                i18n::t(lang, Key::WeatherFeelsLike),
+                &[&temp_short(Some(value), units.temp)],
+            )
+        }),
+        description: current
+            .and_then(|n| n.code)
+            .map(|code| wmo_description(code, lang)),
         sky: current.and_then(|n| n.code).map_or(Sky::Unknown, wmo_sky),
         night: current.is_some_and(|n| n.is_day == Some(false)),
         rows,
@@ -2791,11 +2941,14 @@ pub enum TransferDirection {
 }
 
 impl TransferDirection {
-    pub fn label(self) -> &'static str {
-        match self {
-            TransferDirection::ToComputer => "На компьютер",
-            TransferDirection::ToPhone => "На телефон",
-        }
+    pub fn label(self, lang: Lang) -> &'static str {
+        i18n::t(
+            lang,
+            match self {
+                TransferDirection::ToComputer => Key::TransferToComputer,
+                TransferDirection::ToPhone => Key::TransferToPhone,
+            },
+        )
     }
 }
 
@@ -2835,11 +2988,14 @@ pub enum ShareEvent {
 ///
 /// Собирается на приёме события, а не в кадре: прогресс приезжает
 /// несколько раз в секунду, кадров — шестьдесят (Правило 1).
-pub fn transfer_line(done: u64, total: Option<u64>) -> String {
+pub fn transfer_line(done: u64, total: Option<u64>, lang: Lang) -> String {
     match total {
-        Some(total) if done < total => format!("{} из {}", human_bytes(done), human_bytes(total)),
-        Some(total) => human_bytes(total),
-        None => human_bytes(done),
+        Some(total) if done < total => i18n::fill(
+            i18n::t(lang, Key::AmountOfTotal),
+            &[&human_bytes(done, lang), &human_bytes(total, lang)],
+        ),
+        Some(total) => human_bytes(total, lang),
+        None => human_bytes(done, lang),
     }
 }
 
@@ -2876,10 +3032,13 @@ mod tests {
 
     #[test]
     fn transfer_line_counts_up_to_the_total() {
-        assert_eq!(transfer_line(0, Some(2048)), "0 Б из 2.0 КБ");
+        assert_eq!(transfer_line(0, Some(2048), Lang::Ru), "0 Б из 2.0 КБ");
         // Дошедший файл — просто размер: «2 КБ из 2 КБ» читается как недосказанность.
-        assert_eq!(transfer_line(2048, Some(2048)), "2.0 КБ");
-        assert_eq!(transfer_line(1024, None), "1.0 КБ");
+        assert_eq!(transfer_line(2048, Some(2048), Lang::Ru), "2.0 КБ");
+        assert_eq!(transfer_line(1024, None, Lang::Ru), "1.0 КБ");
+        // Единица и слово «из» — тоже перевод, и пропустить их легче всего:
+        // подписями они не выглядят.
+        assert_eq!(transfer_line(0, Some(2048), Lang::En), "0 B of 2.0 KB");
     }
 
     #[test]
@@ -2916,31 +3075,42 @@ mod tests {
 
     #[test]
     fn bytes_switch_units() {
-        assert_eq!(human_bytes(0), "0 Б");
-        assert_eq!(human_bytes(512), "512 Б");
-        assert_eq!(human_bytes(1024), "1.0 КБ");
-        assert_eq!(human_bytes(1536), "1.5 КБ");
-        assert_eq!(human_bytes(1024 * 1024), "1.0 МБ");
-        assert_eq!(human_bytes(1024 * 1024 * 1024), "1.0 ГБ");
-        assert_eq!(human_bytes(5 * 1024 * 1024 * 1024), "5.0 ГБ");
-        assert_eq!(human_bytes(1024_u64.pow(4)), "1.0 ТБ");
-        assert_eq!(human_bytes(5 * 1024_u64.pow(4)), "5.0 ТБ");
+        assert_eq!(human_bytes(0, Lang::Ru), "0 Б");
+        assert_eq!(human_bytes(512, Lang::Ru), "512 Б");
+        assert_eq!(human_bytes(1024, Lang::Ru), "1.0 КБ");
+        assert_eq!(human_bytes(1536, Lang::Ru), "1.5 КБ");
+        assert_eq!(human_bytes(1024 * 1024, Lang::Ru), "1.0 МБ");
+        assert_eq!(human_bytes(1024 * 1024 * 1024, Lang::Ru), "1.0 ГБ");
+        assert_eq!(human_bytes(5 * 1024 * 1024 * 1024, Lang::Ru), "5.0 ГБ");
+        assert_eq!(human_bytes(1024_u64.pow(4), Lang::Ru), "1.0 ТБ");
+        assert_eq!(human_bytes(5 * 1024_u64.pow(4), Lang::Ru), "5.0 ТБ");
         // Терабайт — последняя единица, дальше просто копятся ТБ.
-        assert_eq!(human_bytes(5 * 1024_u64.pow(5)), "5120.0 ТБ");
-        // Верхняя граница типа не должна ни паниковать, ни переполняться.
-        assert!(human_bytes(u64::MAX).ends_with(" ТБ"));
+        assert_eq!(human_bytes(5 * 1024_u64.pow(5), Lang::Ru), "5120.0 ТБ");
+        // Верхняя граница типа не должна ни паниковать, ни переполняться —
+        // и шкала обязана доезжать до верха на каждом языке.
+        for lang in Lang::ALL {
+            let top = i18n::t(lang, Key::UnitTerabyte);
+            assert!(
+                human_bytes(u64::MAX, lang).ends_with(&format!(" {top}")),
+                "{lang:?}: верх шкалы не доехал"
+            );
+        }
     }
 
     #[test]
     fn speed_carries_its_unit() {
-        assert_eq!(human_speed(0.0), "0 Б/с");
-        assert_eq!(human_speed(512.0), "512 Б/с");
+        assert_eq!(human_speed(0.0, Lang::Ru), "0 Б/с");
+        assert_eq!(human_speed(512.0, Lang::Ru), "512 Б/с");
         // Дробные байты в секунду — не «стоит»: округляем вверх, а не в ноль.
-        assert_eq!(human_speed(0.9), "1 Б/с");
-        assert_eq!(human_speed(1024.0), "1.0 КБ/с");
-        assert_eq!(human_speed(1_572_864.0), "1.5 МБ/с");
+        assert_eq!(human_speed(0.9, Lang::Ru), "1 Б/с");
+        assert_eq!(human_speed(1024.0, Lang::Ru), "1.0 КБ/с");
+        assert_eq!(human_speed(1_572_864.0, Lang::Ru), "1.5 МБ/с");
         // Ровно то, что приходит от yt-dlp: 15943362.460976 Б/с.
-        assert_eq!(human_speed(15_943_362.460976), "15.2 МБ/с");
+        assert_eq!(human_speed(15_943_362.460976, Lang::Ru), "15.2 МБ/с");
+        // Хвост «в секунду» переводится вместе с единицей: «15.2 MB/с» —
+        // ровно та наполовину переведённая строка, которую легче всего не
+        // заметить.
+        assert_eq!(human_speed(1_572_864.0, Lang::En), "1.5 MB/s");
     }
 
     #[test]
@@ -2949,7 +3119,24 @@ mod tests {
         // формат вывода не должен зависеть от их бдительности: «NaN Б/с»
         // в строке прогресса — это доклад об ошибке чужим языком.
         for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, -0.0] {
-            assert_eq!(human_speed(bad), "0 Б/с", "вход: {bad}");
+            assert_eq!(human_speed(bad, Lang::Ru), "0 Б/с", "вход: {bad}");
+        }
+    }
+
+    /// Единицы объёма обязаны различаться внутри одного языка: совпавшие
+    /// «КБ» и «МБ» превратили бы размер файла в загадку, а разъехаться они
+    /// могут молча — опечатка в таблице переводов ошибкой сборки не станет.
+    #[test]
+    fn byte_units_are_distinct_in_every_language() {
+        for lang in Lang::ALL {
+            let units = byte_units(lang);
+            for (i, unit) in units.iter().enumerate() {
+                assert!(!unit.trim().is_empty(), "{lang:?}: единица {i} пуста");
+                assert!(
+                    !units[..i].contains(unit),
+                    "{lang:?}: единица «{unit}» повторяется"
+                );
+            }
         }
     }
 
@@ -3094,12 +3281,17 @@ mod tests {
     /// с соседним ничего ему не объяснит.
     #[test]
     fn section_errors_explain_themselves_distinctly() {
-        let mut seen: Vec<&str> = Vec::new();
-        for err in [SectionError::Start, SectionError::End, SectionError::Order] {
-            let message = err.message();
-            assert!(!message.trim().is_empty(), "{err:?}: пустое сообщение");
-            assert!(!seen.contains(&message), "{err:?}: сообщение повторяется");
-            seen.push(message);
+        for lang in Lang::ALL {
+            let mut seen: Vec<&str> = Vec::new();
+            for err in [SectionError::Start, SectionError::End, SectionError::Order] {
+                let message = err.message(lang);
+                assert!(!message.trim().is_empty(), "{lang:?}/{err:?}: пусто");
+                assert!(
+                    !seen.contains(&message),
+                    "{lang:?}/{err:?}: сообщение повторяется"
+                );
+                seen.push(message);
+            }
         }
     }
 
@@ -3366,7 +3558,7 @@ mod tests {
     fn the_only_authored_track_beats_a_language_without_one() {
         let info = info_with(Some("ru"), &["en"], &[]);
         assert_eq!(info.subtitle_code(&SubLang::Original), Some("en"));
-        assert_eq!(info.subtitle_note(&SubLang::Original, false), None);
+        assert_eq!(info.subtitle_note(&SubLang::Original, false, Lang::Ru), None);
     }
 
     /// А вот когда отдавать нечего — ни дорожки на названном языке, ни
@@ -3378,7 +3570,10 @@ mod tests {
         // Авторских две — выбрать «единственную» не выйдет.
         let info = info_with(Some("ru"), &["en", "de"], &[]);
         assert_eq!(info.subtitle_code(&SubLang::Original), Some("ru"));
-        assert!(info.subtitle_note(&SubLang::Original, false).is_some());
+        assert!(
+            info.subtitle_note(&SubLang::Original, false, Lang::Ru)
+                .is_some()
+        );
 
         // Только автоматические, и русского среди них нет.
         let info = info_with(Some("ru"), &[], &["en", "de"]);
@@ -3406,30 +3601,44 @@ mod tests {
     /// язык» — советы противоположные.
     #[test]
     fn subtitle_note_tells_the_two_troubles_apart() {
-        // Всё в порядке — молчим.
-        let good = info_with(Some("ru"), &[], &["ru"]);
-        assert_eq!(good.subtitle_note(&SubLang::Original, true), None);
+        // Сверяемся с ключом, а не с куском русского текста: подгонка теста
+        // под новую формулировку потеряла бы саму проверку, а на двух других
+        // языках такой тест не работал бы вовсе.
+        for lang in Lang::ALL {
+            // Всё в порядке — молчим.
+            let good = info_with(Some("ru"), &[], &["ru"]);
+            assert_eq!(good.subtitle_note(&SubLang::Original, true, lang), None);
 
-        // Есть автоматические, но галочка снята.
-        let note = good
-            .subtitle_note(&SubLang::Original, false)
-            .expect("нет оговорки про выключенные автоматические");
-        assert!(note.contains("Можно автоматические"), "{note}");
+            // Есть автоматические, но галочка снята.
+            assert_eq!(
+                good.subtitle_note(&SubLang::Original, false, lang)
+                    .as_deref(),
+                Some(i18n::t(lang, Key::SubsOnlyAuto)),
+                "{lang:?}: не та оговорка про выключенные автоматические"
+            );
 
-        // Субтитров нет вовсе.
-        let note = MediaInfo::default()
-            .subtitle_note(&SubLang::Original, true)
-            .expect("нет оговорки про полное отсутствие субтитров");
-        assert!(note.contains("нет вовсе"), "{note}");
-        assert!(!note.contains("Можно автоматические"), "{note}");
+            // Субтитров нет вовсе — беда другая, и совет противоположный.
+            assert_eq!(
+                MediaInfo::default()
+                    .subtitle_note(&SubLang::Original, true, lang)
+                    .as_deref(),
+                Some(i18n::t(lang, Key::SubsNoneAtAll)),
+                "{lang:?}: не та оговорка про полное отсутствие субтитров"
+            );
 
-        // Выбран язык, которого у ролика нет: так бывает, когда список
-        // остался от прошлой ссылки.
-        let note = good
-            .subtitle_note(&SubLang::Code("de".to_owned()), true)
-            .expect("нет оговорки про недоступный язык");
-        assert!(note.contains("de"), "{note}");
-        assert!(note.contains("другой язык"), "{note}");
+            // Выбран язык, которого у ролика нет: так бывает, когда список
+            // остался от прошлой ссылки. Код языка обязан доехать до текста —
+            // без него оговорка не говорит, о каком языке речь.
+            let note = good
+                .subtitle_note(&SubLang::Code("de".to_owned()), true, lang)
+                .expect("нет оговорки про недоступный язык");
+            assert!(note.contains("de"), "{lang:?}: {note}");
+            assert_eq!(
+                note,
+                i18n::fill(i18n::t(lang, Key::SubsNoSuchLang), &["de"]),
+                "{lang:?}: не та оговорка про недоступный язык"
+            );
+        }
     }
 
     /// Язык не определился — сказать нечего: что возьмёт yt-dlp своим
@@ -3437,7 +3646,7 @@ mod tests {
     #[test]
     fn subtitle_note_stays_quiet_when_the_language_is_unknown() {
         let info = info_with(None, &["en", "de"], &[]);
-        assert_eq!(info.subtitle_note(&SubLang::Original, true), None);
+        assert_eq!(info.subtitle_note(&SubLang::Original, true, Lang::Ru), None);
     }
 
     /// Робота зовём только туда, где автора нет.
@@ -3506,7 +3715,12 @@ mod tests {
     #[test]
     fn subtitles_default_to_the_video_language() {
         assert_eq!(SubLang::default(), SubLang::Original);
-        assert!(!SubLang::ORIGINAL_LABEL.trim().is_empty());
+        for lang in Lang::ALL {
+            assert!(
+                !SubLang::original_label(lang).trim().is_empty(),
+                "{lang:?}: первый пункт списка без подписи"
+            );
+        }
     }
 
     /// `any()` обязан замечать каждый флажок по отдельности: на нём держится
@@ -3607,12 +3821,20 @@ mod tests {
     /// превратили бы выбор в угадайку.
     #[test]
     fn cookie_labels_are_distinct() {
-        let mut seen: Vec<&str> = Vec::new();
-        for source in CookieSource::ALL {
-            let label = source.label();
-            assert!(!label.trim().is_empty(), "{source:?}: пустая подпись");
-            assert!(!seen.contains(&label), "{label}: подпись повторяется");
-            seen.push(label);
+        for lang in Lang::ALL {
+            let mut seen: Vec<&str> = Vec::new();
+            for source in CookieSource::ALL {
+                let label = source.label(lang);
+                assert!(
+                    !label.trim().is_empty(),
+                    "{lang:?}/{source:?}: пустая подпись"
+                );
+                assert!(
+                    !seen.contains(&label),
+                    "{lang:?}: подпись «{label}» повторяется"
+                );
+                seen.push(label);
+            }
         }
     }
 
@@ -3637,14 +3859,21 @@ mod tests {
     /// кроме «Макс.», которое одинаково значит «сколько дают».
     #[test]
     fn labels_differ_by_format() {
-        for quality in Quality::ALL {
-            let (video, audio) = (quality.label(Format::Mp4), quality.label(Format::Mp3));
-            assert!(!video.is_empty() && !audio.is_empty());
-            if quality != Quality::Best {
-                assert_ne!(video, audio, "{quality:?}: подписи совпали");
+        for lang in Lang::ALL {
+            for quality in Quality::ALL {
+                let video = quality.label(Format::Mp4, lang);
+                let audio = quality.label(Format::Mp3, lang);
+                assert!(!video.is_empty() && !audio.is_empty(), "{lang:?}");
+                if quality != Quality::Best {
+                    assert_ne!(video, audio, "{lang:?}/{quality:?}: подписи совпали");
+                }
             }
+            assert_ne!(
+                Format::Mp4.quality_label(lang),
+                Format::Mp3.quality_label(lang),
+                "{lang:?}: единицы у видео и звука разные, подписи обязаны это говорить"
+            );
         }
-        assert_ne!(Format::Mp4.quality_label(), Format::Mp3.quality_label());
     }
 
     #[test]
@@ -3700,11 +3929,13 @@ mod tests {
     fn short_format_name_is_the_head_of_the_full_label() {
         assert_eq!(Format::Mp4.short(), "MP4");
         assert_eq!(Format::Mp3.short(), "MP3");
-        for format in [Format::Mp4, Format::Mp3] {
-            assert!(
-                format.label().starts_with(format.short()),
-                "{format:?}: короткое имя разошлось с подписью переключателя"
-            );
+        for lang in Lang::ALL {
+            for format in [Format::Mp4, Format::Mp3] {
+                assert!(
+                    format.label(lang).starts_with(format.short()),
+                    "{lang:?}/{format:?}: короткое имя разошлось с подписью переключателя"
+                );
+            }
         }
     }
 
@@ -3714,20 +3945,30 @@ mod tests {
     /// уехало не то, что он выбрал.
     #[test]
     fn quality_with_unit_matches_the_segment_it_came_from() {
-        for format in [Format::Mp4, Format::Mp3] {
-            for quality in Quality::ALL {
-                let (bare, with_unit) = (quality.label(format), quality.label_with_unit(format));
-                assert!(
-                    with_unit.starts_with(bare),
-                    "{format:?}/{quality:?}: «{with_unit}» не начинается с «{bare}»"
-                );
+        for lang in Lang::ALL {
+            for format in [Format::Mp4, Format::Mp3] {
+                for quality in Quality::ALL {
+                    let bare = quality.label(format, lang);
+                    let with_unit = quality.label_with_unit(format, lang);
+                    assert!(
+                        with_unit.starts_with(bare),
+                        "{lang:?}/{format:?}/{quality:?}: «{with_unit}» не начинается с «{bare}»"
+                    );
+                }
             }
         }
         // У видео единица уже внутри подписи — дописывать нечего.
-        assert_eq!(Quality::P1080.label_with_unit(Format::Mp4), "1080p");
+        assert_eq!(Quality::P1080.label_with_unit(Format::Mp4, Lang::Ru), "1080p");
         // У звука без единицы подпись читается как загадка.
-        assert_eq!(Quality::P1080.label_with_unit(Format::Mp3), "192 кбит/с");
-        assert_eq!(Quality::Best.label_with_unit(Format::Mp3), "Макс.");
+        assert_eq!(
+            Quality::P1080.label_with_unit(Format::Mp3, Lang::Ru),
+            "192 кбит/с"
+        );
+        assert_eq!(
+            Quality::P1080.label_with_unit(Format::Mp3, Lang::En),
+            "192 kbps"
+        );
+        assert_eq!(Quality::Best.label_with_unit(Format::Mp3, Lang::Ru), "Макс.");
     }
 
     /// Прогресс по умолчанию не принадлежит ни одной загрузке.
@@ -3887,12 +4128,17 @@ mod tests {
     /// Две кнопки с одинаковой подписью — это выбор вслепую.
     #[test]
     fn power_modes_name_themselves_distinctly() {
-        let mut seen: Vec<&str> = Vec::new();
-        for mode in PowerMode::ALL {
-            let label = mode.label();
-            assert!(!label.trim().is_empty(), "{mode:?}: пустая подпись");
-            assert!(!seen.contains(&label), "{mode:?}: подпись повторяется");
-            seen.push(label);
+        for lang in Lang::ALL {
+            let mut seen: Vec<&str> = Vec::new();
+            for mode in PowerMode::ALL {
+                let label = mode.label(lang);
+                assert!(!label.trim().is_empty(), "{lang:?}/{mode:?}: пустая подпись");
+                assert!(
+                    !seen.contains(&label),
+                    "{lang:?}/{mode:?}: подпись повторяется"
+                );
+                seen.push(label);
+            }
         }
     }
 
@@ -3964,13 +4210,19 @@ mod tests {
     /// незнакомый — общее описание, а не пустую строку и не панику.
     #[test]
     fn every_wmo_code_is_described() {
-        for code in WMO_CODES {
-            assert_ne!(wmo_description(code), WMO_UNKNOWN, "код {code} без описания");
-            assert_ne!(wmo_sky(code), Sky::Unknown, "код {code} без значка");
-        }
-        for code in [4, 42, 100, u16::MAX] {
-            assert_eq!(wmo_description(code), WMO_UNKNOWN);
-            assert_eq!(wmo_sky(code), Sky::Unknown);
+        for lang in Lang::ALL {
+            for code in WMO_CODES {
+                assert_ne!(
+                    wmo_description(code, lang),
+                    wmo_unknown(lang),
+                    "{lang:?}: код {code} без описания"
+                );
+                assert_ne!(wmo_sky(code), Sky::Unknown, "код {code} без значка");
+            }
+            for code in [4, 42, 100, u16::MAX] {
+                assert_eq!(wmo_description(code, lang), wmo_unknown(lang));
+                assert_eq!(wmo_sky(code), Sky::Unknown);
+            }
         }
     }
 
@@ -4022,11 +4274,15 @@ mod tests {
     #[test]
     fn days_are_named_relative_to_today() {
         let today = JAN_1_2024 / 86_400;
-        assert_eq!(day_label(today, today), "Сегодня");
-        assert_eq!(day_label(today + 1, today), "Завтра");
+        assert_eq!(day_label(today, today, Lang::Ru), "Сегодня");
+        assert_eq!(day_label(today + 1, today, Lang::Ru), "Завтра");
         // 2024-01-03 — среда.
-        assert_eq!(day_label(today + 2, today), "ср, 3 янв");
-        assert_eq!(day_label(today + 6, today), "вс, 7 янв");
+        assert_eq!(day_label(today + 2, today, Lang::Ru), "ср, 3 янв");
+        assert_eq!(day_label(today + 6, today, Lang::Ru), "вс, 7 янв");
+        // Порядок «число — месяц» свой у каждого языка, и зашить русский
+        // во все три — ровно та ошибка, ради которой здесь подстановка.
+        assert_eq!(day_label(today + 2, today, Lang::En), "Wed, 3 Jan");
+        assert_eq!(day_label(today, today, Lang::Am), "Այսօր");
     }
 
     /// Минус типографский, минус ноль не бывает, Фаренгейт пересчитан.
@@ -4045,44 +4301,62 @@ mod tests {
     fn wind_is_told_in_words() {
         let ms = WindUnit::MetersPerSecond;
         assert_eq!(
-            wind_text(Some(36.0), Some(54.0), Some(45.0), ms).as_deref(),
+            wind_text(Some(36.0), Some(54.0), Some(45.0), ms, Lang::Ru).as_deref(),
             Some("10 м/с, северо-восточный · порывы до 15 м/с")
         );
         assert_eq!(
-            wind_text(Some(36.0), Some(36.0), Some(350.0), WindUnit::KilometersPerHour).as_deref(),
+            wind_text(
+                Some(36.0),
+                Some(36.0),
+                Some(350.0),
+                WindUnit::KilometersPerHour,
+                Lang::Ru
+            )
+            .as_deref(),
             Some("36 км/ч, северный")
         );
         // Отрицательный угол — тот же север, а не паника на индексе.
         assert_eq!(
-            wind_text(Some(10.0), None, Some(-10.0), ms).as_deref(),
+            wind_text(Some(10.0), None, Some(-10.0), ms, Lang::Ru).as_deref(),
             Some("3 м/с, северный")
         );
         assert_eq!(
-            wind_text(Some(1.0), Some(11.0), Some(90.0), ms).as_deref(),
+            wind_text(Some(1.0), Some(11.0), Some(90.0), ms, Lang::Ru).as_deref(),
             Some("штиль · порывы до 3 м/с")
         );
-        assert_eq!(wind_text(None, Some(20.0), Some(90.0), ms), None);
+        assert_eq!(wind_text(None, Some(20.0), Some(90.0), ms, Lang::Ru), None);
+        // Единица, направление и слово про порывы переводятся все три:
+        // наполовину переведённая строка выглядит опечаткой, а не пропуском.
+        assert_eq!(
+            wind_text(Some(36.0), Some(54.0), Some(45.0), ms, Lang::En).as_deref(),
+            Some("10 m/s, north-easterly · gusts up to 15 m/s")
+        );
     }
 
     /// Давление и шкалы УФ и воздуха — на своих границах.
     #[test]
     fn scales_break_where_they_should() {
-        assert_eq!(pressure_text(1013.25, PressureUnit::MmHg), "760 мм рт. ст.");
-        assert_eq!(pressure_text(904.5, PressureUnit::Hectopascal), "905 гПа");
+        let ru = Lang::Ru;
+        assert_eq!(pressure_text(1013.25, PressureUnit::MmHg, ru), "760 мм рт. ст.");
+        assert_eq!(pressure_text(904.5, PressureUnit::Hectopascal, ru), "905 гПа");
 
-        assert_eq!(uv_text(2.4), "2 — низкий");
-        assert_eq!(uv_text(2.6), "3 — умеренный");
-        assert_eq!(uv_text(7.0), "7 — высокий");
-        assert_eq!(uv_text(10.4), "10 — очень высокий");
-        assert_eq!(uv_text(11.0), "11 — экстремальный");
+        assert_eq!(uv_text(2.4, ru), "2 — низкий");
+        assert_eq!(uv_text(2.6, ru), "3 — умеренный");
+        assert_eq!(uv_text(7.0, ru), "7 — высокий");
+        assert_eq!(uv_text(10.4, ru), "10 — очень высокий");
+        assert_eq!(uv_text(11.0, ru), "11 — экстремальный");
 
-        assert_eq!(aqi_text(20.0), "20 — хорошее");
-        assert_eq!(aqi_text(33.0), "33 — удовлетворительное");
-        assert_eq!(aqi_text(101.0), "101 — крайне плохое");
+        assert_eq!(aqi_text(20.0, ru), "20 — хорошее");
+        assert_eq!(aqi_text(33.0, ru), "33 — удовлетворительное");
+        assert_eq!(aqi_text(101.0, ru), "101 — крайне плохое");
 
-        assert_eq!(precipitation_text(0.0), "0 мм");
-        assert_eq!(precipitation_text(1.24), "1.2 мм");
-        assert_eq!(particles_text(4.9), "4.9 мкг/м³");
+        assert_eq!(precipitation_text(0.0, ru), "0 мм");
+        assert_eq!(precipitation_text(1.24, ru), "1.2 мм");
+        assert_eq!(particles_text(4.9, ru), "4.9 мкг/м³");
+
+        // Границы шкал от языка не зависят, а слова — зависят.
+        assert_eq!(uv_text(7.0, Lang::En), "7 — high");
+        assert_eq!(aqi_text(33.0, Lang::En), "33 — fair");
     }
 
     fn place(name: &str, region: Option<&str>, country: Option<&str>) -> Place {
@@ -4186,7 +4460,13 @@ mod tests {
         let midnight = JAN_1_2024 - report.utc_offset;
         // 10:20 по Нью-Йорку.
         let now = midnight + 10 * 3600 + 20 * 60;
-        let view = weather_view(&report, WeatherUnits::default(), Some(now), Some(3 * 3600));
+        let view = weather_view(
+            &report,
+            WeatherUnits::default(),
+            Some(now),
+            Some(3 * 3600),
+            Lang::Ru,
+        );
 
         let times: Vec<&str> = view.hours.iter().map(|hour| hour.time.as_str()).collect();
         assert_eq!(times, ["Сейчас", "11:00", "12:00"]);
@@ -4234,7 +4514,7 @@ mod tests {
             wind: WindUnit::KilometersPerHour,
             pressure: PressureUnit::Hectopascal,
         };
-        let view = weather_view(&report, units, now, Some(0));
+        let view = weather_view(&report, units, now, Some(0), Lang::Ru);
         assert_eq!(view.temperature, "29 °F");
         assert!(
             view.rows
@@ -4253,26 +4533,29 @@ mod tests {
 
         let next_day = fetched + 20 * 3600;
         assert_eq!(
-            weather_view(&report, units, Some(next_day), Some(0)).updated,
+            weather_view(&report, units, Some(next_day), Some(0), Lang::Ru).updated,
             "Обновлено 1 янв в 15:00"
         );
         assert_eq!(
-            weather_view(&report, units, Some(fetched), None).updated,
+            weather_view(&report, units, Some(next_day), Some(0), Lang::En).updated,
+            "Updated 1 Jan at 15:00"
+        );
+        assert_eq!(
+            weather_view(&report, units, Some(fetched), None, Lang::Ru).updated,
             "Обновлено в 15:00 UTC"
         );
 
         report.saved = true;
         assert!(
-            weather_view(&report, units, Some(fetched), Some(0))
+            weather_view(&report, units, Some(fetched), Some(0), Lang::Ru)
                 .updated
-                .starts_with("Сохранённый отчёт")
+                .starts_with(i18n::t(Lang::Ru, Key::WeatherSavedReport))
         );
 
         report.fetched_at = None;
-        assert!(
-            weather_view(&report, units, None, Some(0))
-                .updated
-                .contains("раньше 1970 года")
+        assert_eq!(
+            weather_view(&report, units, None, Some(0), Lang::Ru).updated,
+            i18n::t(Lang::Ru, Key::WeatherClockBroken)
         );
     }
 
@@ -4283,7 +4566,13 @@ mod tests {
             now: None,
             ..new_york_report()
         };
-        let view = weather_view(&report, WeatherUnits::default(), report.fetched_at, Some(0));
+        let view = weather_view(
+            &report,
+            WeatherUnits::default(),
+            report.fetched_at,
+            Some(0),
+            Lang::Ru,
+        );
         assert_eq!(view.temperature, "—");
         assert_eq!(view.feels_like, None);
         assert_eq!(view.description, None);

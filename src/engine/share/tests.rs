@@ -12,6 +12,53 @@ fn scratch(name: &str) -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
+// Страница для телефона
+// ---------------------------------------------------------------------------
+
+/// После подстановки в разметке не должно остаться ни одного места.
+///
+/// Забытое место видно только на экране телефона — буквальным `{{Имя}}`
+/// посреди текста, — и только тому, кто открыл страницу. Ни сборка, ни
+/// `clippy` такого не ловят: для них это обычная строка.
+#[test]
+fn the_phone_page_has_no_slots_left() {
+    for lang in Lang::ALL {
+        let html = page(lang);
+        assert!(
+            !html.contains("{{"),
+            "{lang:?}: в странице осталось место подстановки"
+        );
+        // Заодно проверка, что подставили не пустоту: заголовок обязан быть.
+        assert!(
+            html.contains(i18n::t(lang, Key::PageTitle)),
+            "{lang:?}: заголовок не подставился"
+        );
+    }
+}
+
+/// Строки страницы попадают и в разметку, и внутрь строковых литералов
+/// JavaScript. Кавычка-лапка закрыла бы литерал раньше времени, `<` —
+/// открыл бы тег, обратная косая съела бы следующий знак. Скрипт при этом
+/// не «испортился бы немного»: он перестал бы выполняться целиком, и страница
+/// на телефоне осталась бы без отправки и без списка. Ни сборка, ни `clippy`,
+/// ни глаза на русском такого не увидят — промах приезжает вместе с чужим
+/// переводом.
+#[test]
+fn the_phone_page_strings_are_safe_to_paste() {
+    for (_, key) in PAGE_SLOTS {
+        for lang in Lang::ALL {
+            let text = i18n::t(lang, key);
+            for bad in ['"', '\\', '<', '>', '&'] {
+                assert!(
+                    !text.contains(bad),
+                    "{lang:?}/{key:?}: знак «{bad}» сломает разметку или скрипт: {text}"
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Разбор запроса
 // ---------------------------------------------------------------------------
 
@@ -215,7 +262,10 @@ fn an_upload_never_overwrites_a_file() {
     for (content, expected) in [(b"new1", "IMG (2).jpg"), (b"new2", "IMG (3).jpg")] {
         let temp = dir.join(".savio-upload-x.part");
         fs::write(&temp, content).expect("временный файл");
-        assert_eq!(place(&dir, "IMG.jpg", &temp).expect("лёг"), expected);
+        assert_eq!(
+            place(&dir, "IMG.jpg", &temp, Lang::Ru).expect("лёг"),
+            expected
+        );
         assert!(!temp.exists(), "временный файл остался");
         assert_eq!(fs::read(dir.join(expected)).expect("прочитать"), content);
     }
@@ -260,10 +310,13 @@ fn devices_are_named_by_user_agent() {
     let iphone = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15";
     let android = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 Chrome/126.0 Mobile";
     let ipad = "Mozilla/5.0 (iPad; CPU OS 17_5 like Mac OS X)";
-    assert_eq!(device_name(iphone), "iPhone");
-    assert_eq!(device_name(android), "Android");
-    assert_eq!(device_name(ipad), "iPad");
-    assert_eq!(device_name(""), "Устройство");
+    assert_eq!(device_name(iphone, Lang::Ru), "iPhone");
+    assert_eq!(device_name(android, Lang::Ru), "Android");
+    assert_eq!(device_name(ipad, Lang::Ru), "iPad");
+    assert_eq!(device_name("", Lang::Ru), "Устройство");
+    // Имена систем — названия, а не слова: на другом языке они те же.
+    assert_eq!(device_name(android, Lang::En), "Android");
+    assert_eq!(device_name("", Lang::En), "Device");
 }
 
 #[test]
@@ -362,6 +415,7 @@ fn live(dir: &Path) -> Live {
             find: loopback,
         },
         dir.to_owned(),
+        Lang::Ru,
         tx,
         || {},
     );
@@ -431,7 +485,17 @@ fn a_phone_sends_lists_and_takes_files() {
     let (status, head, body) = http(port, request.as_bytes());
     assert_eq!(status, 200);
     assert!(head.contains("text/html"));
-    assert_eq!(body, PAGE.as_bytes());
+    // Сверяем с собранной страницей, а не с шаблоном `PAGE`: в нём ещё
+    // стоят `{{Слоты}}`, и равенство с ним значило бы, что подстановка не
+    // сработала вовсе. Язык — тот, с каким запущен сервер (`live`).
+    assert_eq!(body, page(Lang::Ru).as_bytes());
+    // И отдельно: слотов в отданном теле не осталось ни одного. Без этой
+    // строки забытый слот выглядел бы как исправная страница — `page`
+    // и сервер брали бы его из одного места и сошлись бы на `{{…}}`.
+    assert!(
+        !String::from_utf8_lossy(&body).contains("{{"),
+        "в отданной странице остался неподставленный слот"
+    );
     match next_share(&server.rx) {
         ShareEvent::Visitor(who) => assert_eq!(who, "Android · 127.0.0.1"),
         other => panic!("ждали посетителя, пришло {other:?}"),

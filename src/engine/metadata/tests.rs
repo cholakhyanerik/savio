@@ -6,6 +6,63 @@
 use super::*;
 
 // ---------------------------------------------------------------------------
+// Разбор на одном языке
+//
+// Тесты ниже про устройство контейнеров, а не про переводы: они сверяют имена
+// тегов, а имя тега — это перевод. Поэтому язык подставляют обёртки, и он не
+// мелькает в каждой строке. Сами переводы проверяет `i18n`, а то, что имена
+// тегов вообще переводятся, — `tag_name` и `id3_name`.
+// ---------------------------------------------------------------------------
+
+fn read_jpeg(data: &[u8]) -> Result<Vec<Tag>, String> {
+    super::read_jpeg(data, Lang::Ru)
+}
+
+fn strip_jpeg(data: &[u8]) -> Result<Vec<u8>, String> {
+    super::strip_jpeg(data, Lang::Ru)
+}
+
+fn jpeg_segments(data: &[u8]) -> Result<(Vec<Segment>, usize), String> {
+    super::jpeg_segments(data, Lang::Ru)
+}
+
+fn read_png(data: &[u8]) -> Result<Vec<Tag>, String> {
+    super::read_png(data, Lang::Ru)
+}
+
+fn strip_png(data: &[u8]) -> Result<Vec<u8>, String> {
+    super::strip_png(data, Lang::Ru)
+}
+
+fn read_webp(data: &[u8]) -> Result<Vec<Tag>, String> {
+    super::read_webp(data, Lang::Ru)
+}
+
+fn strip_webp(data: &[u8]) -> Result<Vec<u8>, String> {
+    super::strip_webp(data, Lang::Ru)
+}
+
+fn read_gif(data: &[u8]) -> Result<Vec<Tag>, String> {
+    super::read_gif(data, Lang::Ru)
+}
+
+fn strip_gif(data: &[u8]) -> Result<Vec<u8>, String> {
+    super::strip_gif(data, Lang::Ru)
+}
+
+fn read_tiff(data: &[u8]) -> Vec<Tag> {
+    super::read_tiff(data, Lang::Ru)
+}
+
+fn read(path: &Path, ffprobe: Option<&Path>) -> Result<Vec<Tag>, String> {
+    super::read(path, ffprobe, Lang::Ru)
+}
+
+fn strip(path: &Path) -> Result<u64, String> {
+    super::strip(path, Lang::Ru)
+}
+
+// ---------------------------------------------------------------------------
 // Сборка образцов
 // ---------------------------------------------------------------------------
 

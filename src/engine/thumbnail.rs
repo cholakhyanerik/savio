@@ -16,6 +16,7 @@
 use std::io::Cursor;
 use std::time::Duration;
 
+use crate::i18n::{self, Key, Lang};
 use crate::model::Thumbnail;
 
 /// До какой ширины уменьшаем картинку.
@@ -57,7 +58,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// Повторов, в отличие от установки инструментов, здесь нет намеренно: от
 /// обложки ничего не зависит, а каждая лишняя попытка — это задержка перед
 /// началом загрузки ролика.
-pub fn fetch(url: &str) -> Result<Thumbnail, String> {
+pub fn fetch(url: &str, lang: Lang) -> Result<Thumbnail, String> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         // Часть сайтов отвечает на запрос без User-Agent отказом.
         .user_agent(concat!("savio/", env!("CARGO_PKG_VERSION")))
@@ -73,16 +74,16 @@ pub fn fetch(url: &str) -> Result<Thumbnail, String> {
     let mut body = agent
         .get(url)
         .call()
-        .map_err(|e| format!("сервер не отдал обложку ({e})"))?
+        .map_err(|e| i18n::fill(i18n::t(lang, Key::CoverServerRefused), &[&e.to_string()]))?
         .into_body();
 
     let bytes = body
         .with_config()
         .limit(MAX_BYTES)
         .read_to_vec()
-        .map_err(|e| format!("не удалось прочитать обложку ({e})"))?;
+        .map_err(|e| i18n::fill(i18n::t(lang, Key::CoverReadFailed), &[&e.to_string()]))?;
 
-    decode(&bytes)
+    decode(&bytes, lang)
 }
 
 /// Разбирает байты картинки и уменьшает её до `TARGET_WIDTH`.
@@ -90,10 +91,10 @@ pub fn fetch(url: &str) -> Result<Thumbnail, String> {
 /// Формат определяется по содержимому, а не по расширению в адресе: у обложек
 /// оно врёт регулярно — YouTube отдаёт WebP по ссылке, которая кончается
 /// на `.jpg`.
-fn decode(bytes: &[u8]) -> Result<Thumbnail, String> {
+fn decode(bytes: &[u8], lang: Lang) -> Result<Thumbnail, String> {
     let mut reader = image::ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
-        .map_err(|e| format!("не удалось определить формат обложки ({e})"))?;
+        .map_err(|e| i18n::fill(i18n::t(lang, Key::CoverFormatUnknown), &[&e.to_string()]))?;
 
     // Поля правим по одному: `Limits` помечен `non_exhaustive`, и собрать его
     // выражением структуры нельзя — за пределами `image` таких полей может
@@ -105,7 +106,7 @@ fn decode(bytes: &[u8]) -> Result<Thumbnail, String> {
 
     let image = reader
         .decode()
-        .map_err(|e| format!("не удалось разобрать обложку ({e})"))?;
+        .map_err(|e| i18n::fill(i18n::t(lang, Key::CoverDecodeFailed), &[&e.to_string()]))?;
 
     // Уменьшаем только вниз. Растянуть мелкую обложку до 480 точек значит
     // занять в разы больше памяти, не добавив ни одной детали.
@@ -134,9 +135,13 @@ fn decode(bytes: &[u8]) -> Result<Thumbnail, String> {
     // Согласованность проверяем на выходе, а не надеемся на неё: несовпадение
     // размеров с длиной буфера UI встретит паникой внутри `ColorImage`.
     if !thumbnail.is_valid() {
-        return Err(format!(
-            "обложка разобрана неправдоподобно: {width}×{height} при {} байтах",
-            thumbnail.rgba.len()
+        return Err(i18n::fill(
+            i18n::t(lang, Key::CoverImplausible),
+            &[
+                &width.to_string(),
+                &height.to_string(),
+                &thumbnail.rgba.len().to_string(),
+            ],
         ));
     }
 
@@ -195,7 +200,8 @@ mod tests {
     #[test]
     fn big_cover_is_scaled_down_to_the_target_width() {
         // 1920×1080 — это `maxresdefault` у YouTube, самый частый крупный вход.
-        let thumbnail = decode(&encoded(1920, 1080, ImageFormat::Png)).expect("PNG обязан читаться");
+        let thumbnail =
+            decode(&encoded(1920, 1080, ImageFormat::Png), Lang::Ru).expect("PNG обязан читаться");
 
         assert_eq!(thumbnail.width, TARGET_WIDTH as usize);
         // Пропорция обязана сохраниться: 1920×1080 → 480×270.
@@ -208,7 +214,8 @@ mod tests {
     /// фичи `jpeg` осталась бы незамеченной.
     #[test]
     fn jpeg_cover_is_decoded() {
-        let thumbnail = decode(&encoded(640, 480, ImageFormat::Jpeg)).expect("JPEG обязан читаться");
+        let thumbnail =
+            decode(&encoded(640, 480, ImageFormat::Jpeg), Lang::Ru).expect("JPEG обязан читаться");
         assert_eq!(thumbnail.width, TARGET_WIDTH as usize);
         assert_eq!(thumbnail.height, 360);
         assert!(thumbnail.is_valid());
@@ -218,7 +225,8 @@ mod tests {
     /// не прибавится.
     #[test]
     fn small_cover_keeps_its_size() {
-        let thumbnail = decode(&encoded(120, 90, ImageFormat::Png)).expect("PNG обязан читаться");
+        let thumbnail =
+            decode(&encoded(120, 90, ImageFormat::Png), Lang::Ru).expect("PNG обязан читаться");
         assert_eq!((thumbnail.width, thumbnail.height), (120, 90));
         assert!(thumbnail.is_valid());
     }
@@ -228,12 +236,14 @@ mod tests {
     #[test]
     fn portrait_and_square_covers_keep_their_shape() {
         // Вертикальный ролик 1080×1920 → 480×853 (округление вниз).
-        let portrait = decode(&encoded(1080, 1920, ImageFormat::Png)).expect("PNG обязан читаться");
+        let portrait =
+            decode(&encoded(1080, 1920, ImageFormat::Png), Lang::Ru).expect("PNG обязан читаться");
         assert_eq!(portrait.width, 480);
         assert_eq!(portrait.height, 853);
 
         // Квадрат остаётся квадратом.
-        let square = decode(&encoded(1000, 1000, ImageFormat::Png)).expect("PNG обязан читаться");
+        let square =
+            decode(&encoded(1000, 1000, ImageFormat::Png), Lang::Ru).expect("PNG обязан читаться");
         assert_eq!((square.width, square.height), (480, 480));
     }
 
@@ -253,7 +263,7 @@ mod tests {
     fn real_youtube_cover_is_fetched_and_decoded() {
         const URL: &str = "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
 
-        let tools = crate::engine::discover().expect("yt-dlp обязан быть установлен");
+        let tools = crate::engine::discover(Lang::Ru).expect("yt-dlp обязан быть установлен");
         // Обычный запрос без cookies: обложка у публичного ролика видна и так,
         // а читать профиль браузера в тесте незачем.
         let request = crate::model::Request {
@@ -268,14 +278,19 @@ mod tests {
         };
         // Ручка отмены своя и никем не тронутая: отменять тесту нечего,
         // а `probe` без неё запуститься не может — он отдаёт ей процесс.
-        let info = super::super::probe(&request, &tools, &super::super::Control::default())
-            .expect("метаданные обязаны прийти");
+        let info = super::super::probe(
+            &request,
+            &tools,
+            &super::super::Control::default(),
+            Lang::Ru,
+        )
+        .expect("метаданные обязаны прийти");
         let url = info
             .thumbnail_url
             .expect("у ролика с YouTube обложка есть всегда");
         println!("выбрана обложка: {url}");
 
-        let cover = fetch(&url).expect("обложка обязана скачаться и разобраться");
+        let cover = fetch(&url, Lang::Ru).expect("обложка обязана скачаться и разобраться");
         println!("разобрано: {}×{}", cover.width, cover.height);
 
         assert!(cover.is_valid(), "размеры не сошлись с буфером");
@@ -301,7 +316,10 @@ mod tests {
             // определится, а разбор обязан честно не получиться.
             &b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR"[..],
         ] {
-            assert!(decode(junk).is_err(), "мусор принят за обложку: {junk:?}");
+            assert!(
+                decode(junk, Lang::Ru).is_err(),
+                "мусор принят за обложку: {junk:?}"
+            );
         }
     }
 }

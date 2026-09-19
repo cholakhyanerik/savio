@@ -2,6 +2,30 @@ use super::*;
 
 use serde_json::json;
 
+/// Разбор и адреса — на языке по умолчанию. Тесты ниже про форму ответа
+/// сервера, а не про переводы, и язык в каждой строке только мешал бы читать.
+fn build_report(
+    place: Place,
+    forecast: &Value,
+    air: Option<&Value>,
+    fetched_at: Option<i64>,
+    saved: bool,
+) -> Result<WeatherReport, String> {
+    super::build_report(place, forecast, air, fetched_at, saved, Lang::Ru)
+}
+
+fn search_url(query: &str) -> String {
+    super::search_url(query, Lang::Ru)
+}
+
+fn status_message(status: u16, reason: Option<&str>, name: &str) -> String {
+    super::status_message(status, reason, name, Lang::Ru)
+}
+
+fn parse_cache(text: &str) -> Option<WeatherReport> {
+    super::parse_cache(text, Lang::Ru)
+}
+
 /// Прогноз для Еревана — настоящий ответ Open-Meteo от 2026-09-14, сокращённый
 /// до трёх часов и двух дней. Форма у него та же, что у полного: `current` —
 /// объект, `hourly` и `daily` — объекты параллельных массивов.
@@ -404,14 +428,15 @@ fn the_machine_time_zone_is_plausible() {
 fn real_services_answer_as_expected() {
     let agent = agent();
 
-    let found = get_json(&agent, &search_url("Ереван"), Service::Search).expect("поиск ответил");
+    let found = get_json(&agent, &search_url("Ереван"), Service::Search, Lang::Ru)
+        .expect("поиск ответил");
     let places = parse_places(&found);
     println!("найдено: {places:?}");
     let place = places.first().cloned().expect("Ереван находится");
     assert_eq!(place.name, "Ереван");
     assert_eq!(place.country.as_deref(), Some("Армения"));
 
-    let report = fetch(&agent, place).expect("прогноз пришёл");
+    let report = fetch(&agent, place, Lang::Ru).expect("прогноз пришёл");
     println!("сейчас: {:?}", report.now);
     assert_eq!(report.utc_offset, 14_400);
     assert!(report.now.as_ref().is_some_and(|now| now.temperature.is_some()));
@@ -419,9 +444,10 @@ fn real_services_answer_as_expected() {
     assert_eq!(report.days.len(), 7);
     assert!(report.air.is_some(), "воздух не пришёл");
 
-    let empty = get_json(&agent, &search_url("qqqzzzxx"), Service::Search).expect("поиск ответил");
+    let empty = get_json(&agent, &search_url("qqqzzzxx"), Service::Search, Lang::Ru)
+        .expect("поиск ответил");
     assert!(parse_places(&empty).is_empty());
 
-    let here = locate(&agent).expect("место по IP определилось");
+    let here = locate(&agent, Lang::Ru).expect("место по IP определилось");
     println!("по IP: {} ({}, {})", here.title(), here.latitude, here.longitude);
 }

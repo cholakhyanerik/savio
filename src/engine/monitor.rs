@@ -37,9 +37,10 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use crate::i18n::{self, Key, Lang};
 use crate::model::{
     Event, Metric, PROC_LIMIT, PerfSample, ProcRow, human_bytes, human_mhz, human_percent,
-    human_speed, plural_ru,
+    human_speed,
 };
 
 /// Как часто снимаем показания.
@@ -109,12 +110,12 @@ impl Stop {
 /// Первый замер приезжает через `INTERVAL`, а не сразу, и это не задержка,
 /// а необходимость: загрузка процессора — разница между двумя точками, и
 /// показать её раньше, чем набралась вторая, нельзя ничем, кроме нуля.
-pub fn start(tx: Sender<Event>, notify: impl Fn() + Send + 'static) -> Handle {
+pub fn start(lang: Lang, tx: Sender<Event>, notify: impl Fn() + Send + 'static) -> Handle {
     let stop = Arc::new(Stop::default());
     let mine = Arc::clone(&stop);
 
     std::thread::spawn(move || {
-        let mut sampler = Sampler::new();
+        let mut sampler = Sampler::new(lang);
 
         loop {
             if mine.wait(INTERVAL) {
@@ -148,6 +149,12 @@ struct Sampler {
     /// на константу скорость на занятой машине оказывалась бы завышенной
     /// ровно там, где на неё и смотрят.
     last: Instant,
+    /// На каком языке собирать готовые строки замера.
+    ///
+    /// Полем, а не аргументом каждого замера: язык у идущего опроса не
+    /// меняется — `SavioApp` перезапускает поток при смене языка, иначе
+    /// половина монитора осталась бы на прежнем до следующего открытия.
+    lang: Lang,
 }
 
 impl Sampler {
@@ -156,7 +163,7 @@ impl Sampler {
     /// Первый замер каждого счётчика ничего не значит: у процессора он
     /// сравнивать не с чем, у сети и дисков `sysinfo` отдаёт всё накопленное
     /// с загрузки машины. Поэтому его снимаем здесь и выбрасываем.
-    fn new() -> Self {
+    fn new(lang: Lang) -> Self {
         let mut sys = sysinfo::System::new_with_specifics(
             sysinfo::RefreshKind::nothing()
                 .with_cpu(cpu_kind())
@@ -173,6 +180,7 @@ impl Sampler {
             nets: sysinfo::Networks::new_with_refreshed_list(),
             disks: sysinfo::Disks::new_with_refreshed_list_specifics(disk_kind()),
             last: Instant::now(),
+            lang,
         }
     }
 
@@ -210,17 +218,27 @@ impl Sampler {
         // Частота приезжает нулём и когда её не спросили, и когда система не
         // ответила (`CallNtPowerInformation` на Windows заполняет вектор
         // нулями), — `human_mhz` превращает такой ноль в отсутствие значения.
-        let freq = cpus.first().map(sysinfo::Cpu::frequency).and_then(human_mhz);
+        let freq = cpus
+            .first()
+            .map(sysinfo::Cpu::frequency)
+            .and_then(|mhz| human_mhz(mhz, self.lang));
 
+        let word = i18n::plural(
+            self.lang,
+            cores as u64,
+            i18n::t(self.lang, Key::MonCoreOne),
+            i18n::t(self.lang, Key::MonCoreFew),
+            i18n::t(self.lang, Key::MonCoreMany),
+        );
         let detail = match (cores, freq) {
             (0, _) => None,
-            (n, Some(freq)) => Some(format!(
-                "{n} {} · {freq}",
-                plural_ru(n as u64, "ядро", "ядра", "ядер")
+            (n, Some(freq)) => Some(i18n::fill(
+                i18n::t(self.lang, Key::MonCoresWithFrequency),
+                &[&n.to_string(), word, &freq],
             )),
-            (n, None) => Some(format!(
-                "{n} {}",
-                plural_ru(n as u64, "ядро", "ядра", "ядер")
+            (n, None) => Some(i18n::fill(
+                i18n::t(self.lang, Key::MonCoresOnly),
+                &[&n.to_string(), word],
             )),
         };
 
@@ -240,7 +258,18 @@ impl Sampler {
 
         Metric::new(
             used as f32 / total as f32 * 100.0,
-            Some(format!("{} из {}", human_bytes(used), human_bytes(total))),
+            Some(self.amount_of_total(used, total)),
+        )
+    }
+
+    /// «13.1 ГБ из 31.9 ГБ» — общая часть памяти и подкачки.
+    fn amount_of_total(&self, used: u64, total: u64) -> String {
+        i18n::fill(
+            i18n::t(self.lang, Key::AmountOfTotal),
+            &[
+                &human_bytes(used, self.lang),
+                &human_bytes(total, self.lang),
+            ],
         )
     }
 
@@ -249,13 +278,13 @@ impl Sampler {
         // Подкачка, выключенная пользователем, — честный ноль, а не «нет
         // данных»: так и пишем словами, как в снимке системы.
         if total == 0 {
-            return Metric::missing(Some("выключена".to_owned()));
+            return Metric::missing(Some(i18n::t(self.lang, Key::HwSwapOff).to_owned()));
         }
 
         let used = self.sys.used_swap();
         Metric::new(
             used as f32 / total as f32 * 100.0,
-            Some(format!("{} из {}", human_bytes(used), human_bytes(total))),
+            Some(self.amount_of_total(used, total)),
         )
     }
 
@@ -280,10 +309,12 @@ impl Sampler {
             return None;
         }
 
-        Some(format!(
-            "Приём {} · Отдача {}",
-            human_speed(per_second(down, elapsed)),
-            human_speed(per_second(up, elapsed))
+        Some(i18n::fill(
+            i18n::t(self.lang, Key::MonNetworkLine),
+            &[
+                &human_speed(per_second(down, elapsed), self.lang),
+                &human_speed(per_second(up, elapsed), self.lang),
+            ],
         ))
     }
 
@@ -306,10 +337,12 @@ impl Sampler {
             return None;
         }
 
-        Some(format!(
-            "Чтение {} · Запись {}",
-            human_speed(per_second(read, elapsed)),
-            human_speed(per_second(written, elapsed))
+        Some(i18n::fill(
+            i18n::t(self.lang, Key::MonDiskLine),
+            &[
+                &human_speed(per_second(read, elapsed), self.lang),
+                &human_speed(per_second(written, elapsed), self.lang),
+            ],
         ))
     }
 
@@ -344,7 +377,7 @@ impl Sampler {
                 // идёт через ту же проверку, что и остальные проценты, —
                 // прочерк тут честнее подставленного нуля.
                 cpu_text: human_percent(cpu).unwrap_or_else(|| "—".to_owned()),
-                mem_text: human_bytes(mem),
+                mem_text: human_bytes(mem, self.lang),
                 cpu,
                 name,
             })
@@ -448,7 +481,7 @@ mod tests {
     #[test]
     #[ignore = "спрашивает живую систему и занимает две секунды"]
     fn real_sample_from_this_machine() {
-        let mut sampler = Sampler::new();
+        let mut sampler = Sampler::new(Lang::Ru);
         std::thread::sleep(INTERVAL);
         let sample = sampler.take();
 
