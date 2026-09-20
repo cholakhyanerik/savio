@@ -3103,6 +3103,14 @@ pub struct SavioApp {
     /// (`binaries::welcome_seen`), а не поле настроек: это не выбор
     /// человека, а след того, что он здесь уже был.
     welcome_open: bool,
+    /// Подписи вкладок правой колонки вместе с числами: «Очередь 3».
+    ///
+    /// Собраны заранее, и пересобираются только когда число вправду
+    /// изменилось: `format!` в кадре отрисовки — это аллокация шестьдесят
+    /// раз в секунду ни за что (Правило 1). Сравнение двух чисел — вся цена.
+    rail_labels: (String, String),
+    /// Числа, по которым собраны `rail_labels`. `None` — пересобрать.
+    rail_counts: Option<(usize, usize)>,
     /// Названия групп рельса прописными.
     ///
     /// Собраны заранее, а не в кадре: `to_uppercase` — это аллокация на
@@ -3232,6 +3240,8 @@ impl SavioApp {
             saver: settings::Saver::spawn(),
             gpu_errors: Arc::default(),
             welcome_open: !binaries::welcome_seen(),
+            rail_labels: (String::new(), String::new()),
+            rail_counts: None,
             nav_groups: nav_groups(lang),
             appearance: saved.appearance,
             palette: theme::Palette::of(saved.appearance),
@@ -3505,6 +3515,33 @@ impl SavioApp {
         self.remember();
     }
 
+    /// Пересобирает подписи вкладок правой колонки, если числа изменились.
+    ///
+    /// Ноль в подписи не пишется: «История 0» рядом с пустым списком —
+    /// это то же самое, сказанное дважды, а место в колонке шириной 340
+    /// не бесплатно.
+    fn rebuild_rail_labels(&mut self) {
+        let counts = (self.queue.items.len(), self.history.entries.len());
+        if self.rail_counts == Some(counts) {
+            return;
+        }
+        self.rail_counts = Some(counts);
+
+        let lang = self.lang;
+        let label = |key, count: usize| {
+            let name = i18n::t(lang, key);
+            if count == 0 {
+                name.to_owned()
+            } else {
+                format!("{name} {count}")
+            }
+        };
+        self.rail_labels = (
+            label(Key::RailQueue, counts.0),
+            label(Key::RailHistory, counts.1),
+        );
+    }
+
     /// Строка интерфейса на выбранном языке.
     ///
     /// Короткий доступ, чтобы `i18n::t(self.lang, …)` не повторялся в каждой
@@ -3538,6 +3575,10 @@ impl SavioApp {
         // на прежнем языке до следующего события движка, то есть, возможно,
         // навсегда.
         self.nav_groups = nav_groups(lang);
+        // Числа те же, а слова другие — сбрасываем память о числах, иначе
+        // подписи остались бы на прежнем языке до первой правки очереди.
+        self.rail_counts = None;
+        self.rebuild_rail_labels();
         self.out_dir_display = display_dir(self.out_dir.as_deref(), lang);
         self.cookie_file_display = display_cookie_file(self.cookie_file.as_deref(), lang);
         self.meta.relabel(lang);
@@ -6323,6 +6364,10 @@ impl SavioApp {
         let mut open_at: Option<PathBuf> = None;
         let speed = self.speed;
         let lang = self.lang;
+        self.rebuild_rail_labels();
+        // Копии ссылок, а не полей: внутри замыкания `self` занят целиком.
+        let (queue_label, history_label) =
+            (self.rail_labels.0.as_str(), self.rail_labels.1.as_str());
 
         theme::card_rising(ui, pal, self.appear(2), |ui| {
             ui.horizontal(|ui| {
@@ -6333,8 +6378,8 @@ impl SavioApp {
                     self.speed,
                     self.rail_tab,
                     &[
-                        (RailTab::Queue, i18n::t(lang, Key::RailQueue)),
-                        (RailTab::History, i18n::t(lang, Key::RailHistory)),
+                        (RailTab::Queue, queue_label),
+                        (RailTab::History, history_label),
                     ],
                     false,
                 );

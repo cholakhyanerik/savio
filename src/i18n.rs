@@ -1090,8 +1090,12 @@ strings! {
         "Հղումները սպասում են հերթում։ Սեղմեք «Ներբեռնել» — դրանք կգնան վերևից ներքև, \
          մեկ առ մեկ։";
     UiIdleNote =
-        "Вставьте ссылку и нажмите «Скачать».", "Paste a link and press “Download”.",
-        "Տեղադրեք հղում և սեղմեք «Ներբեռնել»։";
+        "Здесь будет видно, как идёт загрузка: проценты, скорость, сколько \
+         осталось — и путь к готовому файлу с кнопкой «Открыть папку».",
+        "Here you will see how the download goes: per cent, speed, how much is \
+         left — and the path to the finished file with an “Open folder” button.",
+        "Այստեղ կերևա, թե ինչպես է ընթանում ներբեռնումը՝ տոկոսները, արագությունը, \
+         որքան է մնացել, և պատրաստ ֆայլի ուղին՝ «Բացել պանակը» կոճակով։";
 
     UiClear = "Очистить", "Clear", "Մաքրել";
     UiClearHint =
@@ -1099,14 +1103,25 @@ strings! {
         "The list will empty: both the downloaded ones and those still waiting will go.",
         "Ցանկը կդատարկվի. կգնան և՛ ներբեռնվածները, և՛ դեռ սպասողները։";
     UiQueueEmptyNote =
-        "Пока пусто. «В очередь» кладёт сюда ссылку из поля и освобождает его под следующую.",
-        "Empty for now. “To the queue” puts the link from the field here and frees it up for \
-         the next one.",
-        "Առայժմ դատարկ է։ «Հերթ»-ը այստեղ է դնում դաշտի հղումը և ազատում այն հաջորդի համար։";
+        "Очередь нужна, когда ссылок несколько. «Отложить в очередь» кладёт ссылку \
+         сюда и очищает поле — так десяток ссылок набирается за полминуты. \
+         Потом одно «Скачать», и Savio пройдёт список сверху вниз, пока вас нет.",
+        "The queue is for when there are several links. “Put in the queue” places \
+         the link here and clears the field — a dozen links are collected in half \
+         a minute. Then one “Download”, and Savio walks the list top to bottom.",
+        "Հերթը պետք է, երբ հղումները մի քանիսն են։ «Հետաձգել հերթ»-ը հղումը դնում \
+         է այստեղ և մաքրում դաշտը՝ այսպես տասնյակ հղում հավաքվում է կես րոպեում։ \
+         Հետո մեկ «Ներբեռնել», և Savio-ն կանցնի ցանկը վերևից ներքև։";
     UiQueueNote =
-        "Качаются по одной, сверху вниз. Сорвавшаяся не останавливает остальные.",
-        "They download one at a time, top to bottom. One that fails does not stop the rest.",
-        "Ներբեռնվում են մեկ առ մեկ, վերևից ներքև։ Ձախողվածը մնացածը չի կանգնեցնում։";
+        "Качаются по одной, сверху вниз; сорвавшаяся не останавливает остальные. \
+         Каждая ссылка уедет с теми настройками, которые стояли, когда её \
+         отложили, — переключатели слева можно трогать.",
+        "They download one at a time, top to bottom; one that fails does not stop \
+         the rest. Each link leaves with the settings that were set when it was \
+         put aside — the switches on the left can be touched.",
+        "Ներբեռնվում են մեկ առ մեկ, վերևից ներքև. ձախողվածը մնացածը չի կանգնեցնում։ \
+         Յուրաքանչյուր հղում կմեկնի այն կարգավորումներով, որոնք դրված էին \
+         հետաձգելու պահին՝ ձախի փոխարկիչներին կարելի է դիպչել։";
     UiHistoryEmptyNote =
         "Пока пусто. Сюда попадёт всё, что вы скачаете за этот запуск.",
         "Empty for now. Everything you download in this run will land here.",
