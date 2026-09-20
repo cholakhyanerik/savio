@@ -867,6 +867,49 @@ strings! {
     /// `{}` — сколько осталось, «ч:мм:сс».
     UiTimeLeft = "осталось {}", "{} left", "մնաց {}";
 
+    // Заголовки шагов экрана загрузки. Номер рядом с названием отвечает на
+    // «с чего начинать» раньше, чем человек прочтёт подписи: три шага подряд
+    // читаются последовательностью, а три равноправных заголовка — списком
+    // настроек, в котором непонятно, что из этого обязательно.
+    UiStepLink = "Ссылка на ролик", "The video link", "Տեսանյութի հղումը";
+    UiStepWhat = "Что скачать", "What to download", "Ինչ ներբեռնել";
+    UiStepWhere = "Куда сохранить", "Where to save", "Ուր պահպանել";
+    UiLinkSourcesNote =
+        "YouTube, VK Видео, Rutube, Vimeo, SoundCloud и ещё полторы тысячи сайтов. \
+         Сверить, тот ли это ролик, можно будет прямо здесь — до загрузки.",
+        "YouTube, VK Video, Rutube, Vimeo, SoundCloud and fifteen hundred more sites. \
+         You will be able to check that this is the right video right here — before \
+         downloading.",
+        "YouTube, VK Video, Rutube, Vimeo, SoundCloud և ևս հազար հինգ հարյուր կայք։ \
+         Ստուգել՝ արդյոք դա ճիշտ տեսանյութն է, կարելի կլինի հենց այստեղ՝ մինչև \
+         ներբեռնումը։";
+    UiFoundVideo = "Ролик найден", "The video was found", "Տեսանյութը գտնվեց";
+    UiQualityMaxNote =
+        "«Макс.» берёт лучшее, что отдаёт сайт. Ступень ниже пригодится на медленном \
+         интернете и когда мало места на диске.",
+        "“Max.” takes the best the site gives. A step lower is useful on slow internet \
+         and when there is little room on the disk.",
+        "«Մաքս․»-ը վերցնում է լավագույնը, ինչ տալիս է կայքը։ Ավելի ցածր աստիճանը պետք \
+         կգա դանդաղ ինտերնետի և սկավառակի քիչ տեղի դեպքում։";
+    UiEmbedNote =
+        "Название, автор и картинка окажутся внутри файла — плеер покажет их вместо \
+         голого имени. Ничего не отмечено — файл скачается как есть.",
+        "The title, author and picture will end up inside the file — a player will show \
+         them instead of a bare name. Nothing ticked — the file is downloaded as is.",
+        "Վերնագիրը, հեղինակը և նկարը կհայտնվեն ֆայլի ներսում՝ նվագարկիչը դրանք ցույց \
+         կտա մերկ անվան փոխարեն։ Ոչինչ նշված չէ՝ ֆայլը ներբեռնվում է ինչպես կա։";
+    UiQueueButtonNote =
+        "Отложит ссылку и освободит поле",
+        "Sets the link aside and frees the field",
+        "Կհետաձգի հղումը և կազատի դաշտը";
+    UiDownloadButtonNote = "Начнёт прямо сейчас", "Starts right now", "Կսկսի հենց հիմա";
+    /// Причина, по которой «Скачать» выключена, — на виду, а не по наведению.
+    /// Подсказка остаётся, но перестаёт быть единственным способом узнать её.
+    UiDownloadNeedsLink =
+        "Вставьте ссылку — и кнопка оживёт",
+        "Paste a link and the button comes alive",
+        "Տեղադրեք հղումը՝ և կոճակը կաշխատի";
+
     UiFormat = "Формат", "Format", "Ձևաչափ";
     UiEmbed = "Вшить", "Embed", "Ներկարել";
     UiSectionField = "Фрагмент", "Fragment", "Հատված";
@@ -1000,7 +1043,10 @@ strings! {
     FilterTextFile = "Текстовый файл", "Text file", "Տեքստային ֆայլ";
 
     // Кнопки запуска и их причины отказа.
-    UiEnqueue = "В очередь", "To the queue", "Հերթ";
+    /// Не «В очередь»: без подписи под кнопкой её путали со «Скачать» —
+    /// оба глагола читались как «поехали», и разницу приходилось выяснять
+    /// нажатием. Глагол «отложить» говорит про отсрочку сам.
+    UiEnqueue = "Отложить в очередь", "Put in the queue", "Հետաձգել հերթ";
     UiEnqueueHint =
         "Ссылка встанет в конец очереди, а поле освободится под следующую.",
         "The link will go to the end of the queue and the field will free up for the next one.",

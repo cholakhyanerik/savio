@@ -4964,8 +4964,25 @@ impl SavioApp {
     /// Главная колонка: всё, что нужно решить до нажатия «Скачать».
     fn download_main(&mut self, ui: &mut egui::Ui) {
         let pal = self.palette;
+        let lang = self.lang;
+        // Ответ о ролике уже пришёл — говорим об этом плашкой у заголовка
+        // шага, а не только карточкой под полем: до неё ещё надо опустить
+        // взгляд, а «нашлось или нет» — первое, что хотят знать.
+        let found = matches!(self.preview.state, PreviewState::Ready);
+
         theme::card_rising(ui, pal, self.appear(0), |ui| {
+            step_header(ui, pal, 1, i18n::t(lang, Key::UiStepLink), |ui| {
+                if found {
+                    status_pill(ui, pal, i18n::t(lang, Key::UiFoundVideo), pal.state_success);
+                }
+            });
+            ui.add_space(8.0);
             self.url_field(ui);
+            // Список сайтов стоит постоянно, а не всплывает подсказкой:
+            // «а мой сайт поддерживается?» спрашивают до того, как вставят
+            // ссылку, то есть до того, как появится к чему навести курсор.
+            ui.add_space(6.0);
+            note(ui, i18n::t(lang, Key::UiLinkSourcesNote), pal.text_muted);
             // Превью идёт сразу под полем, а не в карточке хода работы
             // справа: оно про то, что собираются скачать, а не про то, что
             // качается. К моменту, когда очередь дойдёт до третьей ссылки,
@@ -4973,7 +4990,9 @@ impl SavioApp {
             // про обеих.
             self.preview_row(ui);
 
-            ui.add_space(14.0);
+            ui.add_space(18.0);
+            step_header(ui, pal, 2, i18n::t(lang, Key::UiStepWhat), |_| {});
+            ui.add_space(8.0);
             labelled_row(ui, pal, self.t(Key::UiFormat), |ui| self.format_selector(ui));
 
             ui.add_space(12.0);
@@ -4982,14 +5001,34 @@ impl SavioApp {
             // пишем здесь второй раз: две копии одной подписи разъезжаются.
             let quality_label = self.format.quality_label(self.lang);
             labelled_row(ui, pal, quality_label, |ui| self.quality_selector(ui));
+            // Что делает «Макс.», из самой дорожки не следует, а ступень
+            // ниже выбирают не от хорошей жизни — про обе причины сказано
+            // здесь. Когда сайт отдаёт меньше запрошенного, на это место
+            // встаёт уже собранная оговорка: два объяснения подряд человек
+            // читать не станет, а второе важнее.
+            ui.add_space(4.0);
+            labelled_row(ui, pal, "", |ui| {
+                let (text, color) = if self.quality_note.is_empty() {
+                    (i18n::t(lang, Key::UiQualityMaxNote), pal.text_muted)
+                } else {
+                    (self.quality_note.as_str(), pal.state_warning)
+                };
+                note(ui, text, color);
+            });
 
             ui.add_space(12.0);
             labelled_row(ui, pal, self.t(Key::UiEmbed), |ui| self.embed_options(ui));
+            ui.add_space(4.0);
+            labelled_row(ui, pal, "", |ui| {
+                note(ui, i18n::t(lang, Key::UiEmbedNote), pal.text_muted);
+            });
 
             ui.add_space(14.0);
             self.advanced_group(ui);
 
-            ui.add_space(14.0);
+            ui.add_space(18.0);
+            step_header(ui, pal, 3, i18n::t(lang, Key::UiStepWhere), |_| {});
+            ui.add_space(8.0);
             self.folder_row(ui);
             ui.add_space(12.0);
             self.action_button(ui);
@@ -5957,7 +5996,13 @@ impl SavioApp {
             enqueue_clicked = ui
                 .add_enabled(
                     can_enqueue,
+                    // Подпись переносится: «Отложить в очередь» длиннее
+                    // прежнего «В очередь», и в треть строки узкой карточки
+                    // она в один ряд не встаёт ни на одном языке. Высота
+                    // задана полом, так что на вторую строку кнопка растёт
+                    // сама. Держит это `the_action_buttons_fit_the_card`.
                     egui::Button::new(i18n::t(lang, Key::UiEnqueue))
+                        .wrap()
                         .min_size(egui::vec2(secondary, theme::CTA_HEIGHT)),
                 )
                 .on_hover_text(i18n::t(lang, Key::UiEnqueueHint))
@@ -5965,6 +6010,51 @@ impl SavioApp {
                 .clicked();
 
             primary_clicked = self.primary_button(ui, ui.available_width());
+        });
+
+        // Подписи под кнопками, а не подсказки по наведению. Подсказка
+        // требует догадаться, что наводить есть на что, — а вопрос «чем эти
+        // две кнопки отличаются» возникает ровно у того, кто их видит
+        // впервые. Под выключенной «Скачать» на месте подписи стоит причина,
+        // и жёлтым: это не пояснение, а то, что мешает.
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            const GAP: f32 = 10.0;
+            ui.spacing_mut().item_spacing.x = GAP;
+            let secondary = ((ui.available_width() - GAP) / 3.0).max(90.0);
+            let rest = (ui.available_width() - secondary - GAP).max(90.0);
+            // Ширина задаётся с обеих сторон, и это не перестраховка:
+            // `allocate_ui_with_layout` двигает курсор на то, что занял
+            // потомок, а не на запрошенное. Без нижней границы вторая
+            // подпись прилипала к концу первой и стояла под чужой кнопкой —
+            // проверено глазами, выглядело как случайно слипшаяся строка.
+            let column = |ui: &mut egui::Ui, width: f32, text: &str, color| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(width, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_min_width(width);
+                        ui.set_max_width(width);
+                        note(ui, text, color);
+                    },
+                );
+            };
+
+            column(
+                ui,
+                secondary,
+                i18n::t(lang, Key::UiQueueButtonNote),
+                pal.text_muted,
+            );
+            let running = matches!(self.state, State::Running);
+            let (text, color) = if running {
+                (i18n::t(lang, Key::UiCancelHint), pal.text_muted)
+            } else if self.url.trim().is_empty() && self.queue.next_waiting().is_none() {
+                (i18n::t(lang, Key::UiDownloadNeedsLink), pal.state_warning)
+            } else {
+                (i18n::t(lang, Key::UiDownloadButtonNote), pal.text_muted)
+            };
+            column(ui, rest, text, color);
         });
 
         if enqueue_clicked && self.enqueue() {
@@ -9984,6 +10074,66 @@ fn rail_block(ui: &mut egui::Ui, state: &RailState<'_>, picks: &mut RailPicks) {
     }
 }
 
+/// Заголовок шага: номер в кружке и название дисплейным начертанием.
+///
+/// Номер отвечает на «с чего начинать» раньше, чем человек прочтёт подписи.
+/// Без него экран загрузки читался списком равноправных настроек, в котором
+/// непонятно, что обязательно, а что можно не трогать: поле ссылки, две
+/// дорожки, три галочки и свёрнутая группа выглядели одинаково важными.
+///
+/// `right` рисует то, что встаёт у правого края строки, — плашку состояния
+/// шага. Закрытие, а не `Option`, чтобы вызывающему не приходилось собирать
+/// виджет заранее: рисовать его надо внутри нужной раскладки.
+///
+/// Высота ряду задаётся явно. `with_layout` отдал бы потомку весь остаток
+/// высоты карточки, а центрирующая раскладка считает его занятым целиком —
+/// заголовок уехал бы в середину экрана (дефект 42).
+fn step_header<R>(
+    ui: &mut egui::Ui,
+    pal: theme::Palette,
+    number: usize,
+    title: &str,
+    right: impl FnOnce(&mut egui::Ui) -> R,
+) {
+    const CIRCLE: f32 = 26.0;
+
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width(), CIRCLE),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+
+            // Кружок с номером рисуется кистью: цифра в кружке — это не знак
+            // из шрифта (кружкам с цифрами внутри в наших гарнитурах взяться
+            // неоткуда), а две фигуры и текст поверх них.
+            let (circle, _) =
+                ui.allocate_exact_size(egui::vec2(CIRCLE, CIRCLE), egui::Sense::hover());
+            let painter = ui.painter();
+            painter.circle_filled(circle.center(), CIRCLE / 2.0, pal.accent_soft);
+            painter.circle_stroke(
+                circle.center(),
+                CIRCLE / 2.0,
+                egui::Stroke::new(1.0, pal.accent),
+            );
+            painter.text(
+                circle.center(),
+                egui::Align2::CENTER_CENTER,
+                number,
+                theme::display(13.0),
+                pal.accent_text,
+            );
+
+            ui.label(
+                egui::RichText::new(title)
+                    .font(theme::display(17.0))
+                    .color(pal.text_primary),
+            );
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), right);
+        },
+    );
+}
+
 /// Кнопка-«таблетка» во всю ширину.
 ///
 /// Нужна рельсу: там кнопки стоят колонкой, и разной ширины они выглядели
@@ -13221,6 +13371,64 @@ mod tests {
         }
     }
 
+    /// Подписи кнопок запуска умещаются в свою долю карточки.
+    ///
+    /// «В очередь» переименована в «Отложить в очередь», и это вдвое длиннее.
+    /// Кнопке достаётся треть строки, а строка в окне минимальной ширины —
+    /// это около 390 точек: доля выходит меньше полутораста, и подпись
+    /// в один ряд не встаёт ни на одном языке. Поэтому она переносится,
+    /// а проверка следит за тем, что двух строк хватает: на третьей кнопка
+    /// вырастает настолько, что выдавливает «Скачать» из карточки.
+    ///
+    /// Ширина считается по тем же числам, что и раскладка, а не копией:
+    /// своя копия разъехалась бы при первой же правке и перестала бы что-либо
+    /// ловить. Проверено красным: без `.wrap()` у кнопки подпись остаётся
+    /// одной строкой и проверка падает на русском и армянском.
+    #[test]
+    fn the_action_buttons_fit_the_card() {
+        let pal = theme::Palette::dark();
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, pal);
+
+        // Окно минимальной ширины, свёрнутый рельс, поля содержимого и
+        // поля карточки — всё, что стоит между кромкой окна и кнопкой.
+        let card = 520.0
+            - theme::NAV_NARROW
+            - theme::CONTENT_MARGIN * 2.0
+            - 18.0 * 2.0;
+        const GAP: f32 = 10.0;
+        let secondary = ((card - GAP) / 3.0).max(90.0);
+
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let font = egui::TextStyle::Button.resolve(ui.style());
+            for lang in Lang::ALL {
+                for (key, room) in [
+                    (Key::UiEnqueue, secondary),
+                    (Key::UiDownload, card - secondary - GAP),
+                ] {
+                    let label = i18n::t(lang, key);
+                    // Поля кнопки с обеих сторон — штатные 16 из темы.
+                    let room = room - 16.0 * 2.0;
+                    let galley = ui.ctx().fonts_mut(|fonts| {
+                        fonts.layout(label.to_owned(), font.clone(), pal.text_primary, room)
+                    });
+                    assert!(
+                        galley.rows.len() <= 2,
+                        "{lang:?}: кнопка «{label}» разворачивается в {} строки при ширине {room}",
+                        galley.rows.len()
+                    );
+                    assert!(
+                        galley.size().x <= room + 0.5,
+                        "{lang:?}: кнопка «{label}» не умещается даже с переносом: {} при {room}",
+                        galley.size().x
+                    );
+                }
+            }
+        });
+        output.textures_delta.clear();
+    }
+
     /// Приветствие помещается в окно минимальной ширины на всех языках.
     ///
     /// Та же проверка, что у «О программе», и та же причина: модалка растёт
@@ -13379,12 +13587,12 @@ mod tests {
                     });
                     assert!(
                         galley.rows.len() <= 2,
-                        "{lang:?}: кнопка «{label}» разворачивается в {} строки                          при ширине {room}",
+                        "{lang:?}: кнопка «{label}» разворачивается в {} строки при ширине {room}",
                         galley.rows.len()
                     );
                     assert!(
                         galley.size().x <= room + 0.5,
-                        "{lang:?}: кнопка «{label}» не уместилась даже с переносом:                          {} при {room}",
+                        "{lang:?}: кнопка «{label}» не уместилась даже с переносом: {} при {room}",
                         galley.size().x
                     );
                 }
