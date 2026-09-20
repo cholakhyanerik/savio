@@ -8,6 +8,31 @@ use std::path::PathBuf;
 
 use crate::i18n::{self, Key, Lang};
 
+/// Какая тема у окна.
+///
+/// Живёт в домене, а не в `theme.rs`, ровно по одной причине: этот выбор
+/// надо запоминать, а `settings.rs` — слой движка, и знать про оформление
+/// ему нельзя. Сами цвета собирает `theme::Palette::of`, и вот он про этот
+/// тип знает — зависимость идёт вниз, а не вверх.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Appearance {
+    /// Значение по умолчанию: Savio открывался тёмным всегда.
+    #[default]
+    Dark,
+    Light,
+}
+
+impl Appearance {
+    pub const ALL: [Appearance; 2] = [Appearance::Dark, Appearance::Light];
+
+    pub fn label(self, lang: Lang) -> &'static str {
+        match self {
+            Appearance::Dark => i18n::t(lang, Key::UiThemeDark),
+            Appearance::Light => i18n::t(lang, Key::UiThemeLight),
+        }
+    }
+}
+
 /// Что именно скачиваем.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Format {

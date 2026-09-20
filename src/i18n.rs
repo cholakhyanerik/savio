@@ -1061,6 +1061,14 @@ strings! {
          and stay in its language.",
         "Savio-ի պատուհանի լեզուն։ Ֆայլի և թղթապանակի ընտրության պատուհանները նկարում է \
          համակարգը՝ դրանք կմնան իր լեզվով։";
+    UiThemeDark = "Тёмная", "Dark", "Մուգ";
+    UiThemeLight = "Светлая", "Light", "Բաց";
+    UiThemeHint =
+        "Тема окна. Выбор запоминается вместе с языком и папкой сохранения.",
+        "The window theme. The choice is remembered along with the language and the \
+         save folder.",
+        "Պատուհանի տեսքը։ Ընտրությունը հիշվում է լեզվի և պահպանման թղթապանակի հետ միասին։";
+
     UiSmooth = "Плавные переходы", "Smooth transitions", "Սահուն անցումներ";
     UiSmoothHint =
         "Снимите, если движение в окне мешает или машина слабая.",

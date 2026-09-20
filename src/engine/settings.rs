@@ -23,8 +23,8 @@ use std::time::{Duration, Instant};
 use super::{binaries, weather};
 use crate::i18n::Lang;
 use crate::model::{
-    CookieSource, DownloadOptions, FAVORITES_LIMIT, Format, Place, PressureUnit, Quality, TempUnit,
-    WeatherUnits, WindUnit,
+    Appearance, CookieSource, DownloadOptions, FAVORITES_LIMIT, Format, Place, PressureUnit,
+    Quality, TempUnit, WeatherUnits, WindUnit,
 };
 
 /// Имя файла в каталоге Savio.
@@ -132,6 +132,17 @@ pub struct Settings {
     /// открылось на незнакомом алфавите, не прочтёт и подписи «Тонкие
     /// настройки».
     pub lang: Lang,
+    /// Тема окна, тёмная или светлая.
+    ///
+    /// Запоминается по той же причине, что язык: это предпочтение человека,
+    /// а не свойство ссылки. Умолчание — тёмная: она была у Savio
+    /// единственной, и обновление не имеет права молча перекрасить окно.
+    ///
+    /// Переключатель стоит там же, где язык, и это требование, а не вкус:
+    /// запомненная настройка, спрятанная за щелчком, встречает человека
+    /// своими последствиями при запуске, а объяснением — только если он сам
+    /// полезет её искать.
+    pub appearance: Appearance,
 }
 
 impl Default for Settings {
@@ -148,6 +159,7 @@ impl Default for Settings {
             weather_units: WeatherUnits::default(),
             weather_favorites: Vec::new(),
             lang: Lang::default(),
+            appearance: Appearance::default(),
         }
     }
 }
@@ -294,6 +306,22 @@ fn cookies_from_token(token: &str) -> Option<CookieSource> {
     }
 }
 
+/// Тема окна строкой.
+fn appearance_token(appearance: Appearance) -> &'static str {
+    match appearance {
+        Appearance::Dark => "dark",
+        Appearance::Light => "light",
+    }
+}
+
+fn appearance_from_token(token: &str) -> Option<Appearance> {
+    match token {
+        "dark" => Some(Appearance::Dark),
+        "light" => Some(Appearance::Light),
+        _ => None,
+    }
+}
+
 /// Единицы погоды строками.
 ///
 /// Свои короткие метки, а не подписи из домена: «°C» и «мм рт. ст.»
@@ -364,6 +392,7 @@ fn to_json(settings: &Settings) -> String {
         // Двухбуквенный код языка, а не имя варианта: имена принадлежат коду
         // и переименовываются рефакторингом, а файлу лежать годами.
         "lang": settings.lang.code(),
+        "theme": appearance_token(settings.appearance),
         "weather_units": {
             "temp": temp_token(settings.weather_units.temp),
             "wind": wind_token(settings.weather_units.wind),
@@ -493,6 +522,15 @@ fn parse(text: &str) -> Settings {
         .and_then(Lang::from_code)
     {
         settings.lang = lang;
+    }
+
+    // Незнакомая тема — та же история: откат к тёмной, а не пустое окно.
+    if let Some(appearance) = value
+        .get("theme")
+        .and_then(serde_json::Value::as_str)
+        .and_then(appearance_from_token)
+    {
+        settings.appearance = appearance;
     }
 
     // Погода. Каждое поле само по себе, как и всё выше: битое место не
@@ -714,8 +752,28 @@ mod tests {
             },
             weather_favorites: vec![nizhny(), new_york()],
             lang: Lang::Am,
+            appearance: Appearance::Light,
         };
         assert_eq!(parse(&to_json(&settings)), settings);
+    }
+
+    /// Файл от версии до появления второй темы обязан открываться тёмным.
+    ///
+    /// Умолчание тут не общее «оставить как было», а осмысленное: тёмная была
+    /// у Savio единственной, и обновление не имеет права молча перекрасить
+    /// окно у всех, кто просто обновился. Незнакомая тема из файла будущей
+    /// версии откатывается туда же.
+    #[test]
+    fn a_file_without_a_theme_opens_dark() {
+        for text in [
+            r#"{"version":1,"format":"mp3"}"#,
+            r#"{"theme":"solarized"}"#,
+            r#"{"theme":""}"#,
+            r#"{"theme":42}"#,
+            r#"{"theme":null}"#,
+        ] {
+            assert_eq!(parse(text).appearance, Appearance::Dark, "на входе {text}");
+        }
     }
 
     /// Файл от версии до появления языка обязан открываться по-русски.
@@ -1032,6 +1090,7 @@ mod tests {
                 pressure: PressureUnit::MmHg,
             },
             weather_favorites: vec![new_york()],
+            appearance: Appearance::Light,
         };
 
         let mut saver = Saver::spawn_to(path.clone());

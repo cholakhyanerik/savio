@@ -16,7 +16,8 @@ use crate::engine::power;
 use crate::engine::share;
 use crate::engine::weather;
 use crate::model::{
-    BALANCED_PLAN, CheckStatus, CookieSource, DownloadId, DownloadOptions, Event, FAVORITES_LIMIT,
+    Appearance, BALANCED_PLAN, CheckStatus, CookieSource, DownloadId, DownloadOptions, Event,
+    FAVORITES_LIMIT,
     Format, GpuInfo, MediaInfo, Metric, PerfSample, Place, PowerMode, PowerModes, PowerState,
     PressureUnit, Progress, Quality, Request, Section, SectionError, SectionPlan, ShareAddress,
     ShareEvent, Sky, SubLang, SystemReport, TRACE_LIMIT, TRANSFER_LIMIT, Tag, TempUnit, Thumbnail,
@@ -67,11 +68,11 @@ impl ModalArrival {
     ///
     /// `Order::Middle` — выше панелей (`Background`) и ниже самой модалки
     /// (`Foreground`).
-    fn veil(self, ctx: &egui::Context, name: &'static str) {
+    fn veil(self, pal: theme::Palette, ctx: &egui::Context, name: &'static str) {
         if self.veil <= 0.0 {
             return;
         }
-        let color = motion::mix(egui::Color32::TRANSPARENT, theme::MODAL_BACKDROP, self.veil);
+        let color = motion::mix(egui::Color32::TRANSPARENT, pal.modal_backdrop, self.veil);
         ctx.layer_painter(egui::LayerId::new(
             egui::Order::Middle,
             egui::Id::new("modal-veil").with(name),
@@ -97,13 +98,6 @@ impl ModalArrival {
         );
     }
 }
-
-/// За сколько подложка перекладывается к выбранному разделу.
-///
-/// Дольше самого прихода раздела, и намеренно: свет за стеклом обязан
-/// отставать от содержимого, иначе он читается как часть карточек, а не
-/// как то, что лежит под ними.
-const DRIFT_PULL_TIME: f32 = 0.9;
 
 /// За сколько полоса прогресса догоняет присланную долю.
 ///
@@ -594,13 +588,13 @@ impl QueueStatus {
     ///
     /// Цветом одним состояние не передаётся: рядом с точкой всегда стоит
     /// слово из `label()`.
-    fn color(&self) -> egui::Color32 {
+    fn color(&self, pal: theme::Palette) -> egui::Color32 {
         match self {
-            QueueStatus::Waiting => theme::TEXT_MUTED,
-            QueueStatus::Running => theme::ACCENT,
-            QueueStatus::Done => theme::STATE_SUCCESS,
-            QueueStatus::Failed(_) => theme::STATE_ERROR,
-            QueueStatus::Cancelled => theme::TEXT_SECONDARY,
+            QueueStatus::Waiting => pal.text_muted,
+            QueueStatus::Running => pal.accent,
+            QueueStatus::Done => pal.state_success,
+            QueueStatus::Failed(_) => pal.state_error,
+            QueueStatus::Cancelled => pal.text_secondary,
         }
     }
 }
@@ -951,6 +945,44 @@ impl Queue {
     }
 }
 
+/// Каким по смыслу читается короткое сообщение панели.
+///
+/// Роль, а не готовый `Color32`, и это не педантизм. Такие сообщения кладутся
+/// в поле панели, когда приходит событие движка, и живут там до следующего;
+/// положи туда цвет — он пережил бы смену темы и остался бы от прежней
+/// палитры. Это ровно та беда, что у строки, собранной заранее и не
+/// пересобранной в `set_lang`, только тише: текст хотя бы читается, а вот
+/// песочная подпись на белой карточке пропадёт. Роль же разрешается в цвет
+/// в кадре отрисовки, то есть всегда по текущей теме.
+///
+/// Заодно это и про слои: `drain` панели разбирает события движка, и знать
+/// ему про палитру незачем.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Tone {
+    /// Обычное сообщение: «удалять было нечего».
+    Plain,
+    /// Тише обычного: подсказки поиска, «ничего не нашлось».
+    Quiet,
+    /// Получилось.
+    Good,
+    /// Получилось не так, как ждали, но это не отказ.
+    Warn,
+    /// Не получилось.
+    Bad,
+}
+
+impl Tone {
+    fn color(self, pal: theme::Palette) -> egui::Color32 {
+        match self {
+            Tone::Plain => pal.text_secondary,
+            Tone::Quiet => pal.text_muted,
+            Tone::Good => pal.state_success,
+            Tone::Warn => pal.state_warning,
+            Tone::Bad => pal.state_error,
+        }
+    }
+}
+
 /// Состояние вкладки «Метаданные».
 ///
 /// Со своим приёмником событий: чистить метаданные во время скачивания —
@@ -970,7 +1002,7 @@ struct MetaPanel {
     /// Пустой список внутри — законный исход, а не ошибка.
     tags: Option<Vec<Tag>>,
     /// Итог последней операции: текст и цвет плашки.
-    outcome: Option<(String, egui::Color32)>,
+    outcome: Option<(String, Tone)>,
     /// Показан вопрос «точно перезаписать?».
     confirming: bool,
     rx: Option<Receiver<Event>>,
@@ -1074,7 +1106,7 @@ impl MetaPanel {
                     self.outcome = Some(if freed == 0 {
                         (
                             i18n::t(lang, Key::UiMetaNothingToWipe).to_owned(),
-                            theme::TEXT_SECONDARY,
+                            Tone::Plain,
                         )
                     } else {
                         (
@@ -1082,7 +1114,7 @@ impl MetaPanel {
                                 i18n::t(lang, Key::UiMetaWiped),
                                 &[&human_bytes(freed, lang)],
                             ),
-                            theme::STATE_SUCCESS,
+                            Tone::Good,
                         )
                     });
                     self.busy = false;
@@ -1090,7 +1122,7 @@ impl MetaPanel {
                 // Номер загрузки здесь всегда `NO_DOWNLOAD` и никого
                 // не интересует: канал у метаданных свой, разводить нечего.
                 Event::Failed { message, .. } => {
-                    self.outcome = Some((message, theme::STATE_ERROR));
+                    self.outcome = Some((message, Tone::Bad));
                     self.busy = false;
                 }
                 // Остальные варианты рождаются только загрузкой и установкой,
@@ -1138,7 +1170,7 @@ struct SystemPanel {
     /// шаг там, где ответ всё равно нужен всегда.
     asked: bool,
     /// Итог последнего сохранения отчёта в файл.
-    saved: Option<(String, egui::Color32)>,
+    saved: Option<(String, Tone)>,
     rx: Option<Receiver<Event>>,
 }
 
@@ -1251,7 +1283,7 @@ struct PowerPanel {
     /// перечитывание.
     open: bool,
     /// Итог последнего переключения: текст и цвет.
-    outcome: Option<(String, egui::Color32)>,
+    outcome: Option<(String, Tone)>,
     /// Оговорка под рядом режимов. Собирается на приёме события, а не в кадре
     /// отрисовки: `format!` в `ui()` — это аллокация шестьдесят раз в секунду
     /// ради строки, которая меняется раз в минуту (Правило 1).
@@ -1345,12 +1377,12 @@ impl PowerPanel {
                     self.busy = false;
                 }
                 // Переключилось и проверено перечитыванием.
-                Event::Notice(text) => self.outcome = Some((text, theme::STATE_SUCCESS)),
+                Event::Notice(text) => self.outcome = Some((text, Tone::Good)),
                 // Система приняла просьбу, но работает по-прежнему. Не ошибка
                 // и не успех — свой цвет (Правило 6).
-                Event::Warning(text) => self.outcome = Some((text, theme::STATE_WARNING)),
+                Event::Warning(text) => self.outcome = Some((text, Tone::Warn)),
                 Event::Failed { message, .. } => {
-                    self.outcome = Some((message, theme::STATE_ERROR));
+                    self.outcome = Some((message, Tone::Bad));
                     self.busy = false;
                 }
                 // Остальное ходит по чужим каналам. Перечислено явно, а не
@@ -1486,7 +1518,7 @@ struct WeatherPanel {
     /// Вторые строки найденного («область, страна»), готовые к показу.
     result_details: Vec<String>,
     /// Что сказать под полем поиска: текст и цвет.
-    search_note: Option<(String, egui::Color32)>,
+    search_note: Option<(String, Tone)>,
     search_rx: Option<Receiver<Event>>,
 }
 
@@ -1614,7 +1646,7 @@ impl WeatherPanel {
             self.results = None;
             self.search_note = Some((
                 i18n::t(lang, Key::UiWeatherTwoLetters).to_owned(),
-                theme::TEXT_MUTED,
+                Tone::Quiet,
             ));
             return;
         }
@@ -1787,7 +1819,7 @@ impl WeatherPanel {
                                 i18n::t(lang, Key::UiWeatherNothingFound),
                                 &[&self.searched_for],
                             ),
-                            theme::TEXT_MUTED,
+                            Tone::Quiet,
                         ));
                         self.results = None;
                     } else {
@@ -1797,7 +1829,7 @@ impl WeatherPanel {
                 }
                 Event::Failed { message, .. } => {
                     self.searching = false;
-                    self.search_note = Some((message, theme::STATE_ERROR));
+                    self.search_note = Some((message, Tone::Bad));
                 }
                 // Остальное по этому каналу не ходит. Ветка выписана явно,
                 // а не через `_`, по той же причине, что и выше.
@@ -1953,7 +1985,7 @@ struct SharePanel {
     /// Старые сверху, свежие снизу; рисуются в обратном порядке.
     transfers: Vec<TransferRow>,
     /// Что сказать о прошлой раздаче: почему остановилась.
-    note: Option<(String, egui::Color32)>,
+    note: Option<(String, Tone)>,
     copied_at: Option<f64>,
 }
 
@@ -2014,7 +2046,7 @@ impl SharePanel {
             }
         }
         if self.running() && let Some(why) = why {
-            self.note = Some((why.to_owned(), theme::TEXT_MUTED));
+            self.note = Some((why.to_owned(), Tone::Quiet));
         }
         self.state = ShareState::Off;
         self.addresses.clear();
@@ -2127,7 +2159,7 @@ impl SharePanel {
             self.stop(None, lang);
             self.note = Some((
                 i18n::t(lang, Key::UiShareDied).to_owned(),
-                theme::STATE_WARNING,
+                Tone::Warn,
             ));
         }
     }
@@ -2204,11 +2236,11 @@ impl SharePanel {
                 Some(row) => row.outcome = TransferOutcome::Failed(message),
                 // Отказ до начала передачи (в папку нельзя писать): строки
                 // ещё нет, а сказать надо.
-                None => self.note = Some((message, theme::STATE_ERROR)),
+                None => self.note = Some((message, Tone::Bad)),
             },
             ShareEvent::Stopped(message) => {
                 self.stop(None, lang);
-                self.note = Some((message, theme::STATE_ERROR));
+                self.note = Some((message, Tone::Bad));
             }
         }
     }
@@ -2452,7 +2484,7 @@ impl MonitorPanel {
     /// его просят на каждом проходе. Замыкание при этом собирается заново —
     /// так требует API (`Fn + Send + Sync + 'static`), и дешевле этого здесь
     /// ничего нет: сами данные лежат в общей ячейке и не копируются.
-    fn show_overlay(&mut self, lang: Lang, ctx: &egui::Context) {
+    fn show_overlay(&mut self, pal: theme::Palette, lang: Lang, ctx: &egui::Context) {
         // Закрыли изнутри — гасим галочку и забываем просьбу: иначе окно,
         // открытое заново, тут же закрылось бы старым флагом.
         if self.overlay_closing.swap(false, Ordering::Relaxed) {
@@ -2483,7 +2515,7 @@ impl MonitorPanel {
         let sample = Arc::clone(&self.overlay_sample);
         let closing = Arc::clone(&self.overlay_closing);
         ctx.show_viewport_deferred(self.overlay_id, builder, move |ui, class| {
-            overlay_ui(ui, class, lang, &sample, &closing);
+            overlay_ui(ui, pal, class, lang, &sample, &closing);
         });
     }
 }
@@ -2964,12 +2996,15 @@ pub struct SavioApp {
     /// Разделяется с обработчиком, поэтому `Arc`, а не поле по значению.
     gpu_errors: Arc<GpuErrors>,
 
-    /// Сетка фона: три тёплых пятна и вуаль поверх.
+    /// Выбранная тема, тёмная или светлая. Сохраняется.
+    appearance: Appearance,
+    /// Цвета выбранной темы.
     ///
-    /// Полем, а не переменной кадра: сетка зависит только от размера окна,
-    /// и пересобирать её шестьдесят раз в секунду было бы ровно той лишней
-    /// работой, которой не велит Правило 1.
-    backdrop: theme::Backdrop,
+    /// Полем, а не вызовом `Palette::of` в кадре: палитра меняется только
+    /// щелчком по переключателю, а собирать её шестьдесят раз в секунду было
+    /// бы ровно той лишней работой, которой не велит Правило 1. Отсюда же она
+    /// раздаётся вниз параметром — как `Lang`, и по той же причине.
+    palette: theme::Palette,
 }
 
 impl SavioApp {
@@ -3083,8 +3118,13 @@ impl SavioApp {
             maximize_pending: true,
             saver: settings::Saver::spawn(),
             gpu_errors: Arc::default(),
-            backdrop: theme::Backdrop::default(),
+            appearance: saved.appearance,
+            palette: theme::Palette::of(saved.appearance),
         };
+
+        // Стиль ставится здесь, а не в `main`: тема лежит в настройках,
+        // а читает их этот конструктор. Шрифты к этому моменту уже стоят.
+        theme::apply(ctx, app.palette);
 
         app.ffmpeg_missing = !engine::has_ffmpeg();
         app.rebuild_advanced_summary();
@@ -3331,7 +3371,23 @@ impl SavioApp {
             weather_units: self.weather.units,
             weather_favorites: self.weather.favorites.clone(),
             lang: self.lang,
+            appearance: self.appearance,
         });
+    }
+
+    /// Переключает тему окна.
+    ///
+    /// Стиль пересобирается здесь, а не в кадре: `Style` содержит `BTreeMap`
+    /// шрифтов. Сами шрифты при этом не трогаются — `set_fonts` пересобрал бы
+    /// атлас глифов, то есть подвесил бы окно на ровном месте.
+    fn set_appearance(&mut self, appearance: Appearance, ctx: &egui::Context) {
+        if self.appearance == appearance {
+            return;
+        }
+        self.appearance = appearance;
+        self.palette = theme::Palette::of(appearance);
+        theme::apply(ctx, self.palette);
+        self.remember();
     }
 
     /// Строка интерфейса на выбранном языке.
@@ -3766,13 +3822,14 @@ impl SavioApp {
     /// Короткая подпись состояния для плашки. Строки статические —
     /// в кадре отрисовки ничего не выделяется.
     fn status(&self) -> (&'static str, egui::Color32) {
+        let pal = self.palette;
         match self.state {
-            State::Idle => (self.t(Key::StateIdle), theme::TEXT_SECONDARY),
-            State::Queued => (self.t(Key::StateQueued), theme::TEXT_SECONDARY),
-            State::Running => (self.t(Key::StateRunning), theme::ACCENT),
-            State::Done(_) => (self.t(Key::StateDone), theme::STATE_SUCCESS),
-            State::Failed(_) => (self.t(Key::StateFailed), theme::STATE_ERROR),
-            State::Cancelled => (self.t(Key::StateCancelled), theme::TEXT_SECONDARY),
+            State::Idle => (self.t(Key::StateIdle), pal.text_secondary),
+            State::Queued => (self.t(Key::StateQueued), pal.text_secondary),
+            State::Running => (self.t(Key::StateRunning), pal.accent),
+            State::Done(_) => (self.t(Key::StateDone), pal.state_success),
+            State::Failed(_) => (self.t(Key::StateFailed), pal.state_error),
+            State::Cancelled => (self.t(Key::StateCancelled), pal.text_secondary),
         }
     }
 
@@ -4184,10 +4241,11 @@ fn version_line(name: &str, version: &crate::model::ToolVersion, lang: Lang) -> 
 // ---------------------------------------------------------------------------
 
 impl eframe::App for SavioApp {
-    /// Фон окна до первой отрисовки — основа темы, иначе при запуске
-    /// и ресайзе видна светлая вспышка. Пятна поверх неё кладёт уже кадр.
+    /// Фон окна до первой отрисовки, иначе при запуске и ресайзе видна
+    /// вспышка чужого цвета. Берётся из выбранной темы: в светлой вспышка
+    /// была бы чёрной, то есть заметнее, чем в тёмной.
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        theme::BG_BASE.to_normalized_gamma_f32()
+        self.palette.bg.to_normalized_gamma_f32()
     }
 
     /// Последнее, что успевает случиться перед закрытием.
@@ -4282,30 +4340,17 @@ impl eframe::App for SavioApp {
         );
         self.sweep_queue(ui.ctx());
 
+        // Палитра берётся один раз на кадр и дальше ездит вниз параметром.
+        // Копия, а не ссылка: `Palette` — `Copy` в 140 байт, зато методы ниже
+        // берут `&mut self`, и с заимствованием поля они бы не ужились.
+        let pal = self.palette;
+
         // Фон кладём первым и прямо в корневой `Ui`, до всех панелей: egui
         // рисует фигуры в порядке добавления, и всё, что появится дальше,
-        // ляжет поверх. Заливки у панелей при этом нет вовсе (`panel_fill`
-        // прозрачный) — иначе сплошной цвет закрасил бы пятна.
-        // Подложка слегка тянется к выбранному разделу (приём 07). Вечного
-        // дрейфа у неё намеренно нет: он один во всём наборе просил бы кадры
-        // в покое, а пересборка сетки — это сотни вершин и новый `Mesh`
-        // в куче, то есть далеко не пара сравнений. Сдвиг же доезжает за
-        // `DRIFT_PULL_TIME` и останавливается, и в покое Savio по-прежнему
-        // не тратит ни кадра.
-        // «Погода» стоит в меню правее «Машины», но тянет подложку не дальше
-        // неё: крайние сдвиги ±`DRIFT_PULL` — те, при которых фон проверен
-        // глазами, а контраст палитры посчитан для несдвинутых пятен.
-        let pull = match self.tab {
-            Tab::Download => -theme::DRIFT_PULL,
-            Tab::Metadata => 0.0,
-            Tab::Machine | Tab::Weather | Tab::Phone => theme::DRIFT_PULL,
-        };
-        let shift = ui.ctx().animate_value_with_time(
-            egui::Id::new("backdrop-shift"),
-            pull,
-            DRIFT_PULL_TIME * self.speed,
-        );
-        self.backdrop.paint(ui.painter(), ui.max_rect(), shift);
+        // ляжет поверх. Заливки панелей одной этой заливки не заменяют —
+        // между панелями остаются щели, в которых иначе просвечивал бы цвет
+        // «до первого кадра».
+        theme::paint_background(ui.painter(), pal, ui.max_rect());
 
         // Шапка и подвал — панели, а не первая и последняя строки прокрутки:
         // они обязаны стоять на месте, пока содержимое едет. У панелей это
@@ -4313,13 +4358,13 @@ impl eframe::App for SavioApp {
         egui::Panel::top("savio-header")
             .resizable(false)
             .show_separator_line(false)
-            .frame(theme::bar_frame())
+            .frame(theme::bar_frame(pal))
             .show(ui, |ui| self.header(ui));
 
         egui::Panel::bottom("savio-footer")
             .resizable(false)
             .show_separator_line(false)
-            .frame(theme::bar_frame())
+            .frame(theme::bar_frame(pal))
             .show(ui, |ui| self.footer(ui));
 
         egui::CentralPanel::default()
@@ -4341,7 +4386,7 @@ impl eframe::App for SavioApp {
         // Оверлей — отдельное окно, и просить его надо на каждом проходе,
         // иначе egui его закроет. Место здесь, а не во вкладке: оверлей живёт
         // и при закрытой вкладке — ради этого он и нужен.
-        self.monitor.show_overlay(self.lang, ui.ctx());
+        self.monitor.show_overlay(pal, self.lang, ui.ctx());
 
         // Модалки рисуются последними, поверх всего остального.
         let ctx = ui.ctx().clone();
@@ -4501,8 +4546,10 @@ impl SavioApp {
     /// шапки, а не растянута на всё окно, и равные доли растащили бы её
     /// по ширине самого длинного слова.
     fn header(&mut self, ui: &mut egui::Ui) {
+        let pal = self.palette;
         let row = Self::header_row(
             ui,
+            pal,
             self.speed,
             self.tab,
             self.lang,
@@ -4535,6 +4582,7 @@ impl SavioApp {
     /// а померить можно только то, что окно и тест берут из одного места.
     fn header_row(
         ui: &mut egui::Ui,
+        pal: theme::Palette,
         speed: f32,
         tab: Tab,
         lang: Lang,
@@ -4556,11 +4604,11 @@ impl SavioApp {
             ui.label(
                 egui::RichText::new("Savio")
                     .font(theme::display(21.0))
-                    .color(theme::TEXT_PRIMARY),
+                    .color(pal.text_primary),
             );
             // Акцентная точка — единственный «логотип», который нужен.
             let (dot, _) = ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
-            ui.painter().circle_filled(dot.center(), 4.5, theme::ACCENT);
+            ui.painter().circle_filled(dot.center(), 4.5, pal.accent);
 
             // Раздел из меню отмечается в дорожке сегментом «Ещё»: таблетка
             // уезжает туда, и видно, что показан не один из трёх.
@@ -4574,7 +4622,7 @@ impl SavioApp {
                 .map(|(item, key)| (*item, i18n::t(lang, *key)))
                 .collect();
             let track = ui.scope(|ui| {
-                segment_track(ui, egui::Id::new("track:tab"), speed, current, &items, false)
+                segment_track(ui, pal, egui::Id::new("track:tab"), speed, current, &items, false)
             });
             row.track = track.response.rect;
             match track.inner {
@@ -4606,7 +4654,7 @@ impl SavioApp {
             .open_bool(more_open)
             .show(|ui| {
                 for (item, key) in MORE_TABS {
-                    if choice_pill(ui, i18n::t(lang, key), item == tab, speed).clicked() {
+                    if choice_pill(ui, pal, i18n::t(lang, key), item == tab, speed).clicked() {
                         row.picked = Some(item);
                     }
                 }
@@ -4619,7 +4667,7 @@ impl SavioApp {
                 // кнопка в подвале и щелчок по версии в шапке.
                 ui.separator();
                 for other in Lang::ALL {
-                    if choice_pill(ui, other.label(), other == lang, speed).clicked() {
+                    if choice_pill(ui, pal, other.label(), other == lang, speed).clicked() {
                         row.lang = Some(other);
                     }
                 }
@@ -4643,7 +4691,7 @@ impl SavioApp {
                         egui::Label::new(
                             egui::RichText::new(VERSION)
                                 .small()
-                                .color(motion::mix(theme::TEXT_MUTED, theme::TEXT_PRIMARY, t)),
+                                .color(motion::mix(pal.text_muted, pal.text_primary, t)),
                         )
                         .selectable(false)
                         .sense(egui::Sense::click()),
@@ -4674,7 +4722,7 @@ impl SavioApp {
                 // промежуток; замерено кадром без окна.
                 const LANG_MIN: f32 = 34.0;
                 if ui.available_width() >= LANG_MIN {
-                    let (picked, rect) = Self::lang_pill(ui, speed, lang, lang_open);
+                    let (picked, rect) = Self::lang_pill(ui, pal, speed, lang, lang_open);
                     row.lang = row.lang.or(picked);
                     row.lang_pill = rect;
                 }
@@ -4694,6 +4742,7 @@ impl SavioApp {
     /// и открывает список щелчком.
     fn lang_pill(
         ui: &mut egui::Ui,
+        pal: theme::Palette,
         speed: f32,
         lang: Lang,
         open: &mut bool,
@@ -4705,7 +4754,7 @@ impl SavioApp {
                 egui::Label::new(
                     egui::RichText::new(lang.label())
                         .small()
-                        .color(motion::mix(theme::TEXT_MUTED, theme::TEXT_PRIMARY, t)),
+                        .color(motion::mix(pal.text_muted, pal.text_primary, t)),
                 )
                 .selectable(false)
                 .sense(egui::Sense::click()),
@@ -4730,7 +4779,7 @@ impl SavioApp {
         .open_bool(open)
         .show(|ui| {
             for other in Lang::ALL {
-                if choice_pill(ui, other.label(), other == lang, speed).clicked() {
+                if choice_pill(ui, pal, other.label(), other == lang, speed).clicked() {
                     picked = Some(other);
                 }
             }
@@ -4748,6 +4797,7 @@ impl SavioApp {
     /// незачем, но и прятать его при переключении вкладки не за чем —
     /// полоса на месте, и это одно из того, что делает окно спокойным.
     fn footer(&mut self, ui: &mut egui::Ui) {
+        let pal = self.palette;
         // Пока занят единственный канал событий — обновляться нечем: и
         // загрузка, и установка ходят через тот же `rx`.
         let enabled = !matches!(self.state, State::Running) && !self.setup.busy();
@@ -4765,9 +4815,9 @@ impl SavioApp {
                 dot.center(),
                 3.5,
                 if known {
-                    theme::STATE_SUCCESS
+                    pal.state_success
                 } else {
-                    theme::TEXT_MUTED
+                    pal.text_muted
                 },
             );
 
@@ -4792,7 +4842,7 @@ impl SavioApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let has_log = !self.log.is_empty();
                 let response = ui.add_enabled_ui(has_log, |ui| {
-                    toggle_pill(ui, self.t(Key::UiLog), self.log_open, speed)
+                    toggle_pill(ui, pal, self.t(Key::UiLog), self.log_open, speed)
                 });
                 if response.inner.clicked() {
                     self.log_open = !self.log_open;
@@ -4836,12 +4886,41 @@ impl SavioApp {
                 // открывается развёрнутым, так что до порога доводят вручную.
                 const SWITCH_MIN: f32 = 180.0;
                 if ui.available_width() >= SWITCH_MIN
-                    && checkbox(ui, &mut self.smooth, i18n::t(lang, Key::UiSmooth), true)
+                    && checkbox(ui, pal, &mut self.smooth, i18n::t(lang, Key::UiSmooth), true)
                         .on_hover_text(i18n::t(lang, Key::UiSmoothHint))
                         .changed()
                 {
                     self.speed = motion::scale(self.smooth);
                     self.remember();
+                }
+
+                // Выбор темы — здесь же и по той же причине, что галочка
+                // движения: настройка запоминается между запусками, а
+                // спрятанная за щелчком запомненная настройка встречает
+                // человека своими последствиями, а объяснением — нет.
+                //
+                // Порог свой: дорожка из двух подписей шире галочки, и в
+                // окне 520 её некуда деть. Тема при этом не теряется —
+                // выбранная переживает закрытие окна, а окно открывается
+                // развёрнутым.
+                const THEME_MIN: f32 = 300.0;
+                if ui.available_width() >= THEME_MIN {
+                    let items: Vec<(Appearance, &str)> = Appearance::ALL
+                        .iter()
+                        .map(|choice| (*choice, choice.label(lang)))
+                        .collect();
+                    let picked = segment_track(
+                        ui,
+                        pal,
+                        egui::Id::new("track:theme"),
+                        self.speed,
+                        self.appearance,
+                        &items,
+                        false,
+                    );
+                    if let Some(choice) = picked {
+                        self.set_appearance(choice, ui.ctx());
+                    }
                 }
 
                 // Подсказку с полной строкой вешает сама обрезанная метка
@@ -4865,7 +4944,7 @@ impl SavioApp {
                         egui::Label::new(
                             egui::RichText::new(&self.tools_line)
                                 .small()
-                                .color(theme::TEXT_MUTED),
+                                .color(pal.text_muted),
                         )
                         .truncate(),
                     );
@@ -4937,22 +5016,23 @@ impl SavioApp {
 
     /// Сообщения, которые относятся ко всему экрану загрузки.
     fn download_banners(&mut self, ui: &mut egui::Ui) {
+        let pal = self.palette;
         // Причина неудавшейся установки идёт первой: она объясняет, почему
         // инструмента нет, а баннер ниже — что с этим делать.
         let messages = [
             match &self.setup {
-                Setup::Failed(err) => Some((err.as_str(), theme::STATE_WARNING)),
+                Setup::Failed(err) => Some((err.as_str(), pal.state_warning)),
                 _ => None,
             },
             self.warning
                 .as_deref()
-                .map(|text| (text, theme::STATE_WARNING)),
+                .map(|text| (text, pal.state_warning)),
             self.notice
                 .as_deref()
-                .map(|text| (text, theme::STATE_SUCCESS)),
+                .map(|text| (text, pal.state_success)),
             self.setup_error
                 .as_deref()
-                .map(|text| (text, theme::STATE_ERROR)),
+                .map(|text| (text, pal.state_error)),
         ];
 
         // Про появление спрашиваем **у каждого места сразу**, включая пустые,
@@ -4969,14 +5049,15 @@ impl SavioApp {
             let Some((text, color)) = message else {
                 continue;
             };
-            theme::rising(ui, appear, |ui| banner(ui, text, color));
+            theme::rising(ui, appear, |ui| banner(ui, pal, text, color));
             ui.add_space(12.0);
         }
     }
 
     /// Главная колонка: всё, что нужно решить до нажатия «Скачать».
     fn download_main(&mut self, ui: &mut egui::Ui) {
-        theme::card_rising(ui, self.appear(0), |ui| {
+        let pal = self.palette;
+        theme::card_rising(ui, pal, self.appear(0), |ui| {
             self.url_field(ui);
             // Превью идёт сразу под полем, а не в карточке хода работы
             // справа: оно про то, что собираются скачать, а не про то, что
@@ -4986,17 +5067,17 @@ impl SavioApp {
             self.preview_row(ui);
 
             ui.add_space(14.0);
-            labelled_row(ui, self.t(Key::UiFormat), |ui| self.format_selector(ui));
+            labelled_row(ui, pal, self.t(Key::UiFormat), |ui| self.format_selector(ui));
 
             ui.add_space(12.0);
             // Подпись зависит от формата: у видео ступени — это высота
             // кадра, у звука — килобиты в секунду. Берём её у домена, а не
             // пишем здесь второй раз: две копии одной подписи разъезжаются.
             let quality_label = self.format.quality_label(self.lang);
-            labelled_row(ui, quality_label, |ui| self.quality_selector(ui));
+            labelled_row(ui, pal, quality_label, |ui| self.quality_selector(ui));
 
             ui.add_space(12.0);
-            labelled_row(ui, self.t(Key::UiEmbed), |ui| self.embed_options(ui));
+            labelled_row(ui, pal, self.t(Key::UiEmbed), |ui| self.embed_options(ui));
 
             ui.add_space(14.0);
             self.advanced_group(ui);
@@ -5034,6 +5115,7 @@ impl SavioApp {
 
     /// Содержимое «Машины» без оболочки появления.
     fn machine_body(&mut self, ui: &mut egui::Ui) {
+        let pal = self.palette;
         const HALVES: [(MachineTab, Key); 2] = [
             (MachineTab::Now, Key::MachineNow),
             (MachineTab::Spec, Key::MachineSpec),
@@ -5046,6 +5128,7 @@ impl SavioApp {
             ui.spacing_mut().item_spacing.x = 12.0;
             picked = segment_track(
                 ui,
+                pal,
                 egui::Id::new("track:machine"),
                 self.speed,
                 self.machine_tab,
@@ -5059,9 +5142,10 @@ impl SavioApp {
             if self.machine_tab == MachineTab::Now {
                 soft_pill(
                     ui,
+                    pal,
                     i18n::t(lang, Key::UiMachinePolling),
-                    theme::STATE_SUCCESS,
-                    theme::SUCCESS_SOFT,
+                    pal.state_success,
+                    pal.success_soft,
                 );
             }
         });
@@ -5086,8 +5170,9 @@ impl SavioApp {
     /// выход — кнопка «Отменить», иначе оборвавшаяся загрузка заперла бы
     /// пользователя в окне без выхода.
     fn install_modal(&mut self, ctx: &egui::Context, arrival: ModalArrival) {
+        let pal = self.palette;
         let speed = self.speed;
-        arrival.veil(ctx, "setup");
+        arrival.veil(pal, ctx, "setup");
         // Строки статические и выбираются по режиму — в кадре ничего
         // не собирается и не выделяется.
         let (title, subtitle) = match self.setup {
@@ -5111,8 +5196,8 @@ impl SavioApp {
             .backdrop_color(egui::Color32::TRANSPARENT)
             .frame(
                 egui::Frame::new()
-                    .fill(theme::MODAL_FILL)
-                    .stroke(egui::Stroke::new(1.0, theme::BORDER_SUBTLE))
+                    .fill(pal.modal_fill)
+                    .stroke(egui::Stroke::new(1.0, pal.border_subtle))
                     .corner_radius(egui::CornerRadius::same(theme::RADIUS_CARD))
                     .inner_margin(egui::Margin::same(24)),
             )
@@ -5126,15 +5211,15 @@ impl SavioApp {
                     egui::RichText::new(title)
                         .heading()
                         .strong()
-                        .color(theme::TEXT_PRIMARY),
+                        .color(pal.text_primary),
                 );
                 ui.add_space(6.0);
-                ui.label(egui::RichText::new(subtitle).color(theme::TEXT_SECONDARY));
+                ui.label(egui::RichText::new(subtitle).color(pal.text_secondary));
 
                 ui.add_space(16.0);
 
                 ui.scope(|ui| {
-                    ui.visuals_mut().extreme_bg_color = theme::PROGRESS_TRACK;
+                    ui.visuals_mut().extreme_bg_color = pal.progress_track;
                     // Скругление бару не задаём: вместе с `animate` оно
                     // отключает отрисовку бегущей полосы, а она здесь —
                     // единственный признак, что установка не зависла.
@@ -5142,7 +5227,7 @@ impl SavioApp {
                         Some(f) => egui::ProgressBar::new(f),
                         None => egui::ProgressBar::new(0.0).animate(true),
                     };
-                    ui.add(bar.fill(theme::ACCENT).desired_height(8.0));
+                    ui.add(bar.fill(pal.accent).desired_height(8.0));
                 });
 
                 if !self.progress_line.is_empty() {
@@ -5151,7 +5236,7 @@ impl SavioApp {
                         egui::Label::new(
                             egui::RichText::new(&self.progress_line)
                                 .small()
-                                .color(theme::TEXT_SECONDARY),
+                                .color(pal.text_secondary),
                         )
                         .truncate(),
                     );
@@ -5169,13 +5254,14 @@ impl SavioApp {
     }
 
     fn url_field(&mut self, ui: &mut egui::Ui) {
+        let pal = self.palette;
         let invalid = self.url_invalid;
         let lang = self.lang;
 
         let response = ui
             .scope(|ui| {
                 if invalid {
-                    mark_invalid(ui);
+                    mark_invalid(pal, ui);
                 }
 
                 // Поле выше остальных и без подписи над ним: это первое, к
@@ -5185,7 +5271,7 @@ impl SavioApp {
                     [ui.available_width(), theme::FIELD_HEIGHT],
                     egui::TextEdit::singleline(&mut self.url)
                         .hint_text(i18n::t(lang, Key::UiUrlHint))
-                        .text_color(theme::TEXT_PRIMARY)
+                        .text_color(pal.text_primary)
                         // Поля широкие: у «таблетки» текст обязан отступать
                         // от полукруглых торцов, иначе он в них упирается.
                         .margin(egui::Margin::symmetric(18, 8)),
@@ -5205,7 +5291,7 @@ impl SavioApp {
             ui.label(
                 egui::RichText::new(i18n::t(lang, Key::UiNotALink))
                     .small()
-                    .color(theme::STATE_WARNING),
+                    .color(pal.state_warning),
             );
         }
     }
@@ -5216,6 +5302,7 @@ impl SavioApp {
     /// «автор · длительность» собрана в `rebuild_meta_line`. В кадре здесь
     /// не считается и не выделяется ничего.
     fn preview_row(&mut self, ui: &mut egui::Ui) {
+        let pal = self.palette;
         match self.preview.state {
             PreviewState::Idle => return,
             // Про ожидание говорим словами: пустое место под ссылкой человек
@@ -5223,14 +5310,14 @@ impl SavioApp {
             // запрос», и ждать перестаёт.
             PreviewState::Asking => {
                 ui.add_space(8.0);
-                note(ui, self.t(Key::UiPreviewAsking), theme::TEXT_MUTED);
+                note(ui, self.t(Key::UiPreviewAsking), pal.text_muted);
                 return;
             }
             // Не ошибка и баннера не заслуживает: сведения — украшение,
             // и «Скачать» после этого работает как ни в чём не бывало.
             PreviewState::Failed => {
                 ui.add_space(8.0);
-                note(ui, self.t(Key::UiPreviewFailed), theme::TEXT_MUTED);
+                note(ui, self.t(Key::UiPreviewFailed), pal.text_muted);
                 return;
             }
             PreviewState::Ready => {}
@@ -5270,7 +5357,7 @@ impl SavioApp {
                                 // только цвет. Начертание живёт отдельным
                                 // семейством — см. `theme::bold`.
                                 .font(theme::bold(15.0))
-                                .color(theme::TEXT_PRIMARY),
+                                .color(pal.text_primary),
                         )
                         .truncate(),
                     );
@@ -5280,7 +5367,7 @@ impl SavioApp {
                         egui::Label::new(
                             egui::RichText::new(&self.meta_line)
                                 .small()
-                                .color(theme::TEXT_SECONDARY),
+                                .color(pal.text_secondary),
                         )
                         .truncate(),
                     );
@@ -5290,12 +5377,14 @@ impl SavioApp {
     }
 
     fn format_selector(&mut self, ui: &mut egui::Ui) {
+        let pal = self.palette;
         let items = [
             (Format::Mp4, Format::Mp4.label(self.lang)),
             (Format::Mp3, Format::Mp3.label(self.lang)),
         ];
         let picked = segment_track(
             ui,
+            pal,
             egui::Id::new("track:format"),
             self.speed,
             self.format,
@@ -5323,6 +5412,7 @@ impl SavioApp {
     /// Так каждому достаётся честная доля остатка, а последнему — ровно то,
     /// что осталось.
     fn quality_selector(&mut self, ui: &mut egui::Ui) {
+        let pal = self.palette;
         let format = self.format;
         let lang = self.lang;
         // Массив на стеке, а не сборка списка: шесть пар «ступень + подпись»
@@ -5331,6 +5421,7 @@ impl SavioApp {
 
         let picked = segment_track(
             ui,
+            pal,
             egui::Id::new("track:quality"),
             self.speed,
             self.quality,
@@ -5346,7 +5437,7 @@ impl SavioApp {
 
         if !self.quality_note.is_empty() {
             ui.add_space(6.0);
-            note(ui, &self.quality_note, theme::TEXT_SECONDARY);
+            note(ui, &self.quality_note, pal.text_secondary);
         }
     }
 
@@ -5356,6 +5447,7 @@ impl SavioApp {
     /// в кадре отрисовки здесь не считается ничего, включая сообщение об
     /// ошибке — оно статическое и лежит в `SectionError`.
     fn section_row(&mut self, ui: &mut egui::Ui) {
+        let pal = self.palette;
         let error = self.section_error;
         let mut changed = false;
         let lang = self.lang;
@@ -5371,6 +5463,7 @@ impl SavioApp {
 
             changed |= time_field(
                 ui,
+                pal,
                 &mut self.section_start,
                 i18n::t(lang, Key::UiSectionFrom),
                 error.is_some_and(SectionError::at_start),
@@ -5378,11 +5471,12 @@ impl SavioApp {
             );
             ui.add_sized(
                 [DASH, theme::CONTROL_HEIGHT],
-                egui::Label::new(egui::RichText::new("—").color(theme::TEXT_MUTED)),
+                egui::Label::new(egui::RichText::new("—").color(pal.text_muted)),
             );
             let rest = ui.available_width();
             changed |= time_field(
                 ui,
+                pal,
                 &mut self.section_end,
                 i18n::t(lang, Key::UiSectionTo),
                 error.is_some_and(SectionError::at_end),
@@ -5414,13 +5508,13 @@ impl SavioApp {
         // обычной загрузки. Все строки статические.
         ui.add_space(6.0);
         if let Some(err) = self.section_error {
-            note(ui, err.message(self.lang), theme::STATE_ERROR);
+            note(ui, err.message(self.lang), pal.state_error);
         } else if !self.section.any() {
-            note(ui, self.t(Key::UiSectionHint), theme::TEXT_MUTED);
+            note(ui, self.t(Key::UiSectionHint), pal.text_muted);
         } else if self.ffmpeg_missing {
-            note(ui, self.t(Key::UiSectionNoFfmpeg), theme::STATE_WARNING);
+            note(ui, self.t(Key::UiSectionNoFfmpeg), pal.state_warning);
         } else {
-            note(ui, self.section_hint(), theme::TEXT_MUTED);
+            note(ui, self.section_hint(), pal.text_muted);
         }
     }
 
@@ -5465,6 +5559,7 @@ impl SavioApp {
     /// Состояние при этом сказано не только цветом: у включённого чипа
     /// нарисована галочка — см. [`chip`].
     fn embed_options(&mut self, ui: &mut egui::Ui) {
+        let pal = self.palette;
         // Субтитры бывают только у видео: в MP3 их положить некуда. Чип
         // гасим, но причину говорим по наведению — молча выключенный элемент
         // выглядит поломкой, а не запретом.
@@ -5486,6 +5581,7 @@ impl SavioApp {
 
             any_changed |= chip(
                 ui,
+                pal,
                 &mut self.options.embed_metadata,
                 i18n::t(lang, Key::UiEmbedMetadata),
                 true,
@@ -5495,6 +5591,7 @@ impl SavioApp {
             .changed();
             any_changed |= chip(
                 ui,
+                pal,
                 &mut self.options.embed_thumbnail,
                 i18n::t(lang, Key::UiEmbedThumbnail),
                 true,
@@ -5504,6 +5601,7 @@ impl SavioApp {
             .changed();
             subs_changed |= chip(
                 ui,
+                pal,
                 &mut self.options.embed_subs,
                 i18n::t(lang, Key::UiEmbedSubs),
                 subs_enabled,
@@ -5517,6 +5615,7 @@ impl SavioApp {
             if subs_enabled && self.options.embed_subs {
                 subs_changed |= chip(
                     ui,
+                    pal,
                     &mut self.options.auto_subs,
                     i18n::t(lang, Key::UiAutoSubs),
                     true,
@@ -5530,7 +5629,7 @@ impl SavioApp {
         // Оговорка про ffmpeg — статическая строка: в кадре ничего не собирается.
         if self.ffmpeg_missing && self.options.any() {
             ui.add_space(8.0);
-            note(ui, i18n::t(lang, Key::UiEmbedNoFfmpeg), theme::STATE_WARNING);
+            note(ui, i18n::t(lang, Key::UiEmbedNoFfmpeg), pal.state_warning);
         }
 
         if subs_changed {
@@ -5554,20 +5653,22 @@ impl SavioApp {
     /// группа прятала бы заданный фрагмент, и человек потом искал бы, почему
     /// ролик скачался куском.
     fn advanced_group(&mut self, ui: &mut egui::Ui) {
+        let pal = self.palette;
         let open = self.advanced;
         let speed = self.speed;
         let lang = self.lang;
         let mut toggled = false;
 
         egui::Frame::new()
-            .fill(theme::CARD_INNER)
-            .stroke(egui::Stroke::new(1.0, theme::BORDER_SUBTLE))
+            .fill(pal.card_inner)
+            .stroke(egui::Stroke::new(1.0, pal.border_subtle))
             .corner_radius(egui::CornerRadius::same(theme::RADIUS_INNER))
             .inner_margin(egui::Margin::same(4))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 toggled = disclosure_row(
                     ui,
+                    pal,
                     open,
                     i18n::t(lang, Key::UiAdvanced),
                     &self.advanced_summary,
@@ -5585,18 +5686,18 @@ impl SavioApp {
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
 
-                            field_label(ui, i18n::t(lang, Key::UiSectionField));
+                            field_label(ui, pal, i18n::t(lang, Key::UiSectionField));
                             self.section_row(ui);
 
                             ui.add_space(14.0);
-                            field_label(ui, i18n::t(lang, Key::UiSiteLogin));
+                            field_label(ui, pal, i18n::t(lang, Key::UiSiteLogin));
                             self.cookie_selector(ui);
 
                             // Список языков нужен, только если субтитры просят:
                             // в остальное время он не значит ничего.
                             if self.format == Format::Mp4 && self.options.embed_subs {
                                 ui.add_space(14.0);
-                                field_label(ui, i18n::t(lang, Key::UiSubtitleLanguage));
+                                field_label(ui, pal, i18n::t(lang, Key::UiSubtitleLanguage));
                                 if self.sub_lang_selector(ui) {
                                     self.rebuild_subtitles();
                                     self.rebuild_advanced_summary();
@@ -5621,6 +5722,7 @@ impl SavioApp {
     /// списка при этом не бывает — «Язык ролика» есть всегда, и он же
     /// значение по умолчанию, так что и до ответа выбор осмыслен.
     fn sub_lang_selector(&mut self, ui: &mut egui::Ui) -> bool {
+        let pal = self.palette;
         // Ширину берём до `ComboBox`, как и у списка браузеров: внутри он
         // заводит свою горизонтальную раскладку.
         let width = ui.available_width();
@@ -5638,9 +5740,9 @@ impl SavioApp {
             // То же оформление, что у списка браузеров: это такое же поле
             // ввода, и разъехаться им нельзя.
             for state in [&mut v.widgets.inactive, &mut v.widgets.open] {
-                state.weak_bg_fill = theme::INPUT_FILL;
+                state.weak_bg_fill = pal.input_fill;
             }
-            v.widgets.hovered.weak_bg_fill = theme::INPUT_FILL;
+            v.widgets.hovered.weak_bg_fill = pal.input_fill;
 
             // Поля берём по отдельности: внутри замыкания `sub_lang` нужен
             // изменяемым, а `info` — нет, и целиком `self` там занять нельзя.
@@ -5680,7 +5782,7 @@ impl SavioApp {
                             ui.label(
                                 egui::RichText::new(if track.auto { automatic } else { own })
                                     .small()
-                                    .color(theme::TEXT_MUTED),
+                                    .color(pal.text_muted),
                             );
                         }
 
@@ -5701,7 +5803,7 @@ impl SavioApp {
 
         ui.add_space(6.0);
         if !self.subs_note.is_empty() {
-            note(ui, &self.subs_note, theme::STATE_WARNING);
+            note(ui, &self.subs_note, pal.state_warning);
             ui.add_space(6.0);
         }
         // Обе строки статические, и обе нужны: про качество робота человек
@@ -5711,7 +5813,7 @@ impl SavioApp {
         } else {
             Key::UiSubsOwnHint
         };
-        note(ui, i18n::t(ui_lang, hint), theme::TEXT_MUTED);
+        note(ui, i18n::t(ui_lang, hint), pal.text_muted);
 
         changed
     }
@@ -5725,6 +5827,7 @@ impl SavioApp {
     /// Оговорка под ним меняется вместе с выбором и в каждом случае статична —
     /// в кадре отрисовки здесь ничего не собирается.
     fn cookie_selector(&mut self, ui: &mut egui::Ui) {
+        let pal = self.palette;
         // Ширину берём до `ComboBox`: внутри он заводит свою горизонтальную
         // раскладку, и `available_width` там уже другая.
         let width = ui.available_width();
@@ -5743,9 +5846,9 @@ impl SavioApp {
             // кнопку именно этим состоянием, и без него она бы перекрашивалась
             // в момент нажатия.
             for state in [&mut v.widgets.inactive, &mut v.widgets.open] {
-                state.weak_bg_fill = theme::INPUT_FILL;
+                state.weak_bg_fill = pal.input_fill;
             }
-            v.widgets.hovered.weak_bg_fill = theme::INPUT_FILL;
+            v.widgets.hovered.weak_bg_fill = pal.input_fill;
 
             egui::ComboBox::from_id_salt("savio-cookies")
                 .selected_text(self.cookies.label(lang))
@@ -5799,16 +5902,16 @@ impl SavioApp {
 
         ui.add_space(6.0);
         match self.cookies {
-            CookieSource::None => note(ui, i18n::t(lang, Key::UiCookiesWhy), theme::TEXT_MUTED),
+            CookieSource::None => note(ui, i18n::t(lang, Key::UiCookiesWhy), pal.text_muted),
             CookieSource::File => note(
                 ui,
                 i18n::t(lang, Key::UiCookieFileWhy),
-                theme::STATE_WARNING,
+                pal.state_warning,
             ),
             _ => note(
                 ui,
                 i18n::t(lang, Key::UiCookieCloseBrowser),
-                theme::STATE_WARNING,
+                pal.state_warning,
             ),
         }
     }
@@ -5827,12 +5930,13 @@ impl SavioApp {
     /// в UTF-8 и в `settings.json` не попал, и на этот случай на кнопке стоит
     /// [`PICK_COOKIE_FILE`] — приглашение сделать ровно то, что она и делает.
     fn cookie_file_row(&mut self, ui: &mut egui::Ui) {
+        let pal = self.palette;
         let clicked = ui
             .add_sized(
                 [ui.available_width(), theme::CONTROL_HEIGHT],
                 egui::Button::new(
                     egui::RichText::new(&self.cookie_file_display)
-                        .color(theme::TEXT_SECONDARY),
+                        .color(pal.text_secondary),
                 )
                 .truncate(),
             )
@@ -5878,12 +5982,13 @@ impl SavioApp {
     /// `show_tooltip_when_elided` есть только у `Label`, а на кнопке висит
     /// поясняющая подсказка (дефект 48 реестра).
     fn folder_row(&mut self, ui: &mut egui::Ui) {
+        let pal = self.palette;
         // Папки нет — это не оговорка, а помеха работе: «Скачать» без неё
         // выключена. Поэтому предупреждающий тон, а не приглушённый.
         let color = if self.out_dir.is_some() {
-            theme::TEXT_SECONDARY
+            pal.text_secondary
         } else {
-            theme::STATE_WARNING
+            pal.state_warning
         };
 
         let clicked = sized_with_touch(
@@ -5914,6 +6019,7 @@ impl SavioApp {
     /// и без того длинную карточку. Ширины неравные — главное действие экрана
     /// остаётся заметно крупнее.
     fn action_button(&mut self, ui: &mut egui::Ui) {
+        let pal = self.palette;
         // Подсказку выключенной кнопки выбираем по первой же причине, а не
         // по всем сразу: человеку нужно знать, что сделать сейчас.
         let add_hint = self.t(if self.queue.full {
@@ -5972,13 +6078,14 @@ impl SavioApp {
 
         if self.queue.full {
             ui.add_space(6.0);
-            note(ui, i18n::t(lang, Key::UiQueueFullNote), theme::STATE_WARNING);
+            note(ui, i18n::t(lang, Key::UiQueueFullNote), pal.state_warning);
         }
     }
 
     /// Главная кнопка ряда: «Отмена» во время загрузки, «Скачать» в остальное
     /// время. Возвращает `true`, когда её нажали.
     fn primary_button(&mut self, ui: &mut egui::Ui, width: f32) -> bool {
+        let pal = self.palette;
         let lang = self.lang;
         if matches!(self.state, State::Running) {
             return ui
@@ -6012,13 +6119,23 @@ impl SavioApp {
             // а только глушит прозрачность. Поэтому выключенный вид
             // задаём сами: все три состояния красим приглушённым жёлтым,
             // навести на выключенную кнопку всё равно нельзя.
-            let (rest, hover, press) = if enabled {
-                (theme::ACCENT, theme::ACCENT_HOVER, theme::ACCENT_ACTIVE)
+            // Подпись выключенной кнопки берётся отдельным полем палитры.
+            // В тёмной теме она совпадает с обычной, и это сбивает с толку;
+            // в светлой включённая кнопка тёмная и подписана белым, а
+            // выключенная — пастельная, и белым по ней выходит 1.9:1.
+            let (rest, hover, press, ink) = if enabled {
+                (
+                    pal.accent,
+                    pal.accent_hover,
+                    pal.accent_active,
+                    pal.text_on_accent,
+                )
             } else {
                 (
-                    theme::ACCENT_DISABLED,
-                    theme::ACCENT_DISABLED,
-                    theme::ACCENT_DISABLED,
+                    pal.accent_disabled,
+                    pal.accent_disabled,
+                    pal.accent_disabled,
+                    pal.text_on_accent_disabled,
                 )
             };
 
@@ -6035,7 +6152,7 @@ impl SavioApp {
             ] {
                 state.weak_bg_fill = fill;
                 state.bg_stroke = egui::Stroke::NONE;
-                state.fg_stroke = egui::Stroke::new(1.0, theme::TEXT_ON_ACCENT);
+                state.fg_stroke = egui::Stroke::new(1.0, ink);
                 state.corner_radius = egui::CornerRadius::same(theme::RADIUS_PILL);
                 state.expansion = expansion;
             }
@@ -6048,7 +6165,7 @@ impl SavioApp {
                 egui::Button::new(
                     egui::RichText::new(i18n::t(lang, Key::UiDownload))
                         .font(theme::display(17.0))
-                        .color(theme::TEXT_ON_ACCENT),
+                        .color(ink),
                 )
                 .min_size(egui::vec2(width, theme::CTA_HEIGHT)),
             )
@@ -6065,6 +6182,7 @@ impl SavioApp {
     /// остаётся только ход самой работы, а какой ролик качается — видно
     /// в строке очереди ниже, где название и так стоит и подсвечено.
     fn status_section(&mut self, ui: &mut egui::Ui) {
+        let pal = self.palette;
         let (label, color) = self.status();
         let speed = self.speed;
         let lang = self.lang;
@@ -6072,7 +6190,7 @@ impl SavioApp {
         // `self` занят целиком, а `open_dir` запускает процесс.
         let mut open_at: Option<PathBuf> = None;
 
-        theme::card_rising(ui, self.appear(1), |ui| {
+        theme::card_rising(ui, pal, self.appear(1), |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 9.0;
                 // Точка — подсказка глазу, а не носитель смысла: то же
@@ -6100,7 +6218,7 @@ impl SavioApp {
                     egui::Label::new(
                         egui::RichText::new(label)
                             .font(theme::display(17.0))
-                            .color(theme::TEXT_PRIMARY),
+                            .color(pal.text_primary),
                     )
                     .truncate(),
                 );
@@ -6112,7 +6230,7 @@ impl SavioApp {
                 State::Running => {
                     ui.scope(|ui| {
                         // Жёлоб бара берётся из `extreme_bg_color`.
-                        ui.visuals_mut().extreme_bg_color = theme::PROGRESS_TRACK;
+                        ui.visuals_mut().extreme_bg_color = pal.progress_track;
 
                         // Без явного скругления egui рисует бар «таблеткой» —
                         // ровно то, что нужно. Проценты не пишем внутрь бара:
@@ -6133,7 +6251,7 @@ impl SavioApp {
                             // живёт она ровно столько, сколько идёт загрузка.
                             None => egui::ProgressBar::new(0.0).animate(true),
                         };
-                        ui.add(bar.fill(theme::ACCENT).desired_height(8.0));
+                        ui.add(bar.fill(pal.accent).desired_height(8.0));
                     });
 
                     if !self.progress_line.is_empty() {
@@ -6147,7 +6265,7 @@ impl SavioApp {
                             egui::Label::new(
                                 egui::RichText::new(&self.progress_line)
                                     .small()
-                                    .color(theme::TEXT_SECONDARY),
+                                    .color(pal.text_secondary),
                             )
                             .truncate(),
                         );
@@ -6159,7 +6277,7 @@ impl SavioApp {
                             egui::Label::new(
                                 egui::RichText::new(&self.done_path_display)
                                     .small()
-                                    .color(theme::TEXT_SECONDARY),
+                                    .color(pal.text_secondary),
                             )
                             .truncate(),
                         );
@@ -6171,18 +6289,18 @@ impl SavioApp {
                         open_at = Some(dir.to_path_buf());
                     }
                 }
-                State::Failed(err) => banner(ui, err, theme::STATE_ERROR),
+                State::Failed(err) => banner(ui, pal, err, pal.state_error),
                 State::Cancelled => note(
                     ui,
                     i18n::t(lang, Key::UiCancelledNote),
-                    theme::TEXT_SECONDARY,
+                    pal.text_secondary,
                 ),
                 State::Queued => note(
                     ui,
                     i18n::t(lang, Key::UiQueuedNote),
-                    theme::TEXT_SECONDARY,
+                    pal.text_secondary,
                 ),
-                State::Idle => note(ui, i18n::t(lang, Key::UiIdleNote), theme::TEXT_SECONDARY),
+                State::Idle => note(ui, i18n::t(lang, Key::UiIdleNote), pal.text_secondary),
             }
         });
 
@@ -6198,6 +6316,7 @@ impl SavioApp {
     /// История сюда переехала из собственной вкладки — там она отнимала
     /// место в дорожке разделов, а смотрят в неё как раз во время загрузки.
     fn rail_list(&mut self, ui: &mut egui::Ui) {
+        let pal = self.palette;
         // Что нажали, решаем после отрисовки: менять список, пока по нему
         // идёт цикл, нельзя, а откладывать решение до следующего кадра —
         // значит терять его при быстром щелчке.
@@ -6208,10 +6327,11 @@ impl SavioApp {
         let speed = self.speed;
         let lang = self.lang;
 
-        theme::card_rising(ui, self.appear(2), |ui| {
+        theme::card_rising(ui, pal, self.appear(2), |ui| {
             ui.horizontal(|ui| {
                 picked = segment_track(
                     ui,
+                    pal,
                     egui::Id::new("track:rail"),
                     self.speed,
                     self.rail_tab,
@@ -6274,10 +6394,11 @@ impl SavioApp {
 
     /// Содержимое половины «Очередь». Возвращает строку, которую убрали.
     fn queue_list(&self, ui: &mut egui::Ui) -> Option<DownloadId> {
+        let pal = self.palette;
         let speed = self.speed;
         let lang = self.lang;
         if self.queue.items.is_empty() {
-            note(ui, i18n::t(lang, Key::UiQueueEmptyNote), theme::TEXT_MUTED);
+            note(ui, i18n::t(lang, Key::UiQueueEmptyNote), pal.text_muted);
             return None;
         }
 
@@ -6290,7 +6411,7 @@ impl SavioApp {
             egui::Label::new(
                 egui::RichText::new(&self.queue.summary)
                     .small()
-                    .color(theme::TEXT_MUTED),
+                    .color(pal.text_muted),
             )
             .truncate(),
         );
@@ -6306,13 +6427,13 @@ impl SavioApp {
             if index > 0 {
                 ui.add_space(8.0);
             }
-            if queue_row(ui, item, lang, speed) {
+            if queue_row(ui, pal, item, lang, speed) {
                 remove = Some(item.id);
             }
         }
 
         ui.add_space(10.0);
-        note(ui, i18n::t(lang, Key::UiQueueNote), theme::TEXT_MUTED);
+        note(ui, i18n::t(lang, Key::UiQueueNote), pal.text_muted);
 
         remove
     }
@@ -6320,11 +6441,12 @@ impl SavioApp {
     /// Содержимое половины «История». Возвращает папку, которую попросили
     /// открыть.
     fn history_list(&self, ui: &mut egui::Ui) -> Option<PathBuf> {
+        let pal = self.palette;
         let Some((first, rest)) = self.history.entries.split_first() else {
             // Пустой экран без объяснения читается как поломка. Про то, что
             // список не переживает закрытие окна, говорим здесь же: иначе
             // после перезапуска пустая история выглядит потерянными данными.
-            note(ui, self.t(Key::UiHistoryEmptyNote), theme::TEXT_MUTED);
+            note(ui, self.t(Key::UiHistoryEmptyNote), pal.text_muted);
             return None;
         };
 
@@ -6347,11 +6469,12 @@ impl SavioApp {
     /// прокрутка внутри другой схлопывается до 64 точек (дефект 27). Подвал —
     /// панель, своя прокрутка в нём законна.
     fn log_section(&mut self, ui: &mut egui::Ui) {
+        let pal = self.palette;
         self.log_copy_row(ui);
         ui.add_space(8.0);
 
         egui::Frame::new()
-            .fill(theme::INPUT_FILL)
+            .fill(pal.input_fill)
             .corner_radius(egui::CornerRadius::same(theme::RADIUS_INNER))
             .inner_margin(egui::Margin::same(12))
             .show(ui, |ui| {
@@ -6368,7 +6491,7 @@ impl SavioApp {
                         ui.label(
                             egui::RichText::new(line.as_str())
                                 .monospace()
-                                .color(theme::TEXT_MUTED),
+                                .color(pal.text_muted),
                         );
                     }
                 });
@@ -6383,6 +6506,7 @@ impl SavioApp {
     /// и не запускает — берёт уже готовые строки, поэтому и работы с потоками
     /// здесь нет.
     fn log_copy_row(&mut self, ui: &mut egui::Ui) {
+        let pal = self.palette;
         let lang = self.lang;
         ui.horizontal(|ui| {
             let now = ui.input(|i| i.time);
@@ -6407,7 +6531,7 @@ impl SavioApp {
                     ui.label(
                         egui::RichText::new(i18n::t(lang, Key::UiCopied))
                             .small()
-                            .color(theme::STATE_SUCCESS),
+                            .color(pal.state_success),
                     );
                     // Кадр к сроку приходится просить: без ввода egui окно не
                     // перерисовывает, и подпись висела бы до первого движения
@@ -6433,11 +6557,12 @@ impl SavioApp {
     /// перезаписи и список поддерживаемых форматов — это то, что читают
     /// **до** нажатия «Удалить», и под самой кнопкой их не видно.
     fn metadata_tab(&mut self, ui: &mut egui::Ui) {
+        let pal = self.palette;
         const GAP: f32 = 18.0;
         if ui.available_width() < theme::TWO_COLUMN_MIN {
             self.metadata_main(ui);
             ui.add_space(GAP);
-            metadata_rail(ui, self.lang, self.appear(1), self.appear(2));
+            metadata_rail(ui, pal, self.lang, self.appear(1), self.appear(2));
             return;
         }
 
@@ -6462,7 +6587,7 @@ impl SavioApp {
                 |ui| {
                     ui.set_min_width(rail);
                     ui.set_max_width(rail);
-                    metadata_rail(ui, self.lang, self.appear(1), self.appear(2));
+                    metadata_rail(ui, pal, self.lang, self.appear(1), self.appear(2));
                 },
             );
         });
@@ -6470,22 +6595,23 @@ impl SavioApp {
 
     /// Главная колонка вкладки: файл, кнопки и итог.
     fn metadata_main(&mut self, ui: &mut egui::Ui) {
+        let pal = self.palette;
         let lang = self.lang;
-        theme::card_rising(ui, self.appear(0), |ui| {
+        theme::card_rising(ui, pal, self.appear(0), |ui| {
             ui.label(
                 egui::RichText::new(i18n::t(lang, Key::UiMetaTitle))
                     .font(theme::display(21.0))
-                    .color(theme::TEXT_PRIMARY),
+                    .color(pal.text_primary),
             );
             ui.add_space(6.0);
-            note(ui, i18n::t(lang, Key::UiMetaNote), theme::TEXT_MUTED);
+            note(ui, i18n::t(lang, Key::UiMetaNote), pal.text_muted);
 
             ui.add_space(16.0);
             self.meta_file_row(ui);
 
             if let Some(blocked) = &self.meta.blocked {
                 ui.add_space(12.0);
-                banner(ui, blocked, theme::STATE_WARNING);
+                banner(ui, pal, blocked, pal.state_warning);
             }
 
             ui.add_space(16.0);
@@ -6500,10 +6626,11 @@ impl SavioApp {
     /// как «Папка сохранения» на соседней вкладке. Одинаковые по смыслу
     /// пары должны выглядеть одинаково.
     fn meta_file_row(&mut self, ui: &mut egui::Ui) {
+        let pal = self.palette;
         let color = if self.meta.path.is_some() {
-            theme::TEXT_SECONDARY
+            pal.text_secondary
         } else {
-            theme::TEXT_MUTED
+            pal.text_muted
         };
 
         let width = ui.available_width();
@@ -6531,6 +6658,7 @@ impl SavioApp {
     }
 
     fn meta_buttons(&mut self, ui: &mut egui::Ui) {
+        let pal = self.palette;
         // Пока файл не выбран, подсказка должна объяснять именно это, а не
         // молча выключенную кнопку.
         let hint = match (&self.meta.path, &self.meta.blocked) {
@@ -6575,13 +6703,22 @@ impl SavioApp {
             let clicked = ui
                 .scope(|ui| {
                     let v = ui.visuals_mut();
-                    let (rest, hover, press) = if clean_on {
-                        (theme::ACCENT, theme::ACCENT_HOVER, theme::ACCENT_ACTIVE)
+                    // Подпись выключенной кнопки — своим полем палитры, как
+                    // и у «Скачать»: белым по пастельной заливке светлой темы
+                    // выходит 1.9:1.
+                    let (rest, hover, press, ink) = if clean_on {
+                        (
+                            pal.accent,
+                            pal.accent_hover,
+                            pal.accent_active,
+                            pal.text_on_accent,
+                        )
                     } else {
                         (
-                            theme::ACCENT_DISABLED,
-                            theme::ACCENT_DISABLED,
-                            theme::ACCENT_DISABLED,
+                            pal.accent_disabled,
+                            pal.accent_disabled,
+                            pal.accent_disabled,
+                            pal.text_on_accent_disabled,
                         )
                     };
                     for (state, fill) in [
@@ -6591,7 +6728,7 @@ impl SavioApp {
                     ] {
                         state.weak_bg_fill = fill;
                         state.bg_stroke = egui::Stroke::NONE;
-                        state.fg_stroke = egui::Stroke::new(1.0, theme::TEXT_ON_ACCENT);
+                        state.fg_stroke = egui::Stroke::new(1.0, ink);
                         state.corner_radius = egui::CornerRadius::same(theme::RADIUS_PILL);
                         state.expansion = 0.0;
                     }
@@ -6602,7 +6739,7 @@ impl SavioApp {
                         egui::Button::new(
                             egui::RichText::new(i18n::t(self.lang, Key::UiMetaWipe))
                                 .font(theme::display(17.0))
-                                .color(theme::TEXT_ON_ACCENT),
+                                .color(ink),
                         )
                         .min_size(egui::vec2(width, theme::CTA_HEIGHT)),
                     )
@@ -6625,15 +6762,16 @@ impl SavioApp {
     }
 
     fn meta_status(&mut self, ui: &mut egui::Ui) {
+        let pal = self.palette;
         if self.meta.busy {
             ui.scope(|ui| {
-                ui.visuals_mut().extreme_bg_color = theme::PROGRESS_TRACK;
+                ui.visuals_mut().extreme_bg_color = pal.progress_track;
                 // Сколько осталось, здесь неизвестно и не нужно: операция
                 // укладывается в доли секунды. Крутим неопределённый индикатор.
                 ui.add(
                     egui::ProgressBar::new(0.0)
                         .animate(true)
-                        .fill(theme::ACCENT)
+                        .fill(pal.accent)
                         .desired_height(8.0),
                 );
             });
@@ -6642,29 +6780,30 @@ impl SavioApp {
                 ui.label(
                     egui::RichText::new(&self.meta.stage)
                         .small()
-                        .color(theme::TEXT_SECONDARY),
+                        .color(pal.text_secondary),
                 );
             }
             return;
         }
 
-        if let Some((text, color)) = &self.meta.outcome {
-            banner(ui, text, *color);
+        if let Some((text, tone)) = &self.meta.outcome {
+            banner(ui, pal, text, tone.color(pal));
             return;
         }
 
         ui.label(
             egui::RichText::new(self.t(Key::UiMetaHowTo))
                 .small()
-                .color(theme::TEXT_MUTED),
+                .color(pal.text_muted),
         );
     }
 
     /// Окно со списком прочитанных метаданных.
     fn tags_modal(&mut self, ctx: &egui::Context, arrival: ModalArrival) {
+        let pal = self.palette;
         let speed = self.speed;
         let lang = self.lang;
-        arrival.veil(ctx, "tags");
+        arrival.veil(pal, ctx, "tags");
         let Some(tags) = &self.meta.tags else {
             return;
         };
@@ -6683,8 +6822,8 @@ impl SavioApp {
             .backdrop_color(egui::Color32::TRANSPARENT)
             .frame(
                 egui::Frame::new()
-                    .fill(theme::MODAL_FILL)
-                    .stroke(egui::Stroke::new(1.0, theme::BORDER_SUBTLE))
+                    .fill(pal.modal_fill)
+                    .stroke(egui::Stroke::new(1.0, pal.border_subtle))
                     .corner_radius(egui::CornerRadius::same(theme::RADIUS_CARD))
                     .inner_margin(egui::Margin::same(24)),
             )
@@ -6695,14 +6834,14 @@ impl SavioApp {
                     egui::RichText::new(i18n::t(lang, Key::UiMetaFileTags))
                         .heading()
                         .strong()
-                        .color(theme::TEXT_PRIMARY),
+                        .color(pal.text_primary),
                 );
                 ui.add_space(10.0);
 
                 if tags.is_empty() {
                     ui.label(
                         egui::RichText::new(i18n::t(lang, Key::UiMetaNothingFound))
-                            .color(theme::TEXT_SECONDARY),
+                            .color(pal.text_secondary),
                     );
                 } else {
                     // Список может быть длинным (у снимка с телефона легко
@@ -6735,7 +6874,7 @@ impl SavioApp {
                                         egui::Label::new(
                                             egui::RichText::new(&tag.name)
                                                 .small()
-                                                .color(theme::TEXT_MUTED),
+                                                .color(pal.text_muted),
                                         )
                                         .truncate(),
                                     );
@@ -6743,7 +6882,7 @@ impl SavioApp {
                                     ui.add(
                                         egui::Label::new(
                                             egui::RichText::new(&tag.value)
-                                                .color(theme::TEXT_PRIMARY),
+                                                .color(pal.text_primary),
                                         )
                                         .wrap(),
                                     );
@@ -6768,7 +6907,8 @@ impl SavioApp {
 
     /// Подтверждение перезаписи файла.
     fn confirm_modal(&mut self, ctx: &egui::Context, arrival: ModalArrival) {
-        arrival.veil(ctx, "confirm");
+        let pal = self.palette;
+        arrival.veil(pal, ctx, "confirm");
         #[derive(PartialEq)]
         enum Answer {
             None,
@@ -6780,8 +6920,8 @@ impl SavioApp {
             .backdrop_color(egui::Color32::TRANSPARENT)
             .frame(
                 egui::Frame::new()
-                    .fill(theme::MODAL_FILL)
-                    .stroke(egui::Stroke::new(1.0, theme::BORDER_SUBTLE))
+                    .fill(pal.modal_fill)
+                    .stroke(egui::Stroke::new(1.0, pal.border_subtle))
                     .corner_radius(egui::CornerRadius::same(theme::RADIUS_CARD))
                     .inner_margin(egui::Margin::same(24)),
             )
@@ -6792,19 +6932,19 @@ impl SavioApp {
                     egui::RichText::new(self.t(Key::UiMetaOverwriteTitle))
                         .heading()
                         .strong()
-                        .color(theme::TEXT_PRIMARY),
+                        .color(pal.text_primary),
                 );
                 ui.add_space(8.0);
                 ui.label(
                     egui::RichText::new(self.t(Key::UiMetaOverwriteText))
-                        .color(theme::TEXT_SECONDARY),
+                        .color(pal.text_secondary),
                 );
                 ui.add_space(8.0);
                 ui.add(
                     egui::Label::new(
                         egui::RichText::new(&self.meta.path_display)
                             .small()
-                            .color(theme::TEXT_MUTED),
+                            .color(pal.text_muted),
                     )
                     .truncate(),
                 );
@@ -6856,7 +6996,8 @@ impl SavioApp {
     /// Окно «О программе»: здесь то, что делают его кнопки, а само окно
     /// рисует [`about_window`].
     fn about_modal(&mut self, ctx: &egui::Context, arrival: ModalArrival) {
-        arrival.veil(ctx, "about");
+        let pal = self.palette;
+        arrival.veil(pal, ctx, "about");
 
         // «Скопировано» гаснет само, как у журнала, и кадр к сроку так же
         // приходится просить: без ввода egui окно не перерисовывает, и
@@ -6871,7 +7012,7 @@ impl SavioApp {
             None => self.about_copied_at = None,
         }
 
-        let window = about_window(ctx, self.lang, self.speed, copied_left.is_some());
+        let window = about_window(pal, ctx, self.lang, self.speed, copied_left.is_some());
         arrival.apply(ctx, &window.response);
 
         // Как у списка метаданных: окно ничего не делает и запереть в нём
@@ -6915,7 +7056,7 @@ enum AboutAction {
 /// собрать — конструктор читает настройки с диска и спрашивает версии у
 /// внешних программ, — а окну из всего состояния нужно одно: горит ли
 /// «Скопировано».
-fn about_window(
+fn about_window(pal: theme::Palette, 
     ctx: &egui::Context,
     lang: Lang,
     speed: f32,
@@ -6929,8 +7070,8 @@ fn about_window(
         .backdrop_color(egui::Color32::TRANSPARENT)
         .frame(
             egui::Frame::new()
-                .fill(theme::MODAL_FILL)
-                .stroke(egui::Stroke::new(1.0, theme::BORDER_SUBTLE))
+                .fill(pal.modal_fill)
+                .stroke(egui::Stroke::new(1.0, pal.border_subtle))
                 .corner_radius(egui::CornerRadius::same(theme::RADIUS_CARD))
                 .inner_margin(egui::Margin::same(24)),
         )
@@ -6942,24 +7083,26 @@ fn about_window(
                 egui::RichText::new(i18n::t(lang, Key::UiAbout))
                     .heading()
                     .strong()
-                    .color(theme::TEXT_PRIMARY),
+                    .color(pal.text_primary),
             );
             ui.add_space(8.0);
-            note(ui, i18n::t(lang, ABOUT_TEXT), theme::TEXT_SECONDARY);
+            note(ui, i18n::t(lang, ABOUT_TEXT), pal.text_secondary);
             ui.add_space(14.0);
 
             // Строки те же, что в карточках «Машины»: одинаковые по смыслу
             // таблицы должны и выглядеть одинаково.
-            stat_row(ui, lang, i18n::t(lang, Key::UiVersion), Some(VERSION));
+            stat_row(ui, pal, lang, i18n::t(lang, Key::UiVersion), Some(VERSION));
             stat_row(
                 ui,
+                pal,
                 lang,
                 i18n::t(lang, Key::UiDeveloper),
                 Some(i18n::t(lang, AUTHOR)),
             );
-            stat_row(ui, lang, i18n::t(lang, Key::UiLicense), Some(LICENSE));
+            stat_row(ui, pal, lang, i18n::t(lang, Key::UiLicense), Some(LICENSE));
             stat_row(
                 ui,
+                pal,
                 lang,
                 i18n::t(lang, Key::UiFeedback),
                 Some(FEEDBACK_EMAIL),
@@ -6987,7 +7130,7 @@ fn about_window(
                     ui.label(
                         egui::RichText::new(i18n::t(lang, Key::UiCopied))
                             .small()
-                            .color(theme::STATE_SUCCESS),
+                            .color(pal.state_success),
                     );
                 }
             });
@@ -7042,6 +7185,7 @@ impl SavioApp {
     /// экраном была бы лишним шагом: сюда заходят ровно за ответом, и
     /// нажимать «Проверить», чтобы его увидеть, незачем.
     fn system_tab(&mut self, ui: &mut egui::Ui) {
+        let pal = self.palette;
         if !self.system.asked {
             let ctx = ui.ctx().clone();
             let gpu = self.gpu.clone();
@@ -7052,7 +7196,7 @@ impl SavioApp {
         ui.add_space(16.0);
 
         if self.system.busy {
-            note(ui, &self.system.stage, theme::TEXT_SECONDARY);
+            note(ui, &self.system.stage, pal.text_secondary);
             return;
         }
 
@@ -7062,29 +7206,30 @@ impl SavioApp {
         let Some(report) = &self.system.report else {
             // Приёмник умер, а отчёт не приехал: поток сорвался, не отправив
             // ничего. Показать «в порядке» тут нельзя — мы ничего не узнали.
-            note(ui, i18n::t(lang, Key::UiSystemNoAnswer), theme::TEXT_MUTED);
+            note(ui, i18n::t(lang, Key::UiSystemNoAnswer), pal.text_muted);
             return;
         };
 
         for check in &report.checks {
-            check_card(ui, check, lang);
+            check_card(ui, pal, check, lang);
             ui.add_space(8.0);
         }
     }
 
     /// Шапка вкладки: общий итог и две кнопки.
     fn system_header(&mut self, ui: &mut egui::Ui) {
+        let pal = self.palette;
         let mut again = false;
         let mut save = false;
         let lang = self.lang;
 
-        theme::card(ui, |ui| {
+        theme::card(ui, pal, |ui| {
             // Итог — обычной строкой с переносом: он длинный, а в
             // горизонтальной раскладке egui положил бы его в одну строку
             // любой длины и срезал кромкой окна.
             match &self.system.report {
-                Some(report) => note(ui, &report.headline(lang), theme::TEXT_SECONDARY),
-                None => note(ui, i18n::t(lang, Key::UiSystemAbout), theme::TEXT_SECONDARY),
+                Some(report) => note(ui, &report.headline(lang), pal.text_secondary),
+                None => note(ui, i18n::t(lang, Key::UiSystemAbout), pal.text_secondary),
             }
 
             ui.add_space(6.0);
@@ -7092,7 +7237,7 @@ impl SavioApp {
             // у половины пунктов выглядит поломкой Savio, а не отказом
             // системы: человеку неоткуда узнать, что температуры и SMART
             // без прав администратора недоступны в принципе.
-            note(ui, i18n::t(lang, Key::UiSystemNote), theme::TEXT_MUTED);
+            note(ui, i18n::t(lang, Key::UiSystemNote), pal.text_muted);
 
             ui.add_space(14.0);
             ui.horizontal(|ui| {
@@ -7109,9 +7254,9 @@ impl SavioApp {
                     .clicked();
             });
 
-            if let Some((text, color)) = &self.system.saved {
+            if let Some((text, tone)) = &self.system.saved {
                 ui.add_space(10.0);
-                note(ui, text, *color);
+                note(ui, text, tone.color(pal));
             }
         });
 
@@ -7152,20 +7297,21 @@ impl SavioApp {
                     i18n::t(lang, Key::UiReportSaved),
                     &[&path.display().to_string()],
                 ),
-                theme::STATE_SUCCESS,
+                Tone::Good,
             ),
             Err(err) => (
                 i18n::fill(
                     i18n::t(lang, Key::UiReportSaveFailed),
                     &[&err.to_string()],
                 ),
-                theme::STATE_ERROR,
+                Tone::Bad,
             ),
         });
     }
 
     /// Вкладка «Монитор»: что происходит с машиной прямо сейчас.
     fn monitor_tab(&mut self, ui: &mut egui::Ui) {
+        let pal = self.palette;
         self.monitor_header(ui);
         ui.add_space(14.0);
 
@@ -7186,7 +7332,7 @@ impl SavioApp {
             note(
                 ui,
                 i18n::t(lang, Key::UiMonitorWarmingUp),
-                theme::TEXT_SECONDARY,
+                pal.text_secondary,
             );
             return;
         };
@@ -7200,50 +7346,46 @@ impl SavioApp {
             ui.columns(2, |columns| {
                 metric_card(
                     &mut columns[0],
+                    pal,
                     cpu,
                     &sample.cpu,
-                    &self.monitor.cpu_trace,
-                    theme::ACCENT,
-                    phase,
+                    Plot::new(&self.monitor.cpu_trace, pal.accent, phase),
                     speed,
                 );
                 metric_card(
                     &mut columns[1],
+                    pal,
                     memory,
                     &sample.mem,
-                    &self.monitor.mem_trace,
-                    theme::STATE_SUCCESS,
-                    phase,
+                    Plot::new(&self.monitor.mem_trace, pal.state_success, phase),
                     speed,
                 );
             });
         } else {
             metric_card(
                 ui,
+                pal,
                 cpu,
                 &sample.cpu,
-                &self.monitor.cpu_trace,
-                theme::ACCENT,
-                phase,
+                Plot::new(&self.monitor.cpu_trace, pal.accent, phase),
                 speed,
             );
             ui.add_space(12.0);
             metric_card(
                 ui,
+                pal,
                 memory,
                 &sample.mem,
-                &self.monitor.mem_trace,
-                theme::STATE_SUCCESS,
-                phase,
+                Plot::new(&self.monitor.mem_trace, pal.state_success, phase),
                 speed,
             );
         }
         ui.add_space(12.0);
 
-        io_card(ui, sample, self.gpu.as_ref(), lang);
+        io_card(ui, pal, sample, self.gpu.as_ref(), lang);
         ui.add_space(12.0);
 
-        process_card(ui, &sample.procs, lang);
+        process_card(ui, pal, &sample.procs, lang);
     }
 
     /// Карточка «Питание»: чем машина питается сейчас и как это переключить.
@@ -7254,13 +7396,14 @@ impl SavioApp {
     /// метаданных), а лишний вопрос там, где отменить можно тут же, только
     /// приучает жать «Да» не глядя.
     fn power_card(&mut self, ui: &mut egui::Ui) {
+        let pal = self.palette;
         let busy = self.power.busy;
         let mut refresh = false;
         let mut change = None;
         let speed = self.speed;
         let lang = self.lang;
 
-        theme::card(ui, |ui| {
+        theme::card(ui, pal, |ui| {
             // Ряду задаётся высота, и это не украшение вёрстки. `with_layout`
             // отдаёт потомку всю оставшуюся высоту карточки, а `Align::Center`
             // в горизонтальной раскладке «считает занятой» её целиком
@@ -7288,7 +7431,7 @@ impl SavioApp {
                             egui::Label::new(
                                 egui::RichText::new(i18n::t(lang, Key::UiPower))
                                     .font(theme::display(17.0))
-                                    .color(theme::TEXT_PRIMARY),
+                                    .color(pal.text_primary),
                             )
                             .truncate(),
                         );
@@ -7298,19 +7441,19 @@ impl SavioApp {
 
             if let Some(trouble) = &self.power.state.trouble {
                 ui.add_space(6.0);
-                note(ui, trouble, theme::TEXT_MUTED);
+                note(ui, trouble, pal.text_muted);
             }
 
             // Ответа ещё нет. Молчать здесь нельзя: пустая карточка с одним
             // заголовком выглядит поломкой, а не ожиданием.
             if self.power.state.is_blank() && self.power.state.trouble.is_none() {
                 ui.add_space(6.0);
-                note(ui, i18n::t(lang, Key::UiPowerAsking), theme::TEXT_SECONDARY);
+                note(ui, i18n::t(lang, Key::UiPowerAsking), pal.text_secondary);
             }
 
             if !self.power.state.plans.is_empty() {
                 ui.add_space(14.0);
-                field_label(ui, i18n::t(lang, Key::UiPowerPlan));
+                field_label(ui, pal, i18n::t(lang, Key::UiPowerPlan));
                 // Раскладка с переносом, а не дорожка сегментов: названий
                 // бывает и шесть (вендорские схемы), длина у них любая, а
                 // в окне шириной 520 даже три не встают в строку.
@@ -7325,7 +7468,7 @@ impl SavioApp {
                             // Нажатие на уже активную ничего не значит:
                             // просить систему переключиться на то, что и так
                             // работает, — бодрый отчёт о безделье.
-                            if choice_pill(ui, &plan.name, on, speed).clicked() && !on {
+                            if choice_pill(ui, pal, &plan.name, on, speed).clicked() && !on {
                                 change = Some(power::Change::Plan(plan.id));
                             }
                         }
@@ -7335,7 +7478,7 @@ impl SavioApp {
 
             if let PowerModes::Known { effective, .. } = self.power.state.modes {
                 ui.add_space(14.0);
-                field_label(ui, i18n::t(lang, Key::UiPowerMode));
+                field_label(ui, pal, i18n::t(lang, Key::UiPowerMode));
                 ui.add_enabled_ui(!busy, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
@@ -7350,7 +7493,7 @@ impl SavioApp {
                             if !mode.offered() && !on {
                                 continue;
                             }
-                            if choice_pill(ui, mode.label(lang), on, speed).clicked() && !on {
+                            if choice_pill(ui, pal, mode.label(lang), on, speed).clicked() && !on {
                                 change = Some(power::Change::Mode(mode));
                             }
                         }
@@ -7361,21 +7504,21 @@ impl SavioApp {
                 // выглядит сломанным.
                 if effective.is_none() {
                     ui.add_space(8.0);
-                    note(ui, i18n::t(lang, Key::UiPowerUnknownMode), theme::TEXT_MUTED);
+                    note(ui, i18n::t(lang, Key::UiPowerUnknownMode), pal.text_muted);
                 }
 
                 if !self.power.hint.is_empty() {
                     ui.add_space(8.0);
-                    note(ui, &self.power.hint, theme::STATE_WARNING);
+                    note(ui, &self.power.hint, pal.state_warning);
                 }
             }
 
             // Итог последнего нажатия — последней строкой карточки, у самых
             // кнопок: сказанное про переключение должно стоять там, где
             // переключали.
-            if let Some((text, color)) = &self.power.outcome {
+            if let Some((text, tone)) = &self.power.outcome {
                 ui.add_space(12.0);
-                note(ui, text, *color);
+                note(ui, text, tone.color(pal));
             }
         });
 
@@ -7393,19 +7536,21 @@ impl SavioApp {
 
     /// Шапка половины: чем монитор занят и как включить оверлей.
     fn monitor_header(&mut self, ui: &mut egui::Ui) {
+        let pal = self.palette;
         let lang = self.lang;
-        theme::card(ui, |ui| {
-            note(ui, i18n::t(lang, Key::UiMonitorNote), theme::TEXT_SECONDARY);
+        theme::card(ui, pal, |ui| {
+            note(ui, i18n::t(lang, Key::UiMonitorNote), pal.text_secondary);
 
             ui.add_space(6.0);
             // Та же оговорка, что и в «Составе», и по той же причине: без неё
             // отсутствие видеокарты в списке выглядит недоделкой Savio,
             // а не отказом системы.
-            note(ui, i18n::t(lang, Key::UiMonitorNoGpuLoad), theme::TEXT_MUTED);
+            note(ui, i18n::t(lang, Key::UiMonitorNoGpuLoad), pal.text_muted);
 
             ui.add_space(14.0);
             checkbox(
                 ui,
+                pal,
                 &mut self.monitor.overlay,
                 i18n::t(lang, Key::UiOverlay),
                 true,
@@ -7414,6 +7559,7 @@ impl SavioApp {
             ui.add_space(6.0);
             let passthrough = checkbox(
                 ui,
+                pal,
                 &mut self.monitor.passthrough,
                 i18n::t(lang, Key::UiOverlayPassthrough),
                 self.monitor.overlay,
@@ -7421,7 +7567,7 @@ impl SavioApp {
             passthrough.on_disabled_hover_text(i18n::t(lang, Key::UiOverlayFirst));
 
             ui.add_space(10.0);
-            note(ui, i18n::t(lang, Key::UiOverlayNote), theme::TEXT_MUTED);
+            note(ui, i18n::t(lang, Key::UiOverlayNote), pal.text_muted);
         });
     }
 
@@ -7432,9 +7578,10 @@ impl SavioApp {
     /// одинаково. Своей прокрутки здесь нет — вкладка целиком лежит в общей,
     /// и вложенная полоса рядом с внешней только мешала бы.
     fn history_card(&self, ui: &mut egui::Ui, entry: &HistoryEntry) -> Option<PathBuf> {
+        let pal = self.palette;
         let mut open_at = None;
 
-        theme::inner_frame().show(ui, |ui| {
+        theme::inner_frame(pal).show(ui, |ui| {
             // Без этого карточка сжалась бы по ширине имени файла: у
             // короткого имени получилась бы узкая полоска посреди окна.
             ui.set_width(ui.available_width());
@@ -7453,7 +7600,7 @@ impl SavioApp {
                 egui::Label::new(
                     egui::RichText::new(&entry.name)
                         .font(theme::bold(14.0))
-                        .color(theme::TEXT_PRIMARY),
+                        .color(pal.text_primary),
                 )
                 .truncate(),
             );
@@ -7499,7 +7646,7 @@ impl SavioApp {
                             egui::Label::new(
                                 egui::RichText::new(&entry.dir_display)
                                     .small()
-                                    .color(theme::TEXT_MUTED),
+                                    .color(pal.text_muted),
                             )
                             .truncate(),
                         );
@@ -7518,21 +7665,22 @@ impl SavioApp {
 /// состояния приложения — обе карточки статические.
 fn metadata_rail(
     ui: &mut egui::Ui,
+    pal: theme::Palette,
     lang: Lang,
     warning: Option<theme::Appear>,
     kinds: Option<theme::Appear>,
 ) {
-    theme::card_rising(ui, warning, |ui| {
+    theme::card_rising(ui, pal, warning, |ui| {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 9.0;
             let (dot, _) = ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
             ui.painter()
-                .circle_filled(dot.center(), 4.5, theme::STATE_WARNING);
+                .circle_filled(dot.center(), 4.5, pal.state_warning);
             ui.add(
                 egui::Label::new(
                     egui::RichText::new(i18n::t(lang, Key::UiMetaWillOverwrite))
                         .font(theme::display(17.0))
-                        .color(theme::TEXT_PRIMARY),
+                        .color(pal.text_primary),
                 )
                 .truncate(),
             );
@@ -7541,24 +7689,25 @@ fn metadata_rail(
         note(
             ui,
             i18n::t(lang, Key::UiMetaWillOverwriteText),
-            theme::TEXT_SECONDARY,
+            pal.text_secondary,
         );
     });
 
     ui.add_space(14.0);
 
-    theme::card_rising(ui, kinds, |ui| {
-        field_label(ui, i18n::t(lang, Key::UiMetaSupported));
+    theme::card_rising(ui, pal, kinds, |ui| {
+        field_label(ui, pal, i18n::t(lang, Key::UiMetaSupported));
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(7.0, 7.0);
             for name in ["MP3", "JPG", "PNG", "WebP", "GIF"] {
-                soft_pill(ui, name, theme::STATE_SUCCESS, theme::SUCCESS_SOFT);
+                soft_pill(ui, pal, name, pal.state_success, pal.success_soft);
             }
             for key in [Key::UiMetaTiffReadOnly, Key::UiMetaVideoNotYet] {
                 soft_pill(
                     ui,
+                    pal,
                     i18n::t(lang, key),
-                    theme::TEXT_MUTED,
+                    pal.text_muted,
                     egui::Color32::TRANSPARENT,
                 );
             }
@@ -7651,6 +7800,7 @@ impl SavioApp {
 
     /// Карточка места: где, когда обновлено, поиск и избранное.
     fn weather_place_card(&mut self, ui: &mut egui::Ui) {
+        let pal = self.palette;
         let speed = self.speed;
         let mut refresh = false;
         let mut locate = false;
@@ -7659,7 +7809,7 @@ impl SavioApp {
         let mut picked: Option<Place> = None;
         let lang = self.lang;
 
-        theme::card_rising(ui, self.appear(0), |ui| {
+        theme::card_rising(ui, pal, self.appear(0), |ui| {
             let panel = &mut self.weather;
 
             // Высота ряду задаётся явно, а кнопка кладётся первой справа
@@ -7695,7 +7845,7 @@ impl SavioApp {
                             egui::Label::new(
                                 egui::RichText::new(title)
                                     .font(theme::display(21.0))
-                                    .color(theme::TEXT_PRIMARY),
+                                    .color(pal.text_primary),
                             )
                             .truncate(),
                         );
@@ -7707,15 +7857,15 @@ impl SavioApp {
             // Когда получены числа — всегда, если они есть: без этой строки не
             // понять, свежий прогноз на экране или вчерашний.
             if let Some(view) = &panel.view {
-                note(ui, &view.updated, theme::TEXT_MUTED);
+                note(ui, &view.updated, pal.text_muted);
             }
             if panel.busy {
-                note(ui, &panel.stage, theme::TEXT_SECONDARY);
+                note(ui, &panel.stage, pal.text_secondary);
             } else if panel.place.is_none() && panel.error.is_none() {
                 note(
                     ui,
                     i18n::t(lang, Key::UiWeatherNoPlaceNote),
-                    theme::TEXT_MUTED,
+                    pal.text_muted,
                 );
             }
             if panel.located {
@@ -7725,7 +7875,7 @@ impl SavioApp {
                 note(
                     ui,
                     i18n::t(lang, Key::UiWeatherLocatedNote),
-                    theme::TEXT_MUTED,
+                    pal.text_muted,
                 );
             }
             if let Some(error) = &panel.error {
@@ -7734,15 +7884,15 @@ impl SavioApp {
                 // красным: работать с ними можно, просто они не свежие, и
                 // строка «Обновлено в …» выше говорит, насколько.
                 let color = if panel.view.is_some() {
-                    theme::STATE_WARNING
+                    pal.state_warning
                 } else {
-                    theme::STATE_ERROR
+                    pal.state_error
                 };
-                banner(ui, error, color);
+                banner(ui, pal, error, color);
             }
 
             ui.add_space(14.0);
-            field_label(ui, i18n::t(lang, Key::UiWeatherFindCity));
+            field_label(ui, pal, i18n::t(lang, Key::UiWeatherFindCity));
             ui.allocate_ui_with_layout(
                 egui::vec2(ui.available_width(), theme::CONTROL_HEIGHT),
                 egui::Layout::right_to_left(egui::Align::Center),
@@ -7754,7 +7904,7 @@ impl SavioApp {
                         [ui.available_width(), theme::CONTROL_HEIGHT],
                         egui::TextEdit::singleline(&mut panel.query)
                             .hint_text(i18n::t(lang, Key::UiWeatherSearchHint))
-                            .text_color(theme::TEXT_PRIMARY)
+                            .text_color(pal.text_primary)
                             .margin(egui::Margin::symmetric(14, 6)),
                     );
                     // Enter в поле — то же, что «Найти»: руки уже на клавиатуре.
@@ -7766,16 +7916,16 @@ impl SavioApp {
 
             if panel.searching {
                 ui.add_space(8.0);
-                note(ui, i18n::t(lang, Key::UiWeatherSearching), theme::TEXT_SECONDARY);
+                note(ui, i18n::t(lang, Key::UiWeatherSearching), pal.text_secondary);
             }
-            if let Some((text, color)) = &panel.search_note {
+            if let Some((text, tone)) = &panel.search_note {
                 ui.add_space(8.0);
-                note(ui, text, *color);
+                note(ui, text, tone.color(pal));
             }
             if let Some(results) = &panel.results {
                 ui.add_space(8.0);
                 for (place, detail) in results.iter().zip(&panel.result_details) {
-                    if place_row(ui, &place.name, detail, speed) {
+                    if place_row(ui, pal, &place.name, detail, speed) {
                         picked = Some(place.clone());
                     }
                     ui.add_space(6.0);
@@ -7796,6 +7946,7 @@ impl SavioApp {
                 let response = ui.add_enabled_ui(panel.place.is_some() && !full, |ui| {
                     toggle_pill(
                         ui,
+                        pal,
                         i18n::t(
                             lang,
                             if on {
@@ -7824,7 +7975,7 @@ impl SavioApp {
 
             if !panel.favorites.is_empty() {
                 ui.add_space(14.0);
-                field_label(ui, i18n::t(lang, Key::UiWeatherFavorites));
+                field_label(ui, pal, i18n::t(lang, Key::UiWeatherFavorites));
                 // Своими таблетками с переносом, а не дорожкой: названий бывает
                 // десяток, и в строку окна 520 не встают даже три (см.
                 // `choice_pill` про перенос).
@@ -7835,7 +7986,7 @@ impl SavioApp {
                             .place
                             .as_ref()
                             .is_some_and(|current| current.same_as(place));
-                        if choice_pill(ui, &place.name, on, speed).clicked() && !on {
+                        if choice_pill(ui, pal, &place.name, on, speed).clicked() && !on {
                             picked = Some(place.clone());
                         }
                     }
@@ -7868,18 +8019,19 @@ impl SavioApp {
 
     /// Карточка «сейчас»: значок, температура и подробности.
     fn weather_now_card(&self, ui: &mut egui::Ui) {
+        let pal = self.palette;
         let lang = self.lang;
         let missing = i18n::t(lang, WEATHER_MISSING);
         let Some(view) = &self.weather.view else {
             return;
         };
 
-        theme::card_rising(ui, self.appear(1), |ui| {
+        theme::card_rising(ui, pal, self.appear(1), |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 14.0;
                 let (icon, _) =
                     ui.allocate_exact_size(egui::vec2(BIG_ICON, BIG_ICON), egui::Sense::hover());
-                weather_icon(ui.painter(), icon, view.sky, view.night);
+                weather_icon(pal, ui.painter(), icon, view.sky, view.night);
 
                 // Своя вертикальная раскладка: в горизонтальной egui вытянул бы
                 // описание в одну строку за кромку окна (см. `preview_row`).
@@ -7888,12 +8040,12 @@ impl SavioApp {
                     ui.label(
                         egui::RichText::new(&view.temperature)
                             .font(theme::display(36.0))
-                            .color(theme::TEXT_PRIMARY),
+                            .color(pal.text_primary),
                     );
                     if let Some(description) = view.description {
                         ui.add(
                             egui::Label::new(
-                                egui::RichText::new(description).color(theme::TEXT_PRIMARY),
+                                egui::RichText::new(description).color(pal.text_primary),
                             )
                             .truncate(),
                         );
@@ -7903,7 +8055,7 @@ impl SavioApp {
                             egui::Label::new(
                                 egui::RichText::new(feels)
                                     .small()
-                                    .color(theme::TEXT_SECONDARY),
+                                    .color(pal.text_secondary),
                             )
                             .truncate(),
                         );
@@ -7913,18 +8065,18 @@ impl SavioApp {
 
             ui.add_space(12.0);
             for (label, value) in &view.rows {
-                stat_row_with(ui, label, value.as_deref(), missing);
+                stat_row_with(ui, pal, label, value.as_deref(), missing);
             }
 
             ui.add_space(10.0);
             if view.air.is_empty() {
                 // Частичный успех говорит о себе сам: пропавшие строки без
                 // объяснения выглядели бы недоделкой вкладки.
-                note(ui, i18n::t(lang, Key::UiWeatherNoAir), theme::TEXT_MUTED);
+                note(ui, i18n::t(lang, Key::UiWeatherNoAir), pal.text_muted);
             } else {
-                field_label(ui, i18n::t(lang, Key::UiWeatherAirQuality));
+                field_label(ui, pal, i18n::t(lang, Key::UiWeatherAirQuality));
                 for (label, value) in &view.air {
-                    stat_row_with(ui, label, value.as_deref(), missing);
+                    stat_row_with(ui, pal, label, value.as_deref(), missing);
                 }
             }
         });
@@ -7932,21 +8084,22 @@ impl SavioApp {
 
     /// Карточка почасового прогноза.
     fn weather_hours_card(&self, ui: &mut egui::Ui) {
+        let pal = self.palette;
         let lang = self.lang;
         let Some(view) = &self.weather.view else {
             return;
         };
 
-        theme::card_rising(ui, self.appear(2), |ui| {
+        theme::card_rising(ui, pal, self.appear(2), |ui| {
             ui.label(
                 egui::RichText::new(i18n::t(lang, Key::UiWeatherTwoDays))
                     .font(theme::display(17.0))
-                    .color(theme::TEXT_PRIMARY),
+                    .color(pal.text_primary),
             );
             ui.add_space(10.0);
 
             if view.hours.is_empty() {
-                note(ui, i18n::t(lang, Key::UiWeatherNoHours), theme::TEXT_MUTED);
+                note(ui, i18n::t(lang, Key::UiWeatherNoHours), pal.text_muted);
                 return;
             }
 
@@ -7961,7 +8114,7 @@ impl SavioApp {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
                         for hour in &view.hours {
-                            hour_slot(ui, hour);
+                            hour_slot(ui, pal, hour);
                         }
                     });
                 });
@@ -7970,25 +8123,26 @@ impl SavioApp {
 
     /// Карточка недельного прогноза.
     fn weather_days_card(&self, ui: &mut egui::Ui) {
+        let pal = self.palette;
         let lang = self.lang;
         let Some(view) = &self.weather.view else {
             return;
         };
 
-        theme::card_rising(ui, self.appear(1), |ui| {
+        theme::card_rising(ui, pal, self.appear(1), |ui| {
             ui.label(
                 egui::RichText::new(i18n::t(lang, Key::UiWeatherWeek))
                     .font(theme::display(17.0))
-                    .color(theme::TEXT_PRIMARY),
+                    .color(pal.text_primary),
             );
             ui.add_space(8.0);
 
             if view.days.is_empty() {
-                note(ui, i18n::t(lang, Key::UiWeatherNoDays), theme::TEXT_MUTED);
+                note(ui, i18n::t(lang, Key::UiWeatherNoDays), pal.text_muted);
                 return;
             }
             for day in &view.days {
-                day_row(ui, day);
+                day_row(ui, pal, day);
             }
         });
     }
@@ -7999,24 +8153,26 @@ impl SavioApp {
     /// но и прятать тут нечего: выбранная единица стоит у каждого числа
     /// вкладки, и забытым выбором она не станет.
     fn weather_units_card(&mut self, ui: &mut egui::Ui) {
+        let pal = self.palette;
         let speed = self.speed;
         let mut units = self.weather.units;
         let step = if self.weather.view.is_some() { 2 } else { 1 };
         let lang = self.lang;
 
-        theme::card_rising(ui, self.appear(step), |ui| {
+        theme::card_rising(ui, pal, self.appear(step), |ui| {
             ui.label(
                 egui::RichText::new(i18n::t(lang, Key::UiWeatherUnits))
                     .font(theme::display(17.0))
-                    .color(theme::TEXT_PRIMARY),
+                    .color(pal.text_primary),
             );
             ui.add_space(10.0);
 
             // Подписи сегментов берутся у домена: две копии «мм рт. ст.»
             // разъехались бы. `map` у массива не выделяет памяти.
-            labelled_row(ui, i18n::t(lang, Key::UiWeatherTemperature), |ui| {
+            labelled_row(ui, pal, i18n::t(lang, Key::UiWeatherTemperature), |ui| {
                 if let Some(temp) = segment_track(
                     ui,
+                    pal,
                     egui::Id::new("track:weather-temp"),
                     speed,
                     units.temp,
@@ -8027,9 +8183,10 @@ impl SavioApp {
                 }
             });
             ui.add_space(10.0);
-            labelled_row(ui, i18n::t(lang, Key::WeatherWind), |ui| {
+            labelled_row(ui, pal, i18n::t(lang, Key::WeatherWind), |ui| {
                 if let Some(wind) = segment_track(
                     ui,
+                    pal,
                     egui::Id::new("track:weather-wind"),
                     speed,
                     units.wind,
@@ -8040,9 +8197,10 @@ impl SavioApp {
                 }
             });
             ui.add_space(10.0);
-            labelled_row(ui, i18n::t(lang, Key::WeatherPressure), |ui| {
+            labelled_row(ui, pal, i18n::t(lang, Key::WeatherPressure), |ui| {
                 if let Some(pressure) = segment_track(
                     ui,
+                    pal,
                     egui::Id::new("track:weather-pressure"),
                     speed,
                     units.pressure,
@@ -8103,6 +8261,7 @@ impl SavioApp {
 
     /// Карточка раздачи: папка, кнопка, адрес с QR-кодом и кто подключился.
     fn share_card(&mut self, ui: &mut egui::Ui) {
+        let pal = self.palette;
         let speed = self.speed;
         let now = ui.ctx().input(|i| i.time);
         let mut toggle = false;
@@ -8115,7 +8274,7 @@ impl SavioApp {
         // Какая папка будет раздана, если нажать сейчас.
         let dir = self.share.own_dir.clone().or_else(|| self.out_dir.clone());
 
-        theme::card_rising(ui, self.appear(0), |ui| {
+        theme::card_rising(ui, pal, self.appear(0), |ui| {
             let panel = &self.share;
             let running = panel.running();
 
@@ -8126,17 +8285,17 @@ impl SavioApp {
                 egui::Layout::right_to_left(egui::Align::Center),
                 |ui| {
                     let (key, color) = match panel.state {
-                        ShareState::Off => (Key::UiShareOff, theme::TEXT_MUTED),
-                        ShareState::Starting => (Key::UiShareStarting, theme::TEXT_SECONDARY),
-                        ShareState::On => (Key::UiShareOn, theme::STATE_SUCCESS),
+                        ShareState::Off => (Key::UiShareOff, pal.text_muted),
+                        ShareState::Starting => (Key::UiShareStarting, pal.text_secondary),
+                        ShareState::On => (Key::UiShareOn, pal.state_success),
                     };
-                    status_pill(ui, i18n::t(lang, key), color);
+                    status_pill(ui, pal, i18n::t(lang, key), color);
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         ui.add(
                             egui::Label::new(
                                 egui::RichText::new(i18n::t(lang, Key::TabPhone))
                                     .font(theme::display(21.0))
-                                    .color(theme::TEXT_PRIMARY),
+                                    .color(pal.text_primary),
                             )
                             .truncate(),
                         );
@@ -8144,10 +8303,10 @@ impl SavioApp {
                 },
             );
             ui.add_space(4.0);
-            note(ui, i18n::t(lang, Key::UiShareNote), theme::TEXT_SECONDARY);
+            note(ui, i18n::t(lang, Key::UiShareNote), pal.text_secondary);
 
             ui.add_space(14.0);
-            field_label(ui, i18n::t(lang, Key::UiShareFolder));
+            field_label(ui, pal, i18n::t(lang, Key::UiShareFolder));
             ui.allocate_ui_with_layout(
                 egui::vec2(ui.available_width(), theme::CONTROL_HEIGHT),
                 egui::Layout::right_to_left(egui::Align::Center),
@@ -8165,9 +8324,9 @@ impl SavioApp {
                         self.out_dir_display.as_str()
                     };
                     let color = if dir.is_some() {
-                        theme::TEXT_SECONDARY
+                        pal.text_secondary
                     } else {
-                        theme::STATE_WARNING
+                        pal.state_warning
                     };
                     let size = egui::vec2(ui.available_width(), theme::CONTROL_HEIGHT);
                     choose_dir = ui
@@ -8196,7 +8355,7 @@ impl SavioApp {
                         Key::UiShareDefaultFolderNote
                     },
                 ),
-                theme::TEXT_MUTED,
+                pal.text_muted,
             );
 
             ui.add_space(14.0);
@@ -8212,6 +8371,7 @@ impl SavioApp {
             } else {
                 toggle = accent_button(
                     ui,
+                    pal,
                     i18n::t(lang, Key::UiShareStart),
                     width,
                     dir.is_some(),
@@ -8221,16 +8381,16 @@ impl SavioApp {
             ui.add_space(6.0);
             // Видно без единого щелчка: остановка при уходе с экрана — не
             // оговорка на всякий случай, а поведение, о которое споткнутся.
-            note(ui, i18n::t(lang, Key::UiShareAutoStop), theme::TEXT_MUTED);
+            note(ui, i18n::t(lang, Key::UiShareAutoStop), pal.text_muted);
 
-            if let Some((text, color)) = &panel.note {
+            if let Some((text, tone)) = &panel.note {
                 ui.add_space(10.0);
-                banner(ui, text, *color);
+                banner(ui, pal, text, tone.color(pal));
             }
 
             if panel.state == ShareState::Starting {
                 ui.add_space(12.0);
-                note(ui, i18n::t(lang, Key::UiShareOpening), theme::TEXT_SECONDARY);
+                note(ui, i18n::t(lang, Key::UiShareOpening), pal.text_secondary);
             }
 
             let Some(address) = panel.addresses.get(panel.picked) else {
@@ -8245,17 +8405,17 @@ impl SavioApp {
             // и было при пороге в 240 — проверено глазами в окне 520.
             let beside = ui.available_width() >= QR_SIDE + 350.0;
             let address_block = |ui: &mut egui::Ui, copy: &mut bool| {
-                field_label(ui, i18n::t(lang, Key::UiShareAddressForPhone));
+                field_label(ui, pal, i18n::t(lang, Key::UiShareAddressForPhone));
                 ui.add(
                     egui::Label::new(
                         egui::RichText::new(&address.url)
                             .font(theme::bold(17.0))
-                            .color(theme::TEXT_PRIMARY),
+                            .color(pal.text_primary),
                     )
                     .wrap(),
                 );
                 ui.add_space(6.0);
-                note(ui, i18n::t(lang, Key::UiShareQrHint), theme::TEXT_MUTED);
+                note(ui, i18n::t(lang, Key::UiShareQrHint), pal.text_muted);
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 10.0;
@@ -8266,7 +8426,7 @@ impl SavioApp {
                             ui.label(
                                 egui::RichText::new(i18n::t(lang, Key::UiCopied))
                                     .small()
-                                    .color(theme::STATE_SUCCESS),
+                                    .color(pal.state_success),
                             );
                             ui.ctx()
                                 .request_repaint_after(std::time::Duration::from_secs_f64(left));
@@ -8289,34 +8449,35 @@ impl SavioApp {
 
             if panel.addresses.len() > 1 {
                 ui.add_space(14.0);
-                field_label(ui, i18n::t(lang, Key::UiShareComputerAddress));
+                field_label(ui, pal, i18n::t(lang, Key::UiShareComputerAddress));
                 // Таблетки с переносом, а не дорожка: подписи с именем сети
                 // длинные, и в строку окна 520 не встают и две.
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
                     for (index, other) in panel.addresses.iter().enumerate() {
-                        if choice_pill(ui, &other.label, index == panel.picked, speed).clicked() {
+                        let chosen = index == panel.picked;
+                        if choice_pill(ui, pal, &other.label, chosen, speed).clicked() {
                             picked = Some(index);
                         }
                     }
                 });
                 ui.add_space(6.0);
-                note(ui, i18n::t(lang, Key::UiShareAddressesHint), theme::TEXT_MUTED);
+                note(ui, i18n::t(lang, Key::UiShareAddressesHint), pal.text_muted);
             }
 
             ui.add_space(14.0);
             if panel.visitors.is_empty() {
                 if now - panel.started_at < SHARE_QUIET_SECS {
-                    note(ui, i18n::t(lang, Key::UiShareWaiting), theme::TEXT_SECONDARY);
+                    note(ui, i18n::t(lang, Key::UiShareWaiting), pal.text_secondary);
                     ui.add_space(6.0);
-                    note(ui, i18n::t(lang, SHARE_HELP), theme::TEXT_MUTED);
+                    note(ui, i18n::t(lang, SHARE_HELP), pal.text_muted);
                 } else {
                     // Та же подсказка, но жёлтым: полминуты тишины — уже повод.
-                    banner(ui, i18n::t(lang, SHARE_HELP), theme::STATE_WARNING);
+                    banner(ui, pal, i18n::t(lang, SHARE_HELP), pal.state_warning);
                 }
             } else {
-                field_label(ui, i18n::t(lang, Key::UiShareVisitors));
-                note(ui, &panel.visitors_line, theme::STATE_SUCCESS);
+                field_label(ui, pal, i18n::t(lang, Key::UiShareVisitors));
+                note(ui, &panel.visitors_line, pal.state_success);
             }
         });
 
@@ -8347,29 +8508,30 @@ impl SavioApp {
 
     /// Карточка передач: что идёт, что дошло, что оборвалось.
     fn transfers_card(&self, ui: &mut egui::Ui) {
+        let pal = self.palette;
         let lang = self.lang;
-        theme::card_rising(ui, self.appear(1), |ui| {
+        theme::card_rising(ui, pal, self.appear(1), |ui| {
             ui.label(
                 egui::RichText::new(i18n::t(lang, Key::UiShareTransfers))
                     .font(theme::display(17.0))
-                    .color(theme::TEXT_PRIMARY),
+                    .color(pal.text_primary),
             );
             ui.add_space(8.0);
 
             if self.share.transfers.is_empty() {
-                note(ui, i18n::t(lang, Key::UiShareNoTransfers), theme::TEXT_MUTED);
+                note(ui, i18n::t(lang, Key::UiShareNoTransfers), pal.text_muted);
                 return;
             }
 
             for row in self.share.transfers.iter().rev() {
                 ui.add(
-                    egui::Label::new(egui::RichText::new(&row.name).color(theme::TEXT_PRIMARY))
+                    egui::Label::new(egui::RichText::new(&row.name).color(pal.text_primary))
                         .truncate(),
                 );
                 let color = match row.outcome {
-                    TransferOutcome::Going => theme::TEXT_SECONDARY,
-                    TransferOutcome::Done => theme::STATE_SUCCESS,
-                    TransferOutcome::Failed(_) => theme::TEXT_MUTED,
+                    TransferOutcome::Going => pal.text_secondary,
+                    TransferOutcome::Done => pal.state_success,
+                    TransferOutcome::Failed(_) => pal.text_muted,
                 };
                 note(ui, &row.line, color);
                 match &row.outcome {
@@ -8379,10 +8541,10 @@ impl SavioApp {
                             Some(fraction) => egui::ProgressBar::new(fraction),
                             None => egui::ProgressBar::new(0.0).animate(true),
                         };
-                        ui.add(bar.fill(theme::ACCENT).desired_height(6.0));
+                        ui.add(bar.fill(pal.accent).desired_height(6.0));
                     }
                     TransferOutcome::Done => {}
-                    TransferOutcome::Failed(message) => note(ui, message, theme::STATE_ERROR),
+                    TransferOutcome::Failed(message) => note(ui, message, pal.state_error),
                 }
                 ui.add_space(12.0);
             }
@@ -8413,13 +8575,35 @@ fn qr_image(ui: &mut egui::Ui, texture: Option<&egui::TextureHandle>) {
 /// Вид тот же, что у «Скачать» (`SavioApp::primary_button`): состояния заданы
 /// через `visuals`, выключенная — приглушённым оранжевым явно, потому что
 /// `ui.disable()` сам её от включённой не отличает (Правило 4).
-fn accent_button(ui: &mut egui::Ui, label: &str, width: f32, enabled: bool, hint: &str) -> bool {
+fn accent_button(
+    ui: &mut egui::Ui,
+    pal: theme::Palette,
+    label: &str,
+    width: f32,
+    enabled: bool,
+    hint: &str,
+) -> bool {
     ui.scope(|ui| {
         let v = ui.visuals_mut();
-        let (rest, hover, press) = if enabled {
-            (theme::ACCENT, theme::ACCENT_HOVER, theme::ACCENT_ACTIVE)
+        // У выключенной кнопки своя подпись, а не та же самая. В тёмной теме
+        // они совпадают, и это сбивает с толку: там обе тёмные. В светлой
+        // включённая кнопка тёмная и подписана белым, а выключенная —
+        // пастельная, и белым по ней выходит 1.9:1. Проверено глазами:
+        // «Скачать» в светлой теме читался как пустая таблетка.
+        let (rest, hover, press, ink) = if enabled {
+            (
+                pal.accent,
+                pal.accent_hover,
+                pal.accent_active,
+                pal.text_on_accent,
+            )
         } else {
-            (theme::ACCENT_DISABLED, theme::ACCENT_DISABLED, theme::ACCENT_DISABLED)
+            (
+                pal.accent_disabled,
+                pal.accent_disabled,
+                pal.accent_disabled,
+                pal.text_on_accent_disabled,
+            )
         };
         let squeeze = -width * motion::PRESS;
         for (state, fill, expansion) in [
@@ -8429,7 +8613,7 @@ fn accent_button(ui: &mut egui::Ui, label: &str, width: f32, enabled: bool, hint
         ] {
             state.weak_bg_fill = fill;
             state.bg_stroke = egui::Stroke::NONE;
-            state.fg_stroke = egui::Stroke::new(1.0, theme::TEXT_ON_ACCENT);
+            state.fg_stroke = egui::Stroke::new(1.0, ink);
             state.corner_radius = egui::CornerRadius::same(theme::RADIUS_PILL);
             state.expansion = expansion;
         }
@@ -8445,7 +8629,7 @@ fn accent_button(ui: &mut egui::Ui, label: &str, width: f32, enabled: bool, hint
                 egui::Button::new(
                     egui::RichText::new(label)
                         .font(theme::display(17.0))
-                        .color(theme::TEXT_ON_ACCENT),
+                        .color(ink),
                 )
                 .min_size(egui::vec2(width, theme::CTA_HEIGHT)),
             )
@@ -8469,8 +8653,8 @@ const WEATHER_MISSING: Key = Key::UiWeatherValueMissing;
 /// Вложенной карточкой, а не кнопкой: у места две строки текста, а у кнопки
 /// egui одна. Отклик под курсором — акцентная кромка: без него строка
 /// выглядела бы надписью, а не выбором.
-fn place_row(ui: &mut egui::Ui, name: &str, detail: &str, speed: f32) -> bool {
-    let frame = theme::inner_frame().show(ui, |ui| {
+fn place_row(ui: &mut egui::Ui, pal: theme::Palette, name: &str, detail: &str, speed: f32) -> bool {
+    let frame = theme::inner_frame(pal).show(ui, |ui| {
         ui.set_width(ui.available_width());
         // Выделяемые подписи съедали бы щелчок по строке.
         ui.style_mut().interaction.selectable_labels = false;
@@ -8478,13 +8662,13 @@ fn place_row(ui: &mut egui::Ui, name: &str, detail: &str, speed: f32) -> bool {
             egui::Label::new(
                 egui::RichText::new(name)
                     .font(theme::bold(14.0))
-                    .color(theme::TEXT_PRIMARY),
+                    .color(pal.text_primary),
             )
             .truncate(),
         );
         if !detail.is_empty() {
             ui.add(
-                egui::Label::new(egui::RichText::new(detail).small().color(theme::TEXT_MUTED))
+                egui::Label::new(egui::RichText::new(detail).small().color(pal.text_muted))
                     .truncate(),
             );
         }
@@ -8503,7 +8687,7 @@ fn place_row(ui: &mut egui::Ui, name: &str, detail: &str, speed: f32) -> bool {
             egui::CornerRadius::same(theme::RADIUS_INNER),
             egui::Stroke::new(
                 1.0,
-                motion::mix(egui::Color32::TRANSPARENT, theme::ACCENT, touch),
+                motion::mix(egui::Color32::TRANSPARENT, pal.accent, touch),
             ),
             egui::StrokeKind::Inside,
         );
@@ -8515,7 +8699,7 @@ fn place_row(ui: &mut egui::Ui, name: &str, detail: &str, speed: f32) -> bool {
 ///
 /// Кистью в прямоугольнике постоянного размера, а не раскладкой из меток:
 /// столбики обязаны стоять ровно, а у меток ширина своя у каждого числа.
-fn hour_slot(ui: &mut egui::Ui, hour: &crate::model::HourView) {
+fn hour_slot(ui: &mut egui::Ui, pal: theme::Palette, hour: &crate::model::HourView) {
     let (rect, _) = ui.allocate_exact_size(
         egui::vec2(HOUR_SLOT_WIDTH, HOUR_SLOT_HEIGHT),
         egui::Sense::hover(),
@@ -8531,8 +8715,8 @@ fn hour_slot(ui: &mut egui::Ui, hour: &crate::model::HourView) {
         painter.rect(
             rect,
             egui::CornerRadius::same(theme::RADIUS_INNER),
-            theme::ACCENT_SOFT,
-            egui::Stroke::new(1.0, theme::ACCENT),
+            pal.accent_soft,
+            egui::Stroke::new(1.0, pal.accent),
             egui::StrokeKind::Inside,
         );
     }
@@ -8545,22 +8729,22 @@ fn hour_slot(ui: &mut egui::Ui, hour: &crate::model::HourView) {
         &hour.time,
         small.clone(),
         if hour.now {
-            theme::ACCENT_HOVER
+            pal.accent_hover
         } else {
-            theme::TEXT_MUTED
+            pal.text_muted
         },
     );
     let icon = egui::Rect::from_center_size(
         egui::pos2(x, rect.top() + 28.0 + SMALL_ICON / 2.0),
         egui::vec2(SMALL_ICON, SMALL_ICON),
     );
-    weather_icon(painter, icon, hour.sky, hour.night);
+    weather_icon(pal, painter, icon, hour.sky, hour.night);
     painter.text(
         egui::pos2(x, rect.top() + 62.0),
         egui::Align2::CENTER_TOP,
         &hour.temperature,
         theme::bold(14.0),
-        theme::TEXT_PRIMARY,
+        pal.text_primary,
     );
     if let Some(chance) = &hour.chance {
         painter.text(
@@ -8568,13 +8752,13 @@ fn hour_slot(ui: &mut egui::Ui, hour: &crate::model::HourView) {
             egui::Align2::CENTER_TOP,
             chance,
             small,
-            theme::SKY_WATER,
+            pal.sky_water,
         );
     }
 }
 
 /// Строка недельного прогноза: день, значок, температуры, осадки.
-fn day_row(ui: &mut egui::Ui, day: &crate::model::DayView) {
+fn day_row(ui: &mut egui::Ui, pal: theme::Palette, day: &crate::model::DayView) {
     /// Колонка вероятности осадков — постоянной ширины, иначе температуры
     /// разных дней не встали бы одна под другой.
     const CHANCE_WIDTH: f32 = 40.0;
@@ -8600,7 +8784,7 @@ fn day_row(ui: &mut egui::Ui, day: &crate::model::DayView) {
                     egui::Align2::RIGHT_CENTER,
                     text,
                     egui::TextStyle::Small.resolve(ui.style()),
-                    theme::SKY_WATER,
+                    pal.sky_water,
                 );
             }
 
@@ -8611,19 +8795,19 @@ fn day_row(ui: &mut egui::Ui, day: &crate::model::DayView) {
                 egui::Align2::RIGHT_CENTER,
                 &day.temperatures,
                 egui::TextStyle::Body.resolve(ui.style()),
-                theme::TEXT_PRIMARY,
+                pal.text_primary,
             );
 
             let (icon, response) =
                 ui.allocate_exact_size(egui::vec2(SMALL_ICON, SMALL_ICON), egui::Sense::hover());
-            weather_icon(ui.painter(), icon, day.sky, false);
+            weather_icon(pal, ui.painter(), icon, day.sky, false);
             // Описание словами — по наведению: в узкой колонке ему нет места,
             // а значок «дождь» не различает морось и ливень.
             response.on_hover_text(day.description);
 
             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 ui.add(
-                    egui::Label::new(egui::RichText::new(&day.label).color(theme::TEXT_PRIMARY))
+                    egui::Label::new(egui::RichText::new(&day.label).color(pal.text_primary))
                         .truncate(),
                 );
             });
@@ -8642,7 +8826,13 @@ fn day_row(ui: &mut egui::Ui, day: &crate::model::DayView) {
 ///
 /// Рисуется в квадрате, вписанном в `rect`, в долях его стороны: один и тот
 /// же значок годится и для крупного «сейчас», и для столбика часа.
-fn weather_icon(painter: &egui::Painter, rect: egui::Rect, sky: Sky, night: bool) {
+fn weather_icon(
+    pal: theme::Palette,
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    sky: Sky,
+    night: bool,
+) {
     let side = rect.width().min(rect.height());
     let origin = rect.center() - egui::vec2(side, side) / 2.0;
     let at = |x: f32, y: f32| origin + egui::vec2(x * side, y * side);
@@ -8651,10 +8841,10 @@ fn weather_icon(painter: &egui::Painter, rect: egui::Rect, sky: Sky, night: bool
         if night {
             // Месяц крупнее солнца: у серпа нет лучей, и того же радиуса ему
             // мало, чтобы в столбике часа читаться формой, а не точкой.
-            crescent(painter, center, radius * 1.5, theme::SKY_MOON);
+            crescent(painter, center, radius * 1.5, pal.sky_moon());
         } else {
-            painter.circle_filled(center, radius, theme::SKY_SUN);
-            let stroke = egui::Stroke::new((side * 0.06).max(1.2), theme::SKY_SUN);
+            painter.circle_filled(center, radius, pal.sky_sun());
+            let stroke = egui::Stroke::new((side * 0.06).max(1.2), pal.sky_sun());
             for ray in 0..8 {
                 let angle = ray as f32 * std::f32::consts::FRAC_PI_4;
                 let direction = egui::vec2(angle.cos(), angle.sin());
@@ -8685,23 +8875,23 @@ fn weather_icon(painter: &egui::Painter, rect: egui::Rect, sky: Sky, night: bool
         );
     };
     // Облако над осадками: поднято, чтобы под ним осталось место.
-    let raised = || cloud(0.0, -0.12, 0.9, theme::SKY_CLOUD);
+    let raised = || cloud(0.0, -0.12, 0.9, pal.sky_cloud());
 
     match sky {
         Sky::Clear => body(at(0.5, 0.5), 0.2 * side),
         Sky::PartlyCloudy => {
             body(at(0.36, 0.36), 0.15 * side);
-            cloud(0.08, 0.08, 0.85, theme::SKY_CLOUD);
+            cloud(0.08, 0.08, 0.85, pal.sky_cloud());
         }
         // Незнакомый код — облако: это ни «ясно», ни осадки, и соврать
         // в какую-то сторону значком хуже, чем нарисовать нейтральное.
         Sky::Cloudy | Sky::Unknown => {
-            cloud(0.1, -0.1, 0.75, theme::SKY_CLOUD_FAR);
-            cloud(-0.04, 0.06, 0.95, theme::SKY_CLOUD);
+            cloud(0.1, -0.1, 0.75, pal.sky_cloud_far());
+            cloud(-0.04, 0.06, 0.95, pal.sky_cloud());
         }
         Sky::Fog => {
-            cloud(0.0, -0.12, 0.9, theme::SKY_CLOUD_FAR);
-            let stroke = egui::Stroke::new((side * 0.06).max(1.2), theme::SKY_CLOUD);
+            cloud(0.0, -0.12, 0.9, pal.sky_cloud_far());
+            let stroke = egui::Stroke::new((side * 0.06).max(1.2), pal.sky_cloud());
             for (y, left, right) in [(0.72, 0.18, 0.74), (0.86, 0.28, 0.84)] {
                 painter.line_segment([at(left, y), at(right, y)], stroke);
             }
@@ -8709,19 +8899,19 @@ fn weather_icon(painter: &egui::Painter, rect: egui::Rect, sky: Sky, night: bool
         Sky::Drizzle => {
             raised();
             for x in [0.34, 0.52, 0.70] {
-                painter.circle_filled(at(x, 0.8), side * 0.04, theme::SKY_WATER);
+                painter.circle_filled(at(x, 0.8), side * 0.04, pal.sky_water);
             }
         }
         Sky::Rain => {
             raised();
-            let stroke = egui::Stroke::new((side * 0.055).max(1.2), theme::SKY_WATER);
+            let stroke = egui::Stroke::new((side * 0.055).max(1.2), pal.sky_water);
             for x in [0.38, 0.54, 0.70] {
                 painter.line_segment([at(x, 0.68), at(x - 0.07, 0.9)], stroke);
             }
         }
         Sky::Snow => {
             raised();
-            let stroke = egui::Stroke::new((side * 0.04).max(1.0), theme::SKY_SNOW);
+            let stroke = egui::Stroke::new((side * 0.04).max(1.0), pal.sky_snow());
             for x in [0.34, 0.52, 0.70] {
                 let center = at(x, 0.8);
                 let reach = side * 0.06;
@@ -8734,7 +8924,7 @@ fn weather_icon(painter: &egui::Painter, rect: egui::Rect, sky: Sky, night: bool
         }
         Sky::Thunder => {
             raised();
-            let stroke = egui::Stroke::new((side * 0.06).max(1.2), theme::SKY_BOLT);
+            let stroke = egui::Stroke::new((side * 0.06).max(1.2), pal.sky_bolt());
             let zigzag = [at(0.56, 0.62), at(0.44, 0.78), at(0.58, 0.78), at(0.46, 0.95)];
             for pair in zigzag.windows(2) {
                 painter.line_segment([pair[0], pair[1]], stroke);
@@ -8913,6 +9103,7 @@ struct Segment {
 /// и нужен там, где дорожка стоит посреди строки, а не растянута на всё окно.
 fn segment_button(
     ui: &mut egui::Ui,
+    pal: theme::Palette,
     label: &str,
     selected: bool,
     width: f32,
@@ -8939,16 +9130,16 @@ fn segment_button(
             (egui::Color32::TRANSPARENT, egui::Color32::TRANSPARENT)
         } else {
             (
-                motion::mix(egui::Color32::TRANSPARENT, theme::CARD_INNER, touch),
-                theme::CARD_FILL,
+                motion::mix(egui::Color32::TRANSPARENT, pal.card_inner, touch),
+                pal.card_fill,
             )
         };
         // Подпись выбранного тёмная — на оранжевом светлая даёт 1.9:1.
         // У невыбранного она приглушена в покое и светлеет под курсором:
         // это и есть отклик, заливки там почти нет.
         let text = motion::mix(
-            motion::mix(theme::TEXT_SECONDARY, theme::TEXT_PRIMARY, touch),
-            theme::TEXT_ON_ACCENT,
+            motion::mix(pal.text_secondary, pal.text_primary, touch),
+            pal.text_on_accent,
             chosen,
         );
 
@@ -8995,6 +9186,7 @@ fn segment_button(
 /// и дорожка либо не дотянулась бы до правого края, либо вылезла за него.
 fn segment_track<T: Copy + PartialEq>(
     ui: &mut egui::Ui,
+    pal: theme::Palette,
     id: egui::Id,
     speed: f32,
     current: T,
@@ -9004,15 +9196,37 @@ fn segment_track<T: Copy + PartialEq>(
     const GAP: f32 = theme::SEGMENT_GAP;
 
     let mut picked = None;
-    theme::track_frame().show(ui, |ui| {
+    theme::track_frame(pal).show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = GAP;
+
+            // `ui.horizontal` не «начинает слева направо», а продолжает то
+            // направление, что задано снаружи, — и в раскладке справа налево
+            // самым правым оказывается тот сегмент, который положили первым.
+            // Проверено глазами: переключатель темы в подвале вышел
+            // «Светлая | Тёмная» при списке `[Тёмная, Светлая]`, то есть
+            // подсветка стояла не под той подписью, под которой её искали.
+            //
+            // Поэтому список проходится задом наперёд, а направление остаётся
+            // родительским. Развернуть вместо этого саму раскладку —
+            // соблазнительно и неверно: вложенный `left_to_right` кладёт
+            // содержимое от левого края, `min_rect` справа налево растёт
+            // от правого, и между ними оказывается вся строка. Проверено
+            // глазами обе попытки: с `available_size_before_wrap` дорожка
+            // растянулась на весь подвал и вытеснила строку версий, с нулевой
+            // шириной — налезла на соседнюю галочку.
+            let backwards = ui.layout().prefer_right_to_left();
 
             let slot = ui.painter().add(egui::Shape::Noop);
             let mut chosen: Option<Segment> = None;
             let mut left = items.len() as f32;
 
-            for (item, label) in items {
+            for step in 0..items.len() {
+                let (item, label) = if backwards {
+                    &items[items.len() - 1 - step]
+                } else {
+                    &items[step]
+                };
                 let width = if stretch {
                     let width = (ui.available_width() - GAP * (left - 1.0)) / left;
                     left -= 1.0;
@@ -9021,7 +9235,7 @@ fn segment_track<T: Copy + PartialEq>(
                     0.0
                 };
 
-                let segment = segment_button(ui, label, *item == current, width, speed);
+                let segment = segment_button(ui, pal, label, *item == current, width, speed);
                 if segment.clicked {
                     picked = Some(*item);
                 }
@@ -9040,7 +9254,7 @@ fn segment_track<T: Copy + PartialEq>(
                         // Наведение на уже выбранный сегмент светлит саму
                         // таблетку: до приёма 03 это делала его собственная
                         // заливка, и терять отклик вместе с ней незачем.
-                        motion::mix(theme::ACCENT, theme::ACCENT_HOVER, chosen.touch),
+                        motion::mix(pal.accent, pal.accent_hover, chosen.touch),
                     ),
                 );
             }
@@ -9116,7 +9330,13 @@ fn enabled_with_touch<R>(
 ///
 /// Состояние сказано не только цветом — включённая ещё и обведена акцентной
 /// границей, а рядом с ней всегда есть то, что она показывает.
-fn toggle_pill(ui: &mut egui::Ui, label: &str, on: bool, speed: f32) -> egui::Response {
+fn toggle_pill(
+    ui: &mut egui::Ui,
+    pal: theme::Palette,
+    label: &str,
+    on: bool,
+    speed: f32,
+) -> egui::Response {
     ui.scope(|ui| {
         if on {
             let v = ui.visuals_mut();
@@ -9125,9 +9345,9 @@ fn toggle_pill(ui: &mut egui::Ui, label: &str, on: bool, speed: f32) -> egui::Re
                 &mut v.widgets.hovered,
                 &mut v.widgets.active,
             ] {
-                state.weak_bg_fill = theme::ACCENT_SOFT;
-                state.bg_stroke = egui::Stroke::new(1.0, theme::ACCENT);
-                state.fg_stroke = egui::Stroke::new(1.0, theme::ACCENT_HOVER);
+                state.weak_bg_fill = pal.accent_soft;
+                state.bg_stroke = egui::Stroke::new(1.0, pal.accent);
+                state.fg_stroke = egui::Stroke::new(1.0, pal.accent_hover);
             }
         }
         // Отклик под курсором добавляет `pill_button`, и включённой кнопке
@@ -9149,7 +9369,13 @@ fn toggle_pill(ui: &mut egui::Ui, label: &str, on: bool, speed: f32) -> egui::Re
 /// «TIFF — только чтение» так и уехал за правый край окна. Здесь ширина
 /// известна заранее, из разложенного текста, и `horizontal_wrapped`
 /// переносит плашку сам.
-fn soft_pill(ui: &mut egui::Ui, text: &str, color: egui::Color32, fill: egui::Color32) {
+fn soft_pill(
+    ui: &mut egui::Ui,
+    pal: theme::Palette,
+    text: &str,
+    color: egui::Color32,
+    fill: egui::Color32,
+) {
     const PAD_X: f32 = 11.0;
     const HEIGHT: f32 = 24.0;
 
@@ -9172,7 +9398,7 @@ fn soft_pill(ui: &mut egui::Ui, text: &str, color: egui::Color32, fill: egui::Co
 
     let painter = ui.painter();
     let stroke = if fill == egui::Color32::TRANSPARENT {
-        egui::Stroke::new(1.0, theme::BORDER_SUBTLE)
+        egui::Stroke::new(1.0, pal.border_subtle)
     } else {
         egui::Stroke::NONE
     };
@@ -9202,6 +9428,7 @@ fn soft_pill(ui: &mut egui::Ui, text: &str, color: egui::Color32, fill: egui::Co
 /// сказана одним цветом, а этого мало.
 fn chip(
     ui: &mut egui::Ui,
+    pal: theme::Palette,
     checked: &mut bool,
     label: &str,
     enabled: bool,
@@ -9256,18 +9483,18 @@ fn chip(
         // Невыбранный чип светлеет под курсором, выбранный переливается
         // в зелёный — и одно накладывается на другое, а не спорит с ним.
         let fill = motion::mix(
-            motion::mix(egui::Color32::TRANSPARENT, theme::CARD_INNER, touch),
-            theme::SUCCESS_SOFT,
+            motion::mix(egui::Color32::TRANSPARENT, pal.card_inner, touch),
+            pal.success_soft,
             on_t,
         );
         let stroke = motion::mix(
-            motion::mix(theme::BORDER_STRONG, theme::BORDER_HOVER, touch),
-            theme::STATE_SUCCESS,
+            motion::mix(pal.border_strong, pal.border_hover, touch),
+            pal.state_success,
             on_t,
         );
         let text_color = motion::mix(
-            motion::mix(theme::TEXT_SECONDARY, theme::TEXT_PRIMARY, touch),
-            theme::TEXT_PRIMARY,
+            motion::mix(pal.text_secondary, pal.text_primary, touch),
+            pal.text_primary,
             on_t,
         );
 
@@ -9289,7 +9516,7 @@ fn chip(
             mark,
             egui::CornerRadius::same(theme::RADIUS_TINY),
             egui::Color32::TRANSPARENT,
-            egui::Stroke::new(1.4, motion::mix(stroke, theme::STATE_SUCCESS, on_t)),
+            egui::Stroke::new(1.4, motion::mix(stroke, pal.state_success, on_t)),
             egui::StrokeKind::Inside,
         );
         // Птичка не возникает, а проявляется вместе с заливкой. Порог, а не
@@ -9298,7 +9525,7 @@ fn chip(
         if on_t > 0.0 {
             let tick = egui::Stroke::new(
                 1.8,
-                motion::mix(egui::Color32::TRANSPARENT, theme::STATE_SUCCESS, on_t),
+                motion::mix(egui::Color32::TRANSPARENT, pal.state_success, on_t),
             );
             let (l, t, w, h) = (mark.left(), mark.top(), mark.width(), mark.height());
             painter.line_segment(
@@ -9439,6 +9666,7 @@ fn collapsing_body(
 /// невыделяемые — иначе выделение текста съедало бы щелчок по строке.
 fn disclosure_row(
     ui: &mut egui::Ui,
+    pal: theme::Palette,
     open: bool,
     title: &str,
     summary: &str,
@@ -9467,12 +9695,12 @@ fn disclosure_row(
             .collect();
         ui.painter().add(egui::Shape::convex_polygon(
             points,
-            theme::ACCENT,
+            pal.accent,
             egui::Stroke::NONE,
         ));
 
         ui.add(
-            egui::Label::new(egui::RichText::new(title).color(theme::TEXT_PRIMARY)).truncate(),
+            egui::Label::new(egui::RichText::new(title).color(pal.text_primary)).truncate(),
         );
 
         // Сводка прижата к правому краю и обрезается сама: подсказку с
@@ -9484,7 +9712,7 @@ fn disclosure_row(
                 egui::Label::new(
                     egui::RichText::new(summary)
                         .small()
-                        .color(theme::TEXT_MUTED),
+                        .color(pal.text_muted),
                 )
                 .truncate(),
             );
@@ -9524,7 +9752,12 @@ const LABEL_KEYS: [Key; 5] = [
 /// В узком окне подпись уезжает НАД элементом: колонка в 78 точек съела бы
 /// пятую часть ширины, а переключателю качества из шести ступеней и без того
 /// тесно. Порог — ширина, при которой ступени ещё помещаются в строку.
-fn labelled_row<R>(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+fn labelled_row<R>(
+    ui: &mut egui::Ui,
+    pal: theme::Palette,
+    label: &str,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
     // Ширина колонки подписи — под самую длинную из них, «Битрейт, кбит/с».
     // При 78 она обрезалась в «Битрейт, кб…», а обрезанная подпись у
     // переключателя — это ровно та частая беда, о которой Правило 2.
@@ -9543,7 +9776,7 @@ fn labelled_row<R>(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::U
     const INLINE_MIN: f32 = 470.0;
 
     if ui.available_width() < INLINE_MIN {
-        field_label(ui, label);
+        field_label(ui, pal, label);
         return add(ui);
     }
 
@@ -9565,7 +9798,7 @@ fn labelled_row<R>(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::U
                     egui::Label::new(
                         egui::RichText::new(label)
                             .small()
-                            .color(theme::TEXT_MUTED),
+                            .color(pal.text_muted),
                     )
                     .truncate(),
                 );
@@ -9622,7 +9855,13 @@ fn log_scroll() -> egui::ScrollArea {
 ///
 /// Свободная функция, а не метод: строке нужен только сам элемент, и от
 /// заимствования всего `SavioApp` внутри цикла по списку это избавляет.
-fn queue_row(ui: &mut egui::Ui, item: &QueueItem, lang: Lang, speed: f32) -> bool {
+fn queue_row(
+    ui: &mut egui::Ui,
+    pal: theme::Palette,
+    item: &QueueItem,
+    lang: Lang,
+    speed: f32,
+) -> bool {
     let mut remove = false;
     let id = egui::Id::new("queue-row").with(item.id);
 
@@ -9639,7 +9878,7 @@ fn queue_row(ui: &mut egui::Ui, item: &QueueItem, lang: Lang, speed: f32) -> boo
     }
 
     clipped(ui, id, t, t, |ui| {
-        queue_row_body(ui, item, lang, speed, &mut remove);
+        queue_row_body(ui, pal, item, lang, speed, &mut remove);
     });
     remove
 }
@@ -9647,12 +9886,13 @@ fn queue_row(ui: &mut egui::Ui, item: &QueueItem, lang: Lang, speed: f32) -> boo
 /// Внутренность строки очереди, без оболочки появления.
 fn queue_row_body(
     ui: &mut egui::Ui,
+    pal: theme::Palette,
     item: &QueueItem,
     lang: Lang,
     speed: f32,
     remove: &mut bool,
 ) {
-    theme::inner_frame()
+    theme::inner_frame(pal)
         .show(ui, |ui| {
             // Иначе строка сжалась бы по ширине своего названия: у короткого
             // получилась бы узкая полоска посреди списка.
@@ -9671,7 +9911,7 @@ fn queue_row_body(
                 let color = motion::tint(
                     ui.ctx(),
                     egui::Id::new("queue-dot").with(item.id),
-                    item.status.color(),
+                    item.status.color(pal),
                     motion::MOVE * speed,
                 );
                 let color = if item.status == QueueStatus::Running {
@@ -9709,7 +9949,7 @@ fn queue_row_body(
                         // а добавил вторую коробку с тем же текстом.
                         ui.add(
                             egui::Label::new(
-                                egui::RichText::new(&item.title).color(theme::TEXT_PRIMARY),
+                                egui::RichText::new(&item.title).color(pal.text_primary),
                             )
                             .truncate(),
                         );
@@ -9745,7 +9985,7 @@ fn queue_row_body(
                 egui::RichText::new(&item.detail).small().color(motion::tint(
                     ui.ctx(),
                     egui::Id::new("queue-detail").with(item.id),
-                    item.status.color(),
+                    item.status.color(pal),
                     motion::MOVE * speed,
                 )),
             );
@@ -9761,7 +10001,7 @@ fn queue_row_body(
                     egui::Label::new(
                         egui::RichText::new(&item.error_line)
                             .small()
-                            .color(theme::STATE_ERROR),
+                            .color(pal.state_error),
                     )
                     .truncate(),
                 );
@@ -9780,6 +10020,7 @@ fn queue_row_body(
 /// галочкой монитора. Ни сборка, ни `clippy`, ни тесты этого не видят.
 fn checkbox(
     ui: &mut egui::Ui,
+    pal: theme::Palette,
     checked: &mut bool,
     label: &'static str,
     enabled: bool,
@@ -9804,19 +10045,19 @@ fn checkbox(
             // коробка пуста, и без цвета выбранное не отличить от
             // невыбранного), поэтому подписи цвет задаётся отдельно, через
             // `RichText`: он перебивает цвет по умолчанию.
-            state.fg_stroke = egui::Stroke::new(1.6, theme::ACCENT);
+            state.fg_stroke = egui::Stroke::new(1.6, pal.accent);
             state.corner_radius = egui::CornerRadius::same(theme::RADIUS_TINY);
             state.expansion = 0.0;
         }
         // Коробка «утоплена», как поле ввода и дорожка переключателя: на
         // заливке карточки она иначе держится на одной тонкой рамке.
-        v.widgets.inactive.bg_fill = theme::INPUT_FILL;
+        v.widgets.inactive.bg_fill = pal.input_fill;
 
         ui.add_enabled(
             enabled,
             egui::Checkbox::new(
                 checked,
-                egui::RichText::new(label).color(theme::TEXT_PRIMARY),
+                egui::RichText::new(label).color(pal.text_primary),
             ),
         )
     })
@@ -9831,9 +10072,9 @@ fn checkbox(
 ///
 /// Одна функция на все поля ввода: разъехавшись, две одинаковые по смыслу
 /// ошибки выглядели бы по-разному.
-fn mark_invalid(ui: &mut egui::Ui) {
+fn mark_invalid(pal: theme::Palette, ui: &mut egui::Ui) {
     let v = ui.visuals_mut();
-    let error = egui::Stroke::new(1.0, theme::STATE_ERROR);
+    let error = egui::Stroke::new(1.0, pal.state_error);
     v.widgets.inactive.bg_stroke = error;
     v.widgets.hovered.bg_stroke = error;
     v.widgets.active.bg_stroke = error;
@@ -9846,6 +10087,7 @@ fn mark_invalid(ui: &mut egui::Ui) {
 /// незачем, это работа обработчика изменения.
 fn time_field(
     ui: &mut egui::Ui,
+    pal: theme::Palette,
     value: &mut String,
     hint: &'static str,
     invalid: bool,
@@ -9853,14 +10095,14 @@ fn time_field(
 ) -> bool {
     ui.scope(|ui| {
         if invalid {
-            mark_invalid(ui);
+            mark_invalid(pal, ui);
         }
 
         ui.add_sized(
             [width, theme::CONTROL_HEIGHT],
             egui::TextEdit::singleline(value)
                 .hint_text(hint)
-                .text_color(theme::TEXT_PRIMARY)
+                .text_color(pal.text_primary)
                 .margin(egui::Margin::symmetric(10, 6)),
         )
         .changed()
@@ -9885,7 +10127,13 @@ fn time_field(
 /// Здесь ширина известна заранее, из разложенного текста, и место просится
 /// через `allocate_exact_size` — то есть через ту самую логику переноса
 /// (так же устроен `chip`).
-fn choice_pill(ui: &mut egui::Ui, label: &str, on: bool, speed: f32) -> egui::Response {
+fn choice_pill(
+    ui: &mut egui::Ui,
+    pal: theme::Palette,
+    label: &str,
+    on: bool,
+    speed: f32,
+) -> egui::Response {
     const PAD: f32 = 14.0;
 
     let font = egui::TextStyle::Button.resolve(ui.style());
@@ -9915,18 +10163,18 @@ fn choice_pill(ui: &mut egui::Ui, label: &str, on: bool, speed: f32) -> egui::Re
     let rect = motion::pressed(rect, press);
 
     let fill = motion::mix(
-        motion::mix(egui::Color32::TRANSPARENT, theme::CARD_INNER, touch),
-        theme::ACCENT_SOFT,
+        motion::mix(egui::Color32::TRANSPARENT, pal.card_inner, touch),
+        pal.accent_soft,
         on_t,
     );
     let stroke = motion::mix(
-        motion::mix(theme::BORDER_STRONG, theme::BORDER_HOVER, touch),
-        theme::ACCENT,
+        motion::mix(pal.border_strong, pal.border_hover, touch),
+        pal.accent,
         on_t,
     );
     let text = motion::mix(
-        motion::mix(theme::TEXT_SECONDARY, theme::TEXT_PRIMARY, touch),
-        theme::ACCENT_HOVER,
+        motion::mix(pal.text_secondary, pal.text_primary, touch),
+        pal.accent_hover,
         on_t,
     );
 
@@ -9961,18 +10209,18 @@ fn note(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
 /// беда и не благополучие, а отсутствие сведений. Покрасить его зелёным
 /// значило бы сказать «в порядке» про то, чего не смотрели, красным —
 /// напугать штатным положением дел.
-fn check_color(status: CheckStatus) -> egui::Color32 {
+fn check_color(pal: theme::Palette, status: CheckStatus) -> egui::Color32 {
     match status {
-        CheckStatus::Ok => theme::STATE_SUCCESS,
-        CheckStatus::Warning => theme::STATE_WARNING,
-        CheckStatus::Failed => theme::STATE_ERROR,
-        CheckStatus::Unknown => theme::TEXT_MUTED,
+        CheckStatus::Ok => pal.state_success,
+        CheckStatus::Warning => pal.state_warning,
+        CheckStatus::Failed => pal.state_error,
+        CheckStatus::Unknown => pal.text_muted,
     }
 }
 
 /// Карточка одного пункта отчёта.
-fn check_card(ui: &mut egui::Ui, check: &crate::model::Check, lang: Lang) {
-    theme::card(ui, |ui| {
+fn check_card(ui: &mut egui::Ui, pal: theme::Palette, check: &crate::model::Check, lang: Lang) {
+    theme::card(ui, pal, |ui| {
             // Плашка прижата к правому краю: так статусы всех карточек
             // стоят в одну колонку и читаются сверху вниз, не завися от
             // длины заголовка. Кладём её первой, справа налево: обрезаемый
@@ -9989,13 +10237,13 @@ fn check_card(ui: &mut egui::Ui, check: &crate::model::Check, lang: Lang) {
                 egui::vec2(ui.available_width(), theme::CONTROL_HEIGHT),
                 egui::Layout::right_to_left(egui::Align::Center),
                 |ui| {
-                    status_pill(ui, check.status.label(lang), check_color(check.status));
+                    status_pill(ui, pal, check.status.label(lang), check_color(pal, check.status));
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         ui.add(
                             egui::Label::new(
                                 egui::RichText::new(&check.name)
                                     .font(theme::display(17.0))
-                                    .color(theme::TEXT_PRIMARY),
+                                    .color(pal.text_primary),
                             )
                             .truncate(),
                         );
@@ -10004,25 +10252,25 @@ fn check_card(ui: &mut egui::Ui, check: &crate::model::Check, lang: Lang) {
             );
 
             ui.add_space(6.0);
-            note(ui, &check.summary, theme::TEXT_SECONDARY);
+            note(ui, &check.summary, pal.text_secondary);
 
             if !check.rows.is_empty() {
                 ui.add_space(10.0);
                 for row in &check.rows {
-                    check_row(ui, row, lang);
+                    check_row(ui, pal, row, lang);
                 }
             }
 
             if let Some(advice) = &check.advice {
                 ui.add_space(10.0);
-                banner(ui, advice, theme::STATE_WARNING);
+                banner(ui, pal, advice, pal.state_warning);
             }
         });
 }
 
 /// Строка «подпись — значение» внутри карточки.
-fn check_row(ui: &mut egui::Ui, row: &crate::model::CheckRow, lang: Lang) {
-    stat_row(ui, lang, &row.label, row.value.as_deref());
+fn check_row(ui: &mut egui::Ui, pal: theme::Palette, row: &crate::model::CheckRow, lang: Lang) {
+    stat_row(ui, pal, lang, &row.label, row.value.as_deref());
 }
 
 /// Строка «подпись — значение» в колонку.
@@ -10033,8 +10281,8 @@ fn check_row(ui: &mut egui::Ui, row: &crate::model::CheckRow, lang: Lang) {
 /// ровно там, где Правило 1 этого и не велит. Вид у строк при этом обязан
 /// остаться общим: две одинаковые на вид таблицы, разъехавшиеся по вёрстке,
 /// выглядят небрежностью.
-fn stat_row(ui: &mut egui::Ui, lang: Lang, label: &str, value: Option<&str>) {
-    stat_row_with(ui, label, value, i18n::t(lang, Key::UiSystemValueMissing));
+fn stat_row(ui: &mut egui::Ui, pal: theme::Palette, lang: Lang, label: &str, value: Option<&str>) {
+    stat_row_with(ui, pal, label, value, i18n::t(lang, Key::UiSystemValueMissing));
 }
 
 /// Та же строка, но со своим объяснением прочерка.
@@ -10042,7 +10290,13 @@ fn stat_row(ui: &mut egui::Ui, lang: Lang, label: &str, value: Option<&str>) {
 /// Объяснение — часть смысла прочерка, а не украшение: у снимка системы
 /// значение не сообщила система, у погоды — сервер, и одна общая фраза
 /// соврала бы в одном из двух мест.
-fn stat_row_with(ui: &mut egui::Ui, label: &str, value: Option<&str>, missing: &str) {
+fn stat_row_with(
+    ui: &mut egui::Ui,
+    pal: theme::Palette,
+    label: &str,
+    value: Option<&str>,
+    missing: &str,
+) {
     ui.horizontal_top(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
 
@@ -10072,7 +10326,7 @@ fn stat_row_with(ui: &mut egui::Ui, label: &str, value: Option<&str>, missing: &
                     egui::Label::new(
                         egui::RichText::new(label)
                             .small()
-                            .color(theme::TEXT_MUTED),
+                            .color(pal.text_muted),
                     )
                     .truncate(),
                 );
@@ -10088,7 +10342,7 @@ fn stat_row_with(ui: &mut egui::Ui, label: &str, value: Option<&str>, missing: &
                     egui::Label::new(
                         egui::RichText::new(value)
                             .small()
-                            .color(theme::TEXT_SECONDARY),
+                            .color(pal.text_secondary),
                     )
                     .wrap(),
                 );
@@ -10102,7 +10356,7 @@ fn stat_row_with(ui: &mut egui::Ui, label: &str, value: Option<&str>, missing: &
                     egui::Label::new(
                         egui::RichText::new("—")
                             .small()
-                            .color(theme::TEXT_MUTED),
+                            .color(pal.text_muted),
                     )
                     .wrap(),
                 )
@@ -10112,8 +10366,8 @@ fn stat_row_with(ui: &mut egui::Ui, label: &str, value: Option<&str>, missing: &
     });
 }
 
-fn field_label(ui: &mut egui::Ui, text: &str) {
-    ui.label(egui::RichText::new(text).small().color(theme::TEXT_MUTED));
+fn field_label(ui: &mut egui::Ui, pal: theme::Palette, text: &str) {
+    ui.label(egui::RichText::new(text).small().color(pal.text_muted));
     ui.add_space(6.0);
 }
 
@@ -10134,7 +10388,7 @@ fn field_label(ui: &mut egui::Ui, text: &str) {
 /// Отсюда же и отказ от `ui.horizontal` внутри: тот, оказавшись внутри уже
 /// горизонтальной раскладки, наследует её направление, и точка с подписью
 /// менялись местами. Кисти направление не указ.
-fn status_pill(ui: &mut egui::Ui, label: &str, color: egui::Color32) {
+fn status_pill(ui: &mut egui::Ui, pal: theme::Palette, label: &str, color: egui::Color32) {
     const PAD: f32 = 11.0;
     const GAP: f32 = 7.0;
     const DOT: f32 = 7.0;
@@ -10162,7 +10416,7 @@ fn status_pill(ui: &mut egui::Ui, label: &str, color: egui::Color32) {
     painter.rect_stroke(
         rect,
         egui::CornerRadius::same(theme::RADIUS_PILL),
-        egui::Stroke::new(1.0, theme::BORDER_SUBTLE),
+        egui::Stroke::new(1.0, pal.border_subtle),
         egui::StrokeKind::Inside,
     );
     painter.circle_filled(
@@ -10190,14 +10444,34 @@ fn status_pill(ui: &mut egui::Ui, label: &str, color: egui::Color32) {
 /// а способ сказать «нет данных», и он обязан выглядеть одинаково везде.
 const DASH: &str = "—";
 
+/// Ползущий график показателя: сами замеры, цвет и фаза сдвига.
+///
+/// Группой, а не тремя аргументами подряд: с палитрой у `metric_card` их
+/// стало восемь, и `clippy` тут прав не только формально — восемь
+/// позиционных аргументов, из которых три подряд про одно и то же,
+/// на месте вызова читаются загадкой. Дальше эта же тройка целиком уезжает
+/// в `trace_plot`, то есть группа не выдумана под счётчик, а была и так.
+#[derive(Clone, Copy)]
+struct Plot<'a> {
+    trace: &'a Trace,
+    color: egui::Color32,
+    /// Фаза ползущего графика: доля шага, на которую он уже сдвинулся.
+    phase: f32,
+}
+
+impl<'a> Plot<'a> {
+    fn new(trace: &'a Trace, color: egui::Color32, phase: f32) -> Self {
+        Self { trace, color, phase }
+    }
+}
+
 /// Карточка показателя: крупное число, график и подпись.
 fn metric_card(
     ui: &mut egui::Ui,
+    pal: theme::Palette,
     title: &str,
     metric: &Metric,
-    trace: &Trace,
-    color: egui::Color32,
-    phase: f32,
+    plot: Plot<'_>,
     speed: f32,
 ) {
     // Шрифт числа заведён именем, а не выписан по месту дважды: высоту ряда
@@ -10216,7 +10490,7 @@ fn metric_card(
         .fonts_mut(|fonts| fonts.row_height(&number))
         .max(theme::CONTROL_HEIGHT);
 
-    theme::card(ui, |ui| {
+    theme::card(ui, pal, |ui| {
             // Число прижато к правому краю: так проценты всех карточек
             // стоят в одну колонку и читаются сверху вниз. Кладём его
             // первым, справа налево, — обрезаемый заголовок иначе забрал бы
@@ -10246,13 +10520,13 @@ fn metric_card(
                         (Some(shown), Some(_)) => format!("{}%", shown.round() as i32),
                         _ => DASH.to_owned(),
                     };
-                    ui.label(egui::RichText::new(text).font(number).color(color));
+                    ui.label(egui::RichText::new(text).font(number).color(plot.color));
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         ui.add(
                             egui::Label::new(
                                 egui::RichText::new(title)
                                     .small()
-                                    .color(theme::TEXT_MUTED),
+                                    .color(pal.text_muted),
                             )
                             .truncate(),
                         );
@@ -10261,11 +10535,11 @@ fn metric_card(
             );
 
             ui.add_space(8.0);
-            trace_plot(ui, trace, color, phase);
+            trace_plot(ui, pal, plot);
 
             if let Some(detail) = &metric.detail {
                 ui.add_space(6.0);
-                note(ui, detail, theme::TEXT_SECONDARY);
+                note(ui, detail, pal.text_secondary);
             }
         });
 }
@@ -10275,8 +10549,14 @@ fn metric_card(
 /// Шкала жёстко от нуля до ста, а не «по максимуму в окне». Автомасштаб
 /// нарисовал бы у простаивающей машины ту же гору, что у загруженной, —
 /// график, который врёт ровно в ту сторону, в какую на него смотрят.
-fn trace_plot(ui: &mut egui::Ui, trace: &Trace, color: egui::Color32, phase: f32) {
+fn trace_plot(ui: &mut egui::Ui, pal: theme::Palette, plot: Plot<'_>) {
     const HEIGHT: f32 = 56.0;
+
+    let Plot {
+        trace,
+        color,
+        phase,
+    } = plot;
 
     let (rect, _) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), HEIGHT),
@@ -10286,7 +10566,7 @@ fn trace_plot(ui: &mut egui::Ui, trace: &Trace, color: egui::Color32, phase: f32
     painter.rect_filled(
         rect,
         egui::CornerRadius::same(theme::RADIUS_INNER),
-        theme::INPUT_FILL,
+        pal.input_fill,
     );
     // Одна линия сетки, на половине шкалы. Пять линий на сорока четырёх
     // точках высоты слились бы в серый прямоугольник.
@@ -10295,7 +10575,7 @@ fn trace_plot(ui: &mut egui::Ui, trace: &Trace, color: egui::Color32, phase: f32
             egui::pos2(rect.left(), rect.center().y),
             egui::pos2(rect.right(), rect.center().y),
         ],
-        egui::Stroke::new(1.0, theme::BORDER_SUBTLE),
+        egui::Stroke::new(1.0, pal.border_subtle),
     );
 
     // Одной точке рисовать нечего: линия начинается с отрезка.
@@ -10346,22 +10626,29 @@ fn trace_plot(ui: &mut egui::Ui, trace: &Trace, color: egui::Color32, phase: f32
 /// Втроём в одной карточке, потому что у всех троих одна беда: показать
 /// про них можно строку, а не график. Своя карточка на строку превратила бы
 /// вкладку в лестницу из рамок.
-fn io_card(ui: &mut egui::Ui, sample: &PerfSample, gpu: Option<&GpuInfo>, lang: Lang) {
-    theme::card(ui, |ui| {
+fn io_card(
+    ui: &mut egui::Ui,
+    pal: theme::Palette,
+    sample: &PerfSample,
+    gpu: Option<&GpuInfo>,
+    lang: Lang,
+) {
+    theme::card(ui, pal, |ui| {
             ui.add(
                 egui::Label::new(
                     egui::RichText::new(i18n::t(lang, Key::UiIo))
                         .small()
-                        .color(theme::TEXT_MUTED),
+                        .color(pal.text_muted),
                 )
                 .truncate(),
             );
 
             ui.add_space(8.0);
-            stat_row(ui, lang, i18n::t(lang, Key::UiNetwork), sample.net.as_deref());
-            stat_row(ui, lang, i18n::t(lang, Key::UiDisks), sample.disk.as_deref());
+            stat_row(ui, pal, lang, i18n::t(lang, Key::UiNetwork), sample.net.as_deref());
+            stat_row(ui, pal, lang, i18n::t(lang, Key::UiDisks), sample.disk.as_deref());
             stat_row(
                 ui,
+                pal,
                 lang,
                 i18n::t(lang, Key::HwSwap),
                 sample.swap.detail.as_deref(),
@@ -10370,6 +10657,7 @@ fn io_card(ui: &mut egui::Ui, sample: &PerfSample, gpu: Option<&GpuInfo>, lang: 
             // а имя уже снято с адаптера, которым eframe рисует окно.
             stat_row(
                 ui,
+                pal,
                 lang,
                 i18n::t(lang, Key::HwGpu),
                 gpu.map(|gpu| gpu.name.as_str()),
@@ -10378,24 +10666,29 @@ fn io_card(ui: &mut egui::Ui, sample: &PerfSample, gpu: Option<&GpuInfo>, lang: 
 }
 
 /// Карточка со списком процессов.
-fn process_card(ui: &mut egui::Ui, procs: &[crate::model::ProcRow], lang: Lang) {
-    theme::card(ui, |ui| {
+fn process_card(
+    ui: &mut egui::Ui,
+    pal: theme::Palette,
+    procs: &[crate::model::ProcRow],
+    lang: Lang,
+) {
+    theme::card(ui, pal, |ui| {
             ui.add(
                 egui::Label::new(
                     egui::RichText::new(i18n::t(lang, Key::UiProcesses))
                         .small()
-                        .color(theme::TEXT_MUTED),
+                        .color(pal.text_muted),
                 )
                 .truncate(),
             );
 
             ui.add_space(4.0);
             if procs.is_empty() {
-                note(ui, i18n::t(lang, Key::UiNoProcesses), theme::TEXT_MUTED);
+                note(ui, i18n::t(lang, Key::UiNoProcesses), pal.text_muted);
                 return;
             }
 
-            note(ui, i18n::t(lang, Key::UiProcessesNote), theme::TEXT_MUTED);
+            note(ui, i18n::t(lang, Key::UiProcessesNote), pal.text_muted);
             ui.add_space(8.0);
 
             // Своей прокрутки здесь нет: вкладка целиком лежит в общей, а
@@ -10403,13 +10696,13 @@ fn process_card(ui: &mut egui::Ui, procs: &[crate::model::ProcRow], lang: Lang) 
             // дефект 27, он уже случался с журналом). Список короткий —
             // `PROC_LIMIT` строк, — и в общей прокрутке помещается весь.
             for row in procs {
-                process_row(ui, row);
+                process_row(ui, pal, row);
             }
         });
 }
 
 /// Одна строка списка процессов.
-fn process_row(ui: &mut egui::Ui, row: &crate::model::ProcRow) {
+fn process_row(ui: &mut egui::Ui, pal: theme::Palette, row: &crate::model::ProcRow) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
         // Раскладка справа налево: числа кладутся первыми и занимают
@@ -10421,7 +10714,7 @@ fn process_row(ui: &mut egui::Ui, row: &crate::model::ProcRow) {
                 egui::Label::new(
                     egui::RichText::new(&row.mem_text)
                         .small()
-                        .color(theme::TEXT_SECONDARY),
+                        .color(pal.text_secondary),
                 )
                 .truncate(),
             );
@@ -10429,7 +10722,7 @@ fn process_row(ui: &mut egui::Ui, row: &crate::model::ProcRow) {
                 egui::Label::new(
                     egui::RichText::new(&row.cpu_text)
                         .small()
-                        .color(theme::TEXT_PRIMARY),
+                        .color(pal.text_primary),
                 )
                 .truncate(),
             );
@@ -10446,7 +10739,7 @@ fn process_row(ui: &mut egui::Ui, row: &crate::model::ProcRow) {
                     egui::Label::new(
                         egui::RichText::new(&row.name)
                             .small()
-                            .color(theme::TEXT_SECONDARY),
+                            .color(pal.text_secondary),
                     )
                     .truncate(),
                 );
@@ -10461,12 +10754,12 @@ fn process_row(ui: &mut egui::Ui, row: &crate::model::ProcRow) {
     );
     let radius = egui::CornerRadius::same(2);
     let painter = ui.painter();
-    painter.rect_filled(bar, radius, theme::INPUT_FILL);
+    painter.rect_filled(bar, radius, pal.input_fill);
     let filled = egui::Rect::from_min_size(
         bar.min,
         egui::vec2(bar.width() * (row.cpu / 100.0).clamp(0.0, 1.0), bar.height()),
     );
-    painter.rect_filled(filled, radius, theme::ACCENT);
+    painter.rect_filled(filled, radius, pal.accent);
     ui.add_space(6.0);
 }
 
@@ -10485,6 +10778,7 @@ fn process_row(ui: &mut egui::Ui, row: &crate::model::ProcRow) {
 /// в `log::warn`, которого никто не увидит.
 fn overlay_ui(
     ui: &mut egui::Ui,
+    pal: theme::Palette,
     class: egui::ViewportClass,
     lang: Lang,
     sample: &Mutex<Option<PerfSample>>,
@@ -10499,8 +10793,8 @@ fn overlay_ui(
     egui::CentralPanel::default()
         .frame(
             egui::Frame::new()
-                .fill(theme::MODAL_FILL)
-                .stroke(egui::Stroke::new(1.0, theme::BORDER_STRONG))
+                .fill(pal.modal_fill)
+                .stroke(egui::Stroke::new(1.0, pal.border_strong))
                 .inner_margin(egui::Margin::symmetric(12, 10)),
         )
         .show(ui, |ui| {
@@ -10558,7 +10852,7 @@ fn overlay_ui(
                     egui::Label::new(
                         egui::RichText::new("Savio")
                             .small()
-                            .color(theme::TEXT_MUTED),
+                            .color(pal.text_muted),
                     )
                     .truncate(),
                 );
@@ -10582,11 +10876,13 @@ fn overlay_ui(
                 return;
             };
             let Some(sample) = slot.as_ref() else {
-                note(ui, i18n::t(lang, Key::UiMonitorMeasuring), theme::TEXT_MUTED);
+                note(ui, i18n::t(lang, Key::UiMonitorMeasuring), pal.text_muted);
                 return;
             };
 
-            let row = |ui: &mut egui::Ui, key, value| overlay_row(ui, i18n::t(lang, key), value);
+            let row = |ui: &mut egui::Ui, key, value| {
+                overlay_row(ui, pal, i18n::t(lang, key), value)
+            };
             row(ui, Key::UiOverlayCpu, sample.cpu.percent_text.as_deref());
             row(ui, Key::UiOverlayRam, sample.mem.percent_text.as_deref());
             row(ui, Key::UiNetwork, sample.net.as_deref());
@@ -10599,14 +10895,14 @@ fn overlay_ui(
 /// Своя, а не `stat_row`: там подпись занимает 42% ширины ради колонки из
 /// длинных названий, а здесь подписи в три буквы и места всего 230 точек —
 /// колонка съела бы половину окна.
-fn overlay_row(ui: &mut egui::Ui, label: &str, value: Option<&str>) {
+fn overlay_row(ui: &mut egui::Ui, pal: theme::Palette, label: &str, value: Option<&str>) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
         ui.add(
             egui::Label::new(
                 egui::RichText::new(label)
                     .small()
-                    .color(theme::TEXT_MUTED),
+                    .color(pal.text_muted),
             )
             .truncate(),
         );
@@ -10614,7 +10910,7 @@ fn overlay_row(ui: &mut egui::Ui, label: &str, value: Option<&str>) {
             egui::Label::new(
                 egui::RichText::new(value.unwrap_or(DASH))
                     .font(theme::bold(12.5))
-                    .color(theme::TEXT_PRIMARY),
+                    .color(pal.text_primary),
             )
             .truncate(),
         );
@@ -10622,10 +10918,10 @@ fn overlay_row(ui: &mut egui::Ui, label: &str, value: Option<&str>) {
 }
 
 /// Сообщение об ошибке или предупреждение: цветная полоса слева, текст справа.
-fn banner(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
+fn banner(ui: &mut egui::Ui, pal: theme::Palette, text: &str, color: egui::Color32) {
     egui::Frame::new()
-        .fill(theme::CARD_INNER)
-        .stroke(egui::Stroke::new(1.0, theme::BORDER_SUBTLE))
+        .fill(pal.card_inner)
+        .stroke(egui::Stroke::new(1.0, pal.border_subtle))
         .corner_radius(egui::CornerRadius::same(theme::RADIUS_INNER))
         .inner_margin(egui::Margin::symmetric(14, 12))
         .show(ui, |ui| {
@@ -11613,10 +11909,12 @@ mod tests {
     /// Три кадра — по той же причине, что у [`log_body_height`]: и
     /// прокрутка, и карточка узнают размер по прошлому кадру.
     fn card_height(add: impl Fn(&mut egui::Ui)) -> f32 {
+        let pal = theme::Palette::dark();
         let ctx = egui::Context::default();
         // Без темы карточка мерилась бы чужими шрифтами, а `theme::display`
         // и вовсе уронил бы кадр: семейства с таким именем в умолчаниях нет.
-        theme::apply(&ctx);
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, pal);
         let mut height = 0.0;
 
         for _ in 0..3 {
@@ -11690,8 +11988,10 @@ mod tests {
     /// с `segment_track`: числа, списанные сюда руками, разъехались бы
     /// с раскладкой при первой же правке темы.
     fn widest_segment(labels: &[&str]) -> (f32, f32) {
+        let pal = theme::Palette::dark();
         let ctx = egui::Context::default();
-        theme::apply(&ctx);
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, pal);
         let (mut widest, mut slot) = (0.0_f32, 0.0_f32);
 
         for _ in 0..3 {
@@ -11704,12 +12004,12 @@ mod tests {
             };
             let mut output = ctx.run_ui(input, |ui| {
                 egui::CentralPanel::default().show(ui, |ui| {
-                    theme::card(ui, |ui| {
+                    theme::card(ui, pal, |ui| {
                         // Доля одного сегмента: ширина дорожки за вычетом
                         // промежутков, поделённая на число сегментов.
                         let n = labels.len() as f32;
                         let inner =
-                            ui.available_width() - theme::track_frame().total_margin().sum().x;
+                            ui.available_width() - theme::track_frame(pal).total_margin().sum().x;
                         slot = (inner - theme::SEGMENT_GAP * (n - 1.0)) / n;
 
                         let font = egui::TextStyle::Button.resolve(ui.style());
@@ -11719,7 +12019,7 @@ mod tests {
                                 let text = ui.painter().layout_no_wrap(
                                     (*label).to_owned(),
                                     font.clone(),
-                                    theme::TEXT_PRIMARY,
+                                    pal.text_primary,
                                 );
                                 text.size().x + theme::SEGMENT_PADDING * 2.0
                             })
@@ -11744,8 +12044,10 @@ mod tests {
     /// падает на армянском битрейте.
     #[test]
     fn the_field_labels_fit_their_column() {
+        let pal = theme::Palette::dark();
         let ctx = egui::Context::default();
-        theme::apply(&ctx);
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, pal);
 
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
             // `.small()`, как у самой подписи (`labelled_row`, `field_label`):
@@ -11757,7 +12059,7 @@ mod tests {
                     let label = i18n::t(lang, key);
                     let width = ui
                         .painter()
-                        .layout_no_wrap(label.to_owned(), font.clone(), theme::TEXT_MUTED)
+                        .layout_no_wrap(label.to_owned(), font.clone(), pal.text_muted)
                         .size()
                         .x;
                     assert!(
@@ -11783,8 +12085,10 @@ mod tests {
     /// 884 точки против 99 при ширине окна 900.
     #[test]
     fn a_status_pill_asks_only_for_its_own_width() {
+        let pal = theme::Palette::dark();
         let ctx = egui::Context::default();
-        theme::apply(&ctx);
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, pal);
         let (mut backwards, mut plain) = (0.0, 0.0);
 
         for _ in 0..3 {
@@ -11804,7 +12108,7 @@ mod tests {
                         egui::Layout::right_to_left(egui::Align::Center),
                         |ui| {
                             backwards = ui
-                                .scope(|ui| status_pill(ui, "В порядке", theme::ACCENT))
+                                .scope(|ui| status_pill(ui, pal, "В порядке", pal.accent))
                                 .response
                                 .rect
                                 .width();
@@ -11812,7 +12116,7 @@ mod tests {
                     );
                     ui.horizontal(|ui| {
                         plain = ui
-                            .scope(|ui| status_pill(ui, "В порядке", theme::ACCENT))
+                            .scope(|ui| status_pill(ui, pal, "В порядке", pal.accent))
                             .response
                             .rect
                             .width();
@@ -11827,6 +12131,196 @@ mod tests {
         assert_eq!(
             backwards, plain,
             "справа налево плашка шире самой себя: {backwards} против {plain}"
+        );
+    }
+
+    /// Выключенная главная кнопка подписана своим цветом, а не цветом
+    /// включённой.
+    ///
+    /// В тёмной теме эти два цвета совпадают, поэтому промах там невидим —
+    /// и ровно поэтому его легко внести. В светлой теме включённая кнопка
+    /// тёмная и подписана белым, а выключенная пастельная: белым по ней
+    /// выходит 1.9:1, то есть «Скачать» читается как пустая таблетка.
+    /// Проверено глазами, и ровно так эта беда и нашлась.
+    ///
+    /// Палитра сама по себе тут не спасает: `every_colour_passes_its_threshold`
+    /// проверяет, что нужный цвет в палитре есть и проходит порог, а не то,
+    /// что кнопка его взяла.
+    ///
+    /// Проверено красным: с `pal.text_on_accent` в обеих ветках проверка
+    /// падает на светлой теме.
+    #[test]
+    fn a_disabled_main_button_keeps_its_own_ink() {
+        fn ink(shapes: &[egui::epaint::ClippedShape], text: &str) -> Option<egui::Color32> {
+            fn walk(shape: &egui::Shape, text: &str, found: &mut Option<egui::Color32>) {
+                match shape {
+                    egui::Shape::Text(t) if t.galley.job.text.trim() == text => {
+                        *found = t
+                            .override_text_color
+                            .or_else(|| t.galley.job.sections.first().map(|s| s.format.color));
+                    }
+                    egui::Shape::Vec(list) => {
+                        for shape in list {
+                            walk(shape, text, found);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut found = None;
+            for clipped in shapes {
+                walk(&clipped.shape, text, &mut found);
+            }
+            found
+        }
+
+        for (theme, pal) in [("тёмная", theme::Palette::dark()), ("светлая", theme::Palette::light())]
+        {
+            let ctx = egui::Context::default();
+            theme::install_fonts(&ctx);
+            theme::apply(&ctx, pal);
+
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    accent_button(ui, pal, "выключено", 200.0, false, "почему");
+                    accent_button(ui, pal, "включено", 200.0, true, "");
+                });
+            });
+            let off = ink(&output.shapes, "выключено");
+            let on = ink(&output.shapes, "включено");
+            output.textures_delta.clear();
+
+            assert_eq!(
+                off,
+                Some(pal.text_on_accent_disabled),
+                "{theme}: выключенная кнопка подписана не своим цветом"
+            );
+            assert_eq!(
+                on,
+                Some(pal.text_on_accent),
+                "{theme}: включённая кнопка подписана не своим цветом"
+            );
+        }
+    }
+
+    /// Дорожка переключателя идёт слева направо, куда бы её ни поставили.
+    ///
+    /// `ui.horizontal` не «начинает слева направо», а продолжает направление
+    /// родителя (`horizontal_with_main_wrap_dyn` спрашивает у него
+    /// `prefer_right_to_left`). Дорожка, поставленная в подвал, разложенный
+    /// справа налево, поэтому рисовала сегменты задом наперёд: список
+    /// `[Тёмная, Светлая]` выходил в окне как «Светлая | Тёмная», и выбранной
+    /// выглядела не та подпись, под которой человек искал свою тему.
+    ///
+    /// Меряется положение самих подписей, а не дорожки: дорожка лежит во
+    /// `Frame` и занимает одно и то же место при любом порядке содержимого,
+    /// то есть проверяла бы сама себя.
+    ///
+    /// Проверено красным: с `ui.horizontal` вместо явной раскладки проверка
+    /// падает на второй половине — справа налево «раз» оказывается правее
+    /// «двух».
+    #[test]
+    fn a_segment_track_reads_left_to_right_wherever_it_stands() {
+        /// Где легла подпись с таким текстом, по левому краю.
+        fn label_x(shapes: &[egui::epaint::ClippedShape], text: &str) -> Option<f32> {
+            fn walk(shape: &egui::Shape, text: &str, found: &mut Option<f32>) {
+                match shape {
+                    egui::Shape::Text(t) => {
+                        if t.galley.job.text.trim() == text {
+                            *found = Some(t.pos.x);
+                        }
+                    }
+                    egui::Shape::Vec(list) => {
+                        for shape in list {
+                            walk(shape, text, found);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut found = None;
+            for clipped in shapes {
+                walk(&clipped.shape, text, &mut found);
+            }
+            found
+        }
+
+        let pal = theme::Palette::dark();
+        let items = [(0_u8, "раз"), (1, "два")];
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, pal);
+
+        // Обе раскладки в одном кадре, и у каждой дорожки свой `Id`: с общим
+        // таблетка выбранного сегмента летала бы между ними.
+        let (mut plain, mut backwards) = ((0.0, 0.0), (0.0, 0.0));
+        for _ in 0..3 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 420.0),
+                )),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        segment_track(ui, pal, egui::Id::new("прямо"), 1.0, 0, &items, false);
+                    });
+                });
+            });
+            plain = (
+                label_x(&output.shapes, "раз").unwrap_or(f32::NAN),
+                label_x(&output.shapes, "два").unwrap_or(f32::NAN),
+            );
+            output.textures_delta.clear();
+
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 420.0),
+                )),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    // Ровно то окружение, в котором дорожка темы и живёт:
+                    // ряд подвала, разложенный справа налево.
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(ui.available_width(), theme::CONTROL_HEIGHT),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            segment_track(
+                                ui,
+                                pal,
+                                egui::Id::new("наоборот"),
+                                1.0,
+                                0,
+                                &items,
+                                false,
+                            );
+                        },
+                    );
+                });
+            });
+            backwards = (
+                label_x(&output.shapes, "раз").unwrap_or(f32::NAN),
+                label_x(&output.shapes, "два").unwrap_or(f32::NAN),
+            );
+            output.textures_delta.clear();
+        }
+
+        assert!(
+            plain.0 < plain.1,
+            "слева направо порядок уже сломан: «раз» на {}, «два» на {}",
+            plain.0,
+            plain.1
+        );
+        assert!(
+            backwards.0 < backwards.1,
+            "справа налево дорожка перевернулась: «раз» на {}, «два» на {}",
+            backwards.0,
+            backwards.1
         );
     }
 
@@ -11847,14 +12341,16 @@ mod tests {
     /// оно выше кнопки, и `CONTROL_HEIGHT` ему мал.
     #[test]
     fn a_machine_card_does_not_stretch_to_the_whole_window() {
-        let checked = card_height(|ui| check_card(ui, &sample_check(), Lang::Ru));
+        let pal = theme::Palette::dark();
+        let checked = card_height(|ui| check_card(ui, pal, &sample_check(), Lang::Ru));
         assert!(checked > 60.0, "карточка пункта обрезана: {checked}");
         assert!(checked < 160.0, "карточка пункта во весь экран: {checked}");
 
         let metric = Metric::new(37.0, Some("13.1 ГБ из 31.9 ГБ".to_owned()));
         let trace = Trace::default();
         let measured = card_height(|ui| {
-            metric_card(ui, "Процессор", &metric, &trace, theme::ACCENT, 0.0, 1.0);
+            let plot = Plot::new(&trace, pal.accent, 0.0);
+            metric_card(ui, pal, "Процессор", &metric, plot, 1.0);
         });
         assert!(measured > 140.0, "карточка показателя обрезана: {measured}");
         assert!(
@@ -11876,18 +12372,19 @@ mod tests {
     /// `ui.horizontal` в [`process_row`] проверка падает (431 против 61).
     #[test]
     fn a_row_inside_a_horizontal_keeps_its_height() {
+        let pal = theme::Palette::dark();
         let row = crate::model::ProcRow {
             name: "yt-dlp.exe".to_owned(),
             cpu: 12.0,
             cpu_text: "12%".to_owned(),
             mem_text: "310 МБ".to_owned(),
         };
-        let process = card_height(|ui| process_row(ui, &row));
+        let process = card_height(|ui| process_row(ui, pal, &row));
         assert!(process > 30.0, "строка процесса обрезана: {process}");
         assert!(process < 100.0, "строка процесса во весь экран: {process}");
 
         let disclosure = card_height(|ui| {
-            disclosure_row(ui, false, "Тонкие настройки", "по умолчанию", 1.0);
+            disclosure_row(ui, pal, false, "Тонкие настройки", "по умолчанию", 1.0);
         });
         assert!(disclosure > 20.0, "заголовок группы обрезан: {disclosure}");
         assert!(
@@ -11975,13 +12472,15 @@ mod tests {
     /// это только здесь: глазной прогон идёт на том языке, что выбран.
     #[test]
     fn the_about_window_fits_the_smallest_window() {
+        let pal = theme::Palette::dark();
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(520.0, 420.0));
 
         for lang in Lang::ALL {
             // Свой контекст на язык: у модалки есть память между кадрами,
             // и размер от прошлого языка исказил бы первый кадр следующего.
             let ctx = egui::Context::default();
-            theme::apply(&ctx);
+            theme::install_fonts(&ctx);
+        theme::apply(&ctx, pal);
             let mut rect = egui::Rect::NOTHING;
 
             for _ in 0..3 {
@@ -11991,7 +12490,7 @@ mod tests {
                 };
                 let mut output = ctx.run_ui(input, |ui| {
                     // «Скопировано» горит: так ряд с адресом самый широкий.
-                    rect = about_window(ui.ctx(), lang, 1.0, true).response.rect;
+                    rect = about_window(pal, ui.ctx(), lang, 1.0, true).response.rect;
                 });
                 output.textures_delta.clear();
             }
@@ -12088,8 +12587,10 @@ mod tests {
     /// кадру. Свой контекст на вызов — иначе размер от прошлого языка
     /// исказил бы первый кадр следующего.
     fn header_at(width: f32, lang: Lang) -> HeaderRow {
+        let pal = theme::Palette::dark();
         let ctx = egui::Context::default();
-        theme::apply(&ctx);
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, pal);
         let mut row = None;
 
         for _ in 0..3 {
@@ -12102,12 +12603,13 @@ mod tests {
             };
             let mut output = ctx.run_ui(input, |ui| {
                 egui::Panel::top("шапка")
-                    .frame(theme::bar_frame())
+                    .frame(theme::bar_frame(pal))
                     .show(ui, |ui| {
                         let mut open = false;
                         let mut lang_open = false;
                         row = Some(SavioApp::header_row(
                             ui,
+                            pal,
                             1.0,
                             Tab::Weather,
                             lang,
@@ -12130,6 +12632,7 @@ mod tests {
     /// нижней кромки окна.
     #[test]
     fn a_weather_day_row_keeps_its_height() {
+        let pal = theme::Palette::dark();
         let day = crate::model::DayView {
             label: "ср, 16 сен".to_owned(),
             temperatures: "−12° … −3°".to_owned(),
@@ -12137,7 +12640,7 @@ mod tests {
             sky: Sky::Rain,
             description: "Дождь",
         };
-        let height = card_height(|ui| day_row(ui, &day));
+        let height = card_height(|ui| day_row(ui, pal, &day));
         assert!(height > 20.0, "строка дня обрезана: {height}");
         assert!(height < 80.0, "строка дня во весь экран: {height}");
     }
@@ -12149,6 +12652,7 @@ mod tests {
     /// панику, а `NaN` в вершинах — значок просто пропадает с экрана, молча.
     #[test]
     fn every_weather_icon_draws_finite_shapes() {
+        let pal = theme::Palette::dark();
         const SKIES: [Sky; 9] = [
             Sky::Clear,
             Sky::PartlyCloudy,
@@ -12161,7 +12665,8 @@ mod tests {
             Sky::Unknown,
         ];
         let ctx = egui::Context::default();
-        theme::apply(&ctx);
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, pal);
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -12175,7 +12680,7 @@ mod tests {
                     for sky in SKIES {
                         let (rect, _) =
                             ui.allocate_exact_size(egui::vec2(64.0, 64.0), egui::Sense::hover());
-                        weather_icon(ui.painter(), rect, sky, night);
+                        weather_icon(pal, ui.painter(), rect, sky, night);
                     }
                 }
             });

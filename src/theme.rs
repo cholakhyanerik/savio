@@ -1,187 +1,340 @@
-//! Оформление: тёплый тёмный фон, песочный текст, оранжевый акцент.
+//! Оформление: две темы на холодной нейтральной основе, бирюзовый акцент.
 //!
 //! Здесь только цвета, шрифты, метрики и настройка `egui::Style` — слой UI,
 //! как и `app.rs`. Про yt-dlp и процессы этот модуль не знает ничего.
 //!
-//! Стиль собирается **один раз** при старте (`apply`), а не в кадре отрисовки:
-//! `Style` содержит `BTreeMap` шрифтов, и пересборка его 60 раз в секунду
-//! была бы чистой потерей времени. По той же причине один раз собирается и
-//! сетка фона ([`Backdrop`]): она зависит только от размера окна.
+//! Главное отличие от прежней версии — **тема здесь значение, а не набор
+//! `const`**. Цвет берётся из [`Palette`], которую окно держит в состоянии и
+//! передаёт вниз параметром, ровно как `Lang`. Глобаль была бы короче на
+//! четыре сотни правок, но спрятала бы зависимость и сделала бы невозможным
+//! то, ради чего палитра и стала значением: тест, которому нужны обе темы
+//! в одном процессе, и переключение на ходу без пересборки окна.
+//!
+//! Стиль собирается **один раз** при старте и ещё раз при смене темы
+//! ([`apply`]), а не в кадре отрисовки: `Style` содержит `BTreeMap` шрифтов,
+//! и пересборка его 60 раз в секунду была бы чистой потерей времени. Сами
+//! шрифты ставятся отдельно ([`install_fonts`]) и ровно однажды: `set_fonts`
+//! пересобирает атлас глифов, и звать его на каждое нажатие переключателя
+//! темы — это подвисание на ровном месте.
 
 use std::sync::{Arc, LazyLock};
 
 use eframe::egui::{
     Color32, CornerRadius, Context, FontData, FontDefinitions, FontFamily, FontId, Frame,
-    InnerResponse, Margin, Mesh, Painter, Pos2, Rangef, Rect, Shadow, Shape, Stroke, Style,
-    TextStyle, Theme, ThemePreference, Ui, Vec2, Visuals, pos2,
+    InnerResponse, Margin, Mesh, Painter, Rangef, Rect, Shadow, Shape, Stroke, Style, TextStyle,
+    Theme, ThemePreference, Ui, Vec2, Visuals, pos2,
 };
+
+use crate::model::Appearance;
 
 // ---------------------------------------------------------------------------
 // Палитра
 //
 // Каждая пара «текст на фоне» проверена по WCAG 2.1 (формула относительной
-// яркости), коэффициенты указаны в комментариях. Порог для основного текста —
-// 4.5:1, для крупного текста и границ элементов управления — 3:1.
+// яркости), коэффициенты указаны в комментариях к полям. Порог для основного
+// текста — 4.5:1, для крупного текста и границ элементов управления — 3:1.
 // Комбинации, не указанные здесь, использовать не следует: они не проверены.
 //
-// Считать контраст здесь труднее, чем в прежней плоской теме, и вот почему.
-// Карточки полупрозрачные (это и есть «стекло» из макета), а фон под ними —
-// не один цвет, а три тёплых пятна на почти чёрном (см. [`Backdrop`]).
-// Значит, у каждого текста не один фон, а диапазон, и проверять надо **самый
-// светлый** его край: там контраст наименьший. Худший случай посчитан обходом
-// сетки по шести размерам окна, от 520×420 до 3840×2160, и он приходится на
-// маленькое окно — пятна в нём занимают всю площадь. Числа ниже приведены
-// для него:
+// Считать контраст стало проще, чем в прежней тёплой теме, и это единственная
+// приятная новость от смены макета. Раньше карточки были полупрозрачным
+// стеклом, а под ними лежали три тёплых пятна, так что у одного и того же
+// текста фон был разным в разных углах окна, и проверять приходилось самый
+// светлый край диапазона. Теперь поверхности сплошные, и «худший фон» — не
+// диапазон, а конечный список из семи значений: фон окна, рельс, карточка,
+// вложенный блок на карточке, вложенный блок на рельсе, поле ввода и модалка.
+// Их и перебирает `every_colour_passes_its_threshold_in_both_themes`.
 //
-//     фон               rgb(49, 41, 33)
-//     карточка          rgb(64, 57, 48)   фон + 7.5% песочного
-//     вложенная         rgb(74, 67, 59)   карточка + 5.5% песочного
+// Два расхождения с макетом, оба намеренные и оба — в пользу Правила 4,
+// а не вкуса.
 //
-// Отсюда два расхождения с макетом, оба намеренные и оба — в пользу правила,
-// а не вкуса. Приглушённый текст в макете `#a19786`: на вложенной карточке
-// это 3.5:1, порог 4.5 не проходит. Границы в макете — песочный с прозрачностью
-// 0.14: это 1.5:1, порог 3:1 не проходит даже близко. Оба подняты до
-// проходящих значений; всё остальное взято из макета как есть.
+// Первое: кромка элементов управления. В макете это `rgba(255,255,255,.16)`
+// в тёмной теме и `rgba(26,31,31,.22)` в светлой, то есть 1.66:1 и 1.58:1
+// на карточке — порог 3:1 не проходит даже близко. Ровно та же правка уже
+// делалась однажды, в первой версии темы, и по той же причине; здесь граница
+// снова сплошная и снова поднята до проходящего значения.
+//
+// Второе: `TEXT_FAINT`. Макет даёт ему 4.23:1 на вложенной карточке, и потому
+// этот цвет разрешён только на четырёх поверхностях из семи (см. его поле).
+// Поднимать его было нельзя: между `text_muted` и порогом остаётся меньше
+// десятка единиц яркости, и «ещё более тусклый» цвет, проходящий везде, от
+// `text_muted` уже неотличим — то есть роль исчезла бы, а не стала безопаснее.
 // ---------------------------------------------------------------------------
 
-// Поверхности.
-/// Основа фона: почти чёрный тёплого тона. Поверх него [`Backdrop`] кладёт
-/// три пятна и общую вуаль — вместе это и есть фон окна.
-pub const BG_BASE: Color32 = Color32::from_rgb(16, 14, 12);
+/// Все цвета окна одним значением.
+///
+/// `Copy` намеренно: 35 полей по четыре байта — это 140 байт, дешевле
+/// указателя с разыменованием, и копия в начале функции снимает все споры
+/// с заимствованием `&mut self` у методов `SavioApp`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Palette {
+    // Поверхности.
+    /// Фон окна. Сплошной: пятен и вуали, как в прежней теме, больше нет.
+    pub bg: Color32,
+    /// Заливка рельса слева и полос шапки, пока они есть.
+    pub rail_fill: Color32,
+    /// Заливка карточки. Сплошная, а не стеклянная, — так в макете v2.
+    pub card_fill: Color32,
+    /// Заливка вложенного блока: строка очереди, строка истории, поле графика,
+    /// нижний блок рельса. Полупрозрачная, поэтому её цвет зависит от того,
+    /// на чём она лежит, — отсюда в проверке две подложки, а не одна.
+    pub card_inner: Color32,
+    /// Поле ввода. В светлой теме совпадает с карточкой намеренно: поле там
+    /// держится на кромке, а не на заливке.
+    pub input_fill: Color32,
+    /// Жёлоб прогресс-бара. Отдельно от поля ввода, и это не придирка:
+    /// в светлой теме поле белое, и белый жёлоб на белой карточке был бы
+    /// невидим — полосу не стало бы видно, пока она не заполнится.
+    pub progress_track: Color32,
+    /// Заливка модального окна. Сплошная: модалка лежит поверх затемнения,
+    /// и просвечивать сквозь неё нечему.
+    pub modal_fill: Color32,
+    /// Затемнение под модальным окном. Тёмное в обеих темах: оно гасит окно,
+    /// а не подкрашивает его.
+    pub modal_backdrop: Color32,
 
-/// Заливка карточки. Полупрозрачная намеренно: сквозь неё виден фон, и
-/// карточка выглядит стеклом, а не наклейкой. Размытия под слоем egui не
-/// умеет (в CSS это `backdrop-filter`), так что «стекло» здесь — только
-/// прозрачность и общий градиент под ней.
-pub const CARD_FILL: Color32 = Color32::from_rgba_premultiplied(19, 18, 18, 19);
+    // Границы.
+    /// Декоративная линия: кромка карточки, разделитель. Намеренно почти
+    /// незаметна — не годится как единственный признак элемента, и порог
+    /// 3:1 к ней не применяется.
+    pub border_subtle: Color32,
+    /// Граница элементов управления: дорожка переключателя, вторичная кнопка,
+    /// поле ввода. Сплошная, а не прозрачная, и это не придирка: у прозрачной
+    /// границы контраст меняется вместе с фоном под ней. Минимум 3.15:1.
+    pub border_strong: Color32,
+    /// Граница при наведении: заметно ярче обычной, чтобы отклик читался
+    /// и без изменения заливки. Минимум 4.5:1.
+    pub border_hover: Color32,
 
-/// Заливка вложенной карточки: строка очереди, строка истории, поле графика.
-/// Светлее основной ровно настолько, чтобы отделиться от неё, не превращаясь
-/// во вторую рамку.
-pub const CARD_INNER: Color32 = Color32::from_rgba_premultiplied(14, 13, 13, 14);
+    // Текст.
+    /// Заголовки и значения. Минимум 8.9:1.
+    pub text_primary: Color32,
+    /// Подписи, значения в таблицах, строка прогресса. Минимум 6.1:1.
+    pub text_secondary: Color32,
+    /// Оговорки, журнал, подсказка в пустом поле, прочерк «нет данных».
+    /// Минимум 4.78:1.
+    pub text_muted: Color32,
+    /// Заголовки групп в рельсе и номер версии.
+    ///
+    /// Разрешён **не везде**: на фоне окна, на рельсе, на карточке и в
+    /// модалке (минимум 4.65:1), но не во вложенном блоке — там он даёт
+    /// 4.23:1. Это ограничение держит проверка, у которой для каждого цвета
+    /// свой список поверхностей, а не общий.
+    pub text_faint: Color32,
+    /// Подпись на акцентной заливке главной кнопки. Минимум 6.1:1.
+    pub text_on_accent: Color32,
+    /// Подпись на заливке выключенной главной кнопки. Отдельно от предыдущей,
+    /// потому что в светлой теме они разные: включённая кнопка тёмная и
+    /// подписана белым, выключенная — пастельная и подписана тёмным.
+    /// Минимум 5.39:1.
+    pub text_on_accent_disabled: Color32,
 
-/// Поле ввода и жёлоб прогресс-бара — «утоплены» глубже карточки.
-/// Тёмная полупрозрачная заливка, как в макете: на любой карточке она даёт
-/// одинаковое ощущение углубления.
-pub const INPUT_FILL: Color32 = Color32::from_rgba_premultiplied(7, 6, 5, 140);
+    // Акцент.
+    /// Главный цвет. Минимум 4.51:1 как текст.
+    pub accent: Color32,
+    /// Наведение.
+    pub accent_hover: Color32,
+    /// Нажатие.
+    pub accent_active: Color32,
+    /// Приглушённый акцент выключенной кнопки: заметно тусклее активного,
+    /// но не выглядит поломкой. Выключенная кнопка обязана оставаться
+    /// читаемой (`disabled_alpha` там выставлен в единицу).
+    pub accent_disabled: Color32,
+    /// Подсветка выделенного текста в поле ввода.
+    pub accent_selection: Color32,
+    /// Мягкая акцентная подложка: выбранный пункт рельса, подсвеченная строка
+    /// очереди, плашка «идёт сейчас».
+    ///
+    /// На ней `text_muted` брать нельзя: заливка поднимает фон, и приглушённый
+    /// текст падает до 4.03:1. Разрешены `accent_text`, `text_secondary`
+    /// и `text_primary` — минимум 5.03:1.
+    pub accent_soft: Color32,
+    /// Текст на акцентной подложке. Минимум 5.03:1.
+    pub accent_text: Color32,
 
-/// Жёлоб прогресс-бара. Тот же тон, что у поля ввода: и то и другое —
-/// углубление в карточке.
-pub const PROGRESS_TRACK: Color32 = INPUT_FILL;
+    // Состояния.
+    /// Успех и «в порядке». Минимум 6.16:1.
+    pub state_success: Color32,
+    /// Ошибка. Минимум 4.6:1.
+    pub state_error: Color32,
+    /// Предупреждение. Минимум 5.76:1.
+    pub state_warning: Color32,
+    /// Мягкая зелёная подложка: плашка «есть 2160p», «Опрос идёт».
+    pub success_soft: Color32,
 
-/// Заливка модального окна. Сплошная, а не стеклянная: модалка лежит поверх
-/// затемнения, и просвечивать сквозь неё нечему.
-pub const MODAL_FILL: Color32 = Color32::from_rgb(42, 37, 33);
+    // Небо: значки погоды.
+    //
+    // Значок — графика, и порог для него 3:1. Почти все цвета неба берутся
+    // из уже проверенной части палитры и проходят и текстовый порог; свой
+    // здесь один — голубой воды, и он заодно подписывает вероятность осадков
+    // («40%»), поэтому проверяется по порогу текста вместе с остальными.
+    /// Дождь, морось и вероятность осадков. Единственный холодный цвет
+    /// прежней палитры остался холодным и в новой. Минимум 4.53:1.
+    pub sky_water: Color32,
 
-/// Затемнение под модальным окном. Полупрозрачное, а не сплошное: главное
-/// окно должно просвечивать, иначе модалка выглядит отдельным приложением,
-/// а не слоем поверх Savio.
-pub const MODAL_BACKDROP: Color32 = Color32::from_black_alpha(190);
+    // Стекло.
+    /// Постоянный свет на верхней грани карточки.
+    pub gloss_line: Color32,
+    /// Яркость бегущего пятна на той же грани (приём 06).
+    ///
+    /// В светлой теме это не белый, а акцент: белая полоса по белой карточке
+    /// не видна вовсе, и приём исчез бы молча — ровно тот случай, которого
+    /// не ловят ни сборка, ни тесты.
+    pub gloss_spark: Color32,
+    /// Цвет тени под карточкой.
+    pub shadow: Color32,
+}
 
-/// Заливка шапки и подвала. Едва заметная плёнка поверх фона: полосы должны
-/// отделяться от содержимого, но не выглядеть отдельными панелями.
-pub const BG_BAR: Color32 = Color32::from_rgba_premultiplied(10, 10, 9, 10);
+impl Palette {
+    /// Палитра выбранной темы.
+    pub fn of(appearance: Appearance) -> Palette {
+        match appearance {
+            Appearance::Dark => Palette::dark(),
+            Appearance::Light => Palette::light(),
+        }
+    }
 
-// Границы.
-/// Декоративная линия: кромка карточки, разделитель под шапкой, подсветка
-/// верхнего края стекла. Намеренно почти незаметна — не годится как
-/// единственный признак элемента, и порог 3:1 к ней не применяется.
-pub const BORDER_SUBTLE: Color32 = Color32::from_rgba_premultiplied(30, 30, 29, 31);
+    /// Тёмная тема.
+    pub fn dark() -> Palette {
+        Palette {
+            bg: Color32::from_rgb(0x12, 0x15, 0x14),
+            rail_fill: Color32::from_rgb(0x17, 0x1B, 0x1B),
+            card_fill: Color32::from_rgb(0x1A, 0x1F, 0x1F),
+            card_inner: Color32::from_rgba_unmultiplied(255, 255, 255, 10),
+            input_fill: Color32::from_rgb(0x0E, 0x12, 0x12),
+            progress_track: Color32::from_rgb(0x0E, 0x12, 0x12),
+            // Чуть темнее макетного `#1E2322`: на том приглушённая подпись
+            // давала 4.45:1 — на пять сотых ниже порога, и ровно это поймала
+            // проверка палитры. Глазу разница в три единицы яркости не видна,
+            // порог WCAG она переходит.
+            modal_fill: Color32::from_rgb(0x1B, 0x20, 0x20),
+            modal_backdrop: Color32::from_black_alpha(190),
 
-/// Граница элементов управления: дорожка переключателя, вторичная кнопка,
-/// поле ввода. Сплошная, а не прозрачная, и это не придирка: у прозрачной
-/// границы контраст меняется вместе с фоном под ней, и на светлом краю
-/// градиента она перестаёт проходить порог. 3.23:1 на вложенной карточке,
-/// 3.78:1 на обычной, 4.71:1 на фоне — порог 3:1 проходит везде.
-pub const BORDER_STRONG: Color32 = Color32::from_rgb(158, 147, 133);
+            border_subtle: Color32::from_rgba_unmultiplied(255, 255, 255, 18),
+            border_strong: Color32::from_rgb(0x6F, 0x76, 0x76),
+            border_hover: Color32::from_rgb(0x8D, 0x93, 0x93),
 
-/// Граница при наведении: заметно ярче обычной, чтобы отклик читался
-/// и без изменения заливки.
-pub const BORDER_HOVER: Color32 = Color32::from_rgb(186, 176, 160);
+            text_primary: Color32::from_rgb(0xF2, 0xF5, 0xF4),
+            text_secondary: Color32::from_rgb(0xC2, 0xCC, 0xCC),
+            text_muted: Color32::from_rgb(0x8B, 0x98, 0x99),
+            text_faint: Color32::from_rgb(0x7C, 0x8A, 0x8B),
+            text_on_accent: Color32::from_rgb(0x0E, 0x2A, 0x2C),
+            text_on_accent_disabled: Color32::from_rgb(0x0E, 0x2A, 0x2C),
 
-// Текст.
-/// Основной текст. Не чистый белый: на тёплом тёмном фоне он «звенит».
-/// Минимум 8.89:1 — порог 4.5:1 проходит с запасом.
-pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(249, 244, 237);
+            accent: Color32::from_rgb(0x7F, 0xC3, 0xC9),
+            accent_hover: Color32::from_rgb(0x9B, 0xD2, 0xD8),
+            accent_active: Color32::from_rgb(0x6B, 0xB0, 0xB6),
+            accent_disabled: Color32::from_rgb(0x6F, 0xA3, 0xA7),
+            accent_selection: Color32::from_rgb(0x1E, 0x4A, 0x4E),
+            accent_soft: Color32::from_rgba_unmultiplied(0x7F, 0xC3, 0xC9, 41),
+            accent_text: Color32::from_rgb(0x9F, 0xD6, 0xDB),
 
-/// Подписи, значения в таблицах, строка прогресса. Минимум 6.56:1.
-pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(220, 211, 196);
+            state_success: Color32::from_rgb(0xAE, 0xBF, 0x92),
+            state_error: Color32::from_rgb(0xD0, 0x76, 0x6C),
+            state_warning: Color32::from_rgb(0xE8, 0xB9, 0x6A),
+            success_soft: Color32::from_rgba_unmultiplied(0xAE, 0xBF, 0x92, 36),
 
-/// Оговорки, журнал, подсказка в пустом поле, прочерк «нет данных».
-/// Минимум 4.54:1 — порог 4.5:1 проходит, но без запаса, поэтому светлее
-/// макетного `#a19786` (тот давал 3.54:1 на вложенной карточке).
-pub const TEXT_MUTED: Color32 = Color32::from_rgb(186, 176, 160);
+            sky_water: Color32::from_rgb(0x92, 0xBA, 0xE0),
 
-/// Текст на оранжевой кнопке. Светлый здесь дал бы 1.9:1 — нечитаемо.
-/// Тёмно-коричневая подпись даёт 6.93:1.
-pub const TEXT_ON_ACCENT: Color32 = Color32::from_rgb(64, 35, 16);
+            gloss_line: Color32::from_rgba_unmultiplied(255, 255, 255, 13),
+            gloss_spark: Color32::from_rgba_unmultiplied(255, 255, 255, 150),
+            shadow: Color32::from_black_alpha(70),
+        }
+    }
 
-// Акцент.
-/// Главный цвет: тёплый оранжевый. Минимум 4.71:1 как текст.
-pub const ACCENT: Color32 = Color32::from_rgb(246, 160, 107);
-/// Наведение — светлее.
-pub const ACCENT_HOVER: Color32 = Color32::from_rgb(255, 198, 165);
-/// Нажатие — темнее. С `TEXT_ON_ACCENT` даёт 5.36:1.
-pub const ACCENT_ACTIVE: Color32 = Color32::from_rgb(224, 139, 87);
-/// Приглушённый акцент выключенной кнопки: заметно тусклее активного,
-/// но не выглядит поломкой. С `TEXT_ON_ACCENT` даёт 4.94:1 — выключенная
-/// кнопка обязана оставаться читаемой.
-pub const ACCENT_DISABLED: Color32 = Color32::from_rgb(196, 139, 104);
-/// Подсветка выделенного текста в поле ввода. Тёмная, чтобы сам текст
-/// поверх неё оставался читаемым.
-pub const ACCENT_SELECTION: Color32 = Color32::from_rgb(92, 55, 30);
-/// Мягкая акцентная подложка: выбранный пункт списка, плашка «идёт сейчас».
-pub const ACCENT_SOFT: Color32 = Color32::from_rgba_premultiplied(34, 22, 15, 36);
+    /// Светлая тема.
+    ///
+    /// Акцент здесь заметно темнее, чем в тёмной теме, и это намеренно:
+    /// бирюзовый `#7FC3C9` на светлом фоне даёт около 1.9:1 и не читается
+    /// ни подписью, ни кромкой.
+    pub fn light() -> Palette {
+        Palette {
+            bg: Color32::from_rgb(0xF4, 0xF2, 0xEC),
+            rail_fill: Color32::from_rgb(0xEA, 0xE7, 0xDF),
+            card_fill: Color32::from_rgb(0xFF, 0xFF, 0xFF),
+            card_inner: Color32::from_rgba_unmultiplied(0x1A, 0x1F, 0x1F, 13),
+            input_fill: Color32::from_rgb(0xFF, 0xFF, 0xFF),
+            progress_track: Color32::from_rgb(0xE3, 0xE0, 0xD8),
+            modal_fill: Color32::from_rgb(0xFF, 0xFF, 0xFF),
+            modal_backdrop: Color32::from_black_alpha(110),
 
-// Состояния.
-/// Успех и «в порядке»: приглушённый шалфейный. Минимум 4.94:1.
-pub const STATE_SUCCESS: Color32 = Color32::from_rgb(174, 191, 146);
-/// Ошибка: тёплый красный. Минимум 4.55:1 — светлее макетного `#f0897c`,
-/// который на вложенной карточке давал 3.97:1.
-pub const STATE_ERROR: Color32 = Color32::from_rgb(243, 154, 143);
-/// Предупреждение: медовый. Минимум 5.36:1.
-pub const STATE_WARNING: Color32 = Color32::from_rgb(232, 185, 106);
-/// Мягкая зелёная подложка: плашка «есть 2160p», «Опрос идёт».
-pub const SUCCESS_SOFT: Color32 = Color32::from_rgba_premultiplied(26, 28, 22, 38);
+            border_subtle: Color32::from_rgba_unmultiplied(0x1A, 0x1F, 0x1F, 26),
+            border_strong: Color32::from_rgb(0x7A, 0x7A, 0x76),
+            border_hover: Color32::from_rgb(0x61, 0x62, 0x5E),
 
-// Небо: значки погоды.
-//
-// Значок — графика, и порог для него 3:1. Почти все цвета неба взяты из уже
-// проверенной палитры и проходят и текстовый порог; новый здесь один — голубой
-// воды, и он заодно подписывает вероятность осадков («40%»), поэтому
-// проверяется тестом по порогу текста вместе с остальными.
-/// Солнце — оранжевый акцент: тёплое пятно на значке.
-pub const SKY_SUN: Color32 = ACCENT;
-/// Луна — бледный персик. Ночь на значке обязана отличаться от дня не только
-/// формой: на мелком столбике почасового прогноза форму не разглядеть.
-pub const SKY_MOON: Color32 = ACCENT_HOVER;
-/// Ближнее облако.
-pub const SKY_CLOUD: Color32 = TEXT_SECONDARY;
-/// Дальнее облако пасмурного неба — тусклее ближнего, иначе два облака
-/// сливаются в одно пятно.
-pub const SKY_CLOUD_FAR: Color32 = TEXT_MUTED;
-/// Дождь, морось и вероятность осадков. Единственный холодный цвет палитры —
-/// и ровно поэтому вода с ним читается водой, а не ещё одним оттенком песка.
-/// 7.02:1 на фоне, 5.59:1 на карточке, 4.78:1 на вложенной.
-pub const SKY_WATER: Color32 = Color32::from_rgb(146, 186, 224);
-/// Снег — самый светлый текст.
-pub const SKY_SNOW: Color32 = TEXT_PRIMARY;
-/// Молния — медовый предупреждения.
-pub const SKY_BOLT: Color32 = STATE_WARNING;
+            text_primary: Color32::from_rgb(0x17, 0x1B, 0x1B),
+            text_secondary: Color32::from_rgb(0x43, 0x50, 0x4F),
+            text_muted: Color32::from_rgb(0x56, 0x60, 0x5F),
+            text_faint: Color32::from_rgb(0x5E, 0x68, 0x67),
+            text_on_accent: Color32::from_rgb(0xFF, 0xFF, 0xFF),
+            text_on_accent_disabled: Color32::from_rgb(0x1B, 0x3A, 0x3C),
+
+            accent: Color32::from_rgb(0x26, 0x6B, 0x72),
+            accent_hover: Color32::from_rgb(0x1F, 0x5A, 0x60),
+            accent_active: Color32::from_rgb(0x17, 0x47, 0x4C),
+            accent_disabled: Color32::from_rgb(0x9D, 0xBF, 0xC2),
+            accent_selection: Color32::from_rgb(0xBB, 0xD9, 0xDC),
+            accent_soft: Color32::from_rgba_unmultiplied(0x26, 0x6B, 0x72, 31),
+            accent_text: Color32::from_rgb(0x1F, 0x5F, 0x66),
+
+            state_success: Color32::from_rgb(0x46, 0x52, 0x31),
+            state_error: Color32::from_rgb(0xA1, 0x42, 0x37),
+            state_warning: Color32::from_rgb(0x6F, 0x4B, 0x08),
+            success_soft: Color32::from_rgba_unmultiplied(0x46, 0x52, 0x31, 31),
+
+            sky_water: Color32::from_rgb(0x2C, 0x66, 0x90),
+
+            gloss_line: Color32::from_rgba_unmultiplied(0x1A, 0x1F, 0x1F, 15),
+            gloss_spark: Color32::from_rgba_unmultiplied(0x26, 0x6B, 0x72, 90),
+            shadow: Color32::from_black_alpha(28),
+        }
+    }
+
+    /// Солнце: ясное небо на значке погоды.
+    pub fn sky_sun(self) -> Color32 {
+        self.accent
+    }
+
+    /// Луна. Ночь на значке обязана отличаться от дня не только формой:
+    /// на мелком столбике почасового прогноза форму не разглядеть.
+    pub fn sky_moon(self) -> Color32 {
+        self.accent_hover
+    }
+
+    /// Ближнее облако.
+    pub fn sky_cloud(self) -> Color32 {
+        self.text_secondary
+    }
+
+    /// Дальнее облако пасмурного неба — тусклее ближнего, иначе два облака
+    /// сливаются в одно пятно.
+    pub fn sky_cloud_far(self) -> Color32 {
+        self.text_muted
+    }
+
+    /// Снег — самый контрастный цвет текста.
+    pub fn sky_snow(self) -> Color32 {
+        self.text_primary
+    }
+
+    /// Молния — медовый предупреждения.
+    pub fn sky_bolt(self) -> Color32 {
+        self.state_warning
+    }
+}
 
 // QR-код на экране «Телефон».
 //
-// Тёмные модули на светлом поле, а не наоборот, и это не вкус. Камеры
-// телефонов код в обратных цветах читают не все: по стандарту QR тёмное —
-// это модуль, и часть сканеров светлые модули на тёмном просто не находит.
-// Светлое поле вокруг кода (тихая зона) обязательно по той же причине —
-// без неё край кода сливается с тёмной карточкой. Пара даёт 17.60:1:
-// сканеру нужен не порог WCAG, а как можно больший перепад, и больше него
-// в палитре не набрать.
+// От темы не зависит, и это не недосмотр. Тёмные модули на светлом поле, а не
+// наоборот: камеры телефонов код в обратных цветах читают не все — по
+// стандарту QR тёмное это модуль, и часть сканеров светлые модули на тёмном
+// просто не находит. Светлое поле вокруг кода (тихая зона) обязательно по той
+// же причине. Возьми эти два цвета из палитры — и в светлой теме код
+// перевернулся бы: `bg` там светлее `text_primary`. Пара даёт 17.60:1:
+// сканеру нужен не порог WCAG, а как можно больший перепад.
 /// Модуль кода.
-pub const QR_DARK: Color32 = BG_BASE;
+pub const QR_DARK: Color32 = Color32::from_rgb(16, 14, 12);
 /// Поле кода и тихая зона вокруг.
-pub const QR_LIGHT: Color32 = TEXT_PRIMARY;
+pub const QR_LIGHT: Color32 = Color32::from_rgb(249, 244, 237);
 
 // ---------------------------------------------------------------------------
 // Метрики
@@ -349,16 +502,22 @@ fn fonts() -> FontDefinitions {
     defs
 }
 
-/// Собирает стиль и ставит его в контекст.
+/// Ставит шрифты в контекст. Зовётся **один раз**, при создании приложения.
 ///
-/// Вызывается один раз при создании приложения. Тема задаётся жёстко и не
-/// зависит от системной светлой/тёмной схемы: приложение всегда тёмное,
-/// иначе часть палитры перестала бы проходить по контрасту.
-pub fn apply(ctx: &Context) {
+/// Отдельно от [`apply`] намеренно: `set_fonts` пересобирает атлас глифов, и
+/// если звать его при каждой смене темы, переключатель будет подвешивать окно
+/// на десятки миллисекунд там, где меняются одни только цвета.
+pub fn install_fonts(ctx: &Context) {
     ctx.set_fonts(fonts());
+}
 
+/// Собирает стиль выбранной темы и ставит его в контекст.
+///
+/// Зовётся при старте и при каждой смене темы — но не в кадре: `Style`
+/// содержит `BTreeMap` шрифтов, и пересобирать его 60 раз в секунду незачем.
+pub fn apply(ctx: &Context, palette: Palette) {
     let mut style = Style {
-        visuals: visuals(),
+        visuals: visuals(palette),
         ..Style::default()
     };
 
@@ -382,9 +541,13 @@ pub fn apply(ctx: &Context) {
     spacing.menu_margin = Margin::same(8);
 
     // По умолчанию egui следует за системной схемой (`ThemePreference::System`),
-    // и на светлой ОС приложение открылось бы со светлым стилем. Тема Savio
-    // тёмная всегда: часть палитры на светлом фоне не прошла бы по контрасту.
-    ctx.set_theme(ThemePreference::Dark);
+    // и на светлой ОС тёмная тема Savio открылась бы со светлым стилем. Выбор
+    // темы принадлежит человеку и лежит в настройках, а не в системе.
+    ctx.set_theme(if palette.is_dark() {
+        ThemePreference::Dark
+    } else {
+        ThemePreference::Light
+    });
 
     // Стиль кладём в оба слота: если egui всё же переключит тему (например,
     // при смене системной схемы на ходу), внешний вид не поедет.
@@ -393,40 +556,52 @@ pub fn apply(ctx: &Context) {
     ctx.set_style_of(Theme::Light, style);
 }
 
-fn visuals() -> Visuals {
-    let mut v = Visuals::dark();
+impl Palette {
+    /// Тёмная ли это тема. Спрашивается по яркости фона, а не по полю
+    /// «какую выбрали»: палитра обязана оставаться значением, из которого
+    /// всё выводится, иначе подправленный вручную набор цветов и его признак
+    /// разъедутся.
+    fn is_dark(self) -> bool {
+        self.text_primary.r() > self.bg.r()
+    }
+}
 
-    // Фон рисует [`Backdrop`], а не заливка панели: сплошным цветом три
-    // тёплых пятна не передать. Панели поэтому прозрачные.
-    v.panel_fill = Color32::TRANSPARENT;
-    v.window_fill = MODAL_FILL;
-    v.faint_bg_color = CARD_INNER;
-    v.extreme_bg_color = INPUT_FILL;
+fn visuals(p: Palette) -> Visuals {
+    let mut v = if p.is_dark() {
+        Visuals::dark()
+    } else {
+        Visuals::light()
+    };
+
+    v.panel_fill = p.bg;
+    v.window_fill = p.modal_fill;
+    v.faint_bg_color = p.card_inner;
+    v.extreme_bg_color = p.input_fill;
     // Поле ввода красим напрямую, не полагаясь на `extreme_bg_color`.
-    v.text_edit_bg_color = Some(INPUT_FILL);
-    v.code_bg_color = CARD_INNER;
-    v.window_stroke = Stroke::new(1.0, BORDER_SUBTLE);
+    v.text_edit_bg_color = Some(p.input_fill);
+    v.code_bg_color = p.card_inner;
+    v.window_stroke = Stroke::new(1.0, p.border_subtle);
     v.window_corner_radius = CornerRadius::same(RADIUS_INNER);
     v.menu_corner_radius = CornerRadius::same(RADIUS_INNER);
-    v.warn_fg_color = STATE_WARNING;
-    v.error_fg_color = STATE_ERROR;
+    v.warn_fg_color = p.state_warning;
+    v.error_fg_color = p.state_error;
     // `ui.weak()` по умолчанию берёт полупрозрачный основной цвет, из-за чего
     // контраст плавает. Задаём его явно проверенным тоном.
-    v.weak_text_color = Some(TEXT_SECONDARY);
+    v.weak_text_color = Some(p.text_secondary);
 
     // Фокус и выделение текста — акцентные.
-    v.selection.bg_fill = ACCENT_SELECTION;
-    v.selection.stroke = Stroke::new(1.0, ACCENT);
-    v.text_cursor.stroke = Stroke::new(2.0, ACCENT);
+    v.selection.bg_fill = p.accent_selection;
+    v.selection.stroke = Stroke::new(1.0, p.accent);
+    v.text_cursor.stroke = Stroke::new(2.0, p.accent);
 
     let pill = CornerRadius::same(RADIUS_PILL);
 
     // Неинтерактивное: подписи, рамки, разделители.
     let w = &mut v.widgets.noninteractive;
-    w.bg_fill = CARD_FILL;
-    w.weak_bg_fill = CARD_FILL;
-    w.bg_stroke = Stroke::new(1.0, BORDER_SUBTLE);
-    w.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+    w.bg_fill = p.card_fill;
+    w.weak_bg_fill = p.card_fill;
+    w.bg_stroke = Stroke::new(1.0, p.border_subtle);
+    w.fg_stroke = Stroke::new(1.0, p.text_primary);
     w.corner_radius = pill;
 
     // Покой: вторичные кнопки, поле ввода. Заливки у вторичной кнопки нет —
@@ -434,230 +609,38 @@ fn visuals() -> Visuals {
     let w = &mut v.widgets.inactive;
     w.bg_fill = Color32::TRANSPARENT;
     w.weak_bg_fill = Color32::TRANSPARENT;
-    w.bg_stroke = Stroke::new(1.0, BORDER_STRONG);
-    w.fg_stroke = Stroke::new(1.0, TEXT_SECONDARY);
+    w.bg_stroke = Stroke::new(1.0, p.border_strong);
+    w.fg_stroke = Stroke::new(1.0, p.text_secondary);
     w.corner_radius = pill;
     w.expansion = 0.0;
 
     // Наведение: проступает заливка, граница светлеет, подпись — тоже.
     let w = &mut v.widgets.hovered;
-    w.bg_fill = CARD_INNER;
-    w.weak_bg_fill = CARD_INNER;
-    w.bg_stroke = Stroke::new(1.0, BORDER_HOVER);
-    w.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+    w.bg_fill = p.card_inner;
+    w.weak_bg_fill = p.card_inner;
+    w.bg_stroke = Stroke::new(1.0, p.border_hover);
+    w.fg_stroke = Stroke::new(1.0, p.text_primary);
     w.corner_radius = pill;
     w.expansion = 1.0;
 
     // Нажатие.
     let w = &mut v.widgets.active;
-    w.bg_fill = CARD_FILL;
-    w.weak_bg_fill = CARD_FILL;
-    w.bg_stroke = Stroke::new(1.0, ACCENT);
-    w.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+    w.bg_fill = p.card_fill;
+    w.weak_bg_fill = p.card_fill;
+    w.bg_stroke = Stroke::new(1.0, p.accent);
+    w.fg_stroke = Stroke::new(1.0, p.text_primary);
     w.corner_radius = pill;
     w.expansion = 0.0;
 
     // Раскрытый список / развёрнутый «Журнал».
     let w = &mut v.widgets.open;
-    w.bg_fill = CARD_INNER;
-    w.weak_bg_fill = CARD_INNER;
-    w.bg_stroke = Stroke::new(1.0, BORDER_STRONG);
-    w.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+    w.bg_fill = p.card_inner;
+    w.weak_bg_fill = p.card_inner;
+    w.bg_stroke = Stroke::new(1.0, p.border_strong);
+    w.fg_stroke = Stroke::new(1.0, p.text_primary);
     w.corner_radius = pill;
 
     v
-}
-
-// ---------------------------------------------------------------------------
-// Фон
-// ---------------------------------------------------------------------------
-
-/// Одно тёплое пятно фона: цвет, плотность в середине, положение в долях
-/// окна, радиусы в точках и доля радиуса, на которой оно сходит на нет.
-struct Spot {
-    color: Color32,
-    alpha: f32,
-    at: (f32, f32),
-    radius: (f32, f32),
-    stop: f32,
-}
-
-/// Три пятна из макета: оранжевое сверху слева, шалфейное справа, глиняное
-/// снизу. Положение — в долях окна, радиусы — в точках, как в исходном CSS:
-/// поэтому в маленьком окне пятна занимают всю площадь, а в развёрнутом
-/// на два монитора остаются мягкими кляксами, а не растянутой заливкой.
-static SPOTS: [Spot; 3] = [
-    Spot {
-        color: Color32::from_rgb(246, 160, 107),
-        alpha: 0.20,
-        at: (0.18, -0.10),
-        radius: (900.0, 620.0),
-        stop: 0.70,
-    },
-    Spot {
-        color: Color32::from_rgb(174, 191, 146),
-        alpha: 0.14,
-        at: (0.92, 0.12),
-        radius: (760.0, 560.0),
-        stop: 0.72,
-    },
-    Spot {
-        color: Color32::from_rgb(214, 127, 72),
-        alpha: 0.16,
-        at: (0.60, 1.08),
-        radius: (700.0, 520.0),
-        stop: 0.70,
-    },
-];
-
-/// Вуаль поверх пятен: из тёплого серого в почти чёрный, по диагонали.
-/// Она и делает фон достаточно тёмным, чтобы светлый текст на нём читался.
-const VEIL_NEAR: (Color32, f32) = (Color32::from_rgb(46, 41, 34), 0.72);
-const VEIL_FAR: (Color32, f32) = (Color32::from_rgb(20, 18, 15), 0.86);
-/// Угол вуали в градусах, считая как в CSS: 0 — вверх, дальше по часовой.
-const VEIL_ANGLE: f32 = 158.0;
-
-/// Сторона ячейки сетки фона в точках.
-///
-/// Цвет между вершинами видеокарта растягивает линейно, а пятна круглые, —
-/// значит, чем крупнее ячейка, тем заметнее гранёность. 64 точки подобраны
-/// так, что переходы уже неотличимы от гладких, а вершин остаётся немного:
-/// в окне 1920×1080 это 31×18, то есть около шестисот вершин на весь фон.
-const CELL: f32 = 64.0;
-
-/// Фон окна: три тёплых пятна и вуаль поверх, одной треугольной сеткой.
-///
-/// Сетка пересобирается только при изменении размера окна, а в кадре из неё
-/// берётся `Arc` — то есть один атомарный инкремент вместо сотни вершин
-/// (Правило 1). Держать её в поле приложения обязательно: считать цвета
-/// шестьсот раз в кадре, шестьдесят кадров в секунду, было бы ровно той
-/// лишней работой, которой правило и не велит.
-pub struct Backdrop {
-    rect: Rect,
-    /// Сдвиг центров пятен в долях окна, на котором собрана нынешняя сетка.
-    shift: f32,
-    mesh: Arc<Mesh>,
-}
-
-impl Default for Backdrop {
-    fn default() -> Self {
-        Self {
-            rect: Rect::ZERO,
-            shift: 0.0,
-            mesh: Arc::new(Mesh::default()),
-        }
-    }
-}
-
-/// Насколько центры пятен тянутся к выбранному разделу, в долях окна.
-///
-/// Три сотых — это несколько десятков точек на обычном окне: свет за стеклом
-/// заметно перекладывается, но узнать в этом «анимацию» нельзя, а именно так
-/// подложке и положено себя вести.
-pub const DRIFT_PULL: f32 = 0.03;
-
-impl Backdrop {
-    /// Рисует фон в отведённом прямоугольнике, пересобрав сетку, если окно
-    /// изменило размер или пятна сдвинулись.
-    ///
-    /// `shift` — сдвиг центров пятен по горизонтали, в долях ширины окна.
-    ///
-    /// Пересборка **не бесплатна**, и это главное, что нужно про неё знать:
-    /// это сотни вершин, у каждой три пятна и вуаль, плюс новый `Mesh`
-    /// в куче. Поэтому сетка живёт полем и пересобирается только тогда,
-    /// когда одно из двух чисел вправду изменилось. В покое здесь по-прежнему
-    /// не тратится ни кадра — сдвиг доезжает до цели и останавливается,
-    /// а вечного дрейфа у Savio нет намеренно: он один просил бы кадры
-    /// всегда, а это ноутбук и батарея.
-    pub fn paint(&mut self, painter: &Painter, rect: Rect, shift: f32) {
-        if self.rect != rect || self.shift != shift {
-            self.rect = rect;
-            self.shift = shift;
-            self.mesh = Arc::new(build(rect, shift));
-        }
-        painter.add(Shape::Mesh(Arc::clone(&self.mesh)));
-    }
-}
-
-/// Считает цвет фона в точке.
-fn color_at(rect: Rect, at: Pos2, shift: f32) -> Color32 {
-    let (w, h) = (rect.width().max(1.0), rect.height().max(1.0));
-    let (x, y) = (at.x - rect.left(), at.y - rect.top());
-
-    let mut color = [
-        BG_BASE.r() as f32,
-        BG_BASE.g() as f32,
-        BG_BASE.b() as f32,
-    ];
-
-    let mut blend = |src: Color32, alpha: f32| {
-        let alpha = alpha.clamp(0.0, 1.0);
-        let src = [src.r() as f32, src.g() as f32, src.b() as f32];
-        for i in 0..3 {
-            color[i] = src[i] * alpha + color[i] * (1.0 - alpha);
-        }
-    };
-
-    for spot in &SPOTS {
-        // Сдвиг долей окна, а не точками: в развёрнутом окне пятна должны
-        // отъезжать заметнее, чем в маленьком, — иначе движение теряется.
-        let dx = (x - (spot.at.0 + shift) * w) / spot.radius.0;
-        let dy = (y - spot.at.1 * h) / spot.radius.1;
-        // Плотность падает от середины к краю линейно и обрывается на `stop` —
-        // ровно так ведёт себя `radial-gradient(… , transparent 70%)` в CSS.
-        let t = dx.hypot(dy);
-        blend(spot.color, spot.alpha * (1.0 - t / spot.stop).max(0.0));
-    }
-
-    // Вуаль: проекция точки на направление градиента, нормированная длиной
-    // линии градиента. Длина считается как в CSS — сумма проекций сторон.
-    let (sin, cos) = VEIL_ANGLE.to_radians().sin_cos();
-    let (dx, dy) = (sin, -cos);
-    let length = (w * dx).abs() + (h * dy).abs();
-    let t = (((x - w / 2.0) * dx + (y - h / 2.0) * dy) / length + 0.5).clamp(0.0, 1.0);
-    let veil = Color32::from_rgb(
-        lerp_u8(VEIL_NEAR.0.r(), VEIL_FAR.0.r(), t),
-        lerp_u8(VEIL_NEAR.0.g(), VEIL_FAR.0.g(), t),
-        lerp_u8(VEIL_NEAR.0.b(), VEIL_FAR.0.b(), t),
-    );
-    blend(veil, VEIL_NEAR.1 + (VEIL_FAR.1 - VEIL_NEAR.1) * t);
-
-    Color32::from_rgb(color[0] as u8, color[1] as u8, color[2] as u8)
-}
-
-fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
-    (a as f32 + (b as f32 - a as f32) * t) as u8
-}
-
-/// Собирает сетку фона под прямоугольник окна.
-fn build(rect: Rect, shift: f32) -> Mesh {
-    let cols = (rect.width() / CELL).ceil().max(1.0) as usize;
-    let rows = (rect.height() / CELL).ceil().max(1.0) as usize;
-
-    let mut mesh = Mesh::default();
-    mesh.reserve_vertices((cols + 1) * (rows + 1));
-    mesh.reserve_triangles(cols * rows * 2);
-
-    for row in 0..=rows {
-        for col in 0..=cols {
-            let at = pos2(
-                rect.left() + rect.width() * col as f32 / cols as f32,
-                rect.top() + rect.height() * row as f32 / rows as f32,
-            );
-            mesh.colored_vertex(at, color_at(rect, at, shift));
-        }
-    }
-
-    let stride = (cols + 1) as u32;
-    for row in 0..rows as u32 {
-        for col in 0..cols as u32 {
-            let top_left = row * stride + col;
-            mesh.add_triangle(top_left, top_left + 1, top_left + stride);
-            mesh.add_triangle(top_left + 1, top_left + stride + 1, top_left + stride);
-        }
-    }
-
-    mesh
 }
 
 // ---------------------------------------------------------------------------
@@ -665,23 +648,25 @@ fn build(rect: Rect, shift: f32) -> Mesh {
 // ---------------------------------------------------------------------------
 
 /// Тень под карточкой. Мягкая и без смещения вниз: карточка не «висит над
-/// столом», а лежит слоем стекла — в макете это `0 12px 30px rgba(0,0,0,.3)`.
-const CARD_SHADOW: Shadow = Shadow {
-    offset: [0, 6],
-    blur: 24,
-    spread: 0,
-    color: Color32::from_black_alpha(70),
-};
+/// столом», а лежит слоем — в макете это `0 12px 30px rgba(0,0,0,.3)`.
+fn card_shadow(p: Palette) -> Shadow {
+    Shadow {
+        offset: [0, 6],
+        blur: 24,
+        spread: 0,
+        color: p.shadow,
+    }
+}
 
 /// Заготовка большой карточки без блика. Нужна там, где карточку рисует не
 /// [`card`], а чужой контейнер — например модальное окно.
-pub fn card_frame() -> Frame {
+pub fn card_frame(p: Palette) -> Frame {
     Frame::new()
-        .fill(CARD_FILL)
-        .stroke(Stroke::new(1.0, BORDER_SUBTLE))
+        .fill(p.card_fill)
+        .stroke(Stroke::new(1.0, p.border_subtle))
         .corner_radius(CornerRadius::same(RADIUS_CARD))
         .inner_margin(Margin::same(18))
-        .shadow(CARD_SHADOW)
+        .shadow(card_shadow(p))
 }
 
 /// Как появляющаяся карточка выглядит на этом кадре.
@@ -708,11 +693,7 @@ pub struct Appear {
 /// Прозрачность **умножается**, а не выставляется: содержимое вкладки может
 /// появляться внутри уже приглушённого слоя (модалка, выключенная группа),
 /// и `set_opacity` там вернул бы ему полную яркость.
-pub fn rising<R>(
-    ui: &mut Ui,
-    appear: Option<Appear>,
-    add_contents: impl FnOnce(&mut Ui) -> R,
-) -> R {
+pub fn rising<R>(ui: &mut Ui, appear: Option<Appear>, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
     let Some(appear) = appear else {
         return add_contents(ui);
     };
@@ -724,22 +705,26 @@ pub fn rising<R>(
     .inner
 }
 
-/// Большая карточка: стекло, кромка, тень и блик по верхнему краю.
+/// Большая карточка: заливка, кромка, тень и блик по верхнему краю.
 ///
-/// Блик — то, что отличает стекло от матовой плашки: свет ложится на верхнюю
-/// грань. Рисуется поверх готовой карточки одной линией, потому что своей
-/// «внутренней тени» (`inset` из CSS) у `Frame` нет.
-pub fn card<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R> {
-    card_with_sweep(ui, 1.0, add_contents)
+/// Блик — одна светлая линия на верхней грани, поверх готовой карточки:
+/// своей «внутренней тени» (`inset` из CSS) у `Frame` нет.
+pub fn card<R>(
+    ui: &mut Ui,
+    p: Palette,
+    add_contents: impl FnOnce(&mut Ui) -> R,
+) -> InnerResponse<R> {
+    card_with_sweep(ui, p, 1.0, add_contents)
 }
 
 /// Та же карточка, но с блеском, бегущим по кромке.
 fn card_with_sweep<R>(
     ui: &mut Ui,
+    p: Palette,
     sweep: f32,
     add_contents: impl FnOnce(&mut Ui) -> R,
 ) -> InnerResponse<R> {
-    let result = card_frame().show(ui, |ui| {
+    let result = card_frame(p).show(ui, |ui| {
         // Без этого карточка сжалась бы по ширине самого длинного слова
         // внутри, и у короткого содержимого вышла бы узкая полоска посреди
         // окна. Ставится здесь, а не у каждого места вызова: разъехавшись,
@@ -747,7 +732,7 @@ fn card_with_sweep<R>(
         ui.set_width(ui.available_width());
         add_contents(ui)
     });
-    gloss(ui, result.response.rect, sweep);
+    gloss(ui, p, result.response.rect, sweep);
     result
 }
 
@@ -758,38 +743,30 @@ fn card_with_sweep<R>(
 /// которой не сказали, как появляться, ведёт себя как раньше.
 pub fn card_rising<R>(
     ui: &mut Ui,
+    p: Palette,
     appear: Option<Appear>,
     add_contents: impl FnOnce(&mut Ui) -> R,
 ) -> InnerResponse<R> {
     let sweep = appear.map_or(1.0, |appear| appear.sweep);
-    rising(ui, appear, |ui| card_with_sweep(ui, sweep, add_contents))
+    rising(ui, appear, |ui| card_with_sweep(ui, p, sweep, add_contents))
 }
 
 /// Вложенная карточка: строка очереди, строка истории, пункт списка.
-pub fn inner_frame() -> Frame {
+pub fn inner_frame(p: Palette) -> Frame {
     Frame::new()
-        .fill(CARD_INNER)
-        .stroke(Stroke::new(1.0, BORDER_SUBTLE))
+        .fill(p.card_inner)
+        .stroke(Stroke::new(1.0, p.border_subtle))
         .corner_radius(CornerRadius::same(RADIUS_INNER))
         .inner_margin(Margin::symmetric(14, 12))
 }
 
 /// Дорожка переключателя: контурная «таблетка», внутри которой сидят сегменты.
-pub fn track_frame() -> Frame {
+pub fn track_frame(p: Palette) -> Frame {
     Frame::new()
-        .stroke(Stroke::new(1.0, BORDER_STRONG))
+        .stroke(Stroke::new(1.0, p.border_strong))
         .corner_radius(CornerRadius::same(RADIUS_PILL))
         .inner_margin(Margin::same(2))
 }
-
-/// Постоянный свет на верхней грани карточки.
-const GLOSS_LINE: Color32 = Color32::from_rgba_premultiplied(41, 40, 39, 42);
-/// Яркость бегущего пятна на той же грани.
-///
-/// Втрое ярче постоянного света и всё равно едва заметна: это блик по стеклу,
-/// а не подсветка. Ярче — и кромка начинает мигать, а мигающая кромка
-/// утомляет за минуту (потому приём 06 и разрешён **один раз** при появлении).
-const GLOSS_SPARK: Color32 = Color32::from_rgba_premultiplied(150, 146, 140, 150);
 
 /// Блик по верхней грани: одна светлая линия внутри кромки.
 ///
@@ -799,7 +776,7 @@ const GLOSS_SPARK: Color32 = Color32::from_rgba_premultiplied(150, 146, 140, 150
 /// Пятно рисуется `Mesh`-полоской с вершинными цветами, а не отрезком: у
 /// `Stroke` цвет один на всю линию, и мягкого края у пятна не вышло бы —
 /// получилась бы светлая чёрточка, ползущая по кромке.
-fn gloss(ui: &Ui, rect: Rect, sweep: f32) {
+fn gloss(ui: &Ui, p: Palette, rect: Rect, sweep: f32) {
     let inset = RADIUS_CARD as f32 * 0.6;
     if rect.width() <= inset * 2.0 {
         return;
@@ -807,11 +784,7 @@ fn gloss(ui: &Ui, rect: Rect, sweep: f32) {
     let (left, right) = (rect.left() + inset, rect.right() - inset);
     let y = rect.top() + 0.5;
     let painter = ui.painter();
-    painter.hline(
-        Rangef::new(left, right),
-        y,
-        Stroke::new(1.0, GLOSS_LINE),
-    );
+    painter.hline(Rangef::new(left, right), y, Stroke::new(1.0, p.gloss_line));
 
     if !(0.0..1.0).contains(&sweep) {
         return;
@@ -826,7 +799,7 @@ fn gloss(ui: &Ui, rect: Rect, sweep: f32) {
     let mut mesh = Mesh::default();
     for (offset, color) in [
         (-half, Color32::TRANSPARENT),
-        (0.0, GLOSS_SPARK),
+        (0.0, p.gloss_spark),
         (half, Color32::TRANSPARENT),
     ] {
         let x = (at + offset).clamp(left, right);
@@ -840,11 +813,19 @@ fn gloss(ui: &Ui, rect: Rect, sweep: f32) {
     painter.add(Shape::Mesh(Arc::new(mesh)));
 }
 
-/// Ставит стиль полосы шапки или подвала.
-pub fn bar_frame() -> Frame {
+/// Ставит стиль полосы рельса.
+pub fn bar_frame(p: Palette) -> Frame {
     Frame::new()
-        .fill(BG_BAR)
+        .fill(p.rail_fill)
         .inner_margin(Margin::symmetric(20, 12))
+}
+
+/// Закрашивает окно фоном темы.
+///
+/// Заливки у панелей хватило бы, если бы панель была одна; их несколько,
+/// и между ними остаются щели, в которых иначе просвечивал бы чёрный.
+pub fn paint_background(painter: &Painter, p: Palette, rect: Rect) {
+    painter.rect_filled(rect, 0.0, p.bg);
 }
 
 #[cfg(test)]
@@ -884,121 +865,189 @@ mod tests {
         )
     }
 
-    /// Самое светлое место фона по всем разумным размерам окна.
-    fn brightest_backdrop() -> Color32 {
-        const SIZES: [(f32, f32); 6] = [
-            (520.0, 420.0),
-            (720.0, 560.0),
-            (1100.0, 720.0),
-            (1920.0, 1080.0),
-            (2560.0, 1440.0),
-            (3840.0, 2160.0),
-        ];
-        const STEPS: usize = 40;
-
-        let mut brightest = BG_BASE;
-        for (w, h) in SIZES {
-            let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(w, h));
-            for row in 0..=STEPS {
-                for col in 0..=STEPS {
-                    let at = pos2(
-                        w * col as f32 / STEPS as f32,
-                        h * row as f32 / STEPS as f32,
-                    );
-                    let color = color_at(rect, at, 0.0);
-                    if luminance(color) > luminance(brightest) {
-                        brightest = color;
-                    }
-                }
-            }
-        }
-        brightest
-    }
-
-    /// Проверять контраст на самом светлом месте фона мало — надо ещё, чтобы
-    /// это место оставалось там, где его посчитали. Пятна фона задаются
-    /// числами в `SPOTS`, и сделать их ярче — правка на одну цифру, после
-    /// которой все коэффициенты в комментариях палитры станут враньём. Ни
-    /// сборка, ни `clippy`, ни глаза этого не поймают: разница в пару единиц
-    /// яркости не видна, а порог WCAG она перейти успевает.
-    #[test]
-    fn the_backdrop_stays_as_dark_as_the_palette_assumes() {
-        let brightest = brightest_backdrop();
-        assert!(
-            brightest.r() <= 51 && brightest.g() <= 43 && brightest.b() <= 35,
-            "фон посветлел до rgb({}, {}, {}) — коэффициенты в палитре \
-             считались для rgb(49, 41, 33) и больше не верны",
-            brightest.r(),
-            brightest.g(),
-            brightest.b()
-        );
+    /// Все непрозрачные поверхности темы, на которых вообще бывает текст.
+    ///
+    /// Вложенный блок встречается дважды, и оба раза считать обязательно:
+    /// его заливка полупрозрачная, так что на карточке и на рельсе это два
+    /// разных цвета. Именно на вложенном блоке текст ближе всего к порогу.
+    fn surfaces(p: Palette) -> Vec<(&'static str, Color32)> {
+        vec![
+            ("фон окна", p.bg),
+            ("рельс", p.rail_fill),
+            ("карточка", p.card_fill),
+            ("блок на карточке", over(p.card_inner, p.card_fill)),
+            ("блок на рельсе", over(p.card_inner, p.rail_fill)),
+            ("поле ввода", p.input_fill),
+            ("модалка", p.modal_fill),
+        ]
     }
 
     /// Правило 4: 4.5:1 для текста, 3:1 для границ элементов управления.
     ///
-    /// Худший фон — вложенная карточка на самом светлом месте: два слоя
-    /// полупрозрачного песочного поверх пятна. Именно там текст ближе всего
-    /// к порогу, и именно там его проверяет этот тест.
+    /// Гоняется по **обеим** палитрам, и это не формальность: светлая тема
+    /// переворачивает половину пар, и проверка одной только тёмной пропустила
+    /// бы её целиком. Проверено красным: с макетным `border_strong`
+    /// (`rgba(255,255,255,.16)`) проверка падает на первой же поверхности.
     #[test]
-    fn every_colour_passes_its_threshold_on_the_worst_background() {
-        let backdrop = brightest_backdrop();
-        let card = over(CARD_FILL, backdrop);
-        let inner = over(CARD_INNER, card);
+    fn every_colour_passes_its_threshold_in_both_themes() {
+        for (theme, p) in [("тёмная", Palette::dark()), ("светлая", Palette::light())] {
+            let all = surfaces(p);
 
-        let text = [
-            ("TEXT_PRIMARY", TEXT_PRIMARY),
-            ("TEXT_SECONDARY", TEXT_SECONDARY),
-            ("TEXT_MUTED", TEXT_MUTED),
-            ("ACCENT", ACCENT),
-            ("ACCENT_HOVER", ACCENT_HOVER),
-            ("STATE_SUCCESS", STATE_SUCCESS),
-            ("STATE_ERROR", STATE_ERROR),
-            ("STATE_WARNING", STATE_WARNING),
-            // Не только капли на значке, но и подпись «40%» под ним.
-            ("SKY_WATER", SKY_WATER),
-        ];
-        for (name, color) in text {
-            for (where_, bg) in [("фон", backdrop), ("карточка", card), ("вложенная", inner)] {
-                let ratio = contrast(color, bg);
-                assert!(
-                    ratio >= 4.5,
-                    "{name} на «{where_}» даёт {ratio:.2}:1 — порог 4.5:1 не проходит"
-                );
+            // Третье поле — разрешён ли цвет на вложенном блоке. У приглушённой
+            // подписи там 4.23:1, поэтому ей нельзя, и это записано у самого
+            // поля, а не только здесь. Последняя пара — не только капли на
+            // значке погоды, но и подпись «40%» под ним.
+            let text = [
+                ("text_primary", p.text_primary, true),
+                ("text_secondary", p.text_secondary, true),
+                ("text_muted", p.text_muted, true),
+                ("text_faint", p.text_faint, false),
+                ("accent", p.accent, true),
+                ("accent_text", p.accent_text, true),
+                ("state_success", p.state_success, true),
+                ("state_error", p.state_error, true),
+                ("state_warning", p.state_warning, true),
+                ("sky_water", p.sky_water, true),
+            ];
+
+            for (name, color, on_inner) in text {
+                for (where_, bg) in &all {
+                    if !on_inner && where_.starts_with("блок") {
+                        continue;
+                    }
+                    let ratio = contrast(color, *bg);
+                    assert!(
+                        ratio >= 4.5,
+                        "{theme}: {name} на «{where_}» даёт {ratio:.2}:1 — \
+                         порог 4.5:1 не проходит"
+                    );
+                }
+            }
+
+            for (name, color) in [
+                ("border_strong", p.border_strong),
+                ("border_hover", p.border_hover),
+            ] {
+                for (where_, bg) in &all {
+                    let ratio = contrast(color, *bg);
+                    assert!(
+                        ratio >= 3.0,
+                        "{theme}: {name} на «{where_}» даёт {ratio:.2}:1 — \
+                         порог 3:1 не проходит"
+                    );
+                }
+            }
+        }
+    }
+
+    /// На акцентной подложке читаются три цвета — и приглушённый серый
+    /// в их число не входит.
+    ///
+    /// Заливка поднимает фон, и `text_muted` падает там до 4.03:1, оставаясь
+    /// на вид тем же самым серым, что и на карточке. Отсюда и проверка: три
+    /// разрешённых цвета обязаны проходить на **обеих** подложках, а про
+    /// приглушённый утверждается только то, что правило не выдумано, —
+    /// в тёмной теме он вправду ниже порога.
+    ///
+    /// Шире это требовать нельзя, и это выяснилось на красном прогоне: в
+    /// светлой теме тот же серый на карточке даёт 5.48:1, то есть проходит,
+    /// и падает только на рельсе (4.49:1). Совет «берите `accent_text`»
+    /// остаётся общим для обеих тем, но проверкой он держится там, где
+    /// вправду ломается.
+    #[test]
+    fn the_accent_underlay_carries_only_the_colours_it_can() {
+        for (theme, p) in [("тёмная", Palette::dark()), ("светлая", Palette::light())] {
+            for (where_, base) in [("карточка", p.card_fill), ("рельс", p.rail_fill)] {
+                let soft = over(p.accent_soft, base);
+                for (name, color) in [
+                    ("accent_text", p.accent_text),
+                    ("text_secondary", p.text_secondary),
+                    ("text_primary", p.text_primary),
+                ] {
+                    let ratio = contrast(color, soft);
+                    assert!(
+                        ratio >= 4.5,
+                        "{theme}: {name} на акцентной подложке ({where_}) даёт \
+                         {ratio:.2}:1 — порог 4.5:1 не проходит"
+                    );
+                }
             }
         }
 
-        for (name, color) in [("BORDER_STRONG", BORDER_STRONG), ("BORDER_HOVER", BORDER_HOVER)] {
-            for (where_, bg) in [("фон", backdrop), ("карточка", card), ("вложенная", inner)] {
-                let ratio = contrast(color, bg);
+        let p = Palette::dark();
+        let ratio = contrast(p.text_muted, over(p.accent_soft, p.card_fill));
+        assert!(
+            ratio < 4.5,
+            "приглушённый серый на акцентной подложке вдруг проходит порог \
+             ({ratio:.2}:1) — оговорка у `accent_soft` больше не про эту заливку"
+        );
+    }
+
+    /// На акцентной заливке читается её собственная подпись — и не читается
+    /// обычный текст окна.
+    ///
+    /// Прежнее правило звучало проще — «на акценте текст только тёмный», — но
+    /// оно было про одну тему. В светлой акцент сам тёмный, и подпись на нём
+    /// белая, так что цвет подписи стал полем палитры. Неизменной осталась
+    /// вторая половина: обычным текстом окна акцентную кнопку подписывать
+    /// нельзя. Это и есть та ошибка, которую делают не задумываясь, — светлым
+    /// по светлому акценту выходит 1.81:1.
+    ///
+    /// Выключенная заливка во вторую половину не входит, и намеренно. Она
+    /// бледная, и в светлой теме на ней читаются оба цвета сразу (обычный
+    /// текст даёт там 8.82:1); требовать обратного значило бы выдумать
+    /// правило ради симметрии проверки. А в тёмной теме подпись у неё та же,
+    /// что у включённой, — «ровно один из двух» там не проверить в принципе.
+    #[test]
+    fn an_accent_fill_carries_its_own_label_and_not_the_body_text() {
+        for (theme, p) in [("тёмная", Palette::dark()), ("светлая", Palette::light())] {
+            let fills = [
+                ("accent", p.accent, p.text_on_accent),
+                ("accent_hover", p.accent_hover, p.text_on_accent),
+                ("accent_active", p.accent_active, p.text_on_accent),
+                (
+                    "accent_disabled",
+                    p.accent_disabled,
+                    p.text_on_accent_disabled,
+                ),
+            ];
+            for (name, fill, label) in fills {
+                let ratio = contrast(label, fill);
                 assert!(
-                    ratio >= 3.0,
-                    "{name} на «{where_}» даёт {ratio:.2}:1 — порог 3:1 не проходит"
+                    ratio >= 4.5,
+                    "{theme}: своя подпись на {name} даёт {ratio:.2}:1 — \
+                     порог 4.5:1 не проходит"
+                );
+            }
+
+            for (name, fill) in [
+                ("accent", p.accent),
+                ("accent_hover", p.accent_hover),
+                ("accent_active", p.accent_active),
+            ] {
+                let ratio = contrast(p.text_primary, fill);
+                assert!(
+                    ratio < 4.5,
+                    "{theme}: обычный текст окна на {name} внезапно проходит \
+                     порог ({ratio:.2}:1) — проверьте, тот ли это цвет"
                 );
             }
         }
     }
 
-    /// На акценте текст только тёмный: светлый по нему нечитаем, и это та
-    /// ошибка, которую делают, не задумываясь.
+    /// Темы обязаны отличаться по светлоте, а не только по набору чисел:
+    /// `is_dark` выводится из палитры, и на этом держится выбор `Visuals`.
     #[test]
-    fn the_label_on_the_accent_is_dark_enough() {
-        for (name, fill) in [
-            ("ACCENT", ACCENT),
-            ("ACCENT_HOVER", ACCENT_HOVER),
-            ("ACCENT_ACTIVE", ACCENT_ACTIVE),
-            ("ACCENT_DISABLED", ACCENT_DISABLED),
-        ] {
-            let ratio = contrast(TEXT_ON_ACCENT, fill);
-            assert!(
-                ratio >= 4.5,
-                "тёмная подпись на {name} даёт {ratio:.2}:1 — порог 4.5:1 не проходит"
-            );
-            assert!(
-                contrast(TEXT_PRIMARY, fill) < 4.5,
-                "светлая подпись на {name} внезапно проходит порог — \
-                 проверьте, тот ли это цвет"
-            );
-        }
+    fn the_two_themes_know_which_of_them_is_dark() {
+        assert!(Palette::dark().is_dark(), "тёмная тема считает себя светлой");
+        assert!(
+            !Palette::light().is_dark(),
+            "светлая тема считает себя тёмной"
+        );
+        assert!(
+            luminance(Palette::light().bg) > luminance(Palette::dark().bg),
+            "фон светлой темы не светлее тёмной"
+        );
     }
 
     /// Каждое семейство обязано уметь нарисовать все три алфавита.
@@ -1025,7 +1074,8 @@ mod tests {
         ];
 
         let ctx = Context::default();
-        apply(&ctx);
+        install_fonts(&ctx);
+        apply(&ctx, Palette::dark());
         // Шрифтов нет до первого кадра — `Context::fonts_mut` на этом прямо
         // паникует, так что кадр обязателен.
         let mut output = ctx.run_ui(Default::default(), |_| {});
@@ -1047,30 +1097,16 @@ mod tests {
     }
 
     /// QR-код читается камерой, только если модуль заметно темнее поля.
+    ///
+    /// Цвета кода намеренно не из палитры: возьми их оттуда — и в светлой
+    /// теме код вышел бы в обратных цветах, которые часть сканеров не читает.
     #[test]
-    fn the_qr_code_is_dark_on_light() {
-        assert!(luminance(QR_DARK) < luminance(QR_LIGHT), "код в обратных цветах");
+    fn the_qr_code_is_dark_on_light_in_both_themes() {
+        assert!(
+            luminance(QR_DARK) < luminance(QR_LIGHT),
+            "код в обратных цветах"
+        );
         let ratio = contrast(QR_DARK, QR_LIGHT);
         assert!(ratio >= 15.0, "перепад кода всего {ratio:.2}:1");
-    }
-
-    /// Сетка фона обязана накрывать окно целиком и пересобираться только на
-    /// смену размера: она в кадре не считается, а берётся готовой (Правило 1).
-    #[test]
-    fn the_backdrop_mesh_covers_the_window_and_is_built_once() {
-        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1100.0, 720.0));
-        let mesh = build(rect, 0.0);
-
-        let cols = (1100.0f32 / CELL).ceil() as usize;
-        let rows = (720.0f32 / CELL).ceil() as usize;
-        assert_eq!(mesh.vertices.len(), (cols + 1) * (rows + 1));
-        assert_eq!(mesh.indices.len(), cols * rows * 6);
-
-        let left = mesh.vertices.iter().map(|v| v.pos.x).fold(f32::MAX, f32::min);
-        let right = mesh.vertices.iter().map(|v| v.pos.x).fold(f32::MIN, f32::max);
-        let top = mesh.vertices.iter().map(|v| v.pos.y).fold(f32::MAX, f32::min);
-        let bottom = mesh.vertices.iter().map(|v| v.pos.y).fold(f32::MIN, f32::max);
-        assert_eq!((left, top), (rect.left(), rect.top()));
-        assert_eq!((right, bottom), (rect.right(), rect.bottom()));
     }
 }
