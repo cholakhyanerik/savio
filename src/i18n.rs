@@ -722,8 +722,56 @@ strings! {
     TabMore = "Ещё", "More", "Այլ";
     TabWeather = "Погода", "Weather", "Եղանակ";
     TabPhone = "Телефон", "Phone", "Հեռախոս";
+
+    // Группы рельса разделов и короткие пояснения к ним. Пояснение стоит
+    // в строке заголовка, справа от названия раздела, и отвечает на «что
+    // я тут увижу» до того, как человек начнёт читать карточки.
+    NavGroupFiles = "Файлы", "Files", "Ֆայլեր";
+    NavGroupComputer = "Компьютер", "Computer", "Համակարգիչ";
+    NavGroupNearby = "Рядом", "Nearby", "Մոտակայքում";
+    NavDownloadNote =
+        "вставьте ссылку, остальное можно не трогать",
+        "paste a link, the rest can stay as it is",
+        "տեղադրեք հղումը, մնացածին կարելի է չդիպչել";
+    NavDownloadBusyNote =
+        "ход загрузки — в правой колонке",
+        "the progress is in the right column",
+        "ներբեռնման ընթացքը՝ աջ սյունակում";
+    NavMetadataNote =
+        "что файл рассказывает о вас — и как это стереть",
+        "what the file tells about you — and how to wipe it",
+        "ինչ է ֆայլը պատմում ձեր մասին և ինչպես ջնջել այն";
+    NavMachineNowNote =
+        "замер раз в секунду, пока открыт этот раздел",
+        "measured once a second while this section is open",
+        "չափում վայրկյանը մեկ, քանի դեռ այս բաժինը բաց է";
+    NavMachineSpecNote =
+        "сведения о железе этой машины",
+        "what hardware this machine has",
+        "տեղեկություններ այս մեքենայի սարքավորումների մասին";
+    NavWeatherNote =
+        "сейчас, по часам и на неделю",
+        "now, by the hour and for the week",
+        "հիմա, ժամերով և շաբաթվա համար";
+    NavPhoneNote =
+        "файлы между телефоном и компьютером по своей сети Wi-Fi",
+        "files between the phone and the computer over your own Wi-Fi",
+        "ֆայլեր հեռախոսի և համակարգչի միջև ձեր Wi-Fi ցանցով";
+    NavPhoneOnNote =
+        "страница открыта, телефон подключился",
+        "the page is open, the phone has connected",
+        "էջը բաց է, հեռախոսը միացել է";
+    /// Подсказка кнопки, которая раскрывает нижний блок свёрнутого рельса.
+    NavMoreHint =
+        "Обслуживание и настройки окна: версии инструментов, тема, язык, журнал.",
+        "Upkeep and window settings: tool versions, theme, language, log.",
+        "Սպասարկում և պատուհանի կարգավորումներ՝ գործիքների տարբերակներ, տեսք, լեզու, մատյան։";
+    UiAllInPlaceShort = "Всё на месте", "All in place", "Ամեն ինչ տեղում է";
     MachineNow = "Сейчас", "Now", "Հիմա";
-    MachineSpec = "Состав", "Make-up", "Կազմ";
+    /// По-английски «Make-up» читалось косметикой, а не составом машины.
+    /// Пока подпись жила внутри вкладки «Машина», это сходило с рук; в рельсе
+    /// она стоит отдельным пунктом верхнего уровня, и контекста рядом нет.
+    MachineSpec = "Состав", "Hardware", "Կազմ";
     RailQueue = "Очередь", "Queue", "Հերթ";
     RailHistory = "История", "History", "Պատմություն";
 
