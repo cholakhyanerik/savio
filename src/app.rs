@@ -4848,64 +4848,8 @@ impl SavioApp {
             ),
         };
 
-        let mut about = false;
-        // Высоту ряду задаём явно: `with_layout` отдал бы потомку весь
-        // остаток высоты, а центрирующая раскладка считает его занятым
-        // целиком — строка заголовка уехала бы в середину экрана (дефект 42).
-        ui.allocate_ui_with_layout(
-            egui::vec2(ui.available_width(), theme::CONTROL_HEIGHT),
-            egui::Layout::left_to_right(egui::Align::Center),
-            |ui| {
-                ui.spacing_mut().item_spacing.x = 10.0;
-                ui.label(
-                    egui::RichText::new(title)
-                        .font(theme::display(24.0))
-                        .color(pal.text_primary),
-                );
-
-                // Тире отдельной подписью, а не приклеенным к тексту через
-                // `format!`: строка заголовка рисуется каждый кадр, и склейка
-                // стоила бы аллокации шестьдесят раз в секунду ни за что.
-                ui.label(
-                    egui::RichText::new("—")
-                        .small()
-                        .color(pal.text_muted),
-                );
-                ui.spacing_mut().item_spacing.x = 5.0;
-                // Пояснение обрезается, а не переносится: оно второстепенно,
-                // а в узком окне места ему нет вовсе.
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(i18n::t(lang, note))
-                            .small()
-                            .color(pal.text_muted),
-                    )
-                    .truncate(),
-                );
-
-                // Версия у правого края. Щелчок по ней открывает
-                // «О программе», и это не украшение, а запасной вход:
-                // в узком окне нижний блок рельса свёрнут в одну кнопку.
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let t = touch_at(ui, ui.next_auto_id(), speed);
-                    let version = ui
-                        .add(
-                            egui::Label::new(
-                                egui::RichText::new(VERSION)
-                                    .small()
-                                    .color(motion::mix(pal.text_faint, pal.text_primary, t)),
-                            )
-                            .selectable(false)
-                            .sense(egui::Sense::click()),
-                        )
-                        .on_hover_cursor(egui::CursorIcon::PointingHand)
-                        .on_hover_text(i18n::t(lang, Key::UiAboutVersionHint));
-                    if version.clicked() {
-                        about = true;
-                    }
-                });
-            },
-        );
+        let row = section_title_row(ui, pal, lang, speed, title, note);
+        let about = row.about;
         if about {
             self.about_open = true;
         }
@@ -8492,6 +8436,23 @@ impl SavioApp {
     /// экран. Ниже [`theme::TWO_COLUMN_MIN`] колонки встают друг под друга.
     fn phone_tab(&mut self, ui: &mut egui::Ui) {
         const GAP: f32 = 18.0;
+
+        // Пока раздача идёт, над обеими колонками стоит полоса: папка
+        // открыта для сети. Постоянная, а не баннер об ошибке, — это не
+        // беда, а то, о чём человек обязан знать всё время, пока это верно.
+        // Над колонками, а не внутри карточки: она про экран целиком, и в
+        // узкой колонке читалась бы по три слова в строке.
+        if self.share.running() {
+            let pal = self.palette;
+            banner(
+                ui,
+                pal,
+                i18n::t(self.lang, Key::UiShareOpenWarning),
+                pal.state_warning,
+            );
+            ui.add_space(GAP);
+        }
+
         if ui.available_width() < theme::TWO_COLUMN_MIN {
             self.share_card(ui);
             ui.add_space(GAP);
@@ -8571,15 +8532,46 @@ impl SavioApp {
             ui.add_space(4.0);
             note(ui, i18n::t(lang, Key::UiShareNote), pal.text_secondary);
 
-            ui.add_space(14.0);
-            field_label(ui, pal, i18n::t(lang, Key::UiShareFolder));
+            // Два направления словами и стрелками. Из одного абзаца выше не
+            // видно, что передача идёт в обе стороны: половина людей так и
+            // не догадывалась, что с телефона можно отправить на компьютер.
+            //
+            // Стрелки «→» и «←» есть в Figtree, первом шрифте семейства, —
+            // проверено по таблице `cmap`, а не на глаз: отсутствующий знак
+            // рисуется пустым прямоугольником молча.
+            ui.add_space(12.0);
+            direction_cards(
+                ui,
+                pal,
+                lang,
+                [
+                    (Key::UiShareToPhone, Key::UiShareToPhoneNote),
+                    (Key::UiShareToComputer, Key::UiShareToComputerNote),
+                ],
+            );
+
+            ui.add_space(16.0);
+            step_header(ui, pal, 1, i18n::t(lang, Key::UiShareFolder), |_| {});
+            ui.add_space(8.0);
             ui.allocate_ui_with_layout(
                 egui::vec2(ui.available_width(), theme::CONTROL_HEIGHT),
                 egui::Layout::right_to_left(egui::Align::Center),
                 |ui| {
+                    // Обе кнопки кладутся первыми в раскладке справа налево,
+                    // а путь — во вложенную раскладку слева направо: иначе
+                    // обрезаемая подпись занимает столько, сколько просит
+                    // текст, и налезает на соседа справа.
                     open_dir_clicked = ui
                         .add_enabled(dir.is_some(), pill(i18n::t(lang, Key::UiOpen)))
                         .on_hover_text(i18n::t(lang, Key::UiShareOpenFolderHint))
+                        .clicked();
+                    choose_dir = ui
+                        .add_enabled_ui(!running, |ui| {
+                            pill_button(ui, i18n::t(lang, Key::UiShareChangeFolder), speed)
+                        })
+                        .inner
+                        .on_hover_text(i18n::t(lang, Key::UiSharePickFolderHint))
+                        .on_disabled_hover_text(i18n::t(lang, Key::UiShareFolderLocked))
                         .clicked();
 
                     let display = if running {
@@ -8594,20 +8586,38 @@ impl SavioApp {
                     } else {
                         pal.state_warning
                     };
-                    let size = egui::vec2(ui.available_width(), theme::CONTROL_HEIGHT);
-                    choose_dir = ui
-                        .add_enabled_ui(!running, |ui| {
-                            sized_with_touch(ui, size, speed, |ui| {
-                                ui.add(
-                                    egui::Button::new(egui::RichText::new(display).color(color))
+                    // Путь — подпись, а не кнопка, и это не украшение.
+                    // У `Label` есть `show_tooltip_when_elided`: обрезанный
+                    // путь сам показывает себя целиком по наведению. У
+                    // `Button` такого свойства нет вовсе, и пока путь жил
+                    // на кнопке, полного пути не показывал никто — узнать
+                    // его можно было только заново открыв диалог выбора
+                    // (дефект 48 реестра). Заодно кнопка выбора перестала
+                    // быть невидимой: на путь, не похожий на кнопку, не
+                    // нажимали.
+                    // Таблетка вокруг пути — из макета, и она же отделяет
+                    // значение от подписей вокруг. Растягивается на остаток
+                    // строки, и это ровно то, что нужно: вложенная раскладка
+                    // слева направо внутри раскладки справа налево занимает
+                    // всё между ними (см. Правило 4 про `status_pill`) —
+                    // здесь эта особенность работает на нас, а не против.
+                    egui::Frame::new()
+                        .stroke(egui::Stroke::new(1.0, pal.border_strong))
+                        .corner_radius(egui::CornerRadius::same(theme::RADIUS_PILL))
+                        .inner_margin(egui::Margin::symmetric(16, 7))
+                        .show(ui, |ui| {
+                            ui.with_layout(
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(display).color(color),
+                                        )
                                         .truncate(),
-                                )
-                            })
-                        })
-                        .inner
-                        .on_hover_text(i18n::t(lang, Key::UiSharePickFolderHint))
-                        .on_disabled_hover_text(i18n::t(lang, Key::UiShareFolderLocked))
-                        .clicked();
+                                    );
+                                },
+                            );
+                        });
                 },
             );
             ui.add_space(6.0);
@@ -8623,6 +8633,38 @@ impl SavioApp {
                 ),
                 pal.text_muted,
             );
+
+            // Список проверок — до старта, а не баннером после полуминуты
+            // тишины: то же самое, сказанное вовремя. Третья строка жёлтая
+            // не для порядка — это поведение, о которое спотыкаются: уйдёшь
+            // с экрана, и раздача кончится.
+            if !running {
+                ui.add_space(16.0);
+                step_header(ui, pal, 2, i18n::t(lang, Key::UiShareChecklist), |_| {});
+                ui.add_space(8.0);
+                for (ok, title, text) in [
+                    (
+                        true,
+                        Key::UiShareCheckNetwork,
+                        Some(Key::UiShareCheckNetworkNote),
+                    ),
+                    (
+                        true,
+                        Key::UiShareCheckFirewall,
+                        Some(Key::UiShareCheckFirewallNote),
+                    ),
+                    (false, Key::UiShareCheckScreen, None),
+                ] {
+                    checklist_row(
+                        ui,
+                        pal,
+                        ok,
+                        i18n::t(lang, title),
+                        text.map(|key| i18n::t(lang, key)),
+                    );
+                    ui.add_space(6.0);
+                }
+            }
 
             ui.add_space(14.0);
             let width = ui.available_width();
@@ -8645,9 +8687,21 @@ impl SavioApp {
                 );
             }
             ui.add_space(6.0);
-            // Видно без единого щелчка: остановка при уходе с экрана — не
-            // оговорка на всякий случай, а поведение, о которое споткнутся.
-            note(ui, i18n::t(lang, Key::UiShareAutoStop), pal.text_muted);
+            // Пока раздача выключена — про то, что случится после нажатия;
+            // когда идёт — про то, что её остановит. Видно без единого
+            // щелчка: и то и другое — поведение, о которое спотыкаются.
+            note(
+                ui,
+                i18n::t(
+                    lang,
+                    if running {
+                        Key::UiShareAutoStop
+                    } else {
+                        Key::UiShareStartNote
+                    },
+                ),
+                pal.text_muted,
+            );
 
             if let Some((text, tone)) = &panel.note {
                 ui.add_space(10.0);
@@ -10117,6 +10171,230 @@ fn rail_block(ui: &mut egui::Ui, state: &RailState<'_>, picks: &mut RailPicks) {
     {
         picks.smooth = Some(smooth);
     }
+}
+
+/// Две карточки направления в ряд: «На телефон» и «На компьютер».
+///
+/// Ряд разваливается в колонку, когда места мало: две карточки по два
+/// предложения в каждой в колонке шириной 340 читались бы по три слова
+/// в строке. Порог — из самой раскладки, а не на глаз: карточке нужно
+/// около 200 точек, чтобы заголовок со стрелкой встал в одну строку.
+fn direction_cards(ui: &mut egui::Ui, pal: theme::Palette, lang: Lang, pairs: [(Key, Key); 2]) {
+    const SIDE_BY_SIDE: f32 = 200.0 * 2.0 + 12.0;
+    const ARROWS: [&str; 2] = ["→", "←"];
+
+    let card = |ui: &mut egui::Ui, arrow: &str, title: Key, text: Key| {
+        // Раскладка задаётся явно: в колонках `ui.columns` выключка тянет
+        // пробелы до кромки, и абзац набирается дырами.
+        let width = ui.available_width();
+        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+            ui.set_width(width);
+            theme::inner_frame(pal).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    ui.label(
+                        egui::RichText::new(arrow)
+                            .font(theme::bold(15.0))
+                            .color(pal.accent),
+                    );
+                    ui.label(
+                        egui::RichText::new(i18n::t(lang, title))
+                            .font(theme::bold(14.0))
+                            .color(pal.text_primary),
+                    );
+                });
+                ui.add_space(4.0);
+                note(ui, i18n::t(lang, text), pal.text_muted);
+            });
+        });
+    };
+
+    if ui.available_width() >= SIDE_BY_SIDE {
+        ui.columns(2, |columns| {
+            for (column, (arrow, (title, text))) in
+                columns.iter_mut().zip(ARROWS.into_iter().zip(pairs))
+            {
+                card(column, arrow, title, text);
+            }
+        });
+    } else {
+        for (arrow, (title, text)) in ARROWS.into_iter().zip(pairs) {
+            card(ui, arrow, title, text);
+            ui.add_space(8.0);
+        }
+    }
+}
+
+/// Строка списка проверок перед стартом: знак, заголовок и пояснение.
+///
+/// Не путать с `check_row` — та про строку отчёта о системе.
+///
+/// Знак рисуется кистью, а не берётся из шрифта. «✓» (U+2713) не нашлось
+/// **ни в одной** из тринадцати доступных Savio гарнитур — ни в девяти
+/// своих, ни в четырёх штатных у eframe, — и вышел бы пустой прямоугольник,
+/// причём молча. Проверено разбором таблиц `cmap` у самих файлов.
+fn checklist_row(
+    ui: &mut egui::Ui,
+    pal: theme::Palette,
+    ok: bool,
+    title: &str,
+    text: Option<&str>,
+) {
+    let color = if ok { pal.state_success } else { pal.state_warning };
+    theme::inner_frame(pal).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            let (mark, _) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+            check_mark(ui.painter(), mark, ok, color);
+
+            // Подпись с пояснением — колонкой справа от знака, и ширину ей
+            // задаём явно: без этого пояснение уходит под знак, а не под
+            // заголовок.
+            let width = ui.available_width();
+            ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                ui.set_width(width);
+                ui.label(
+                    egui::RichText::new(title)
+                        .font(theme::bold(14.0))
+                        .color(pal.text_primary),
+                );
+                if let Some(text) = text {
+                    ui.add_space(3.0);
+                    note(ui, text, pal.text_muted);
+                }
+            });
+        });
+    });
+}
+
+/// Галочка в кружке или восклицательный знак в нём же.
+fn check_mark(painter: &egui::Painter, rect: egui::Rect, ok: bool, color: egui::Color32) {
+    let r = rect.width() / 2.0 - 1.0;
+    painter.circle_stroke(rect.center(), r, egui::Stroke::new(1.2, color));
+    let stroke = egui::Stroke::new(1.6, color);
+    if ok {
+        let c = rect.center();
+        painter.line_segment(
+            [
+                egui::pos2(c.x - r * 0.45, c.y),
+                egui::pos2(c.x - r * 0.1, c.y + r * 0.38),
+            ],
+            stroke,
+        );
+        painter.line_segment(
+            [
+                egui::pos2(c.x - r * 0.1, c.y + r * 0.38),
+                egui::pos2(c.x + r * 0.48, c.y - r * 0.38),
+            ],
+            stroke,
+        );
+    } else {
+        let c = rect.center();
+        painter.line_segment(
+            [
+                egui::pos2(c.x, c.y - r * 0.5),
+                egui::pos2(c.x, c.y + r * 0.12),
+            ],
+            stroke,
+        );
+        painter.circle_filled(egui::pos2(c.x, c.y + r * 0.45), 1.1, color);
+    }
+}
+
+/// Что получилось из строки заголовка раздела за кадр.
+struct SectionTitle {
+    /// Щёлкнули по номеру версии.
+    about: bool,
+    /// Где лёг номер версии.
+    version: egui::Rect,
+    /// Где легло пояснение к разделу — то, что в него упирается.
+    note: egui::Rect,
+}
+
+/// Строка заголовка раздела без `self`.
+///
+/// Отдельно от метода ради проверки: запас по ширине здесь — величина
+/// переменная (пояснения у разделов разной длины, а переводов три), и
+/// померить наложение можно только у того, что окно и тест берут из
+/// одного места.
+fn section_title_row(
+    ui: &mut egui::Ui,
+    pal: theme::Palette,
+    lang: Lang,
+    speed: f32,
+    title: &str,
+    note_key: Key,
+) -> SectionTitle {
+    let mut row = SectionTitle {
+        about: false,
+        version: egui::Rect::NOTHING,
+        note: egui::Rect::NOTHING,
+    };
+
+    // Высоту ряду задаём явно: `with_layout` отдал бы потомку весь остаток
+    // высоты, а центрирующая раскладка считает его занятым целиком — строка
+    // заголовка уехала бы в середину экрана (дефект 42).
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width(), theme::CONTROL_HEIGHT),
+        // Справа налево, и номер версии кладётся **первым**. Иначе
+        // обрезаемое пояснение занимает столько, сколько просит текст,
+        // о соседе справа ничего не зная, — и в окне 520 оно наползало
+        // на версию: «…over yo0.32.1». Проверено глазами.
+        egui::Layout::right_to_left(egui::Align::Center),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+
+            // Щелчок по версии открывает «О программе», и это не украшение,
+            // а запасной вход: в узком окне нижний блок рельса свёрнут
+            // в одну кнопку.
+            let t = touch_at(ui, ui.next_auto_id(), speed);
+            let version = ui
+                .add(
+                    egui::Label::new(
+                        egui::RichText::new(VERSION)
+                            .small()
+                            .color(motion::mix(pal.text_faint, pal.text_primary, t)),
+                    )
+                    .selectable(false)
+                    .sense(egui::Sense::click()),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text(i18n::t(lang, Key::UiAboutVersionHint));
+            row.version = version.rect;
+            row.about = version.clicked();
+
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                ui.label(
+                    egui::RichText::new(title)
+                        .font(theme::display(24.0))
+                        .color(pal.text_primary),
+                );
+
+                // Тире отдельной подписью, а не приклеенным к тексту через
+                // `format!`: строка заголовка рисуется каждый кадр, и склейка
+                // стоила бы аллокации шестьдесят раз в секунду ни за что.
+                ui.label(egui::RichText::new("—").small().color(pal.text_muted));
+                ui.spacing_mut().item_spacing.x = 5.0;
+                // Пояснение обрезается, а не переносится: оно второстепенно,
+                // а в узком окне места ему нет вовсе.
+                row.note = ui
+                    .add(
+                        egui::Label::new(
+                            egui::RichText::new(i18n::t(lang, note_key))
+                                .small()
+                                .color(pal.text_muted),
+                        )
+                        .truncate(),
+                    )
+                    .rect;
+            });
+        },
+    );
+
+    row
 }
 
 /// Заголовок шага: номер в кружке и название дисплейным начертанием.
@@ -12048,7 +12326,7 @@ mod tests {
     #[test]
     fn junk_from_the_clipboard_is_not_worth_a_request() {
         let mut preview = Preview::default();
-        for text in ["", "   ", "просто текст", "site.com/watch?v=a", "https://"] {
+        for text in ["", " ", "просто текст", "site.com/watch?v=a", "https://"] {
             preview.retarget(text, CookieSource::None, None, 0.0);
             assert_eq!(preview.due, None, "спросили про {text:?}");
             assert_eq!(preview.state, PreviewState::Idle, "на {text:?}");
@@ -12487,7 +12765,7 @@ mod tests {
 
     /// Настоящее сообщение wgpu 29 — то самое, от которого раньше падал
     /// процесс. Проверено вживую на окне с клиентом 504×8193.
-    const TOO_LARGE: &str = "Validation Error\n\nCaused by:\n  In Surface::configure\n    \
+    const TOO_LARGE: &str = "Validation Error\n\nCaused by:\n  In Surface::configure\n \
          `Surface` width and height must be within the maximum supported texture size. \
          Requested was (504, 8193), maximum extent for either dimension is 8192.";
 
@@ -12533,7 +12811,7 @@ mod tests {
     /// ни clippy этого не ловят.
     #[test]
     fn different_wgpu_messages_about_one_limit_give_the_same_line() {
-        let viewport = "Validation Error\n\nCaused by:\n  In a CommandEncoder, label = 'encoder'\n    \
+        let viewport = "Validation Error\n\nCaused by:\n  In a CommandEncoder, label = 'encoder'\n \
              In a set_viewport command\n      Viewport size { w: 9984, h: 381 } greater than \
              device's requested `max_texture_dimension_2d` limit 8192, or less than zero";
         assert_eq!(gpu_error_line(TOO_LARGE, Lang::Ru), gpu_error_line(viewport, Lang::Ru));
@@ -13472,6 +13750,73 @@ mod tests {
             }
         });
         output.textures_delta.clear();
+    }
+
+    /// Пояснение к разделу не налезает на номер версии.
+    ///
+    /// `Label::truncate()` занимает столько, сколько просит текст, и о соседе
+    /// справа ничего не знает: поставленный после него виджет вытесняется
+    /// влево и уезжает под подпись. В окне 520 это выглядело как «…over
+    /// yo0.32.1» — версия поверх последних букв пояснения. Лечится порядком:
+    /// версия кладётся **первой** в раскладке справа налево, а пояснение
+    /// живёт во вложенной раскладке слева направо, где ему достаётся остаток.
+    ///
+    /// Проверяются все разделы и все языки: пояснения у них разной длины,
+    /// а перевод длиннее русского — «влезло на одном» тут ничего не значит.
+    ///
+    /// Проверено красным: с версией, положенной последней, проверка падает
+    /// на «Телефоне» по-английски.
+    #[test]
+    fn the_section_title_leaves_room_for_the_version() {
+        let pal = theme::Palette::dark();
+        // Раздел, пояснение — самое длинное из всех, и ширина окна
+        // минимальная за вычетом свёрнутого рельса и полей содержимого.
+        const NOTES: [(&str, Key); 4] = [
+            ("Загрузка", Key::NavDownloadNote),
+            ("Телефон", Key::NavPhoneNote),
+            ("Метаданные", Key::NavMetadataNote),
+            ("Сейчас", Key::NavMachineNowNote),
+        ];
+        let room = 520.0 - theme::NAV_NARROW - theme::CONTENT_MARGIN * 2.0;
+
+        for lang in Lang::ALL {
+            let ctx = egui::Context::default();
+            theme::install_fonts(&ctx);
+            theme::apply(&ctx, pal);
+
+            for (title, note) in NOTES {
+                let mut row = None;
+                for _ in 0..3 {
+                    let input = egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(520.0, 420.0),
+                        )),
+                        ..Default::default()
+                    };
+                    let mut output = ctx.run_ui(input, |ui| {
+                        egui::CentralPanel::default().show(ui, |ui| {
+                            ui.set_max_width(room);
+                            row = Some(section_title_row(ui, pal, lang, 1.0, title, note));
+                        });
+                    });
+                    output.textures_delta.clear();
+                }
+
+                let row = row.expect("строка заголовка нарисована");
+                assert!(
+                    row.version.width() > 20.0,
+                    "{lang:?}/{title}: номер версии пропал: {:?}",
+                    row.version
+                );
+                assert!(
+                    row.note.right() <= row.version.left() + 0.5,
+                    "{lang:?}/{title}: пояснение налезает на номер версии: {:?} и {:?}",
+                    row.note,
+                    row.version
+                );
+            }
+        }
     }
 
     /// Приветствие помещается в окно минимальной ширины на всех языках.

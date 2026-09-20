@@ -1556,7 +1556,66 @@ strings! {
          the phone sees in its browser: files are taken from it and put onto it.",
         "Հեռախոսն ու համակարգիչը նույն Wi-Fi ցանցում են։ Savio-ն կբացի էջ, որը հեռախոսը \
          կտեսնի բրաուզերում. այնտեղից վերցնում են ֆայլերը և այնտեղ էլ դնում։";
+    // Два направления словами. Абзац `UiShareNote` говорит про обмен вообще,
+    // и из него не видно, что передача идёт в обе стороны: половина людей
+    // так и не догадывалась, что с телефона можно отправить.
+    UiShareToPhone = "На телефон", "To the phone", "Հեռախոսին";
+    UiShareToPhoneNote =
+        "Файлы из папки ниже телефон видит списком и забирает нажатием.",
+        "The phone sees the files from the folder below as a list and takes them with a tap.",
+        "Ներքևի թղթապանակի ֆայլերը հեռախոսը տեսնում է ցանկով և վերցնում հպումով։";
+    UiShareToComputer = "На компьютер", "To the computer", "Համակարգչին";
+    UiShareToComputerNote =
+        "То, что телефон отправит со страницы, ляжет в эту же папку.",
+        "What the phone sends from the page will land in this same folder.",
+        "Այն, ինչ հեռախոսը կուղարկի էջից, կհայտնվի այս նույն թղթապանակում։";
+
+    // Три причины, по которым страница не открывается. Тот же текст приезжает
+    // баннером после полуминуты тишины (`UiShareHelp`), но это уже после
+    // неудачи — а список стоит до старта, когда его ещё можно прочесть.
+    UiShareChecklist = "Проверьте до старта", "Check before starting", "Ստուգեք մինչ մեկնարկը";
+    UiShareCheckNetwork =
+        "Телефон в той же сети Wi-Fi",
+        "The phone is on the same Wi-Fi",
+        "Հեռախոսը նույն Wi-Fi ցանցում է";
+    UiShareCheckNetworkNote =
+        "Не в мобильном интернете и не в гостевой сети кафе — там устройства друг друга \
+         не видят.",
+        "Not on mobile internet and not on a cafe guest network — devices do not see each \
+         other there.",
+        "Ոչ բջջային ինտերնետում և ոչ սրճարանի հյուրային ցանցում՝ այնտեղ սարքերը միմյանց \
+         չեն տեսնում։";
+    UiShareCheckFirewall =
+        "Savio разрешён в частных сетях",
+        "Savio is allowed on private networks",
+        "Savio-ն թույլատրված է մասնավոր ցանցերում";
+    UiShareCheckFirewallNote =
+        "Если система спрашивала, пускать ли его в сеть, — разрешите: иначе брандмауэр \
+         закроет вход.",
+        "If the system asked whether to let it onto the network, allow it: otherwise the \
+         firewall closes the way in.",
+        "Եթե համակարգը հարցրել է՝ թույլ տալ այն ցանց, թույլատրեք. հակառակ դեպքում \
+         պատնեշը կփակի մուտքը։";
+    UiShareCheckScreen =
+        "Этот экран остаётся открытым",
+        "This screen stays open",
+        "Այս էկրանը մնում է բաց";
+    UiShareStartNote =
+        "Savio откроет порт и покажет QR-код с адресом — их и наводят камерой телефона.",
+        "Savio will open a port and show a QR code with the address — that is what the \
+         phone camera is pointed at.",
+        "Savio-ն կբացի պորտ և ցույց կտա QR-կոդ հասցեով՝ հենց դրան են ուղղում հեռախոսի \
+         տեսախցիկը։";
+    UiShareOpenWarning =
+        "Папка открыта для сети, пока вы на этом экране. Уйдёте на другой раздел или \
+         закроете Savio — раздача остановится.",
+        "The folder is open to the network while you are on this screen. Leave for another \
+         section or close Savio, and sharing stops.",
+        "Թղթապանակը բաց է ցանցի համար, քանի դեռ այս էկրանին եք։ Կգնաք այլ բաժին կամ \
+         կփակեք Savio-ն՝ բաշխումը կկանգնի։";
+
     UiShareFolder = "Папка раздачи", "Shared folder", "Բաշխման թղթապանակ";
+    UiShareChangeFolder = "Изменить", "Change", "Փոխել";
     UiShareOpenFolderHint = "Показать папку раздачи в проводнике.",
         "Show the shared folder in the file manager.",
         "Ցույց տալ բաշխման թղթապանակը ֆայլերի կառավարիչում։";
