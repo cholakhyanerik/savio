@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 
+use crate::engine::binaries;
 use crate::engine::settings;
 use crate::engine::setup;
 use crate::engine::{self, Handle, MetaTask, metadata};
@@ -490,6 +491,8 @@ struct RailPicks {
     lang: Option<Lang>,
     appearance: Option<Appearance>,
     toggle_log: bool,
+    /// Нажали «?» — открыть приветствие.
+    welcome: bool,
     smooth: Option<bool>,
     update: Option<setup::Component>,
     /// Открыто ли меню свёрнутого рельса. Ездит туда и обратно, а не полем
@@ -3093,6 +3096,13 @@ pub struct SavioApp {
     /// Разделяется с обработчиком, поэтому `Arc`, а не поле по значению.
     gpu_errors: Arc<GpuErrors>,
 
+    /// Показано ли сейчас приветствие.
+    ///
+    /// При первом запуске — да, дальше только по кнопке «?». Отметку
+    /// «показали» держит пустой файл в папке инструментов
+    /// (`binaries::welcome_seen`), а не поле настроек: это не выбор
+    /// человека, а след того, что он здесь уже был.
+    welcome_open: bool,
     /// Названия групп рельса прописными.
     ///
     /// Собраны заранее, а не в кадре: `to_uppercase` — это аллокация на
@@ -3221,6 +3231,7 @@ impl SavioApp {
             maximize_pending: true,
             saver: settings::Saver::spawn(),
             gpu_errors: Arc::default(),
+            welcome_open: !binaries::welcome_seen(),
             nav_groups: nav_groups(lang),
             appearance: saved.appearance,
             palette: theme::Palette::of(saved.appearance),
@@ -4532,6 +4543,7 @@ impl eframe::App for SavioApp {
         let tags = self.modal_arrival(&ctx, "tags", self.meta.tags.is_some());
         let confirm = self.modal_arrival(&ctx, "confirm", self.meta.confirming);
         let about = self.modal_arrival(&ctx, "about", self.about_open);
+        let welcome = self.modal_arrival(&ctx, "welcome", self.welcome_open);
 
         if self.setup.busy() {
             self.install_modal(&ctx, install);
@@ -4544,6 +4556,12 @@ impl eframe::App for SavioApp {
         }
         if self.about_open {
             self.about_modal(&ctx, about);
+        }
+        // Приветствие рисуется последним: при самом первом запуске поверх
+        // него не должно оказаться ничего, кроме окна установки, — а то
+        // рисуется раньше и потому ляжет ниже.
+        if self.welcome_open {
+            self.welcome_modal(&ctx, welcome);
         }
     }
 }
@@ -4722,6 +4740,9 @@ impl SavioApp {
         if picks.toggle_log {
             self.log_open = !self.log_open;
         }
+        if picks.welcome {
+            self.welcome_open = true;
+        }
         if let Some(smooth) = picks.smooth {
             self.smooth = smooth;
             self.speed = motion::scale(smooth);
@@ -4730,6 +4751,24 @@ impl SavioApp {
         if let Some(what) = picks.update {
             let ctx = ui.ctx().clone();
             self.start_update(what, &ctx);
+        }
+    }
+
+    /// Приветствие: что это за программа и три шага до файла на диске.
+    ///
+    /// Закрывается кнопкой «Начать», щелчком мимо окна и клавишей Esc —
+    /// любой из трёх способов считается «показали». Запирать человека
+    /// в окне нельзя, а объяснение, которое нельзя закрыть, из объяснения
+    /// превращается в препятствие.
+    fn welcome_modal(&mut self, ctx: &egui::Context, arrival: ModalArrival) {
+        arrival.veil(self.palette, ctx, "welcome");
+        let window = welcome_window(self.palette, ctx, self.lang);
+        arrival.apply(ctx, &window.response);
+
+        if window.inner == Some(true) || window.should_close() {
+            self.welcome_open = false;
+            // Метку ставим здесь, а не при запуске: закрыл — значит, видел.
+            binaries::mark_welcome_seen();
         }
     }
 
@@ -6897,6 +6936,12 @@ impl SavioApp {
             }
             Some(AboutAction::Project) => open_url(PROJECT_URL),
             Some(AboutAction::Changelog) => open_url(CHANGELOG_URL),
+            // «О программе» при этом закрывается: два окна поверх завесы
+            // выглядели бы стопкой, а второе из них — и вовсе загадкой.
+            Some(AboutAction::Welcome) => {
+                close = true;
+                self.welcome_open = true;
+            }
             Some(AboutAction::Close) => close = true,
             None => {}
         }
@@ -6914,6 +6959,10 @@ enum AboutAction {
     Copy,
     Project,
     Changelog,
+    /// Открыть приветствие заново. Второй вход в него помимо кнопки «?»:
+    /// человек, которому надо вспомнить, как всё устроено, идёт в
+    /// «О программе» — там же и остальные объяснения.
+    Welcome,
     Close,
 }
 
@@ -6924,7 +6973,185 @@ enum AboutAction {
 /// собрать — конструктор читает настройки с диска и спрашивает версии у
 /// внешних программ, — а окну из всего состояния нужно одно: горит ли
 /// «Скопировано».
-fn about_window(pal: theme::Palette, 
+/// Окно приветствия.
+///
+/// Свободной функцией, как и `about_window`, ради проверки раскладки:
+/// три карточки в ряд — первое, что ломается в узком окне.
+///
+/// Возвращает `Some(true)`, если нажали «Начать».
+fn welcome_window(
+    pal: theme::Palette,
+    ctx: &egui::Context,
+    lang: Lang,
+) -> egui::ModalResponse<Option<bool>> {
+    // Ширина от окна, как у «О программе»: фиксированная вылезла бы
+    // за кромку окна минимального размера. Вычитаются и поля рамки (24
+    // с каждой стороны), и её кромка: без последней модалка выходила за
+    // кромку окна ровно на два пикселя — незаметно глазом, но проверка
+    // размера это ловит, и правильно делает.
+    let width = 620.0_f32.min(ctx.content_rect().width() - 52.0);
+    // Ниже этой ширины три карточки в ряд не помещаются, и шаги встают
+    // колонкой. Число — из самой раскладки: карточке шага нужно около
+    // 170 точек, чтобы «Нажмите „Скачать"» не заворачивалось в три строки.
+    const STEPS_IN_ROW: f32 = 170.0 * 3.0 + 12.0 * 2.0;
+
+    egui::Modal::new(egui::Id::new("savio-welcome"))
+        .backdrop_color(egui::Color32::TRANSPARENT)
+        .frame(
+            egui::Frame::new()
+                .fill(pal.modal_fill)
+                .stroke(egui::Stroke::new(1.0, pal.border_subtle))
+                .corner_radius(egui::CornerRadius::same(theme::RADIUS_CARD))
+                .inner_margin(egui::Margin::same(24)),
+        )
+        .show(ctx, |ui| {
+            ui.set_width(width);
+            let mut started = None;
+
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 9.0;
+                ui.label(
+                    egui::RichText::new("Savio")
+                        .font(theme::display(21.0))
+                        .color(pal.text_primary),
+                );
+                let (dot, _) =
+                    ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
+                ui.painter().circle_filled(dot.center(), 4.5, pal.accent);
+            });
+            ui.add_space(10.0);
+            ui.label(
+                egui::RichText::new(i18n::t(lang, Key::WelcomeTitle))
+                    .font(theme::display(22.0))
+                    .color(pal.text_primary),
+            );
+            ui.add_space(6.0);
+            note(ui, i18n::t(lang, Key::WelcomeNote), pal.text_secondary);
+            ui.add_space(16.0);
+
+            // Шаги — в прокрутке с потолком по высоте. В окне 420 точек они
+            // встают колонкой, и без потолка окно вырастало выше экрана:
+            // заголовок уходил за верхнюю кромку, «Начать» — за нижнюю, и
+            // приветствие, которое нельзя ни дочитать, ни закрыть кнопкой,
+            // превращалось из объяснения в препятствие. Числом, а не
+            // остатком: прокрутка внутри растущего контейнера берёт высоту
+            // от его прошлого кадра и схлопывается (дефект 27).
+            // Потолок прокрутки считается от того, что уже занято, а не
+            // выбирается числом на глаз: заголовок с пояснением занимает
+            // разное место на разных языках и при разной ширине окна, и
+            // зашитый запас разъехался бы с ними при первом же переводе.
+            // `min_rect` здесь уже настоящий: шапка окна нарисована выше.
+            const BUTTON_BLOCK: f32 = 16.0 + theme::CTA_HEIGHT + 6.0;
+            let inner = (ctx.content_rect().height() - 56.0).max(200.0);
+            let room = (inner - ui.min_rect().height() - BUTTON_BLOCK).max(80.0);
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, true])
+                .max_height(room)
+                .show(ui, |ui| {
+                    ui.set_width(width);
+
+            const STEPS: [(Key, Key); 3] = [
+                (Key::WelcomeStepLinkTitle, Key::WelcomeStepLinkNote),
+                (Key::WelcomeStepPickTitle, Key::WelcomeStepPickNote),
+                (Key::WelcomeStepGoTitle, Key::WelcomeStepGoNote),
+            ];
+            if ui.available_width() >= STEPS_IN_ROW {
+                ui.columns(3, |columns| {
+                    for (column, (number, (title, text))) in
+                        columns.iter_mut().zip(STEPS.into_iter().enumerate())
+                    {
+                        welcome_step(column, pal, lang, number + 1, title, text);
+                    }
+                });
+            } else {
+                for (number, (title, text)) in STEPS.into_iter().enumerate() {
+                    if number > 0 {
+                        ui.add_space(10.0);
+                    }
+                    welcome_step(ui, pal, lang, number + 1, title, text);
+                }
+            }
+                });
+
+            ui.add_space(16.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 14.0;
+                if accent_button(
+                    ui,
+                    pal,
+                    i18n::t(lang, Key::WelcomeStart),
+                    140.0,
+                    true,
+                    "",
+                ) {
+                    started = Some(true);
+                }
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(i18n::t(lang, Key::WelcomeOnce))
+                            .small()
+                            .color(pal.text_muted),
+                    )
+                    .wrap(),
+                );
+            });
+
+            started
+        })
+}
+
+/// Одна карточка шага в приветствии: номер в кружке, заголовок, два-три
+/// предложения.
+fn welcome_step(
+    ui: &mut egui::Ui,
+    pal: theme::Palette,
+    lang: Lang,
+    number: usize,
+    title: Key,
+    text: Key,
+) {
+    // Раскладку задаём явно, и это не перестраховка. `ui.columns` отдаёт
+    // колонкам `Layout::top_down_justified`, а `Label` превращает выключку
+    // раскладки в выключку **текста**: `layout_job.justify` становится
+    // истиной, и абзац растягивается пробелами до кромки — «MP4 is video,
+    // MP3 is sound    only» с дырами в полслова. Ни сборка, ни `clippy`,
+    // ни тесты этого не видят; видно только глазами и только там, где
+    // абзац не занял строку целиком.
+    let width = ui.available_width();
+    ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+        ui.set_width(width);
+    theme::inner_frame(pal).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        // Номер в кружке — тот же приём, что у шагов экрана загрузки:
+        // кружок рисуется кистью, а цифра кладётся в его середину.
+        let (circle, _) = ui.allocate_exact_size(egui::vec2(26.0, 26.0), egui::Sense::hover());
+        ui.painter()
+            .circle_filled(circle.center(), 13.0, pal.accent_soft);
+        ui.painter().circle_stroke(
+            circle.center(),
+            13.0,
+            egui::Stroke::new(1.0, pal.accent),
+        );
+        ui.painter().text(
+            circle.center(),
+            egui::Align2::CENTER_CENTER,
+            number,
+            theme::display(13.0),
+            pal.accent_text,
+        );
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new(i18n::t(lang, title))
+                .font(theme::bold(14.0))
+                .color(pal.text_primary),
+        );
+        ui.add_space(4.0);
+        note(ui, i18n::t(lang, text), pal.text_muted);
+    });
+    });
+}
+
+fn about_window(pal: theme::Palette,
     ctx: &egui::Context,
     lang: Lang,
     speed: f32,
@@ -6954,6 +7181,21 @@ fn about_window(pal: theme::Palette,
                     .color(pal.text_primary),
             );
             ui.add_space(8.0);
+
+            // Всё ниже заголовка — в прокрутке, и потолок ей задаётся числом,
+            // а не остатком. Без потолка `Modal` растёт по содержимому, и
+            // в окне 420 точек высотой оно уходит за верхнюю и нижнюю кромки
+            // разом: кнопки «Написать» и «Закрыть» становятся недостижимы,
+            // причём молча — модалка просто нарисована больше экрана.
+            // Числом, а не `available_height()`, по той же причине, что
+            // у журнала (дефект 27): прокрутка внутри растущего контейнера
+            // берёт высоту от его прошлого кадра и схлопывается.
+            let room = (ctx.content_rect().height() - 48.0 - 56.0).max(160.0);
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, true])
+                .max_height(room)
+                .show(ui, |ui| {
+                    ui.set_width(width);
             note(ui, i18n::t(lang, ABOUT_TEXT), pal.text_secondary);
             ui.add_space(14.0);
 
@@ -6976,7 +7218,27 @@ fn about_window(pal: theme::Palette,
                 Some(FEEDBACK_EMAIL),
             );
 
-            ui.add_space(10.0);
+            // «Показать приветствие» — своей строкой, а не пятой кнопкой
+            // в ряду: впятером они не помещаются в окно минимальной ширины
+            // (проверка `the_about_window_fits_the_smallest_window` поймала
+            // это сразу). Перенос ряда тут не годится — `pill_button`
+            // заворачивает кнопку в `ui.scope`, а тот сообщает занятое место
+            // задним числом, мимо всей логики переноса.
+            ui.add_space(12.0);
+            if accent_button(
+                ui,
+                pal,
+                i18n::t(lang, Key::UiShowWelcome),
+                ui.available_width(),
+                true,
+                "",
+            ) {
+                action = Some(AboutAction::Welcome);
+            }
+            ui.add_space(6.0);
+            note(ui, i18n::t(lang, Key::UiAboutButtonsNote), pal.text_muted);
+
+            ui.add_space(12.0);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
                 // Копирование рядом с «Написать» обязательно, а не для
@@ -7026,6 +7288,7 @@ fn about_window(pal: theme::Palette,
                     }
                 });
             });
+                });
 
             action
         })
@@ -9653,6 +9916,15 @@ fn rail_block(ui: &mut egui::Ui, state: &RailState<'_>, picks: &mut RailPicks) {
         // Открытость меню живёт в `Context::data`, а не полем окна: она
         // нужна ровно здесь и ровно на время показа, а поле пришлось бы
         // тащить через `RailState` и `RailPicks` туда и обратно.
+        // «?» — первый вход в приветствие, и стоит он первым в ряду:
+        // человек, который ищет объяснение, ищет его слева направо.
+        if pill_button(ui, "?", speed)
+            .on_hover_text(i18n::t(lang, Key::UiHelpButtonHint))
+            .clicked()
+        {
+            picks.welcome = true;
+        }
+
         let response = pill_button(ui, lang.label(), speed)
             .on_hover_text(i18n::t(lang, Key::UiLanguageHint));
         let mut open = ui
@@ -12945,6 +13217,48 @@ mod tests {
             assert!(
                 screen.contains_rect(rect),
                 "{lang:?}: окно «О программе» не влезает в 520×420: {rect:?}"
+            );
+        }
+    }
+
+    /// Приветствие помещается в окно минимальной ширины на всех языках.
+    ///
+    /// Та же проверка, что у «О программе», и та же причина: модалка растёт
+    /// по содержимому, а три карточки шагов в узком окне встают колонкой —
+    /// без потолка по высоте заголовок уходит за верхнюю кромку, а «Начать»
+    /// за нижнюю. Приветствие, которое нельзя ни дочитать, ни закрыть
+    /// кнопкой, — худшее из первых впечатлений, и увидеть это можно только
+    /// глазами: окно рисуется больше экрана без единой жалобы.
+    ///
+    /// Проверено красным: без прокрутки проверка падает на всех трёх языках.
+    #[test]
+    fn the_welcome_window_fits_the_smallest_window() {
+        let pal = theme::Palette::dark();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(520.0, 420.0));
+
+        for lang in Lang::ALL {
+            // Свой контекст на язык: у модалки есть память между кадрами,
+            // и размер от прошлого языка исказил бы первый кадр следующего.
+            let ctx = egui::Context::default();
+            theme::install_fonts(&ctx);
+            theme::apply(&ctx, pal);
+            let mut rect = egui::Rect::NOTHING;
+
+            for _ in 0..3 {
+                let input = egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                };
+                let mut output = ctx.run_ui(input, |ui| {
+                    rect = welcome_window(pal, ui.ctx(), lang).response.rect;
+                });
+                output.textures_delta.clear();
+            }
+
+            assert!(rect.height() > 150.0, "{lang:?}: окно схлопнулось: {rect:?}");
+            assert!(
+                screen.contains_rect(rect),
+                "{lang:?}: приветствие не влезает в 520×420: {rect:?}"
             );
         }
     }
