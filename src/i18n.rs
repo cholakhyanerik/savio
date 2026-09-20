@@ -1295,6 +1295,31 @@ strings! {
         "Ֆոտոխցիկի մոդելը, նկարահանման ամսաթիվը, վայրի կոորդինատները, հեղինակը, շապիկը և \
          մեկ տասնյակ ծառայողական գրառումներ։ Այս ամենը գնում է ֆայլի հետ, երբ ուղարկում եք \
          այն հետագա։";
+    UiWeatherHoursLegend =
+        "Рамкой отмечен текущий час. Синим — вероятность осадков.",
+        "The current hour is marked with a frame. In blue — the chance of precipitation.",
+        "Շրջանակով նշված է ընթացիկ ժամը։ Կապույտով՝ տեղումների հավանականությունը։";
+    UiWeatherDaysLegend =
+        "Наведите на значок — покажет погоду словами.",
+        "Hover the icon — it shows the weather in words.",
+        "Սավառնեք պատկերակի վրա՝ եղանակը ցույց կտա բառերով։";
+    UiCpuWholeMachine =
+        "Сто процентов — вся машина, а не одно ядро.",
+        "A hundred per cent is the whole machine, not one core.",
+        "Հարյուր տոկոսը ամբողջ մեքենան է, ոչ թե մեկ միջուկը։";
+    UiIoNote =
+        "Столько за секунду прошло через диски и сеть.",
+        "This much went through the disks and the network in a second.",
+        "Այսքանն է վայրկյանում անցել սկավառակների և ցանցի միջով։";
+    UiMetaFileStep = "Файл", "The file", "Ֆայլ";
+    UiMetaFileStepNote = "— MP3 или изображение", "— MP3 or an image", "— MP3 կամ պատկեր";
+    UiMetaPickAnother = "Выбрать другой", "Choose another", "Ընտրել այլը";
+    UiMetaWipeNote =
+        "Savio спросит подтверждение: копия рядом не создаётся, вернуть стёртое будет нельзя.",
+        "Savio will ask for confirmation: no copy is made alongside, and what is wiped \
+         cannot be brought back.",
+        "Savio-ն կհարցնի հաստատում. կողքին պատճեն չի ստեղծվում, ջնջվածը հետ բերել \
+         հնարավոր չի լինի։";
     UiMetaPickHint =
         "Нажмите, чтобы выбрать MP3 или изображение.",
         "Press to choose an MP3 or an image.",

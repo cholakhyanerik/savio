@@ -6593,6 +6593,14 @@ impl SavioApp {
             note(ui, i18n::t(lang, Key::UiMetaNote), pal.text_muted);
 
             ui.add_space(16.0);
+            step_header(ui, pal, 1, i18n::t(lang, Key::UiMetaFileStep), |ui| {
+                ui.label(
+                    egui::RichText::new(i18n::t(lang, Key::UiMetaFileStepNote))
+                        .small()
+                        .color(pal.text_muted),
+                );
+            });
+            ui.add_space(8.0);
             self.meta_file_row(ui);
 
             if let Some(blocked) = &self.meta.blocked {
@@ -6602,6 +6610,11 @@ impl SavioApp {
 
             ui.add_space(16.0);
             self.meta_buttons(ui);
+            // Оговорка про перезапись — текстом, а не только в диалоге
+            // подтверждения: до диалога ещё надо нажать, а решают, нажимать
+            // ли, до него.
+            ui.add_space(6.0);
+            note(ui, i18n::t(lang, Key::UiMetaWipeNote), pal.text_muted);
 
             ui.add_space(14.0);
             self.meta_status(ui);
@@ -6619,16 +6632,52 @@ impl SavioApp {
             pal.text_muted
         };
 
-        let width = ui.available_width();
-        let clicked = enabled_with_touch(ui, !self.meta.busy, self.speed, |ui| {
-            ui.add(
-                egui::Button::new(egui::RichText::new(&self.meta.path_display).color(color))
-                    .truncate()
-                    .min_size(egui::vec2(width, theme::FIELD_HEIGHT)),
-            )
-        })
-        .on_hover_text(self.t(Key::UiMetaPickHint))
-        .clicked();
+        let lang = self.lang;
+        let speed = self.speed;
+        let busy = self.meta.busy;
+        let display = self.meta.path_display.clone();
+        let mut clicked = false;
+
+        // Кнопка кладётся первой справа налево, имя файла — во вложенную
+        // раскладку слева направо. Иначе обрезаемая подпись занимает
+        // столько, сколько просит текст, и налезает на кнопку.
+        //
+        // Имя — подпись, а не кнопка, и это не украшение: у `Label` есть
+        // `show_tooltip_when_elided`, и обрезанный путь сам показывает себя
+        // целиком по наведению. У `Button` такого свойства нет вовсе
+        // (дефект 48 реестра), а на путь, не похожий на кнопку, вдобавок
+        // не нажимали.
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), theme::CONTROL_HEIGHT),
+            egui::Layout::right_to_left(egui::Align::Center),
+            |ui| {
+                clicked = ui
+                    .add_enabled_ui(!busy, |ui| {
+                        pill_button(ui, i18n::t(lang, Key::UiMetaPickAnother), speed)
+                    })
+                    .inner
+                    .on_hover_text(i18n::t(lang, Key::UiMetaPickHint))
+                    .clicked();
+
+                egui::Frame::new()
+                    .stroke(egui::Stroke::new(1.0, pal.border_strong))
+                    .corner_radius(egui::CornerRadius::same(theme::RADIUS_PILL))
+                    .inner_margin(egui::Margin::symmetric(16, 7))
+                    .show(ui, |ui| {
+                        ui.with_layout(
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(&display).color(color),
+                                    )
+                                    .truncate(),
+                                );
+                            },
+                        );
+                    });
+            },
+        );
 
         if clicked
             && let Some(path) = rfd::FileDialog::new()
@@ -7561,6 +7610,7 @@ impl SavioApp {
                     &sample.cpu,
                     Plot::new(&self.monitor.cpu_trace, pal.accent, phase),
                     speed,
+                    Some(i18n::t(lang, Key::UiCpuWholeMachine)),
                 );
                 metric_card(
                     &mut columns[1],
@@ -7569,6 +7619,7 @@ impl SavioApp {
                     &sample.mem,
                     Plot::new(&self.monitor.mem_trace, pal.state_success, phase),
                     speed,
+                    None,
                 );
             });
         } else {
@@ -7579,6 +7630,7 @@ impl SavioApp {
                 &sample.cpu,
                 Plot::new(&self.monitor.cpu_trace, pal.accent, phase),
                 speed,
+                Some(i18n::t(lang, Key::UiCpuWholeMachine)),
             );
             ui.add_space(12.0);
             metric_card(
@@ -7588,6 +7640,7 @@ impl SavioApp {
                 &sample.mem,
                 Plot::new(&self.monitor.mem_trace, pal.state_success, phase),
                 speed,
+                None,
             );
         }
         ui.add_space(12.0);
@@ -8328,6 +8381,12 @@ impl SavioApp {
                         }
                     });
                 });
+
+            // Рамка вокруг текущего часа и синее число под столбиком —
+            // два условных знака подряд, и ни один из них не подписан.
+            // Одна строка снимает оба вопроса разом.
+            ui.add_space(8.0);
+            note(ui, i18n::t(lang, Key::UiWeatherHoursLegend), pal.text_muted);
         });
     }
 
@@ -8354,6 +8413,11 @@ impl SavioApp {
             for day in &view.days {
                 day_row(ui, pal, day);
             }
+            // Что значок под курсором рассказывает погоду словами, из самого
+            // значка не следует: подсказку ищут только у того, что выглядит
+            // недосказанным, а ряд дней выглядит законченным.
+            ui.add_space(8.0);
+            note(ui, i18n::t(lang, Key::UiWeatherDaysLegend), pal.text_muted);
         });
     }
 
@@ -10503,19 +10567,6 @@ fn sized_with_touch<R>(
     .inner
 }
 
-/// `ui.add_enabled`, но с откликом под курсором.
-///
-/// Выключенному виджету он ничего не стоит: под курсором тот не бывает, и
-/// коэффициент остаётся нулём, то есть покоем.
-fn enabled_with_touch<R>(
-    ui: &mut egui::Ui,
-    enabled: bool,
-    speed: f32,
-    add: impl FnOnce(&mut egui::Ui) -> R,
-) -> R {
-    ui.add_enabled_ui(enabled, |ui| with_touch(ui, speed, add))
-        .inner
-}
 
 /// Кнопка-выключатель: нажатая заливается мягким акцентом.
 ///
@@ -11664,6 +11715,7 @@ fn metric_card(
     metric: &Metric,
     plot: Plot<'_>,
     speed: f32,
+    means: Option<&str>,
 ) {
     // Шрифт числа заведён именем, а не выписан по месту дважды: высоту ряда
     // считаем по нему же, и разъехавшись, эти двое обрезали бы число сверху.
@@ -11731,6 +11783,14 @@ fn metric_card(
             if let Some(detail) = &metric.detail {
                 ui.add_space(6.0);
                 note(ui, detail, pal.text_secondary);
+            }
+
+            // Одна строка о том, что число значит. Без неё «57%» у процессора
+            // читают как долю одного ядра и удивляются, почему при полной
+            // загрузке там не 400: доля уже поделена на число ядер.
+            if let Some(means) = means {
+                ui.add_space(6.0);
+                note(ui, means, pal.text_muted);
             }
         });
 }
@@ -11836,6 +11896,8 @@ fn io_card(
 
             ui.add_space(8.0);
             stat_row(ui, pal, lang, i18n::t(lang, Key::UiNetwork), sample.net.as_deref());
+            ui.add_space(6.0);
+            note(ui, i18n::t(lang, Key::UiIoNote), pal.text_muted);
             stat_row(ui, pal, lang, i18n::t(lang, Key::UiDisks), sample.disk.as_deref());
             stat_row(
                 ui,
@@ -13541,7 +13603,7 @@ mod tests {
         let trace = Trace::default();
         let measured = card_height(|ui| {
             let plot = Plot::new(&trace, pal.accent, 0.0);
-            metric_card(ui, pal, "Процессор", &metric, plot, 1.0);
+            metric_card(ui, pal, "Процессор", &metric, plot, 1.0, None);
         });
         assert!(measured > 140.0, "карточка показателя обрезана: {measured}");
         assert!(
