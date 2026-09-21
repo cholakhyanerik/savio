@@ -62,9 +62,9 @@ use crate::model::Appearance;
 
 /// Все цвета окна одним значением.
 ///
-/// `Copy` намеренно: 35 полей по четыре байта — это 140 байт, дешевле
-/// указателя с разыменованием, и копия в начале функции снимает все споры
-/// с заимствованием `&mut self` у методов `SavioApp`.
+/// `Copy` намеренно: три десятка полей по четыре байта — меньше полутора
+/// сотен байт, дешевле указателя с разыменованием, и копия в начале функции
+/// снимает все споры с заимствованием `&mut self` у методов `SavioApp`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Palette {
     // Поверхности.
@@ -160,6 +160,16 @@ pub struct Palette {
     pub state_warning: Color32,
     /// Мягкая зелёная подложка: плашка «есть 2160p», «Опрос идёт».
     pub success_soft: Color32,
+    /// Мягкая жёлтая подложка: личная строка в таблице метаданных и плашка
+    /// «2 личные записи» над ней. Предупреждение на десяти процентах — так
+    /// в макете v2.
+    ///
+    /// Считается на карточке: таблица лежит там. Подпись личной строки и
+    /// плашки (`state_warning`) даёт на ней минимум 6.69:1, значение
+    /// (`text_primary`) — 12.43:1. Проходит и `text_muted`, но впритык —
+    /// 4.58:1 в тёмной теме, поэтому подложку плотнее десяти процентов
+    /// делать нельзя: приглушённый серый первым уйдёт под порог.
+    pub warning_soft: Color32,
 
     // Небо: значки погоды.
     //
@@ -232,6 +242,7 @@ impl Palette {
             state_error: Color32::from_rgb(0xD0, 0x76, 0x6C),
             state_warning: Color32::from_rgb(0xE8, 0xB9, 0x6A),
             success_soft: Color32::from_rgba_unmultiplied(0xAE, 0xBF, 0x92, 36),
+            warning_soft: Color32::from_rgba_unmultiplied(0xE8, 0xB9, 0x6A, 26),
 
             sky_water: Color32::from_rgb(0x92, 0xBA, 0xE0),
 
@@ -280,6 +291,7 @@ impl Palette {
             state_error: Color32::from_rgb(0xA1, 0x42, 0x37),
             state_warning: Color32::from_rgb(0x6F, 0x4B, 0x08),
             success_soft: Color32::from_rgba_unmultiplied(0x46, 0x52, 0x31, 31),
+            warning_soft: Color32::from_rgba_unmultiplied(0x6F, 0x4B, 0x08, 26),
 
             sky_water: Color32::from_rgb(0x2C, 0x66, 0x90),
 
@@ -1073,6 +1085,34 @@ mod tests {
             "приглушённый серый на акцентной подложке вдруг проходит порог \
              ({ratio:.2}:1) — оговорка у `accent_soft` больше не про эту заливку"
         );
+    }
+
+    /// На жёлтой подложке личной строки читается весь текст окна.
+    ///
+    /// Подложка полупрозрачная, как `card_inner`, поэтому считается там, где
+    /// лежит: таблица метаданных стоит на карточке. Обе темы — потому что
+    /// светлая переворачивает половину пар. Приглушённый серый в списке не
+    /// для полноты: у акцентной подложки он не проходит, и здесь он ближе
+    /// всех к порогу (4.58:1 в тёмной теме) — на нём и сломается первым
+    /// подложка, которую захочется сделать поярче.
+    #[test]
+    fn the_warning_underlay_keeps_every_text_colour_readable() {
+        for (theme, p) in [("тёмная", Palette::dark()), ("светлая", Palette::light())] {
+            let soft = over(p.warning_soft, p.card_fill);
+            for (name, color) in [
+                ("state_warning", p.state_warning),
+                ("text_primary", p.text_primary),
+                ("text_secondary", p.text_secondary),
+                ("text_muted", p.text_muted),
+            ] {
+                let ratio = contrast(color, soft);
+                assert!(
+                    ratio >= 4.5,
+                    "{theme}: {name} на жёлтой подложке даёт {ratio:.2}:1 — \
+                     порог 4.5:1 не проходит"
+                );
+            }
+        }
     }
 
     /// На акцентной заливке читается её собственная подпись — и не читается

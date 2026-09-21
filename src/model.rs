@@ -266,23 +266,288 @@ pub fn meta_kind(path: &std::path::Path) -> MetaKind {
     }
 }
 
-/// Одна строка в списке метаданных: имя и значение, уже готовые к показу.
+/// Что запись говорит о человеке и в какую строку сводки она ляжет.
+///
+/// Роль ставит движок, а не UI, и иначе нельзя: только разбор знает, что
+/// запись пришла из каталога GPS или что это номер 0x9003. По имени этого не
+/// узнать — имена переведены на три языка, и «Дата съёмки» по-армянски ничем
+/// не похожа на себя по-русски.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TagRole {
+    /// Где снято: координаты и высота над морем.
+    Place,
+    /// Когда снято или создано.
+    Taken,
+    /// Владелец камеры — имя, вписанное в её настройки.
+    Owner,
+    /// Серийный номер камеры или объектива. Личный не меньше геометки: он
+    /// связывает все снимки с одной камерой, то есть с одним человеком.
+    Serial,
+    /// Производитель и модель камеры — одна строка «Камера».
+    Camera,
+    /// Фокусное расстояние, диафрагма, выдержка и ISO — одна строка
+    /// «Объектив и выдержка».
+    Shot,
+    /// Программа, через которую прошёл файл.
+    Software,
+    /// Запись, которую стоит показать своей строкой: автор, описание,
+    /// комментарий, название песни, обложка.
+    Named,
+    /// Служебная запись: ориентация, размер кадра, XMP. Уходит в свёрнутый
+    /// хвост таблицы.
+    Service,
+    /// Не метаданные, а свойство самого файла: длительность и битрейт MP3.
+    ///
+    /// Стереть его нельзя, поэтому в таблицу оно не идёт: иначе после очистки
+    /// таблица показывала бы две уцелевшие записи — и человек решил бы, что
+    /// очистка не сработала. Показывается рядом с именем файла.
+    Property,
+}
+
+impl TagRole {
+    /// Личная ли запись — то, по чему человека можно найти. Такие строки
+    /// в таблице жёлтые, и их число стоит в плашке над ней.
+    pub fn personal(self) -> bool {
+        matches!(
+            self,
+            TagRole::Place | TagRole::Taken | TagRole::Owner | TagRole::Serial
+        )
+    }
+}
+
+/// Одна прочитанная запись: роль, имя и значение, уже готовые к показу.
 ///
 /// Значение — всегда строка: EXIF-рациональные, GPS-координаты и ID3-теги
 /// приводятся к человекочитаемому виду там, где их разбирают. UI ничего
 /// не форматирует и не пересобирает в кадре.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Tag {
+    pub role: TagRole,
     pub name: String,
     pub value: String,
 }
 
 impl Tag {
-    pub fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
+    pub fn new(role: TagRole, name: impl Into<String>, value: impl Into<String>) -> Self {
         Self {
+            role,
             name: name.into(),
             value: value.into(),
         }
+    }
+}
+
+/// Что движок узнал о файле: размер и записи.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MetaReport {
+    /// Размер файла в байтах. `None` — система его не сообщила.
+    pub size: Option<u64>,
+    /// Пустой список — законный исход («Метаданные не найдены»), а не
+    /// ошибка: чистый файл выглядит именно так.
+    pub tags: Vec<Tag>,
+}
+
+/// Строка таблицы «Метаданные файла».
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MetaRow {
+    pub label: String,
+    pub value: String,
+    pub personal: bool,
+}
+
+/// Со скольких служебных записей хвост сворачивается в одну строку.
+///
+/// Одну-две записи прятать за щелчок незачем: строка «ещё 2 — …» заняла бы
+/// столько же места, сколько сами записи, и только спрятала бы их.
+const SERVICE_FOLD_MIN: usize = 3;
+
+/// Сколько имён служебных записей перечисляет свёрнутая строка.
+const SERVICE_NAMES_SHOWN: usize = 3;
+
+/// Прочитанное, сложенное так, как его показывает экран: личное сверху,
+/// камера и съёмка — по строке, служебное — свёрнутым хвостом.
+///
+/// Сводка, а не список записей подряд, и это не ради краткости. Снимок
+/// с телефона несёт два десятка записей, и в списке подряд геометка ничем не
+/// отличалась от фокусного расстояния — искать её приходилось глазами, а
+/// кнопка «Стереть всё» уезжала под прокрутку.
+///
+/// Собирается один раз, когда пришёл отчёт, а не в кадре (Правило 1). На
+/// смене языка отчёт перечитывается целиком: имена и значения переводит
+/// движок, и пересобрать их здесь было бы не из чего.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MetaSummary {
+    /// Строки таблицы: сначала личные, потом камера, съёмка, записи, у
+    /// которых своя строка, и программа.
+    pub rows: Vec<MetaRow>,
+    /// Служебные записи. Пусто — хвоста нет: записей мало, и они уже
+    /// стоят в `rows`.
+    pub service: Vec<MetaRow>,
+    /// Значение свёрнутой строки: «ещё 7 — ориентация, размер кадра, XMP…».
+    pub service_line: String,
+    /// Сколько личных строк.
+    pub personal: usize,
+    /// Подпись плашки: «2 личные записи». Пусто, когда личных нет.
+    pub personal_line: String,
+    /// Что известно о файле, кроме имени: «4.2 МБ · 3:25 · 320 кбит/с».
+    pub facts: String,
+}
+
+impl MetaSummary {
+    pub fn new(report: &MetaReport, lang: Lang) -> Self {
+        let tags = &report.tags;
+        let of = |role: TagRole| tags.iter().filter(move |tag| tag.role == role);
+        let own = |tag: &Tag| MetaRow {
+            label: tag.name.clone(),
+            value: tag.value.clone(),
+            personal: tag.role.personal(),
+        };
+        let merged = |key: Key, value: String| MetaRow {
+            label: i18n::t(lang, key).to_owned(),
+            value,
+            personal: false,
+        };
+
+        // Личное — первым: ради него раздел и открывают.
+        let mut rows: Vec<MetaRow> = [
+            TagRole::Place,
+            TagRole::Taken,
+            TagRole::Owner,
+            TagRole::Serial,
+        ]
+        .into_iter()
+        .flat_map(|role| of(role).map(own))
+        .collect();
+        let personal = rows.len();
+
+        // Одинаковые значения склеиваются в одно: одна и та же программа
+        // бывает записана дважды — в EXIF и в текстовом поле PNG.
+        let joined = |role: TagRole| {
+            let mut values: Vec<&str> = Vec::new();
+            for tag in of(role) {
+                if !values.contains(&tag.value.as_str()) {
+                    values.push(&tag.value);
+                }
+            }
+            (!values.is_empty()).then(|| values.join(" · "))
+        };
+
+        if let Some(value) = camera_line(of(TagRole::Camera)) {
+            rows.push(merged(Key::TagCamera, value));
+        }
+        if let Some(value) = joined(TagRole::Shot) {
+            rows.push(merged(Key::TagShot, value));
+        }
+        // Записи со своими строками — раньше программы: у песни это
+        // название и исполнитель, и начинать её таблицу с кодировщика было
+        // бы странно. У снимка порядок тот же, что в макете: программа —
+        // последняя строка перед служебными.
+        rows.extend(of(TagRole::Named).map(own));
+        if let Some(value) = joined(TagRole::Software) {
+            rows.push(merged(Key::TagSoftware, value));
+        }
+
+        let mut service: Vec<MetaRow> = of(TagRole::Service).map(own).collect();
+        if service.len() < SERVICE_FOLD_MIN {
+            rows.append(&mut service);
+        }
+
+        let service_line = if service.is_empty() {
+            String::new()
+        } else {
+            let mut names = service
+                .iter()
+                .take(SERVICE_NAMES_SHOWN)
+                .map(|row| lowercase_first(&row.label))
+                .collect::<Vec<_>>()
+                .join(", ");
+            if service.len() > SERVICE_NAMES_SHOWN {
+                names.push('…');
+            }
+            i18n::fill(
+                i18n::t(lang, Key::UiMetaServiceMore),
+                &[&service.len().to_string(), &names],
+            )
+        };
+
+        let personal_line = if personal == 0 {
+            String::new()
+        } else {
+            let words = i18n::plural(
+                lang,
+                personal as u64,
+                i18n::t(lang, Key::UiMetaPersonalOne),
+                i18n::t(lang, Key::UiMetaPersonalFew),
+                i18n::t(lang, Key::UiMetaPersonalMany),
+            );
+            i18n::fill(
+                i18n::t(lang, Key::UiMetaPersonalCount),
+                &[&personal.to_string(), words],
+            )
+        };
+
+        let facts = report
+            .size
+            .map(|size| human_bytes(size, lang))
+            .into_iter()
+            .chain(of(TagRole::Property).map(|tag| tag.value.clone()))
+            .collect::<Vec<_>>()
+            .join(" · ");
+
+        Self {
+            rows,
+            service,
+            service_line,
+            personal,
+            personal_line,
+            facts,
+        }
+    }
+
+    /// Показать нечего: ни одной записи.
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty() && self.service.is_empty()
+    }
+}
+
+/// Производитель и модель одной строкой — без повтора марки.
+///
+/// Камеры пишут марку по-разному: Apple кладёт в модель «iPhone 14 Pro», а
+/// Canon — «Canon EOS R5», то есть марку ещё раз. Склейка в лоб дала бы
+/// «Canon Canon EOS R5», поэтому марка не повторяется, если модель уже
+/// с неё начинается. Сверяется первое слово: у Nikon производитель —
+/// «NIKON CORPORATION», а модель — «NIKON D850».
+fn camera_line<'a>(parts: impl Iterator<Item = &'a Tag>) -> Option<String> {
+    let parts: Vec<&str> = parts.map(|tag| tag.value.as_str()).collect();
+    let (maker, rest) = parts.split_first()?;
+    let Some(model) = rest.first() else {
+        return Some((*maker).to_owned());
+    };
+    let brand = maker.split_whitespace().next().unwrap_or(maker).to_lowercase();
+    Some(if model.to_lowercase().starts_with(&brand) {
+        (*model).to_owned()
+    } else {
+        format!("{maker} {model}")
+    })
+}
+
+/// «Ориентация» → «ориентация», но «XMP» остаётся «XMP».
+///
+/// Имя встаёт в середину фразы («ещё 7 — ориентация, XMP…»), и заглавная
+/// буква там читается опечаткой, а строчная аббревиатура — ошибкой. Поэтому
+/// первая буква опускается, только если за ней строчная.
+fn lowercase_first(name: &str) -> String {
+    let mut chars = name.chars();
+    let (Some(first), Some(second)) = (chars.next(), chars.next()) else {
+        return name.to_owned();
+    };
+    if second.is_lowercase() {
+        first
+            .to_lowercase()
+            .chain(name[first.len_utf8()..].chars())
+            .collect()
+    } else {
+        name.to_owned()
     }
 }
 
@@ -1166,9 +1431,11 @@ pub enum Event {
     /// выглядело бы как «ничего не произошло» — а именно это и надо было
     /// отличить от настоящего обновления.
     Notice(String),
-    /// Метаданные локального файла прочитаны. Пустой список — законный исход
-    /// («Метаданные не найдены»), а не ошибка: чистый файл выглядит именно так.
-    Tags(Vec<Tag>),
+    /// Метаданные локального файла прочитаны. Пустой список записей —
+    /// законный исход («Метаданные не найдены»), а не ошибка: чистый файл
+    /// выглядит именно так. Размер файла едет здесь же: прочитать его
+    /// в кадре нельзя (Правило 1), а движок открывает файл всё равно.
+    Tags(MetaReport),
     /// Метаданные удалены, файл стал легче на столько байт.
     ///
     /// Ноль здесь тоже законен: чистить было нечего, файл не тронут. Отдельно
@@ -2517,6 +2784,36 @@ fn day_month(day: i64, lang: Lang) -> String {
     )
 }
 
+/// «14 сен 2025, 19:42» — момент, как его записала камера.
+///
+/// Нужен таблице метаданных: EXIF хранит время строкой «2025:09:14 19:42:07»,
+/// и в таком виде дату съёмки узнаёт не всякий. Секунды отброшены — к ответу
+/// на «когда снято» они ничего не прибавляют. Число и месяц ставит тот же
+/// шаблон, что у прогноза погоды, так что даты в окне выглядят одинаково.
+///
+/// Месяц вне 1–12 зажимается, а не роняет разбор: проверять диапазон — дело
+/// того, кто разбирал строку, а здесь важно не упасть.
+pub fn human_date_time(
+    year: i64,
+    month: i64,
+    day: i64,
+    clock: Option<(i64, i64)>,
+    lang: Lang,
+) -> String {
+    let month = i18n::t(lang, MONTHS[(month - 1).clamp(0, 11) as usize]);
+    let date = i18n::fill(
+        i18n::t(lang, Key::DateDayMonth),
+        &[&day.to_string(), month],
+    );
+    match clock {
+        Some((hour, minute)) => i18n::fill(
+            i18n::t(lang, Key::MetaDateTime),
+            &[&date, &year.to_string(), &format!("{hour:02}:{minute:02}")],
+        ),
+        None => i18n::fill(i18n::t(lang, Key::MetaDate), &[&date, &year.to_string()]),
+    }
+}
+
 /// «Сегодня», «Завтра» или «ср, 16 сен».
 fn day_label(day: i64, today: i64, lang: Lang) -> String {
     match day - today {
@@ -3043,6 +3340,164 @@ pub fn qr_modules(text: &str) -> Option<(usize, Vec<bool>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tag(role: TagRole, name: &str, value: &str) -> Tag {
+        Tag::new(role, name, value)
+    }
+
+    fn summary(tags: Vec<Tag>) -> MetaSummary {
+        MetaSummary::new(
+            &MetaReport {
+                size: Some(4_404_019),
+                tags,
+            },
+            Lang::Ru,
+        )
+    }
+
+    /// Личное — первым и посчитано: ради него раздел и открывают.
+    #[test]
+    fn a_summary_puts_personal_rows_first_and_counts_them() {
+        let s = summary(vec![
+            tag(TagRole::Software, "Программа", "18.6"),
+            tag(TagRole::Camera, "Производитель", "Apple"),
+            tag(TagRole::Serial, "Серийный номер камеры", "C39"),
+            tag(TagRole::Place, "Координаты места", "40.1772, 44.5035"),
+            tag(TagRole::Named, "Автор", "Эрик"),
+            tag(TagRole::Taken, "Дата съёмки", "14 сен 2025, 19:42"),
+        ]);
+        let labels: Vec<&str> = s.rows.iter().map(|row| row.label.as_str()).collect();
+        // Программа — последней перед служебными: у песни раньше неё стоят
+        // название и исполнитель, у снимка так и в макете.
+        assert_eq!(
+            labels,
+            [
+                "Координаты места",
+                "Дата съёмки",
+                "Серийный номер камеры",
+                "Камера",
+                "Автор",
+                "Программа"
+            ]
+        );
+        assert_eq!(s.personal, 3);
+        assert!(s.rows[..3].iter().all(|row| row.personal), "{s:?}");
+        assert!(s.rows[3..].iter().all(|row| !row.personal), "{s:?}");
+        assert_eq!(s.personal_line, "3 личные записи");
+    }
+
+    #[test]
+    fn the_camera_brand_is_not_repeated() {
+        let camera = |maker: &str, model: &str| {
+            summary(vec![
+                tag(TagRole::Camera, "Производитель", maker),
+                tag(TagRole::Camera, "Модель камеры", model),
+            ])
+            .rows[0]
+                .value
+                .clone()
+        };
+        assert_eq!(camera("Apple", "iPhone 14 Pro"), "Apple iPhone 14 Pro");
+        assert_eq!(camera("Canon", "Canon EOS R5"), "Canon EOS R5");
+        // У Nikon производитель длиннее марки, а модель начинается с марки.
+        assert_eq!(camera("NIKON CORPORATION", "NIKON D850"), "NIKON D850");
+    }
+
+    #[test]
+    fn shot_and_software_share_one_row_each() {
+        let s = summary(vec![
+            tag(TagRole::Shot, "Фокусное расстояние", "6.86 мм"),
+            tag(TagRole::Shot, "Диафрагма", "f/1.78"),
+            tag(TagRole::Shot, "Выдержка", "1/120"),
+            tag(TagRole::Shot, "ISO", "ISO 250"),
+            tag(TagRole::Software, "Программа", "18.6"),
+            tag(TagRole::Software, "Программа", "18.6"),
+        ]);
+        let rows: Vec<(&str, &str)> = s
+            .rows
+            .iter()
+            .map(|row| (row.label.as_str(), row.value.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("Объектив и выдержка", "6.86 мм · f/1.78 · 1/120 · ISO 250"),
+                // Одна и та же программа, записанная дважды, — одна.
+                ("Программа", "18.6"),
+            ]
+        );
+    }
+
+    /// Хвост из одной-двух записей не прячется: строка «ещё 2 — …» заняла
+    /// бы столько же места и только спрятала бы их.
+    #[test]
+    fn a_short_service_tail_is_not_folded() {
+        let s = summary(vec![
+            tag(TagRole::Service, "Ориентация", "1"),
+            tag(TagRole::Service, "XMP", "присутствует, 4.0 КБ"),
+        ]);
+        assert!(s.service.is_empty(), "{s:?}");
+        assert_eq!(s.rows.len(), 2);
+        assert!(s.service_line.is_empty());
+    }
+
+    #[test]
+    fn a_long_service_tail_folds_under_its_first_names() {
+        let s = summary(
+            ["Ориентация", "XMP", "Дата изменения", "Размер кадра"]
+                .into_iter()
+                .map(|name| tag(TagRole::Service, name, "1"))
+                .collect(),
+        );
+        assert!(s.rows.is_empty(), "{s:?}");
+        assert_eq!(s.service.len(), 4);
+        // Имя посреди фразы — со строчной буквы, аббревиатура — как была.
+        assert_eq!(s.service_line, "ещё 4 — ориентация, XMP, дата изменения…");
+    }
+
+    /// Длительность и битрейт — свойства звука, а не метаданные: стереть их
+    /// нельзя, и в таблице после очистки они выглядели бы уцелевшими.
+    #[test]
+    fn properties_sit_next_to_the_file_name_not_in_the_table() {
+        let s = summary(vec![
+            tag(TagRole::Property, "Длительность", "3:25"),
+            tag(TagRole::Property, "Битрейт", "320 кбит/с"),
+        ]);
+        assert!(s.is_empty(), "{s:?}");
+        assert_eq!(s.facts, "4.2 МБ · 3:25 · 320 кбит/с");
+    }
+
+    #[test]
+    fn the_personal_count_takes_the_right_word_form() {
+        let line = |n: usize, lang: Lang| {
+            let tags = (0..n)
+                .map(|_| tag(TagRole::Serial, "Серийный номер камеры", "1"))
+                .collect();
+            MetaSummary::new(&MetaReport { size: None, tags }, lang).personal_line
+        };
+        assert_eq!(line(1, Lang::Ru), "1 личная запись");
+        assert_eq!(line(2, Lang::Ru), "2 личные записи");
+        assert_eq!(line(5, Lang::Ru), "5 личных записей");
+        assert_eq!(line(11, Lang::Ru), "11 личных записей");
+        assert_eq!(line(21, Lang::Ru), "21 личная запись");
+        assert_eq!(line(1, Lang::En), "1 personal record");
+        assert_eq!(line(2, Lang::En), "2 personal records");
+        // Ноль — это не «0 личных записей», а отсутствие плашки.
+        assert_eq!(line(0, Lang::Ru), "");
+    }
+
+    #[test]
+    fn a_moment_reads_like_the_forecast() {
+        assert_eq!(
+            human_date_time(2025, 9, 14, Some((19, 42)), Lang::Ru),
+            "14 сен 2025, 19:42"
+        );
+        assert_eq!(
+            human_date_time(2025, 9, 14, Some((7, 5)), Lang::En),
+            "14 Sep 2025, 07:05"
+        );
+        assert_eq!(human_date_time(2025, 9, 14, None, Lang::Ru), "14 сен 2025");
+    }
 
     #[test]
     fn share_address_names_its_interface() {

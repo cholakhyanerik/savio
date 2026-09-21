@@ -19,9 +19,11 @@ use crate::engine::weather;
 use crate::model::{
     Appearance, BALANCED_PLAN, CheckStatus, CookieSource, DownloadId, DownloadOptions, Event,
     FAVORITES_LIMIT,
-    Format, GpuInfo, MediaInfo, Metric, PerfSample, Place, PowerMode, PowerModes, PowerState,
-    PressureUnit, Progress, Quality, Request, Section, SectionError, SectionPlan, ShareAddress,
-    ShareEvent, Sky, SubLang, SystemReport, TRACE_LIMIT, TRANSFER_LIMIT, Tag, TempUnit, Thumbnail,
+    Format, GpuInfo, MediaInfo, MetaKind, MetaSummary, Metric, PerfSample, Place, PowerMode,
+    PowerModes,
+    PowerState, PressureUnit, Progress, Quality, Request, Section, SectionError, SectionPlan,
+    ShareAddress, ShareEvent, Sky, SubLang, SystemReport, TRACE_LIMIT, TRANSFER_LIMIT, TempUnit,
+    Thumbnail,
     Trace, TransferDirection, VISITOR_LIMIT, WeatherReport, WeatherUnits, WeatherView, WindUnit,
     human_bytes, human_duration, human_speed, looks_like_url, meta_kind, parse_section, qr_modules,
     transfer_line, weather_view,
@@ -1151,75 +1153,152 @@ impl Tone {
 /// Со своим приёмником событий: чистить метаданные во время скачивания —
 /// законный сценарий, и события двух задач не должны попадать в один канал.
 /// Движка это не касается, он по-прежнему знает только `Sender<Event>`.
+///
+/// Файл читается сам — как только выбран и сразу после очистки. Кнопка
+/// поэтому называется «Прочитать снова»: первым шагом чтение больше не
+/// бывает, а таблица после «Стереть всё» показывает, что осталось, — то есть
+/// сама доказывает, что очистка сработала.
 struct MetaPanel {
     path: Option<PathBuf>,
-    /// Путь строкой. Собирается при выборе файла, а не в кадре отрисовки.
+    /// Полный путь строкой — подсказка по наведению на имя файла и строка
+    /// в вопросе «точно перезаписать?». Собирается при выборе файла, а не
+    /// в кадре отрисовки.
     path_display: String,
+    /// Имя файла без папок: то, что стоит в таблетке первого шага.
+    file_name: String,
+    /// Хвост таблетки: «· 4.2 МБ · 3:25». Пусто, пока файл не прочитан.
+    /// Собирается, когда пришёл отчёт, — не в кадре.
+    file_facts: String,
     /// Почему с этим файлом работать нельзя. `None` — можно.
     blocked: Option<String>,
     readable: bool,
     cleanable: bool,
-    busy: bool,
+    /// Файл — звук. Под его таблицей своя строка: про место и время съёмки
+    /// у песни говорить нечего.
+    audio: bool,
+    /// Что сейчас идёт в потоке. `None` — ничего.
+    ///
+    /// Задача, а не флаг «занято», потому что `Event::Failed` не говорит, чья
+    /// это неудача, а показывать её надо в разных местах: несостоявшееся
+    /// чтение — вместо таблицы, несостоявшуюся очистку — под кнопками, рядом
+    /// с таблицей, которая после неё по-прежнему верна: файл не тронут.
+    running: Option<MetaTask>,
     stage: String,
-    /// Прочитанные метаданные: `Some` — показываем окно со списком.
-    /// Пустой список внутри — законный исход, а не ошибка.
-    tags: Option<Vec<Tag>>,
-    /// Итог последней операции: текст и цвет плашки.
+    /// Прочитанное, сложенное для экрана. `None` — ещё не читали, читаем
+    /// впервые или только что стёрли. Пустая сводка — законный исход.
+    summary: Option<MetaSummary>,
+    /// Почему прочитать не вышло.
+    read_error: Option<String>,
+    /// Итог последней очистки: текст и цвет плашки.
     outcome: Option<(String, Tone)>,
+    /// Сколько освободила последняя очистка. Число, а не только готовая
+    /// строка, чтобы итог можно было пересобрать на новом языке.
+    freed: Option<u64>,
+    /// Раскрыт ли хвост служебных записей.
+    service_open: bool,
+    /// Номер выбранного файла: растёт с каждым выбором.
+    ///
+    /// Из него строятся идентификаторы анимаций хвоста. Состояние анимации
+    /// egui держит по идентификатору, а не по файлу, и без номера хвост
+    /// нового снимка с той же камеры — с тем же числом служебных записей —
+    /// появлялся раскрытым и сворачивался у всех на глазах, доезжая
+    /// анимацию прошлого файла (найдено ревью задачи 65).
+    generation: u64,
     /// Показан вопрос «точно перезаписать?».
     confirming: bool,
     rx: Option<Receiver<Event>>,
 }
 
 impl MetaPanel {
-    fn new(lang: Lang) -> Self {
+    fn new() -> Self {
         Self {
             path: None,
-            path_display: i18n::t(lang, Key::UiNoFileChosen).to_owned(),
+            path_display: String::new(),
+            file_name: String::new(),
+            file_facts: String::new(),
             blocked: None,
             readable: false,
             cleanable: false,
-            busy: false,
+            audio: false,
+            running: None,
             stage: String::new(),
-            tags: None,
+            summary: None,
+            read_error: None,
             outcome: None,
+            freed: None,
+            service_open: false,
+            generation: 0,
             confirming: false,
             rx: None,
         }
     }
 
-    /// Запоминает выбранный файл и сразу решает, что с ним можно делать.
-    ///
-    /// Решение принимается один раз здесь, а не в кадре отрисовки: иначе
-    /// расширение разбиралось бы 60 раз в секунду ради двух флагов.
+    fn busy(&self) -> bool {
+        self.running.is_some()
+    }
+
     /// Пересобирает то, что собрано заранее, на новом языке.
     ///
-    /// Приглашение выбрать файл и объяснение «с этим форматом работать
-    /// нельзя» — готовые строки, и сами они не обновятся.
-    fn relabel(&mut self, lang: Lang) {
-        if self.path.is_none() {
-            self.path_display = i18n::t(lang, Key::UiNoFileChosen).to_owned();
-        }
+    /// Объяснение «с этим форматом работать нельзя» и итог очистки — готовые
+    /// строки, и сами они не обновятся. А таблицу пересобрать не из чего:
+    /// имена и значения записей переводит движок в момент чтения. Поэтому
+    /// показанный файл читается заново — это доли секунды, и идёт оно
+    /// в потоке. Пока идёт очистка, заново не читаем: сразу после неё файл
+    /// перечитается и так, уже на новом языке, а второе чтение рядом с
+    /// перезаписью файла только спорило бы с ней за диск.
+    fn relabel(&mut self, lang: Lang, ctx: &egui::Context) {
         if let Some(path) = &self.path {
             let kind = meta_kind(path);
             self.blocked = (!kind.readable() || !kind.cleanable())
                 .then(|| metadata::unsupported_message(kind, lang));
         }
+        if let Some(freed) = self.freed {
+            self.outcome = Some(wipe_outcome(freed, lang));
+        }
+
+        let shown = self.summary.is_some()
+            || self.read_error.is_some()
+            || self.running == Some(MetaTask::Read);
+        if self.readable && shown && self.running != Some(MetaTask::Clean) {
+            self.start(MetaTask::Read, lang, ctx);
+        }
     }
 
-    fn select(&mut self, path: PathBuf, lang: Lang) {
+    /// Запоминает выбранный файл, решает, что с ним можно делать, и сразу
+    /// его читает.
+    ///
+    /// Решение принимается один раз здесь, а не в кадре отрисовки: иначе
+    /// расширение разбиралось бы 60 раз в секунду ради двух флагов.
+    fn select(&mut self, path: PathBuf, lang: Lang, ctx: &egui::Context) {
         let kind = meta_kind(&path);
         self.readable = kind.readable();
         self.cleanable = kind.cleanable();
+        self.audio = kind == MetaKind::Mp3;
         self.blocked = (!kind.readable() || !kind.cleanable())
             .then(|| metadata::unsupported_message(kind, lang));
         self.path_display = path.display().to_string();
+        self.file_name = path
+            .file_name()
+            .map_or_else(|| self.path_display.clone(), |name| name.to_string_lossy().into_owned());
         self.path = Some(path);
         // Результаты относились к прошлому файлу — показывать их рядом
         // с новым нельзя, это прямой повод перепутать.
-        self.tags = None;
+        self.summary = None;
+        self.file_facts.clear();
+        self.read_error = None;
         self.outcome = None;
+        self.freed = None;
+        self.service_open = false;
+        self.generation = self.generation.wrapping_add(1);
         self.stage.clear();
+        // Приёмник прошлого файла бросаем, даже если новый прочитать нельзя:
+        // иначе запоздалый ответ про прежний файл лёг бы под именем нового.
+        self.rx = None;
+        self.running = None;
+
+        if self.readable {
+            self.start(MetaTask::Read, lang, ctx);
+        }
     }
 
     fn start(&mut self, task: MetaTask, lang: Lang, ctx: &egui::Context) {
@@ -1231,14 +1310,25 @@ impl MetaPanel {
         let notify_ctx = ctx.clone();
         engine::start_metadata(path, task, lang, tx, move || notify_ctx.request_repaint());
 
+        // Прежний приёмник уходит вместе с заменой, а с ним — и запоздалые
+        // события прежнего запуска: перечитывание на смене языка не должно
+        // получить ответ старого чтения на старом языке.
         self.rx = Some(rx);
-        self.busy = true;
-        self.tags = None;
-        self.outcome = None;
+        self.running = Some(task);
         self.stage = i18n::t(lang, Key::StageStarting).to_owned();
+        match task {
+            // Прочитанное остаётся на экране до нового ответа: при смене
+            // языка оно верно, только названо по-старому, и мигать пустым
+            // местом таблице незачем.
+            MetaTask::Read => self.read_error = None,
+            MetaTask::Clean => {
+                self.outcome = None;
+                self.freed = None;
+            }
+        }
     }
 
-    fn drain(&mut self, lang: Lang) {
+    fn drain(&mut self, lang: Lang, ctx: &egui::Context) {
         let mut events = Vec::new();
         let mut disconnected = false;
 
@@ -1255,38 +1345,43 @@ impl MetaPanel {
             }
         }
 
+        let mut reread = false;
         for event in events {
             match event {
                 Event::Stage(stage) => self.stage = stage,
-                Event::Tags(tags) => {
-                    self.tags = Some(tags);
-                    self.busy = false;
+                Event::Tags(report) => {
+                    let summary = MetaSummary::new(&report, lang);
+                    self.file_facts = if summary.facts.is_empty() {
+                        String::new()
+                    } else {
+                        format!("· {}", summary.facts)
+                    };
+                    self.summary = Some(summary);
+                    self.running = None;
                 }
                 Event::Cleaned(freed) => {
-                    // Ноль освобождённых байт — это не неудача, а чистый файл.
-                    // Сказать об этом надо иначе, иначе «освобождено 0 Б»
-                    // выглядит как сломавшаяся операция.
-                    self.outcome = Some(if freed == 0 {
-                        (
-                            i18n::t(lang, Key::UiMetaNothingToWipe).to_owned(),
-                            Tone::Plain,
-                        )
-                    } else {
-                        (
-                            i18n::fill(
-                                i18n::t(lang, Key::UiMetaWiped),
-                                &[&human_bytes(freed, lang)],
-                            ),
-                            Tone::Good,
-                        )
-                    });
-                    self.busy = false;
+                    self.outcome = Some(wipe_outcome(freed, lang));
+                    self.freed = Some(freed);
+                    self.running = None;
+                    // Таблица описывала файл до очистки — стёртое на экране
+                    // осталось бы висеть как найденное, а размер был бы
+                    // прежним. Файл перечитывается, и таблица показывает то,
+                    // что в нём теперь.
+                    self.summary = None;
+                    self.file_facts.clear();
+                    reread = true;
                 }
                 // Номер загрузки здесь всегда `NO_DOWNLOAD` и никого
                 // не интересует: канал у метаданных свой, разводить нечего.
                 Event::Failed { message, .. } => {
-                    self.outcome = Some((message, Tone::Bad));
-                    self.busy = false;
+                    if self.running == Some(MetaTask::Read) {
+                        self.summary = None;
+                        self.file_facts.clear();
+                        self.read_error = Some(message);
+                    } else {
+                        self.outcome = Some((message, Tone::Bad));
+                    }
+                    self.running = None;
                 }
                 // Остальные варианты рождаются только загрузкой и установкой,
                 // а у них свой приёмник. Пустая ветка вместо `_` — чтобы
@@ -1310,10 +1405,46 @@ impl MetaPanel {
             }
         }
 
+        // Поток кончился — ждать больше нечего. Проверяется до перечитывания:
+        // иначе закрытие старого канала сбросило бы новый. Если задача всё
+        // ещё числится идущей, поток умер, не прислав ни ответа, ни отказа
+        // (паника разбора на битом файле), и это надо сказать словами: без
+        // этого на месте таблицы навсегда остался бы индикатор «читаю».
         if disconnected {
             self.rx = None;
-            self.busy = false;
+            match self.running.take() {
+                Some(MetaTask::Read) => {
+                    self.summary = None;
+                    self.file_facts.clear();
+                    self.read_error = Some(i18n::t(lang, Key::UiMetaNoAnswer).to_owned());
+                }
+                Some(MetaTask::Clean) => {
+                    self.outcome = Some((i18n::t(lang, Key::UiMetaNoAnswer).to_owned(), Tone::Bad));
+                }
+                None => {}
+            }
         }
+        if reread {
+            self.start(MetaTask::Read, lang, ctx);
+        }
+    }
+}
+
+/// Итог очистки словами.
+///
+/// Ноль освобождённых байт — это не неудача, а чистый файл. Сказать об этом
+/// надо иначе: «освобождено 0 Б» выглядит как сломавшаяся операция.
+fn wipe_outcome(freed: u64, lang: Lang) -> (String, Tone) {
+    if freed == 0 {
+        (
+            i18n::t(lang, Key::UiMetaNothingToWipe).to_owned(),
+            Tone::Plain,
+        )
+    } else {
+        (
+            i18n::fill(i18n::t(lang, Key::UiMetaWiped), &[&human_bytes(freed, lang)]),
+            Tone::Good,
+        )
     }
 }
 
@@ -3087,6 +3218,13 @@ pub struct SavioApp {
     /// От этого мгновения считается блик: он длиннее самого прихода, и
     /// `animate_*` для него уже не годится.
     tab_changed_at: f64,
+    /// Раздел сменился, и следующий кадр должен показать его с начала.
+    ///
+    /// Прокрутка у всех разделов одна, и без сброса новый раздел открывался
+    /// на смещении прежнего: кнопка «Открыть «Загрузку»» стоит внизу
+    /// «Метаданных», и «Загрузка» открывалась с полем ссылки за верхней
+    /// кромкой (найдено ревью задачи 65).
+    scroll_to_top: bool,
     /// Наибольшая доля, которую полоса прогресса уже показывала в этой
     /// загрузке.
     ///
@@ -3276,11 +3414,12 @@ impl SavioApp {
             // egui начинается с нуля, и `GLOSS` от нуля ещё не истёк.
             sweep: 0.0,
             tab_changed_at: 0.0,
+            scroll_to_top: false,
             // Единица, а не ноль: первый кадр — это не смена раздела, и
             // проявляться при запуске окну незачем.
             arrive: 1.0,
             speed: motion::scale(saved.smooth),
-            meta: MetaPanel::new(lang),
+            meta: MetaPanel::new(),
             system: SystemPanel::new(),
             monitor: MonitorPanel::new(),
             power: PowerPanel::new(),
@@ -3646,7 +3785,7 @@ impl SavioApp {
         self.rebuild_rail_labels();
         self.out_dir_display = display_dir(self.out_dir.as_deref(), lang);
         self.cookie_file_display = display_cookie_file(self.cookie_file.as_deref(), lang);
-        self.meta.relabel(lang);
+        self.meta.relabel(lang, ctx);
         self.rebuild_progress_line();
         self.rebuild_meta_line();
         self.rebuild_quality_note();
@@ -4511,7 +4650,7 @@ impl eframe::App for SavioApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_events(ui.ctx());
         self.tick_preview(ui.ctx());
-        self.meta.drain(self.lang);
+        self.meta.drain(self.lang, ui.ctx());
         self.system.drain();
         self.monitor.drain(ui.ctx());
         self.power.drain(self.lang);
@@ -4563,8 +4702,8 @@ impl eframe::App for SavioApp {
         self.sweep_queue(ui.ctx());
 
         // Палитра берётся один раз на кадр и дальше ездит вниз параметром.
-        // Копия, а не ссылка: `Palette` — `Copy` в 140 байт, зато методы ниже
-        // берут `&mut self`, и с заимствованием поля они бы не ужились.
+        // Копия, а не ссылка: `Palette` — `Copy` в полторы сотни байт, зато
+        // методы ниже берут `&mut self`, и с заимствованием поля не ужились бы.
         let pal = self.palette;
 
         // Фон кладём первым и прямо в корневой `Ui`, до всех панелей: egui
@@ -4619,9 +4758,11 @@ impl eframe::App for SavioApp {
                 ui.add_space(10.0);
                 // Прокрутка нужна на минимальном размере окна: без неё
                 // кнопка «Скачать» просто обрезалась бы нижней кромкой.
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| match self.tab {
+                let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]);
+                if std::mem::take(&mut self.scroll_to_top) {
+                    scroll = scroll.vertical_scroll_offset(0.0);
+                }
+                scroll.show(ui, |ui| match self.tab {
                         Tab::Download => self.download_tab(ui),
                         Tab::Metadata => self.metadata_tab(ui),
                         Tab::Machine => self.machine_tab(ui),
@@ -4642,16 +4783,12 @@ impl eframe::App for SavioApp {
         // увидев идентификатор, отдаёт конечное значение — окно, о котором
         // не спрашивали, пока его не было, возникло бы уже целиком.
         let install = self.modal_arrival(&ctx, "setup", self.setup.busy());
-        let tags = self.modal_arrival(&ctx, "tags", self.meta.tags.is_some());
         let confirm = self.modal_arrival(&ctx, "confirm", self.meta.confirming);
         let about = self.modal_arrival(&ctx, "about", self.about_open);
         let welcome = self.modal_arrival(&ctx, "welcome", self.welcome_open);
 
         if self.setup.busy() {
             self.install_modal(&ctx, install);
-        }
-        if self.meta.tags.is_some() {
-            self.tags_modal(&ctx, tags);
         }
         if self.meta.confirming {
             self.confirm_modal(&ctx, confirm);
@@ -4792,6 +4929,17 @@ impl SavioApp {
         })
     }
 
+    /// Переходит в другой раздел — из рельса или по указателю внутри раздела.
+    fn switch_tab(&mut self, tab: Tab, ctx: &egui::Context) {
+        if tab != self.tab {
+            self.tab = tab;
+            // Момент смены нужен блику: ему отпущено больше времени,
+            // чем самому приходу, и `animate_*` ему не подходит.
+            self.tab_changed_at = ctx.input(|i| i.time);
+            self.scroll_to_top = true;
+        }
+    }
+
     /// Рельс разделов слева.
     ///
     /// Собирает состояние, отдаёт его [`rail_body`] и применяет то, что
@@ -4823,12 +4971,7 @@ impl SavioApp {
             if let Some(half) = half {
                 self.machine_tab = half;
             }
-            if tab != self.tab {
-                self.tab = tab;
-                // Момент смены нужен блику: ему отпущено больше времени,
-                // чем самому приходу, и `animate_*` ему не подходит.
-                self.tab_changed_at = ui.ctx().input(|i| i.time);
-            }
+            self.switch_tab(tab, ui.ctx());
         }
         if picks.about {
             self.about_open = true;
@@ -6576,45 +6719,51 @@ impl SavioApp {
     ///
     /// Две колонки по той же причине, что у загрузки: предупреждение о
     /// перезаписи и список поддерживаемых форматов — это то, что читают
-    /// **до** нажатия «Удалить», и под самой кнопкой их не видно.
+    /// **до** нажатия «Стереть всё», и под самой кнопкой их не видно.
     fn metadata_tab(&mut self, ui: &mut egui::Ui) {
-        let pal = self.palette;
-        const GAP: f32 = 18.0;
+        let (pal, lang, speed) = (self.palette, self.lang, self.speed);
+        const GAP: f32 = COLUMN_GAP;
+        let mut to_download = false;
+
         if ui.available_width() < theme::TWO_COLUMN_MIN {
             self.metadata_main(ui);
             ui.add_space(GAP);
-            metadata_rail(ui, pal, self.lang, self.appear(1), self.appear(2));
-            return;
+            to_download = metadata_rail(ui, pal, lang, speed, self.appear(1), self.appear(2));
+        } else {
+            let total = ui.available_width();
+            let rail = theme::RAIL_WIDTH;
+            let main = total - rail - GAP;
+
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = GAP;
+                ui.allocate_ui_with_layout(
+                    egui::vec2(main, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_min_width(main);
+                        ui.set_max_width(main);
+                        self.metadata_main(ui);
+                    },
+                );
+                ui.allocate_ui_with_layout(
+                    egui::vec2(rail, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_min_width(rail);
+                        ui.set_max_width(rail);
+                        to_download =
+                            metadata_rail(ui, pal, lang, speed, self.appear(1), self.appear(2));
+                    },
+                );
+            });
         }
 
-        let total = ui.available_width();
-        let rail = theme::RAIL_WIDTH;
-        let main = total - rail - GAP;
-
-        ui.horizontal_top(|ui| {
-            ui.spacing_mut().item_spacing.x = GAP;
-            ui.allocate_ui_with_layout(
-                egui::vec2(main, 0.0),
-                egui::Layout::top_down(egui::Align::Min),
-                |ui| {
-                    ui.set_min_width(main);
-                    ui.set_max_width(main);
-                    self.metadata_main(ui);
-                },
-            );
-            ui.allocate_ui_with_layout(
-                egui::vec2(rail, 0.0),
-                egui::Layout::top_down(egui::Align::Min),
-                |ui| {
-                    ui.set_min_width(rail);
-                    ui.set_max_width(rail);
-                    metadata_rail(ui, pal, self.lang, self.appear(1), self.appear(2));
-                },
-            );
-        });
+        if to_download {
+            self.switch_tab(Tab::Download, ui.ctx());
+        }
     }
 
-    /// Главная колонка вкладки: файл, кнопки и итог.
+    /// Главная колонка вкладки: файл, прочитанное, кнопки и итог.
     fn metadata_main(&mut self, ui: &mut egui::Ui) {
         let pal = self.palette;
         let lang = self.lang;
@@ -6639,7 +6788,22 @@ impl SavioApp {
             ui.add_space(8.0);
             self.meta_file_row(ui);
 
-            if let Some(blocked) = &self.meta.blocked {
+            ui.add_space(16.0);
+            let personal = self
+                .meta
+                .summary
+                .as_ref()
+                .map_or("", |summary| summary.personal_line.as_str());
+            findings_header(ui, pal, lang, personal);
+            ui.add_space(8.0);
+            self.meta_findings(ui);
+
+            // TIFF читается, но не стирается, и место этой оговорки — у самих
+            // кнопок: «Стереть всё» выключена, и причина нужна рядом с ней.
+            // Нечитаемый файл объясняется выше, на месте таблицы.
+            if self.meta.readable
+                && let Some(blocked) = &self.meta.blocked
+            {
                 ui.add_space(12.0);
                 banner(ui, pal, blocked, pal.state_warning);
             }
@@ -6652,75 +6816,24 @@ impl SavioApp {
             ui.add_space(6.0);
             note(ui, i18n::t(lang, Key::UiMetaWipeNote), pal.text_muted);
 
-            ui.add_space(14.0);
             self.meta_status(ui);
         });
     }
 
-    /// Какой файл разбираем: путь подписью в рамке и кнопка выбора рядом.
+    /// Какой файл разбираем: имя и размер в таблетке, кнопка выбора рядом.
     ///
-    /// Не одной кнопкой с путём на ней, как «Папка сохранения» на «Загрузке»:
-    /// у кнопки обрезанный путь целиком не показать (дефект 48 реестра), а у
-    /// подписи это делает сам egui.
+    /// Таблетка — подпись, а не кнопка, и это не украшение: на путь, не
+    /// похожий на кнопку, не нажимали, а у кнопки обрезанный текст целиком
+    /// не показать вовсе (дефект 48 реестра).
     fn meta_file_row(&mut self, ui: &mut egui::Ui) {
-        let pal = self.palette;
-        let color = if self.meta.path.is_some() {
-            pal.text_secondary
-        } else {
-            pal.text_muted
-        };
-
-        let lang = self.lang;
-        let speed = self.speed;
-        let busy = self.meta.busy;
-        let has_file = self.meta.path.is_some();
-        let display = self.meta.path_display.as_str();
-        let mut clicked = false;
-
-        // Кнопка кладётся первой справа налево, имя файла — во вложенную
-        // раскладку слева направо. Иначе обрезаемая подпись занимает
-        // столько, сколько просит текст, и налезает на кнопку.
-        //
-        // Имя — подпись, а не кнопка, и это не украшение: у `Label` есть
-        // `show_tooltip_when_elided`, и обрезанный путь сам показывает себя
-        // целиком по наведению. У `Button` такого свойства нет вовсе
-        // (дефект 48 реестра), а на путь, не похожий на кнопку, вдобавок
-        // не нажимали.
-        ui.allocate_ui_with_layout(
-            egui::vec2(ui.available_width(), theme::CONTROL_HEIGHT),
-            egui::Layout::right_to_left(egui::Align::Center),
-            |ui| {
-                // «Выбрать другой» — только когда выбирать уже есть из чего:
-                // рядом с «файл не выбран» это слово звучит издёвкой, и
-                // человек ищет, где же выбрать первый. Найдено глазами.
-                let pick = if has_file {
-                    Key::UiMetaPickAnother
-                } else {
-                    Key::UiMetaPickFile
-                };
-                clicked = ui
-                    .add_enabled_ui(!busy, |ui| pill_button(ui, i18n::t(lang, pick), speed))
-                    .inner
-                    .on_hover_text(i18n::t(lang, Key::UiMetaPickHint))
-                    .clicked();
-
-                egui::Frame::new()
-                    .stroke(egui::Stroke::new(1.0, pal.border_strong))
-                    .corner_radius(egui::CornerRadius::same(theme::RADIUS_PILL))
-                    .inner_margin(egui::Margin::symmetric(16, 7))
-                    .show(ui, |ui| {
-                        ui.with_layout(
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                ui.add(
-                                    egui::Label::new(egui::RichText::new(display).color(color))
-                                        .truncate(),
-                                );
-                            },
-                        );
-                    });
-            },
-        );
+        let (pal, lang, speed) = (self.palette, self.lang, self.speed);
+        let busy = self.meta.busy();
+        let file = self.meta.path.as_ref().map(|_| FilePill {
+            name: &self.meta.file_name,
+            facts: &self.meta.file_facts,
+            path: &self.meta.path_display,
+        });
+        let clicked = file_row(ui, pal, lang, file, busy, speed);
 
         if clicked
             && let Some(path) = rfd::FileDialog::new()
@@ -6731,255 +6844,98 @@ impl SavioApp {
                 .add_filter(self.t(Key::FilterAllFiles), &["*"])
                 .pick_file()
         {
-            self.meta.select(path, self.lang);
+            let ctx = ui.ctx().clone();
+            self.meta.select(path, self.lang, &ctx);
         }
+    }
+
+    /// Второй шаг: что в файле записано. Таблица, а пока её нет — то, что
+    /// стоит на её месте.
+    fn meta_findings(&mut self, ui: &mut egui::Ui) {
+        let (pal, lang, speed) = (self.palette, self.lang, self.speed);
+        let meta = &mut self.meta;
+
+        if meta.path.is_none() {
+            note(ui, i18n::t(lang, Key::UiMetaHowTo), pal.text_muted);
+            return;
+        }
+        if !meta.readable {
+            // Видео и незнакомые форматы: причина стоит там, где была бы
+            // таблица, — на неё и смотрят, выбрав файл.
+            if let Some(blocked) = &meta.blocked {
+                banner(ui, pal, blocked, pal.state_warning);
+            }
+            return;
+        }
+        if let Some(summary) = &meta.summary {
+            if summary.is_empty() {
+                note(ui, i18n::t(lang, Key::UiMetaNothingFound), pal.text_secondary);
+                return;
+            }
+            if meta_table(ui, pal, summary, lang, meta.service_open, meta.generation, speed) {
+                meta.service_open = !meta.service_open;
+            }
+            ui.add_space(8.0);
+            let what_yellow_means = if summary.personal > 0 {
+                Key::UiMetaPersonalNote
+            } else if meta.audio {
+                Key::UiMetaTravelsNote
+            } else {
+                Key::UiMetaNoPersonalNote
+            };
+            note(ui, i18n::t(lang, what_yellow_means), pal.text_muted);
+            return;
+        }
+        if let Some(error) = &meta.read_error {
+            banner(ui, pal, error, pal.state_error);
+            return;
+        }
+        // Файл читается впервые — или заново, сразу после очистки.
+        working(ui, pal, &meta.stage);
     }
 
     fn meta_buttons(&mut self, ui: &mut egui::Ui) {
-        let pal = self.palette;
-        // Пока файл не выбран, подсказка должна объяснять именно это, а не
-        // молча выключенную кнопку.
-        let hint = match (&self.meta.path, &self.meta.blocked) {
-            (None, _) => Some(self.t(Key::UiMetaPickFirst)),
-            (Some(_), Some(_)) => None, // причина уже показана баннером выше
-            _ => None,
-        };
-
-        let (read_on, clean_on) = (
-            self.meta.readable && !self.meta.busy,
-            self.meta.cleanable && !self.meta.busy,
+        let (pal, lang) = (self.palette, self.lang);
+        let busy = self.meta.busy();
+        // Почему кнопка выключена: пока файла нет — ровно это, а про
+        // неподходящий формат — то же, что уже сказано баннером.
+        let why_not = self
+            .meta
+            .blocked
+            .as_deref()
+            .unwrap_or(i18n::t(lang, Key::UiMetaPickFirst));
+        let (read, wipe) = meta_actions(
+            ui,
+            pal,
+            lang,
+            self.meta.readable && !busy,
+            self.meta.cleanable && !busy,
+            why_not,
         );
 
-        ui.horizontal(|ui| {
-            const GAP: f32 = 10.0;
-            ui.spacing_mut().item_spacing.x = GAP;
-            let width = (ui.available_width() - GAP) / 2.0;
-
-            let read = ui.add_enabled(
-                read_on,
-                egui::Button::new(i18n::t(self.lang, Key::UiMetaRead))
-                    .min_size(egui::vec2(width, theme::CTA_HEIGHT)),
-            );
-            let read = match hint {
-                Some(text) => read.on_disabled_hover_text(text),
-                None => read.on_disabled_hover_text(
-                    self.meta
-                        .blocked
-                        .as_deref()
-                        .unwrap_or(i18n::t(self.lang, Key::UiMetaPickFirst)),
-                ),
-            };
-            if read.clicked() {
-                let ctx = ui.ctx().clone();
-                self.meta.start(MetaTask::Read, self.lang, &ctx);
-            }
-
-            // «Удалить» — главное действие вкладки, поэтому акцентная заливка.
-            // Выключенный вид задаём явно: `ui.disable()` не переключает виджет
-            // на `noninteractive`, а только глушит прозрачность, и выключенная
-            // кнопка стала бы неотличима от включённой.
-            let clicked = ui
-                .scope(|ui| {
-                    let v = ui.visuals_mut();
-                    // Подпись выключенной кнопки — своим полем палитры, как
-                    // и у «Скачать»: белым по пастельной заливке светлой темы
-                    // выходит 1.9:1.
-                    let (rest, hover, press, ink) = if clean_on {
-                        (
-                            pal.accent,
-                            pal.accent_hover,
-                            pal.accent_active,
-                            pal.text_on_accent,
-                        )
-                    } else {
-                        (
-                            pal.accent_disabled,
-                            pal.accent_disabled,
-                            pal.accent_disabled,
-                            pal.text_on_accent_disabled,
-                        )
-                    };
-                    for (state, fill) in [
-                        (&mut v.widgets.inactive, rest),
-                        (&mut v.widgets.hovered, hover),
-                        (&mut v.widgets.active, press),
-                    ] {
-                        state.weak_bg_fill = fill;
-                        state.bg_stroke = egui::Stroke::NONE;
-                        state.fg_stroke = egui::Stroke::new(1.0, ink);
-                        state.corner_radius = egui::CornerRadius::same(theme::RADIUS_PILL);
-                        state.expansion = 0.0;
-                    }
-                    v.disabled_alpha = 1.0;
-
-                    ui.add_enabled(
-                        clean_on,
-                        egui::Button::new(
-                            egui::RichText::new(i18n::t(self.lang, Key::UiMetaWipe))
-                                .font(theme::display(17.0))
-                                .color(ink),
-                        )
-                        .min_size(egui::vec2(width, theme::CTA_HEIGHT)),
-                    )
-                    .on_disabled_hover_text(
-                        self.meta
-                            .blocked
-                            .as_deref()
-                            .unwrap_or(i18n::t(self.lang, Key::UiMetaPickFirst)),
-                    )
-                    .clicked()
-                })
-                .inner;
-
-            if clicked {
-                // Файл перезаписывается на месте, и вернуть метаданные будет
-                // нельзя. Один вопрос дешевле безвозвратно очищенного оригинала.
-                self.meta.confirming = true;
-            }
-        });
+        if read {
+            let ctx = ui.ctx().clone();
+            self.meta.start(MetaTask::Read, lang, &ctx);
+        }
+        if wipe {
+            // Файл перезаписывается на месте, и вернуть метаданные будет
+            // нельзя. Один вопрос дешевле безвозвратно очищенного оригинала.
+            self.meta.confirming = true;
+        }
     }
 
+    /// Под кнопками: идёт очистка — индикатор, кончилась — её итог.
+    ///
+    /// Несостоявшееся чтение сюда не попадает: оно стоит на месте таблицы,
+    /// куда и смотрят, выбрав файл.
     fn meta_status(&mut self, ui: &mut egui::Ui) {
         let pal = self.palette;
-        if self.meta.busy {
-            ui.scope(|ui| {
-                ui.visuals_mut().extreme_bg_color = pal.progress_track;
-                // Сколько осталось, здесь неизвестно и не нужно: операция
-                // укладывается в доли секунды. Крутим неопределённый индикатор.
-                ui.add(
-                    egui::ProgressBar::new(0.0)
-                        .animate(true)
-                        .fill(pal.accent)
-                        .desired_height(8.0),
-                );
-            });
-            if !self.meta.stage.is_empty() {
-                ui.add_space(8.0);
-                ui.label(
-                    egui::RichText::new(&self.meta.stage)
-                        .small()
-                        .color(pal.text_secondary),
-                );
-            }
-            return;
-        }
-
-        if let Some((text, tone)) = &self.meta.outcome {
+        if self.meta.running == Some(MetaTask::Clean) {
+            ui.add_space(14.0);
+            working(ui, pal, &self.meta.stage);
+        } else if let Some((text, tone)) = &self.meta.outcome {
+            ui.add_space(14.0);
             banner(ui, pal, text, tone.color(pal));
-            return;
-        }
-
-        ui.label(
-            egui::RichText::new(self.t(Key::UiMetaHowTo))
-                .small()
-                .color(pal.text_muted),
-        );
-    }
-
-    /// Окно со списком прочитанных метаданных.
-    fn tags_modal(&mut self, ctx: &egui::Context, arrival: ModalArrival) {
-        let pal = self.palette;
-        let speed = self.speed;
-        let lang = self.lang;
-        arrival.veil(pal, ctx, "tags");
-        let Some(tags) = &self.meta.tags else {
-            return;
-        };
-
-        // Размеры считаем от окна, а не константами. При фиксированных 440×320
-        // в окне минимального размера (520×420) модалка не помещалась: заголовок
-        // срезало сверху, кнопку «Закрыть» — снизу, и окно становилось нечем
-        // закрыть. Сборка такого не ловит, видно только глазами.
-        let screen = ctx.content_rect();
-        let width = 440.0_f32.min(screen.width() - 48.0);
-        // Вычитаем то, что модалка занимает помимо списка: поля, заголовок,
-        // отступы и кнопку.
-        let list_height = (screen.height() - 230.0).clamp(110.0, 320.0);
-
-        let close = egui::Modal::new(egui::Id::new("savio-tags"))
-            .backdrop_color(egui::Color32::TRANSPARENT)
-            .frame(
-                egui::Frame::new()
-                    .fill(pal.modal_fill)
-                    .stroke(egui::Stroke::new(1.0, pal.border_subtle))
-                    .corner_radius(egui::CornerRadius::same(theme::RADIUS_CARD))
-                    .inner_margin(egui::Margin::same(24)),
-            )
-            .show(ctx, |ui| {
-                ui.set_width(width);
-
-                ui.label(
-                    egui::RichText::new(i18n::t(lang, Key::UiMetaFileTags))
-                        .heading()
-                        .strong()
-                        .color(pal.text_primary),
-                );
-                ui.add_space(10.0);
-
-                if tags.is_empty() {
-                    ui.label(
-                        egui::RichText::new(i18n::t(lang, Key::UiMetaNothingFound))
-                            .color(pal.text_secondary),
-                    );
-                } else {
-                    // Список может быть длинным (у снимка с телефона легко
-                    // набирается пара десятков строк) — держим его в прокрутке,
-                    // иначе окно вылезет за экран.
-                    egui::ScrollArea::vertical()
-                        .max_height(list_height)
-                        .auto_shrink([false, true])
-                        .show(ui, |ui| {
-                            for tag in tags {
-                                ui.horizontal_top(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 10.0;
-                                    // Имя фиксированной ширины: иначе значения
-                                    // не выстроятся в колонку и читать список
-                                    // станет заметно тяжелее. В 150 точек имя
-                                    // тега не влезает почти никогда, так что
-                                    // обрезается тут почти всё.
-                                    //
-                                    // Своего `on_hover_text` рядом быть не
-                                    // должно: у `Label` включён по умолчанию
-                                    // `show_tooltip_when_elided`, и обрезанная
-                                    // метка сама вешает подсказку с полным
-                                    // именем. Свой вызов её не заменяет, а
-                                    // добавляет вторую — egui считает подсказки
-                                    // на виджет и ставит их одна под другой,
-                                    // выходит две коробки с одним и тем же
-                                    // текстом (дефект 22).
-                                    ui.add_sized(
-                                        [150.0, ui.text_style_height(&egui::TextStyle::Body)],
-                                        egui::Label::new(
-                                            egui::RichText::new(&tag.name)
-                                                .small()
-                                                .color(pal.text_muted),
-                                        )
-                                        .truncate(),
-                                    );
-
-                                    ui.add(
-                                        egui::Label::new(
-                                            egui::RichText::new(&tag.value)
-                                                .color(pal.text_primary),
-                                        )
-                                        .wrap(),
-                                    );
-                                });
-                                ui.add_space(6.0);
-                            }
-                        });
-                }
-
-                ui.add_space(18.0);
-                pill_button(ui, i18n::t(lang, Key::UiClose), speed).clicked()
-            });
-        arrival.apply(ctx, &close.response);
-
-        // В отличие от модалки установки, здесь `should_close` уместен:
-        // окно ничего не делает и запереть в нём пользователя нечем, поэтому
-        // Esc и щелчок мимо должны закрывать его как обычно.
-        if close.inner || close.should_close() {
-            self.meta.tags = None;
         }
     }
 
@@ -8056,15 +8012,16 @@ impl SavioApp {
 
 /// Правая колонка вкладки «Метаданные»: то, что читают до нажатия «Стереть».
 ///
-/// Свободная функция, а не метод: ни одно из двух объяснений не зависит от
-/// состояния приложения — обе карточки статические.
+/// Свободная функция, а не метод: обе карточки статические. Возвращает
+/// `true`, когда нажали «Открыть «Загрузку»», — переход делает вызывающий.
 fn metadata_rail(
     ui: &mut egui::Ui,
     pal: theme::Palette,
     lang: Lang,
+    speed: f32,
     warning: Option<theme::Appear>,
     kinds: Option<theme::Appear>,
-) {
+) -> bool {
     theme::card_rising(ui, pal, warning, |ui| {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 9.0;
@@ -8086,28 +8043,602 @@ fn metadata_rail(
             i18n::t(lang, Key::UiMetaWillOverwriteText),
             pal.text_secondary,
         );
+        ui.add_space(6.0);
+        note(ui, i18n::t(lang, Key::UiMetaKeepOriginal), pal.text_muted);
     });
 
     ui.add_space(14.0);
 
     theme::card_rising(ui, pal, kinds, |ui| {
-        field_label(ui, pal, i18n::t(lang, Key::UiMetaSupported));
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(7.0, 7.0);
-            for name in ["MP3", "JPG", "PNG", "WebP", "GIF"] {
-                soft_pill(ui, pal, name, pal.state_success, pal.success_soft);
-            }
-            for key in [Key::UiMetaTiffReadOnly, Key::UiMetaVideoNotYet] {
-                soft_pill(
-                    ui,
-                    pal,
-                    i18n::t(lang, key),
-                    pal.text_muted,
-                    egui::Color32::TRANSPARENT,
-                );
+        ui.label(
+            egui::RichText::new(i18n::t(lang, Key::UiMetaSupported))
+                .font(theme::display(17.0))
+                .color(pal.text_primary),
+        );
+        ui.add_space(10.0);
+        // Три строки с состоянием словами, а не ряд таблеток вперемешку:
+        // в ряду «TIFF — только чтение» стояло между «GIF» и «видео», и что
+        // из перечисленного умеет всё, приходилось выяснять по цвету.
+        for (support, key) in [
+            (Support::Full, Key::UiMetaSupportFull),
+            (Support::ReadOnly, Key::UiMetaTiffReadOnly),
+            (Support::NotYet, Key::UiMetaVideoNotYet),
+        ] {
+            support_row(ui, pal, support, i18n::t(lang, key));
+            ui.add_space(4.0);
+        }
+        ui.add_space(8.0);
+        // Чистить здесь, а вшивать — там: без указателя человек, пришедший
+        // сюда за «добавить название в MP3», ушёл бы ни с чем.
+        note(ui, i18n::t(lang, Key::UiMetaEmbedPointer), pal.text_muted);
+        ui.add_space(10.0);
+        pill_button(ui, i18n::t(lang, Key::UiMetaOpenDownload), speed).clicked()
+    })
+    .inner
+}
+
+/// Что Savio умеет с форматом.
+#[derive(Clone, Copy)]
+enum Support {
+    /// Читает и стирает.
+    Full,
+    /// Только читает.
+    ReadOnly,
+    /// Пока не умеет.
+    NotYet,
+}
+
+/// Строка списка форматов: кружок состояния и подпись.
+///
+/// Состояние сказано словами («только чтение», «пока нет»), а кружок лишь
+/// повторяет его цветом: у полного — галочка, остальные пустые. Галочка
+/// рисуется кистью по той же причине, что в [`chip`]: знака `✓` в наших
+/// шрифтах нет, и вместо него вышел бы пустой прямоугольник.
+fn support_row(ui: &mut egui::Ui, pal: theme::Palette, support: Support, text: &str) {
+    const MARK: f32 = 14.0;
+    let (ring, ink) = match support {
+        Support::Full => (pal.state_success, pal.text_primary),
+        Support::ReadOnly => (pal.state_warning, pal.text_secondary),
+        Support::NotYet => (pal.border_strong, pal.text_muted),
+    };
+
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 9.0;
+        // Кружок стоит против первой строки подписи, а не посередине абзаца:
+        // в узкой колонке «чтение и очистка» переносится на вторую.
+        let line = ui.text_style_height(&egui::TextStyle::Body);
+        let (slot, _) = ui.allocate_exact_size(egui::vec2(MARK, line), egui::Sense::hover());
+        let c = slot.center();
+        let painter = ui.painter();
+        painter.circle_stroke(c, MARK / 2.0 - 0.7, egui::Stroke::new(1.4, ring));
+        if matches!(support, Support::Full) {
+            let tick = egui::Stroke::new(1.4, ring);
+            let at = |x: f32, y: f32| egui::pos2(c.x + (x - 0.5) * MARK, c.y + (y - 0.5) * MARK);
+            painter.line_segment([at(0.3, 0.52), at(0.45, 0.67)], tick);
+            painter.line_segment([at(0.45, 0.67), at(0.72, 0.36)], tick);
+        }
+        ui.add(egui::Label::new(egui::RichText::new(text).color(ink)).wrap());
+    });
+}
+
+/// Заголовок второго шага и плашка с числом личных записей.
+///
+/// Число — словами, а не одним цветом: без различения цветов жёлтая строка
+/// ничем не отличается от прочих. Плашка стоит справа от названия, если
+/// помещается, а если нет — строкой ниже, но не поверх него (`step_fits`).
+fn findings_header(ui: &mut egui::Ui, pal: theme::Palette, lang: Lang, personal: &str) {
+    let title = i18n::t(lang, Key::UiMetaFileTags);
+    let inline = personal.is_empty() || step_fits(ui, title, personal);
+    step_header(ui, pal, 2, title, None, |ui| {
+        if inline && !personal.is_empty() {
+            soft_pill(ui, pal, personal, pal.state_warning, pal.warning_soft);
+        }
+    });
+    if !inline {
+        ui.add_space(6.0);
+        soft_pill(ui, pal, personal, pal.state_warning, pal.warning_soft);
+    }
+}
+
+/// Что показывает таблетка первого шага.
+#[derive(Clone, Copy)]
+struct FilePill<'a> {
+    /// Имя файла без папок.
+    name: &'a str,
+    /// Размер и свойства с точкой впереди: «· 4.2 МБ · 3:25». Пусто, пока
+    /// файл не прочитан.
+    facts: &'a str,
+    /// Полный путь — для подсказки.
+    path: &'a str,
+}
+
+/// Первый шаг целиком: таблетка файла и кнопка выбора справа от неё.
+/// Возвращает `true`, когда нажали кнопку выбора.
+///
+/// Кнопка кладётся первой справа налево, таблетка — после неё. Иначе
+/// обрезаемая подпись занимает столько, сколько просит текст, и налезает
+/// на кнопку.
+fn file_row(
+    ui: &mut egui::Ui,
+    pal: theme::Palette,
+    lang: Lang,
+    file: Option<FilePill>,
+    busy: bool,
+    speed: f32,
+) -> bool {
+    let mut clicked = false;
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width(), theme::CONTROL_HEIGHT),
+        egui::Layout::right_to_left(egui::Align::Center),
+        |ui| {
+            // «Выбрать другой» — только когда выбирать уже есть из чего:
+            // рядом с «файл не выбран» это слово звучит издёвкой, и человек
+            // ищет, где же выбрать первый. Найдено глазами.
+            let pick = if file.is_some() {
+                Key::UiMetaPickAnother
+            } else {
+                Key::UiMetaPickFile
+            };
+            clicked = ui
+                .add_enabled_ui(!busy, |ui| pill_button(ui, i18n::t(lang, pick), speed))
+                .inner
+                .on_hover_text(i18n::t(lang, Key::UiMetaPickHint))
+                .clicked();
+
+            file_pill(ui, pal, lang, file);
+        },
+    );
+    clicked
+}
+
+/// Таблетка первого шага: имя файла и то, что о нём известно.
+///
+/// Места делятся так, чтобы имени досталась хотя бы половина: по нему
+/// отвечают на вопрос, ради которого сюда смотрят, — «тот ли это файл».
+/// Прежде место отмерялось сначала сведениям, и у MP3 хвост «· 4.2 МБ ·
+/// 3:25 · 320 кбит/с» в окне 520 оставлял имени одну букву, а у записи на
+/// час с лишним и вовсе выталкивал таблетку на кнопку (найдено ревью задачи
+/// 65). Не влезают сведения — обрезаются они, а целиком они в подсказке.
+///
+/// Подсказка своя, а не штатная у обрезанных меток: в ней полный путь и
+/// сведения, а не то же имя ещё раз, — и штатная выключена у обеих меток
+/// (`show_tooltip_when_elided`), иначе коробок было бы две (дефект 22).
+/// Висит подсказка на всей таблетке: рамка без собственного отклика
+/// регистрируется после содержимого и потому получает наведение и над
+/// подписью (`interaction.rs`, строки 286–297). Строки собраны при выборе
+/// файла, а показываются лениво, через `on_hover_ui`: аргумент
+/// `on_hover_text` вычислялся бы каждый кадр.
+fn file_pill(ui: &mut egui::Ui, pal: theme::Palette, lang: Lang, file: Option<FilePill>) {
+    let pill = egui::Frame::new()
+        .stroke(egui::Stroke::new(1.0, pal.border_strong))
+        .corner_radius(egui::CornerRadius::same(theme::RADIUS_PILL))
+        .inner_margin(egui::Margin::symmetric(16, 7))
+        .show(ui, |ui| {
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let Some(file) = file else {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(i18n::t(lang, Key::UiNoFileChosen))
+                                .color(pal.text_muted),
+                        )
+                        .truncate(),
+                    );
+                    return;
+                };
+
+                // Раскладка текста у egui кэшируется по самой строке, так
+                // что в следующих кадрах это только хеш — как у `soft_pill`.
+                let font = egui::TextStyle::Body.resolve(ui.style());
+                let width = |text: &str| {
+                    ui.painter()
+                        .layout_no_wrap(text.to_owned(), font.clone(), egui::Color32::PLACEHOLDER)
+                        .size()
+                        .x
+                };
+                let room = ui.available_width();
+                let name = width(file.name);
+                let facts = if file.facts.is_empty() {
+                    0.0
+                } else {
+                    width(file.facts) + ui.spacing().item_spacing.x
+                };
+                let name_room = if name + facts <= room {
+                    name
+                } else {
+                    (room - facts).max(room * 0.5).min(name)
+                };
+
+                ui.scope(|ui| {
+                    ui.set_max_width(name_room);
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(file.name).color(pal.text_secondary),
+                        )
+                        .truncate()
+                        .show_tooltip_when_elided(false),
+                    );
+                });
+                if !file.facts.is_empty() {
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(file.facts).color(pal.text_muted))
+                            .truncate()
+                            .show_tooltip_when_elided(false),
+                    );
+                }
+            });
+        });
+
+    if let Some(file) = file {
+        pill.response.on_hover_ui(|ui| {
+            ui.label(file.path);
+            // Сведения — без точки-разделителя: в подсказке они стоят своей
+            // строкой, а не продолжают имя.
+            let facts = file.facts.trim_start_matches("· ");
+            if !facts.is_empty() {
+                ui.label(egui::RichText::new(facts).small().color(pal.text_muted));
             }
         });
+    }
+}
+
+/// Кнопки раздела: «Прочитать снова» — на треть ширины, «Стереть всё» — на
+/// остаток. Возвращает, какую нажали.
+///
+/// Треть, а не половина, как прежде: файл читается сам, и первая кнопка нужна
+/// только проверить его ещё раз, — главное действие раздела — очистка. Треть
+/// при этом — пол, а не потолок: подпись шире трети (армянская в окне 520)
+/// раздвигает свою кнопку, и очистке достаётся остаток. Делить ширину заранее
+/// поровну нельзя: `min_size` — лишь нижняя граница, и вторая кнопка уехала бы
+/// за кромку карточки.
+fn meta_actions(
+    ui: &mut egui::Ui,
+    pal: theme::Palette,
+    lang: Lang,
+    read_on: bool,
+    clean_on: bool,
+    why_not: &str,
+) -> (bool, bool) {
+    const GAP: f32 = 10.0;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = GAP;
+        let room = ui.available_width() - GAP;
+        let read_width = (room / 3.0).max(meta_read_label_width(ui, lang));
+
+        let read = ui
+            .add_enabled(
+                read_on,
+                egui::Button::new(i18n::t(lang, Key::UiMetaReadAgain))
+                    .min_size(egui::vec2(read_width, theme::CTA_HEIGHT)),
+            )
+            .on_disabled_hover_text(why_not)
+            .clicked();
+        // Акцентная заливка: это главное действие раздела. Выключенный вид
+        // задан у `accent_button` явно — `ui.disable()` только глушит
+        // прозрачность, и выключенная кнопка стала бы неотличима от включённой.
+        let wipe = accent_button(
+            ui,
+            pal,
+            i18n::t(lang, Key::UiMetaWipe),
+            room - read_width,
+            clean_on,
+            why_not,
+        );
+        (read, wipe)
+    })
+    .inner
+}
+
+/// Сколько просит подпись «Прочитать снова» вместе с полями кнопки.
+fn meta_read_label_width(ui: &egui::Ui, lang: Lang) -> f32 {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let text = ui.painter().layout_no_wrap(
+        i18n::t(lang, Key::UiMetaReadAgain).to_owned(),
+        font,
+        egui::Color32::PLACEHOLDER,
+    );
+    text.size().x + ui.spacing().button_padding.x * 2.0
+}
+
+/// Неопределённый индикатор и строка стадии под ним.
+///
+/// Сколько осталось, здесь неизвестно и не нужно: и чтение, и очистка
+/// укладываются в доли секунды.
+fn working(ui: &mut egui::Ui, pal: theme::Palette, stage: &str) {
+    ui.scope(|ui| {
+        ui.visuals_mut().extreme_bg_color = pal.progress_track;
+        ui.add(
+            egui::ProgressBar::new(0.0)
+                .animate(true)
+                .fill(pal.accent)
+                .desired_height(8.0),
+        );
     });
+    if !stage.is_empty() {
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new(stage).small().color(pal.text_secondary));
+    }
+}
+
+/// Зазор между главной и правой колонками «Метаданных».
+///
+/// Константой, а не числом у раскладки, ради проверок ширины: самая узкая
+/// главная колонка — не в окне 520, а сразу за порогом двух колонок
+/// (`TWO_COLUMN_MIN` минус правая колонка и этот зазор), и тест обязан
+/// считать её по тому же числу, что и раскладка.
+const COLUMN_GAP: f32 = 18.0;
+
+/// Ширина колонки подписей в таблице метаданных — как в макете.
+///
+/// Константой рядом с раскладкой, а не числом в вызове: по ней считает
+/// проверка `the_metadata_table_fits_the_smallest_window`, а копия в тесте
+/// разъехалась бы с раскладкой при первой же правке и перестала бы
+/// что-либо ловить.
+const META_LABEL_COLUMN: f32 = 180.0;
+
+/// Зазор между подписью и значением в строке таблицы.
+const META_COLUMN_GAP: f32 = 12.0;
+
+/// Шрифт значения в таблице — на ступень крупнее подписи, как в макете:
+/// читают значение, а подпись его только называет.
+fn meta_value_font() -> egui::FontId {
+    egui::FontId::new(14.0, egui::FontFamily::Proportional)
+}
+
+/// Таблица «Метаданные файла»: личное сверху и жёлтым, служебное — свёрнутой
+/// строкой в конце. Возвращает `true`, когда щёлкнули по свёрнутой строке.
+///
+/// Жёлтый здесь не единственный признак, и это обязательно: без различения
+/// цветов личная строка неотличима от прочих. Сколько их, сказано словами
+/// в плашке над таблицей, а что значит жёлтый — строкой под ней.
+///
+/// Строки разделены зазором в точку, сквозь который видна карточка, — так
+/// в макете. Скругление есть только у крайних строк, иначе в зазорах
+/// проступали бы уголки.
+///
+/// `key` — номер выбранного файла (`MetaPanel::generation`): из него
+/// строятся идентификаторы анимаций хвоста, чтобы у нового файла они
+/// начинались с нуля, а не доезжали прежние.
+fn meta_table(
+    ui: &mut egui::Ui,
+    pal: theme::Palette,
+    summary: &MetaSummary,
+    lang: Lang,
+    open: bool,
+    key: u64,
+    speed: f32,
+) -> bool {
+    let folded = !summary.service.is_empty();
+    let count = summary.rows.len();
+    let tail = egui::Id::new("meta-service").with(key);
+    let mut toggled = false;
+
+    let table = ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.y = 1.0;
+        for (i, row) in summary.rows.iter().enumerate() {
+            let last = i + 1 == count && !folded;
+            meta_row(
+                ui,
+                pal,
+                &row.label,
+                &row.value,
+                row.personal,
+                row_corners(i == 0, last),
+            );
+        }
+        if folded {
+            let fold = Fold {
+                line: &summary.service_line,
+                open,
+                corners: row_corners(count == 0, !open),
+                id: tail.with("row"),
+            };
+            toggled = service_row(ui, pal, lang, fold, speed);
+            // Число строк — тоже в имени: перечитанный файл (после очистки
+            // или смены языка) сохраняет номер, а хвост у него бывает другой
+            // высоты, и раскрытие, помнящее высоту с прошлого раза, поехало
+            // бы по чужой мерке.
+            let id = tail.with(summary.service.len());
+            collapsing_body(ui, id, open, speed, |ui| {
+                ui.spacing_mut().item_spacing.y = 1.0;
+                let tail = summary.service.len();
+                for (i, row) in summary.service.iter().enumerate() {
+                    meta_row(
+                        ui,
+                        pal,
+                        &row.label,
+                        &row.value,
+                        false,
+                        row_corners(false, i + 1 == tail),
+                    );
+                }
+            });
+        }
+    });
+
+    ui.painter().rect_stroke(
+        table.response.rect,
+        egui::CornerRadius::same(theme::RADIUS_INNER),
+        egui::Stroke::new(1.0, pal.border_subtle),
+        egui::StrokeKind::Inside,
+    );
+    toggled
+}
+
+/// Скругление строки таблицы: сверху — у первой, снизу — у последней.
+fn row_corners(first: bool, last: bool) -> egui::CornerRadius {
+    let (top, bottom) = (
+        if first { theme::RADIUS_INNER } else { 0 },
+        if last { theme::RADIUS_INNER } else { 0 },
+    );
+    egui::CornerRadius {
+        nw: top,
+        ne: top,
+        sw: bottom,
+        se: bottom,
+    }
+}
+
+/// Строка таблицы: подпись в колонке слева, значение справа.
+///
+/// Значению `wrap()` обязателен: в горизонтальной раскладке egui кладёт
+/// текст в одну строку любой длины, а XMP и комментарии длинные — строка
+/// растянула бы карточку за кромку окна.
+fn meta_row(
+    ui: &mut egui::Ui,
+    pal: theme::Palette,
+    label: &str,
+    value: &str,
+    personal: bool,
+    corners: egui::CornerRadius,
+) {
+    let (fill, ink) = if personal {
+        (pal.warning_soft, pal.state_warning)
+    } else {
+        (pal.card_inner, pal.text_muted)
+    };
+    egui::Frame::new()
+        .fill(fill)
+        .corner_radius(corners)
+        .inner_margin(egui::Margin::symmetric(14, 10))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = META_COLUMN_GAP;
+                meta_label_cell(ui, label, ink);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(value)
+                            .font(meta_value_font())
+                            .color(pal.text_primary),
+                    )
+                    .wrap(),
+                );
+            });
+        });
+}
+
+/// Подпись строки таблицы в колонке своей ширины.
+///
+/// Подпись переносится, а не обрезается: армянская «Օբյեկտիվի սերիական
+/// համար» в колонку не влезает, и обрезанную её пришлось бы читать по
+/// подсказке. `set_min_width` обязателен, хотя ширина уже запрошена, — та же
+/// грабля, что у `stat_row_with`: без него значения начинались бы сразу за
+/// подписью, каждое на своём месте, и колонки не вышло бы.
+fn meta_label_cell(ui: &mut egui::Ui, label: &str, ink: egui::Color32) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(META_LABEL_COLUMN, 0.0),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            ui.set_min_width(META_LABEL_COLUMN);
+            ui.set_max_width(META_LABEL_COLUMN);
+            ui.add(egui::Label::new(egui::RichText::new(label).small().color(ink)).wrap());
+        },
+    );
+}
+
+/// Свёрнутая строка таблицы: что на ней написано и в каком она состоянии.
+struct Fold<'a> {
+    /// «ещё 7 — ориентация, размер кадра, XMP…».
+    line: &'a str,
+    open: bool,
+    corners: egui::CornerRadius,
+    /// Идентификатор строки — от номера выбранного файла (см. `meta_table`).
+    id: egui::Id,
+}
+
+/// Свёрнутая строка служебных записей: сколько их и как называются первые.
+/// Щелчок раскрывает их под ней; возвращает `true`, когда щёлкнули.
+///
+/// Для диктора строка — кнопка со своим именем (`widget_info`): нарисованное
+/// кистью без имени не нашёл бы ни он, ни проверка кадра.
+fn service_row(ui: &mut egui::Ui, pal: theme::Palette, lang: Lang, fold: Fold, speed: f32) -> bool {
+    let Fold {
+        line,
+        open,
+        corners,
+        id,
+    } = fold;
+    const MARK: f32 = 11.0;
+    const PAD_X: f32 = 14.0;
+    const PAD_Y: f32 = 10.0;
+    let label = i18n::t(lang, Key::UiMetaServiceRecords);
+
+    let frame = egui::Frame::new()
+        .fill(pal.card_inner)
+        .corner_radius(corners)
+        .inner_margin(egui::Margin::symmetric(PAD_X as i8, PAD_Y as i8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            // Выделяемые подписи съедали бы щелчок по строке.
+            ui.style_mut().interaction.selectable_labels = false;
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = META_COLUMN_GAP;
+                meta_label_cell(ui, label, pal.text_muted);
+                // Значению — всё, кроме места под треугольник у правой кромки.
+                ui.scope(|ui| {
+                    ui.set_max_width((ui.available_width() - MARK - META_COLUMN_GAP).max(0.0));
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(line)
+                                .font(meta_value_font())
+                                .color(pal.text_secondary),
+                        )
+                        .wrap(),
+                    );
+                });
+            });
+        });
+
+    let rect = frame.response.rect;
+    let response = ui
+        .interact(rect, id, egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+
+    // Отклик под курсором — кромка, как у строки места в погоде: заливку
+    // строка уже несёт, и её усиление читалось бы как выбор.
+    let touch =
+        ui.ctx()
+            .animate_bool_with_time(response.id, response.hovered(), motion::TOUCH * speed);
+    if touch > 0.0 {
+        ui.painter().rect_stroke(
+            rect,
+            corners,
+            egui::Stroke::new(
+                1.0,
+                motion::mix(egui::Color32::TRANSPARENT, pal.border_hover, touch),
+            ),
+            egui::StrokeKind::Inside,
+        );
+    }
+
+    // Треугольник — кистью и тем же доворотом, что у `disclosure_row`:
+    // стрелок в наших шрифтах нет. Стоит против первой строки значения.
+    let line_height = ui
+        .painter()
+        .fonts_mut(|fonts| fonts.row_height(&meta_value_font()));
+    let c = egui::pos2(
+        rect.right() - PAD_X - MARK / 2.0,
+        rect.top() + PAD_Y + line_height / 2.0,
+    );
+    let turn = motion::liquid(ui.ctx().animate_bool_with_time(
+        response.id.with("turn"),
+        open,
+        motion::MOVE * speed,
+    ));
+    let (sin, cos) = (turn * std::f32::consts::FRAC_PI_2).sin_cos();
+    let points = [(-2.5, -5.0), (-2.5, 5.0), (3.5, 0.0)]
+        .into_iter()
+        .map(|(x, y)| egui::pos2(c.x + x * cos - y * sin, c.y + x * sin + y * cos))
+        .collect();
+    ui.painter().add(egui::Shape::convex_polygon(
+        points,
+        pal.accent,
+        egui::Stroke::NONE,
+    ));
+
+    response.clicked()
 }
 
 // ---------------------------------------------------------------------------
@@ -10789,6 +11320,36 @@ fn system_rail(ui: &mut egui::Ui, pal: theme::Palette, lang: Lang) {
     }
 }
 
+/// Поперечник кружка с номером в заголовке шага.
+///
+/// Вынесен из `step_header` вместе с зазором и шрифтом названия ради
+/// `step_fits`: проверка «поместится ли плашка рядом» обязана считать по тем
+/// же числам, что и раскладка, — своя копия разъехалась бы при первой правке.
+const STEP_CIRCLE: f32 = 26.0;
+/// Зазор между частями заголовка шага.
+const STEP_GAP: f32 = 10.0;
+
+fn step_title_font() -> egui::FontId {
+    theme::display(17.0)
+}
+
+/// Поместится ли плашка справа от названия шага, не налезая на него.
+///
+/// `step_header` кладёт правую часть от правой кромки, и если строки не
+/// хватает, плашка уезжает влево — прямо поверх названия, а её заливка
+/// прозрачна на девять десятых, так что буквы ложатся одни на другие.
+/// По-армянски так и выходило: «Ֆայլի մետատվյալներ» и «4 անձնական
+/// գրառում» вместе длиннее строки в карточке шириной 364 (найдено ревью
+/// задачи 65). Не поместилась — вызывающий кладёт её строкой ниже.
+fn step_fits(ui: &egui::Ui, title: &str, pill: &str) -> bool {
+    let title = ui
+        .painter()
+        .layout_no_wrap(title.to_owned(), step_title_font(), egui::Color32::PLACEHOLDER)
+        .size()
+        .x;
+    STEP_CIRCLE + STEP_GAP + title + STEP_GAP + soft_pill_width(ui, pill) <= ui.available_width()
+}
+
 /// Заголовок шага: номер в кружке и название дисплейным начертанием.
 ///
 /// Номер отвечает на «с чего начинать» раньше, чем человек прочтёт подписи.
@@ -10817,13 +11378,13 @@ fn step_header<R>(
     note: Option<&str>,
     right: impl FnOnce(&mut egui::Ui) -> R,
 ) {
-    const CIRCLE: f32 = 26.0;
+    const CIRCLE: f32 = STEP_CIRCLE;
 
     ui.allocate_ui_with_layout(
         egui::vec2(ui.available_width(), CIRCLE),
         egui::Layout::left_to_right(egui::Align::Center),
         |ui| {
-            ui.spacing_mut().item_spacing.x = 10.0;
+            ui.spacing_mut().item_spacing.x = STEP_GAP;
 
             // Кружок с номером рисуется кистью: цифра в кружке — это не знак
             // из шрифта (кружкам с цифрами внутри в наших гарнитурах взяться
@@ -10847,7 +11408,7 @@ fn step_header<R>(
 
             ui.label(
                 egui::RichText::new(title)
-                    .font(theme::display(17.0))
+                    .font(step_title_font())
                     .color(pal.text_primary),
             );
 
@@ -10951,6 +11512,19 @@ fn toggle_pill(
     .inner
 }
 
+/// Поля плашки [`soft_pill`] по бокам от подписи.
+const SOFT_PILL_PAD_X: f32 = 11.0;
+
+/// Сколько места займёт плашка с этой подписью — по той же раскладке текста,
+/// что у самой плашки.
+fn soft_pill_width(ui: &egui::Ui, text: &str) -> f32 {
+    let font = egui::TextStyle::Small.resolve(ui.style());
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), font, egui::Color32::PLACEHOLDER);
+    galley.size().x + SOFT_PILL_PAD_X * 2.0
+}
+
 /// Неинтерактивная плашка: подпись на мягкой подложке.
 ///
 /// Ею сказаны «MP3», «JPG» и «Опрос идёт» — то, что читают, но не нажимают.
@@ -10969,7 +11543,7 @@ fn soft_pill(
     color: egui::Color32,
     fill: egui::Color32,
 ) {
-    const PAD_X: f32 = 11.0;
+    const PAD_X: f32 = SOFT_PILL_PAD_X;
     const HEIGHT: f32 = 24.0;
 
     let font = egui::TextStyle::Small.resolve(ui.style());
@@ -10981,10 +11555,14 @@ fn soft_pill(
         egui::Color32::PLACEHOLDER,
     );
 
-    let (rect, _) = ui.allocate_exact_size(
+    let (rect, response) = ui.allocate_exact_size(
         egui::vec2(galley.size().x + PAD_X * 2.0, HEIGHT),
         egui::Sense::hover(),
     );
+    // Плашку читают, а не нажимают, — значит, прочесть её должен и экранный
+    // диктор. Нарисованное кистью без имени для него не существует, и
+    // «2 личные записи» над таблицей сказаны были бы одним цветом строк.
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, text));
     if !ui.is_rect_visible(rect) {
         return;
     }
@@ -12615,7 +13193,7 @@ fn open_url(url: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::NO_DOWNLOAD;
+    use crate::model::{MetaReport, NO_DOWNLOAD, Tag, TagRole};
 
     fn request(url: &str, format: Format, quality: Quality) -> Request {
         Request {
@@ -14885,6 +15463,543 @@ mod tests {
             summary: "Загрузка в норме.".to_owned(),
             rows: Vec::new(),
             advice: None,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Метаданные
+    // -----------------------------------------------------------------------
+
+    /// Панель метаданных посреди задачи — с приёмником, в который тест шлёт
+    /// события сам.
+    ///
+    /// Файла по этому пути нет, и это нарочно: перечитывание, которого ждут
+    /// проверки, уходит в настоящий поток движка, а тот на пропавший файл
+    /// отвечает мгновенным отказом — ни диска, ни ffprobe.
+    fn meta_running(task: MetaTask) -> (MetaPanel, std::sync::mpsc::Sender<Event>) {
+        let mut meta = MetaPanel::new();
+        meta.path = Some(std::env::temp_dir().join("savio-нет-такого-файла.jpg"));
+        meta.readable = true;
+        meta.cleanable = true;
+        let (tx, rx) = channel();
+        meta.rx = Some(rx);
+        meta.running = Some(task);
+        (meta, tx)
+    }
+
+    fn one_place() -> MetaSummary {
+        MetaSummary::new(
+            &MetaReport {
+                size: Some(1),
+                tags: vec![Tag::new(TagRole::Place, "Координаты места", "40.1772, 44.5035")],
+            },
+            Lang::Ru,
+        )
+    }
+
+    /// После очистки прежняя таблица уходит сразу, а файл перечитывается.
+    ///
+    /// Иначе стёртые координаты остались бы на экране жёлтой строкой — ровно
+    /// то, что человек только что стёр, выглядело бы найденным. И второе:
+    /// поток очистки, закончив, закрывает свой канал, и это закрытие не
+    /// должно сбросить канал нового чтения. Проверено красным: без
+    /// перечитывания в `drain` проверка падает на первом же утверждении
+    /// о чтении.
+    #[test]
+    fn a_wipe_is_followed_by_a_fresh_read() {
+        let ctx = egui::Context::default();
+        let (mut meta, tx) = meta_running(MetaTask::Clean);
+        meta.summary = Some(one_place());
+        tx.send(Event::Cleaned(2048)).expect("канал жив");
+        drop(tx);
+
+        meta.drain(Lang::Ru, &ctx);
+
+        assert!(meta.summary.is_none(), "таблица до очистки осталась на экране");
+        assert_eq!(meta.running, Some(MetaTask::Read), "файл не перечитывается");
+        assert!(meta.rx.is_some(), "закрытие старого канала сбросило новый");
+        assert!(matches!(meta.outcome, Some((_, Tone::Good))), "{:?}", meta.outcome);
+    }
+
+    /// Несостоявшееся чтение встаёт на место таблицы, несостоявшаяся очистка —
+    /// под кнопки, и таблица рядом с ней остаётся: файл не тронут.
+    #[test]
+    fn a_failure_lands_where_its_task_is_shown() {
+        let ctx = egui::Context::default();
+        let failed = |message: &str| Event::Failed {
+            id: NO_DOWNLOAD,
+            message: message.to_owned(),
+        };
+
+        let (mut meta, tx) = meta_running(MetaTask::Read);
+        meta.summary = Some(one_place());
+        tx.send(failed("не прочитать")).expect("канал жив");
+        meta.drain(Lang::Ru, &ctx);
+        assert_eq!(meta.read_error.as_deref(), Some("не прочитать"));
+        assert!(meta.summary.is_none(), "таблица пережила отказ перечитать файл");
+        assert!(meta.outcome.is_none());
+
+        let (mut meta, tx) = meta_running(MetaTask::Clean);
+        meta.summary = Some(one_place());
+        tx.send(failed("не стереть")).expect("канал жив");
+        meta.drain(Lang::Ru, &ctx);
+        assert_eq!(meta.outcome, Some(("не стереть".to_owned(), Tone::Bad)));
+        assert!(meta.summary.is_some(), "файл не тронут — таблица по-прежнему верна");
+        assert!(meta.read_error.is_none());
+    }
+
+    /// Поток, умерший молча — без ответа и без отказа, — это отказ, и его
+    /// надо сказать словами.
+    ///
+    /// Разбор чужих файлов — ровно то место, где прячется паника на битом
+    /// входе, и без этой ветки на месте таблицы навсегда остался бы
+    /// индикатор «читаю»: задача уже не идёт, а экран об этом не знает.
+    /// Проверено красным: без неё проверка падает на отсутствии объяснения.
+    #[test]
+    fn a_reader_that_dies_silently_is_reported_in_words() {
+        let ctx = egui::Context::default();
+        let (mut meta, tx) = meta_running(MetaTask::Read);
+        drop(tx);
+        meta.drain(Lang::Ru, &ctx);
+        assert_eq!(meta.running, None, "задача числится идущей после смерти потока");
+        assert_eq!(
+            meta.read_error.as_deref(),
+            Some(i18n::t(Lang::Ru, Key::UiMetaNoAnswer)),
+            "молчание потока не объяснено"
+        );
+    }
+
+    /// Имена и значения записей переводит движок в момент чтения, так что на
+    /// смене языка таблицу пересобрать не из чего — файл читается заново.
+    /// Посреди очистки — нет: сразу после неё файл перечитается и так.
+    #[test]
+    fn a_language_change_rereads_what_is_on_screen() {
+        let ctx = egui::Context::default();
+
+        let (mut meta, _tx) = meta_running(MetaTask::Read);
+        meta.running = None;
+        meta.summary = Some(one_place());
+        meta.relabel(Lang::En, &ctx);
+        assert_eq!(
+            meta.running,
+            Some(MetaTask::Read),
+            "таблица осталась на прежнем языке"
+        );
+
+        let (mut meta, _tx) = meta_running(MetaTask::Clean);
+        meta.summary = Some(one_place());
+        meta.relabel(Lang::En, &ctx);
+        assert_eq!(
+            meta.running,
+            Some(MetaTask::Clean),
+            "чтение пошло поперёк очистки"
+        );
+    }
+
+    /// Итог очистки — готовая строка, и сама она на смене языка не
+    /// обновится: пересобирается из запомненного числа.
+    #[test]
+    fn the_wipe_outcome_follows_the_language() {
+        let ctx = egui::Context::default();
+        let mut meta = MetaPanel::new();
+        meta.freed = Some(2048);
+        meta.outcome = Some(wipe_outcome(2048, Lang::Ru));
+        meta.relabel(Lang::En, &ctx);
+        assert_eq!(
+            meta.outcome,
+            Some(("Metadata removed, 2.0 KB freed".to_owned(), Tone::Good))
+        );
+    }
+
+    /// Сводка снимка с телефона — с самыми длинными подписями, какие бывают.
+    fn sample_meta(lang: Lang) -> MetaSummary {
+        let t = |key| i18n::t(lang, key);
+        let tags = vec![
+            Tag::new(TagRole::Place, t(Key::TagPlace), "40.1772, 44.5035 · 1180 м"),
+            Tag::new(TagRole::Taken, t(Key::TagDateTaken), "14 сен 2025, 19:42"),
+            Tag::new(TagRole::Owner, t(Key::TagCameraOwner), "Эрик Чолахян"),
+            Tag::new(TagRole::Serial, t(Key::TagCameraSerial), "C39XK0L2HG7F"),
+            Tag::new(TagRole::Serial, t(Key::TagLensSerial), "LENS-4821"),
+            Tag::new(TagRole::Camera, t(Key::TagMaker), "Apple"),
+            Tag::new(TagRole::Camera, t(Key::TagCameraModel), "iPhone 14 Pro"),
+            Tag::new(TagRole::Shot, t(Key::TagFocalLength), "6.86 мм"),
+            Tag::new(TagRole::Shot, t(Key::TagAperture), "f/1.78"),
+            Tag::new(TagRole::Shot, t(Key::TagExposure), "1/120"),
+            Tag::new(TagRole::Shot, "ISO", "ISO 250"),
+            Tag::new(TagRole::Software, t(Key::TagSoftware), "Adobe Lightroom 7.4"),
+            // Слово длиннее строки — худший случай для переноса: пробела,
+            // по которому перенести, в нём нет.
+            Tag::new(TagRole::Named, t(Key::TagDescription), "Ж".repeat(90)),
+            Tag::new(TagRole::Service, t(Key::TagOrientation), "1"),
+            Tag::new(TagRole::Service, t(Key::TagDateModified), "15 сен 2025, 08:00"),
+            Tag::new(TagRole::Service, t(Key::TagDimensions), "4032 × 3024"),
+            Tag::new(
+                TagRole::Service,
+                t(Key::TagLensModel),
+                "iPhone 14 Pro back triple camera 6.86mm f/1.78",
+            ),
+            Tag::new(TagRole::Service, t(Key::TagThumbnail), "присутствует, 8.0 КБ"),
+        ];
+        MetaSummary::new(
+            &MetaReport {
+                size: Some(4_404_019),
+                tags,
+            },
+            lang,
+        )
+    }
+
+    /// Самые узкие главные колонки «Метаданных». Их две, и уже — вторая:
+    /// в окне 520 колонка одна, но во всю ширину (окно минус свёрнутый рельс
+    /// и поля), а сразу за порогом двух колонок главной остаётся порог минус
+    /// правая колонка и зазор между ними.
+    fn main_columns() -> [f32; 2] {
+        [
+            SMALLEST_WINDOW.width() - theme::NAV_NARROW - theme::CONTENT_MARGIN * 2.0,
+            theme::TWO_COLUMN_MIN - theme::RAIL_WIDTH - COLUMN_GAP,
+        ]
+    }
+
+    /// Один кадр внутри карточки главной колонки: что нарисовано и где
+    /// карточка. Высота своя: мерить ширину надо в низком окне, где у
+    /// прокрутки есть полоса, а щёлкать — в высоком, где нужная строка не
+    /// уехала за нижнюю кромку. Дерево доступности знает и об уехавшей
+    /// строке, а вот указатель до неё не дотянется.
+    fn card_frame<R>(
+        ctx: &egui::Context,
+        size: egui::Vec2,
+        events: Vec<egui::Event>,
+        add: impl FnOnce(&mut egui::Ui) -> R,
+    ) -> (R, Vec<(String, egui::Rect)>, egui::Rect) {
+        let pal = theme::Palette::dark();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            events,
+            ..Default::default()
+        };
+        let mut inner = None;
+        let mut add = Some(add);
+        let mut card = egui::Rect::NOTHING;
+        let mut output = ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            let add = add.take().expect("кадр рисуется один раз");
+                            let shown = theme::card(ui, pal, |ui| add(ui));
+                            card = shown.response.rect;
+                            inner = Some(shown.inner);
+                        });
+                });
+        });
+        output.textures_delta.clear();
+        (
+            inner.expect("карточка не нарисовалась"),
+            named_widgets(&mut output),
+            card,
+        )
+    }
+
+    /// Кадр таблицы метаданных: щёлкнули ли по свёрнутой строке, что
+    /// нарисовано и где карточка. Скорость ноль — как с выключенными
+    /// «Плавными переходами»: раскрытие без промежуточных кадров.
+    fn meta_table_frame(
+        ctx: &egui::Context,
+        lang: Lang,
+        summary: &MetaSummary,
+        open: bool,
+        size: egui::Vec2,
+        events: Vec<egui::Event>,
+    ) -> (bool, Vec<(String, egui::Rect)>, egui::Rect) {
+        let pal = theme::Palette::dark();
+        card_frame(ctx, size, events, |ui| {
+            meta_table(ui, pal, summary, lang, open, 0, 0.0)
+        })
+    }
+
+    /// Прямоугольник виджета с этим именем — или паника с тем, чего нет.
+    fn rect_named(named: &[(String, egui::Rect)], lang: Lang, text: &str) -> egui::Rect {
+        named
+            .iter()
+            .find(|(name, _)| name == text)
+            .map(|(_, rect)| *rect)
+            .unwrap_or_else(|| panic!("{lang:?}: в кадре нет «{text}»"))
+    }
+
+    /// Таблица метаданных помещается в самые узкие главные колонки на всех
+    /// трёх языках, и значения стоят одной колонкой.
+    ///
+    /// Колонка подписей — 180 точек, как в макете, и значению остаётся меньше
+    /// половины строки. Армянские подписи длиннее русских и переносятся; не
+    /// влезшее значение ушло бы за кромку карточки, а подпись, наехавшая на
+    /// значение, спутала бы строки. Глазной прогон идёт на одном языке из
+    /// трёх и на одной ширине, поэтому и мерит это тест.
+    #[test]
+    fn the_metadata_table_fits_the_narrowest_column() {
+        for width in main_columns() {
+            for lang in Lang::ALL {
+                // Свой контекст на язык: общий помнит размеры от прошлого и
+                // искажает первый кадр следующего.
+                let ctx = rail_test_ctx();
+                let summary = sample_meta(lang);
+                let size = egui::vec2(width, SMALLEST_WINDOW.height());
+                let mut frame = (false, Vec::new(), egui::Rect::NOTHING);
+                for _ in 0..3 {
+                    frame = meta_table_frame(&ctx, lang, &summary, true, size, Vec::new());
+                }
+                let (_, named, card) = frame;
+
+                let mut column = None;
+                for row in summary.rows.iter().chain(&summary.service) {
+                    let label = rect_named(&named, lang, &row.label);
+                    let value = rect_named(&named, lang, &row.value);
+                    assert!(
+                        label.max.x <= value.min.x,
+                        "{lang:?}, {width}: подпись «{}» налезает на значение",
+                        row.label
+                    );
+                    assert!(
+                        value.max.x <= card.max.x,
+                        "{lang:?}, {width}: значение «{}» вылезает за карточку: \
+                         {value:?} при {card:?}",
+                        row.value
+                    );
+                    let left = *column.get_or_insert(value.min.x);
+                    assert!(
+                        (value.min.x - left).abs() < 0.5,
+                        "{lang:?}, {width}: значение «{}» не в колонке: {} против {left}",
+                        row.value,
+                        value.min.x
+                    );
+                }
+                assert!(summary.rows[0].personal, "первая строка сводки — не личная");
+            }
+        }
+    }
+
+    /// Плашка с числом личных записей не ложится на название шага.
+    ///
+    /// `step_header` кладёт её от правой кромки, и если строки не хватает,
+    /// она уезжает влево — поверх названия. По-армянски «Ֆայլի մետատվյալներ»
+    /// и «12 անձնական գրառում» вместе длиннее строки узкой карточки (найдено
+    /// ревью задачи 65). Проверено красным: с плашкой, всегда стоящей рядом
+    /// с названием, проверка падает на армянском.
+    #[test]
+    fn the_personal_plate_never_covers_the_step_title() {
+        let pal = theme::Palette::dark();
+        for width in main_columns() {
+            for lang in Lang::ALL {
+                for count in [4_u64, 12] {
+                    let words = i18n::plural(
+                        lang,
+                        count,
+                        i18n::t(lang, Key::UiMetaPersonalOne),
+                        i18n::t(lang, Key::UiMetaPersonalFew),
+                        i18n::t(lang, Key::UiMetaPersonalMany),
+                    );
+                    let plate = i18n::fill(
+                        i18n::t(lang, Key::UiMetaPersonalCount),
+                        &[&count.to_string(), words],
+                    );
+                    let ctx = rail_test_ctx();
+                    let size = egui::vec2(width, SMALLEST_WINDOW.height());
+                    let mut named = Vec::new();
+                    for _ in 0..3 {
+                        named = card_frame(&ctx, size, Vec::new(), |ui| {
+                            findings_header(ui, pal, lang, &plate)
+                        })
+                        .1;
+                    }
+                    let title = rect_named(&named, lang, i18n::t(lang, Key::UiMetaFileTags));
+                    let pill = rect_named(&named, lang, &plate);
+                    assert!(
+                        title.max.x <= pill.min.x || title.max.y <= pill.min.y,
+                        "{lang:?}, {width}, {count}: плашка {pill:?} лежит на названии {title:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Служебные записи раскрываются щелчком по своей строке — и строка
+    /// находится по имени, то есть названа и для экранного диктора.
+    #[test]
+    fn the_service_records_unfold_on_click() {
+        let tall = egui::vec2(main_columns()[0], 1600.0);
+        let lang = Lang::Ru;
+        let ctx = rail_test_ctx();
+        let summary = sample_meta(lang);
+        assert!(!summary.service.is_empty(), "образец собран без хвоста");
+        let hidden = &summary.service[0].value;
+
+        let mut named = Vec::new();
+        for _ in 0..3 {
+            named = meta_table_frame(&ctx, lang, &summary, false, tall, Vec::new()).1;
+        }
+        assert!(
+            !named.iter().any(|(name, _)| name == hidden),
+            "свёрнутый хвост виден"
+        );
+
+        let row = center_of(&named, i18n::t(lang, Key::UiMetaServiceRecords))
+            .expect("у свёрнутой строки нет имени");
+        let mut toggled = false;
+        for events in click_at(row) {
+            toggled |= meta_table_frame(&ctx, lang, &summary, false, tall, events).0;
+        }
+        assert!(toggled, "щелчок по свёрнутой строке ничего не сделал");
+
+        for _ in 0..3 {
+            named = meta_table_frame(&ctx, lang, &summary, true, tall, Vec::new()).1;
+        }
+        assert!(
+            named.iter().any(|(name, _)| name == hidden),
+            "раскрытый хвост не показал записей"
+        );
+    }
+
+    /// Кнопки раздела не вылезают за карточку ни на одном языке.
+    ///
+    /// «Прочитать снова» получает треть ширины, но это пол: армянская
+    /// подпись в узкой колонке шире трети, и если бы ширины делились
+    /// заранее, «Стереть всё» уехала бы за кромку.
+    #[test]
+    fn the_metadata_buttons_fit_the_narrowest_column() {
+        let pal = theme::Palette::dark();
+        for width in main_columns() {
+            for lang in Lang::ALL {
+                let ctx = rail_test_ctx();
+                let size = egui::vec2(width, SMALLEST_WINDOW.height());
+                let mut frame = ((), Vec::new(), egui::Rect::NOTHING);
+                for _ in 0..3 {
+                    frame = card_frame(&ctx, size, Vec::new(), |ui| {
+                        meta_actions(ui, pal, lang, true, true, "");
+                    });
+                }
+                let ((), named, card) = frame;
+
+                let wipe_name = i18n::t(lang, Key::UiMetaWipe);
+                let read = rect_named(&named, lang, i18n::t(lang, Key::UiMetaReadAgain));
+                let wipe = rect_named(&named, lang, wipe_name);
+                assert!(
+                    read.max.x <= wipe.min.x,
+                    "{lang:?}, {width}: кнопки налезают друг на друга"
+                );
+                assert!(
+                    wipe.max.x <= card.max.x,
+                    "{lang:?}, {width}: «{wipe_name}» вылезает за карточку: \
+                     {wipe:?} при {card:?}"
+                );
+                assert!(
+                    read.width() < wipe.width(),
+                    "{lang:?}, {width}: главное действие раздела уже вторичного"
+                );
+            }
+        }
+    }
+
+    /// Правая колонка помещается в свою ширину на всех трёх языках, а
+    /// указатель на «Загрузку» — нажимается.
+    #[test]
+    fn the_metadata_rail_fits_and_points_to_the_download_section() {
+        let pal = theme::Palette::dark();
+        let width = theme::RAIL_WIDTH;
+        for lang in Lang::ALL {
+            let ctx = rail_test_ctx();
+            let frame = |events: Vec<egui::Event>| {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 900.0),
+                    )),
+                    events,
+                    ..Default::default()
+                };
+                let mut clicked = false;
+                let mut output = ctx.run_ui(input, |ui| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ui, |ui| {
+                            clicked = metadata_rail(ui, pal, lang, 0.0, None, None);
+                        });
+                });
+                output.textures_delta.clear();
+                (clicked, named_widgets(&mut output))
+            };
+
+            let mut named = Vec::new();
+            for _ in 0..3 {
+                named = frame(Vec::new()).1;
+            }
+            for (name, rect) in &named {
+                assert!(
+                    rect.max.x <= width + 0.5,
+                    "{lang:?}: «{name}» вылезает из колонки: {rect:?}"
+                );
+            }
+
+            let button = center_of(&named, i18n::t(lang, Key::UiMetaOpenDownload))
+                .expect("нет указателя на «Загрузку»");
+            let mut clicked = false;
+            for events in click_at(button) {
+                clicked |= frame(events).0;
+            }
+            assert!(clicked, "{lang:?}: указатель на «Загрузку» не нажимается");
+        }
+    }
+
+    /// Имени файла в таблетке остаётся место, а сведения рядом с ним не
+    /// выталкивают таблетку на кнопку выбора.
+    ///
+    /// Прежде место отмерялось сначала сведениям, и у MP3 хвост «размер ·
+    /// длительность · битрейт» в окне 520 оставлял имени одну букву, а у
+    /// записи на час с лишним рамка заезжала на «Выбрать другой» (найдено
+    /// ревью задачи 65). Мерится весь ряд, с кнопкой и в карточке, — таблетка
+    /// одна на всю колонку места имела бы вдвое больше и проверяла бы себя.
+    /// Проверено красным: с прежним делением места падает на первом же MP3.
+    #[test]
+    fn a_file_name_keeps_its_share_next_to_long_facts() {
+        let pal = theme::Palette::dark();
+        let name = "Ночной трамвай (remastered 2025).mp3";
+        for width in main_columns() {
+            for lang in Lang::ALL {
+                for facts in ["· 4.2 МБ · 3:25 · 320 кбит/с", "· 80.4 МБ · 1:23:45 · 128 кбит/с"] {
+                    let ctx = rail_test_ctx();
+                    let size = egui::vec2(width, SMALLEST_WINDOW.height());
+                    let file = FilePill {
+                        name,
+                        facts,
+                        path: "C:/музыка/Ночной трамвай (remastered 2025).mp3",
+                    };
+                    let mut named = Vec::new();
+                    for _ in 0..3 {
+                        named = card_frame(&ctx, size, Vec::new(), |ui| {
+                            file_row(ui, pal, lang, Some(file), false, 0.0)
+                        })
+                        .1;
+                    }
+
+                    let button = rect_named(&named, lang, i18n::t(lang, Key::UiMetaPickAnother));
+                    let shown = rect_named(&named, lang, name);
+                    let tail = rect_named(&named, lang, facts);
+                    assert!(
+                        shown.width() >= 60.0,
+                        "{lang:?}, {width}, «{facts}»: имени осталось {} точек",
+                        shown.width()
+                    );
+                    assert!(
+                        shown.max.x <= tail.min.x + 0.5,
+                        "{lang:?}, {width}, «{facts}»: имя налезает на сведения"
+                    );
+                    assert!(
+                        tail.max.x <= button.min.x,
+                        "{lang:?}, {width}, «{facts}»: сведения {tail:?} заезжают на \
+                         кнопку {button:?}"
+                    );
+                }
+            }
         }
     }
 }

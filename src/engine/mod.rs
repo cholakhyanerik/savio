@@ -27,8 +27,8 @@ use std::sync::{Arc, Mutex};
 
 use crate::i18n::{self, Key, Lang};
 use crate::model::{
-    CookieSource, DownloadId, Event, MediaInfo, NO_DOWNLOAD, Request, SectionPlan, SubtitlePlan,
-    human_duration,
+    CookieSource, DownloadId, Event, MediaInfo, MetaReport, NO_DOWNLOAD, Request, SectionPlan,
+    SubtitlePlan, human_duration,
 };
 
 pub use binaries::{Tools, discover};
@@ -722,7 +722,11 @@ pub fn start_metadata(
                 // длительностью. Его отсутствие — не повод отказать в работе:
                 // изображения разбираются без единой внешней программы.
                 let ffprobe = binaries::locate(binaries::FFPROBE_NAME);
-                metadata::read(&path, ffprobe.as_deref(), lang).map(Event::Tags)
+                // Размер — здесь же, в потоке: окно показывает его рядом
+                // с именем файла, а трогать диск из кадра нельзя (Правило 1).
+                let size = std::fs::metadata(&path).ok().map(|meta| meta.len());
+                metadata::read(&path, ffprobe.as_deref(), lang)
+                    .map(|tags| Event::Tags(MetaReport { size, tags }))
             }
             MetaTask::Clean => {
                 let _ = tx.send(Event::Stage(

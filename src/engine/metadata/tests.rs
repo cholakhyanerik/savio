@@ -11,7 +11,7 @@ use super::*;
 // Тесты ниже про устройство контейнеров, а не про переводы: они сверяют имена
 // тегов, а имя тега — это перевод. Поэтому язык подставляют обёртки, и он не
 // мелькает в каждой строке. Сами переводы проверяет `i18n`, а то, что имена
-// тегов вообще переводятся, — `tag_name` и `id3_name`.
+// тегов вообще переводятся, — `exif_tags` и `id3_tag`.
 // ---------------------------------------------------------------------------
 
 fn read_jpeg(data: &[u8]) -> Result<Vec<Tag>, String> {
@@ -199,6 +199,34 @@ fn jpeg_reads_exif_and_comment() {
     assert!(tags.iter().any(|t| t.name == "IPTC / Photoshop"));
 }
 
+/// Продолжения большого XMP стираются вместе с ним — и в таблице стоят
+/// вместе с ним, одной строкой с общим объёмом. Прежде их не было видно
+/// вовсе, и таблица занижала то, что уйдёт при очистке.
+#[test]
+fn extended_xmp_counts_toward_the_xmp_row() {
+    let mut main = b"http://ns.adobe.com/xap/1.0/\x00".to_vec();
+    main.extend(std::iter::repeat_n(b'x', 1000));
+    let mut extension = b"http://ns.adobe.com/xmp/extension/\x00".to_vec();
+    extension.extend(std::iter::repeat_n(b'y', 3000));
+
+    let mut jpeg = vec![0xFF, 0xD8];
+    jpeg.extend(segment(0xE1, &main));
+    jpeg.extend(segment(0xE1, &extension));
+    jpeg.extend(segment(0xDA, &[0x01, 0x00, 0x00, 0x00]));
+    jpeg.extend_from_slice(b"\xFF\xD9");
+
+    let tags = read_jpeg(&jpeg).unwrap();
+    let total = model::human_bytes((main.len() + extension.len()) as u64, Lang::Ru);
+    assert_eq!(
+        tags.iter()
+            .filter(|tag| tag.name == "XMP")
+            .map(|tag| tag.value.as_str())
+            .collect::<Vec<_>>(),
+        [format!("присутствует, {total}")],
+        "{tags:?}"
+    );
+}
+
 #[test]
 fn jpeg_strip_removes_all_metadata() {
     let cleaned = strip_jpeg(&sample_jpeg()).unwrap();
@@ -242,11 +270,33 @@ fn jpeg_rejects_foreign_file() {
 #[test]
 fn png_reads_text_and_exif() {
     let tags = read_png(&sample_png()).unwrap();
+    // «Comment» — слово из стандарта PNG, и называется оно так же, как
+    // комментарий JPEG: одна и та же запись выглядит в таблице одинаково.
     assert!(
         tags.iter()
-            .any(|t| t.name == "Comment" && t.value == "SECRETPNGTEXT")
+            .any(|t| t.name == "Комментарий" && t.value == "SECRETPNGTEXT")
     );
     assert!(tags.iter().any(|t| t.value == "SECRETCAM"));
+}
+
+#[test]
+fn png_keywords_speak_like_exif() {
+    let mut src = Vec::from(PNG_SIGNATURE);
+    src.extend(png_chunk(b"IHDR", &[0u8; 13]));
+    src.extend(png_chunk(b"tEXt", "Author\x00Эрик".as_bytes()));
+    src.extend(png_chunk(b"tEXt", b"Creation Time\x002025-09-14"));
+    src.extend(png_chunk(b"tEXt", b"Software\x00GIMP"));
+    src.extend(png_chunk(b"tEXt", b"Raw profile\x00x"));
+    src.extend(png_chunk(b"IEND", b""));
+
+    let tags = read_png(&src).unwrap();
+    let find = |name: &str| tags.iter().find(|t| t.name == name).map(|t| t.role);
+    assert_eq!(find("Автор"), Some(TagRole::Named), "{tags:?}");
+    // Время создания картинки — для снимка экрана это и есть «когда снято».
+    assert_eq!(find("Дата создания"), Some(TagRole::Taken), "{tags:?}");
+    assert_eq!(find("Программа"), Some(TagRole::Software), "{tags:?}");
+    // Своё слово программы остаётся как есть и уходит в служебные.
+    assert_eq!(find("Raw profile"), Some(TagRole::Service), "{tags:?}");
 }
 
 #[test]
@@ -388,6 +438,452 @@ fn exif_does_not_loop_on_self_referencing_ifd() {
     assert!(read_tiff(&data).is_empty());
 }
 
+/// Значение записи каталога для сборки образца.
+enum Val {
+    Ascii(&'static str),
+    Short(u16),
+    Long(u32),
+    Byte(u8),
+    Rationals(&'static [(u32, u32)]),
+}
+
+impl Val {
+    /// Тип TIFF, число элементов и байты значения, старшим байтом вперёд.
+    fn encode(&self) -> (u16, u32, Vec<u8>) {
+        match self {
+            Val::Ascii(text) => {
+                let mut bytes = text.as_bytes().to_vec();
+                bytes.push(0);
+                (2, bytes.len() as u32, bytes)
+            }
+            Val::Short(value) => (3, 1, value.to_be_bytes().to_vec()),
+            Val::Long(value) => (4, 1, value.to_be_bytes().to_vec()),
+            Val::Byte(value) => (1, 1, vec![*value]),
+            Val::Rationals(parts) => (
+                5,
+                parts.len() as u32,
+                parts
+                    .iter()
+                    .flat_map(|(n, d)| [n.to_be_bytes(), d.to_be_bytes()].concat())
+                    .collect(),
+            ),
+        }
+    }
+}
+
+/// Запись в готовом к записи виде: номер, тип, число элементов, байты.
+type Encoded = (u16, u16, u32, Vec<u8>);
+
+fn encode(dir: &[(u16, Val)]) -> Vec<Encoded> {
+    dir.iter()
+        .map(|(tag, value)| {
+            let (format, count, bytes) = value.encode();
+            (*tag, format, count, bytes)
+        })
+        .collect()
+}
+
+/// Сколько места занимает каталог вместе со своими данными.
+fn ifd_size(entries: &[Encoded]) -> usize {
+    let data: usize = entries
+        .iter()
+        .map(|(_, _, _, bytes)| if bytes.len() > 4 { bytes.len() } else { 0 })
+        .sum();
+    2 + entries.len() * 12 + 4 + data
+}
+
+fn write_ifd(out: &mut Vec<u8>, entries: &[Encoded], next: u32) {
+    let at = out.len();
+    out.extend_from_slice(&(entries.len() as u16).to_be_bytes());
+    let mut data_at = at + 2 + entries.len() * 12 + 4;
+    let mut data = Vec::new();
+    for (tag, format, count, bytes) in entries {
+        out.extend_from_slice(&tag.to_be_bytes());
+        out.extend_from_slice(&format.to_be_bytes());
+        out.extend_from_slice(&count.to_be_bytes());
+        if bytes.len() <= 4 {
+            // Короткое значение лежит в самой записи, прижатым влево.
+            let mut inline = bytes.clone();
+            inline.resize(4, 0);
+            out.extend_from_slice(&inline);
+        } else {
+            out.extend_from_slice(&(data_at as u32).to_be_bytes());
+            data_at += bytes.len();
+            data.extend_from_slice(bytes);
+        }
+    }
+    out.extend_from_slice(&next.to_be_bytes());
+    out.extend_from_slice(&data);
+}
+
+/// Блок EXIF: основной каталог и, если заданы, EXIF, GPS и IFD1.
+///
+/// Каталоги лежат друг за другом, данные длиннее четырёх байт — сразу за
+/// своим каталогом, ссылки на вложенные дописываются в основной сами.
+fn tiff(
+    main: &[(u16, Val)],
+    exif: &[(u16, Val)],
+    gps: &[(u16, Val)],
+    thumb: &[(u16, Val)],
+) -> Vec<u8> {
+    let (exif, gps, thumb) = (encode(exif), encode(gps), encode(thumb));
+    let mut main = encode(main);
+    // Ссылки на вложенные каталоги — по четыре байта, прямо в записи; их
+    // место в основном каталоге надо учесть до того, как считать смещения.
+    let pointers = usize::from(!exif.is_empty()) + usize::from(!gps.is_empty());
+    let main_size = ifd_size(&main) + pointers * 12;
+    let exif_at = 8 + main_size;
+    let gps_at = exif_at + if exif.is_empty() { 0 } else { ifd_size(&exif) };
+    let thumb_at = gps_at + if gps.is_empty() { 0 } else { ifd_size(&gps) };
+
+    if !exif.is_empty() {
+        main.push((0x8769, 4, 1, (exif_at as u32).to_be_bytes().to_vec()));
+    }
+    if !gps.is_empty() {
+        main.push((0x8825, 4, 1, (gps_at as u32).to_be_bytes().to_vec()));
+    }
+
+    let mut out = b"MM\x00\x2a".to_vec();
+    out.extend_from_slice(&8u32.to_be_bytes());
+    let next = if thumb.is_empty() { 0 } else { thumb_at as u32 };
+    write_ifd(&mut out, &main, next);
+    for dir in [&exif, &gps] {
+        if !dir.is_empty() {
+            write_ifd(&mut out, dir, 0);
+        }
+    }
+    if !thumb.is_empty() {
+        write_ifd(&mut out, &thumb, 0);
+    }
+    out
+}
+
+fn with_role(tags: &[Tag], role: TagRole) -> Vec<(&str, &str)> {
+    tags.iter()
+        .filter(|tag| tag.role == role)
+        .map(|tag| (tag.name.as_str(), tag.value.as_str()))
+        .collect()
+}
+
+/// Координаты — одна строка десятичных градусов, а не шесть записей GPS.
+///
+/// Градусы, минуты и секунды порознь («40, 10, 37.92» и «N» отдельной
+/// строкой) не читаются как место вовсе, а ответ на «где снято» — главное,
+/// ради чего раздел открывают.
+#[test]
+fn gps_turns_into_one_row_of_decimal_degrees() {
+    let gps = [
+        (0x0001, Val::Ascii("N")),
+        (0x0002, Val::Rationals(&[(40, 1), (10, 1), (3792, 100)])),
+        (0x0003, Val::Ascii("E")),
+        (0x0004, Val::Rationals(&[(44, 1), (30, 1), (1260, 100)])),
+        (0x0005, Val::Byte(0)),
+        (0x0006, Val::Rationals(&[(1180, 1)])),
+    ];
+    let tags = read_tiff(&tiff(&[], &[], &gps, &[]));
+    assert_eq!(
+        with_role(&tags, TagRole::Place),
+        [("Координаты места", "40.1772, 44.5035 · 1180 м")],
+        "{tags:?}"
+    );
+    assert_eq!(tags.len(), 1, "сырые записи GPS просочились: {tags:?}");
+
+    // Южное полушарие, западная долгота и высота ниже уровня моря — минусом,
+    // и минус типографский, как у температуры в прогнозе.
+    let south = [
+        (0x0001, Val::Ascii("S")),
+        (0x0002, Val::Rationals(&[(33, 1), (52, 1), (768, 100)])),
+        (0x0003, Val::Ascii("W")),
+        (0x0004, Val::Rationals(&[(70, 1), (40, 1), (0, 1)])),
+        (0x0005, Val::Byte(1)),
+        (0x0006, Val::Rationals(&[(12, 1)])),
+    ];
+    let tags = read_tiff(&tiff(&[], &[], &south, &[]));
+    assert_eq!(
+        with_role(&tags, TagRole::Place),
+        [("Координаты места", "−33.8688, −70.6667 · −12 м")]
+    );
+}
+
+/// Одни нули — заглушка приёмника, не поймавшего спутник, а не место.
+///
+/// Жёлтая строка «0.0000, 0.0000 · 0 м» и «Дата съёмки: 00:00 UTC»
+/// выглядели бы находкой ровно там, где находить нечего (Правило 6; найдено
+/// ревью задачи 65). Проверено красным: без проверки на нули обе строки
+/// появляются.
+#[test]
+fn gps_zeros_are_no_fix_rather_than_a_place() {
+    let zeros = [
+        (0x0001, Val::Ascii("N")),
+        (0x0002, Val::Rationals(&[(0, 1), (0, 1), (0, 1)])),
+        (0x0003, Val::Ascii("E")),
+        (0x0004, Val::Rationals(&[(0, 1), (0, 1), (0, 1)])),
+        (0x0006, Val::Rationals(&[(0, 1)])),
+        (0x0007, Val::Rationals(&[(0, 1), (0, 1), (0, 1)])),
+    ];
+    let tags = read_tiff(&tiff(&[], &[], &zeros, &[]));
+    assert!(tags.is_empty(), "заглушка выдана за находку: {tags:?}");
+
+    // Настоящий ноль по одной оси — экватор или Гринвич — место, и высота
+    // уровня моря рядом с ним законна.
+    let greenwich = [
+        (0x0001, Val::Ascii("N")),
+        (0x0002, Val::Rationals(&[(51, 1), (28, 1), (4020, 100)])),
+        (0x0003, Val::Ascii("E")),
+        (0x0004, Val::Rationals(&[(0, 1), (0, 1), (0, 1)])),
+        (0x0006, Val::Rationals(&[(0, 1)])),
+    ];
+    let tags = read_tiff(&tiff(&[], &[], &greenwich, &[]));
+    assert_eq!(
+        with_role(&tags, TagRole::Place),
+        [("Координаты места", "51.4778, 0.0000 · 0 м")]
+    );
+}
+
+/// Ссылки на вложенные каталоги берутся только из основного, и в каталоге
+/// EXIF следующий EXIF уже не открывается.
+///
+/// Иначе каталог из сотен ссылок, каждая на свой вложенный с сотнями своих,
+/// разворачивал обход в сотни тысяч записей: блок EXIF в 35 КБ, помещающийся
+/// в сегмент JPEG, требовал гигабайты памяти и ронял процесс вместе с идущей
+/// загрузкой (найдено ревью задачи 65). Проверено красным: со ссылками из
+/// любого каталога вложенный «Производитель» читается.
+#[test]
+fn nested_directories_are_opened_only_from_the_main_one() {
+    let mut data = b"MM\x00\x2a".to_vec();
+    data.extend_from_slice(&8u32.to_be_bytes());
+    // Основной каталог @8: одна ссылка на EXIF @26.
+    data.extend_from_slice(&1u16.to_be_bytes());
+    data.extend_from_slice(&0x8769u16.to_be_bytes());
+    data.extend_from_slice(&4u16.to_be_bytes());
+    data.extend_from_slice(&1u32.to_be_bytes());
+    data.extend_from_slice(&26u32.to_be_bytes());
+    data.extend_from_slice(&0u32.to_be_bytes());
+    // EXIF @26: «Производитель» и ссылка на ещё один EXIF @56.
+    data.extend_from_slice(&2u16.to_be_bytes());
+    data.extend_from_slice(&0x010Fu16.to_be_bytes());
+    data.extend_from_slice(&2u16.to_be_bytes());
+    data.extend_from_slice(&4u32.to_be_bytes());
+    data.extend_from_slice(b"ABC\x00");
+    data.extend_from_slice(&0x8769u16.to_be_bytes());
+    data.extend_from_slice(&4u16.to_be_bytes());
+    data.extend_from_slice(&1u32.to_be_bytes());
+    data.extend_from_slice(&56u32.to_be_bytes());
+    data.extend_from_slice(&0u32.to_be_bytes());
+    // Вложенный в EXIF @56: свой «Производитель».
+    data.extend_from_slice(&1u16.to_be_bytes());
+    data.extend_from_slice(&0x010Fu16.to_be_bytes());
+    data.extend_from_slice(&2u16.to_be_bytes());
+    data.extend_from_slice(&4u32.to_be_bytes());
+    data.extend_from_slice(b"XYZ\x00");
+    data.extend_from_slice(&0u32.to_be_bytes());
+
+    let tags = read_tiff(&data);
+    let makers: Vec<&str> = tags.iter().map(|tag| tag.value.as_str()).collect();
+    assert_eq!(makers, ["ABC"], "открыт каталог, вложенный во вложенный");
+}
+
+/// Чисел в значении — не больше предела, сколько бы их ни заявила запись:
+/// память под разбор иначе заказывал бы сам файл.
+#[test]
+fn a_value_keeps_at_most_its_limit_of_numbers() {
+    // Поле значения — смещение 4, дальше тысяча дробей.
+    let mut data = 4u32.to_be_bytes().to_vec();
+    for i in 0..1000u32 {
+        data.extend_from_slice(&i.to_be_bytes());
+        data.extend_from_slice(&1u32.to_be_bytes());
+    }
+    let Some(Raw::Rationals(parts)) = tiff_raw(&data, 0, 5, 1000, true) else {
+        panic!("дроби не разобраны");
+    };
+    assert_eq!(parts.len(), VALUE_COUNT_LIMIT);
+}
+
+/// Номера GPS пересекаются с номерами основного каталога: 0x0002 вне GPS —
+/// не широта. Прежде вложенным считался любой каталог, кроме основного.
+#[test]
+fn gps_numbers_mean_nothing_outside_gps() {
+    let exif = [(0x0002, Val::Rationals(&[(40, 1), (10, 1), (0, 1)]))];
+    assert!(read_tiff(&tiff(&[], &exif, &[], &[])).is_empty());
+}
+
+/// Выдержка, диафрагма, фокусное и ISO — так, как их пишет экран камеры,
+/// и в том же порядке.
+#[test]
+fn shot_values_read_like_a_camera_screen() {
+    let exif = [
+        (0x829A, Val::Rationals(&[(1, 120)])),
+        (0x829D, Val::Rationals(&[(178, 100)])),
+        (0x8827, Val::Short(250)),
+        (0x920A, Val::Rationals(&[(686, 100)])),
+    ];
+    let tags = read_tiff(&tiff(&[], &exif, &[], &[]));
+    let values: Vec<&str> = with_role(&tags, TagRole::Shot)
+        .into_iter()
+        .map(|(_, value)| value)
+        .collect();
+    assert_eq!(values, ["6.86 мм", "f/1.78", "1/120", "ISO 250"]);
+}
+
+#[test]
+fn exposure_is_a_fraction_until_a_third_of_a_second() {
+    let exposure = |n, d| exposure_value(&Raw::Rationals(vec![(n, d)]), Lang::Ru);
+    assert_eq!(exposure(1, 120).as_deref(), Some("1/120"));
+    // Камеры пишут долю по-разному, а читается она одинаково.
+    assert_eq!(exposure(10, 1200).as_deref(), Some("1/120"));
+    assert_eq!(exposure(1, 4).as_deref(), Some("1/4"));
+    // Граница — ровно треть секунды: с неё и дольше — секундами, и «1/2» на
+    // месте 0.6 с или «1/3» на месте 0.4 с было бы неправдой, а не
+    // округлением. Два случая по обе стороны от неё держат сам порог.
+    assert_eq!(exposure(3, 10).as_deref(), Some("0.3 с"));
+    assert_eq!(exposure(4, 10).as_deref(), Some("0.4 с"));
+    assert_eq!(exposure(6, 10).as_deref(), Some("0.6 с"));
+    assert_eq!(exposure(2, 1).as_deref(), Some("2 с"));
+    assert_eq!(exposure(0, 1), None, "нулевой выдержки не бывает");
+    assert_eq!(exposure(1, 0), None, "нулевой знаменатель — не число");
+
+    let aperture = |n, d| aperture_value(&Raw::Rationals(vec![(n, d)]));
+    assert_eq!(aperture(28, 10).as_deref(), Some("f/2.8"));
+    assert_eq!(aperture(8, 1).as_deref(), Some("f/8"));
+}
+
+/// Дата съёмки — словами, дата оцифровки — только если она другая.
+#[test]
+fn dates_read_as_dates() {
+    let same = [
+        (0x9003, Val::Ascii("2025:09:14 19:42:07")),
+        (0x9004, Val::Ascii("2025:09:14 19:42:07")),
+    ];
+    let tags = read_tiff(&tiff(&[], &same, &[], &[]));
+    assert_eq!(
+        with_role(&tags, TagRole::Taken),
+        [("Дата съёмки", "14 сен 2025, 19:42")],
+        "у снимка с телефона дата оцифровки — та же самая: {tags:?}"
+    );
+
+    let other = [
+        (0x9003, Val::Ascii("2025:09:14 19:42:07")),
+        (0x9004, Val::Ascii("2025:10:01 08:05:00")),
+    ];
+    let tags = read_tiff(&tiff(&[], &other, &[], &[]));
+    assert_eq!(
+        with_role(&tags, TagRole::Taken),
+        [
+            ("Дата съёмки", "14 сен 2025, 19:42"),
+            ("Дата оцифровки", "1 окт 2025, 08:05")
+        ]
+    );
+
+    let text = |text: &str| Raw::Text(text.to_owned());
+    // Незаданное время камеры пишут нулями или пробелами — это не дата,
+    // и жёлтой строкой «Дата съёмки: 0000:00:00» оно выглядело бы находкой.
+    assert_eq!(date_value(&text("0000:00:00 00:00:00"), Lang::Ru), None);
+    assert_eq!(date_value(&text("    :  :     :  :  "), Lang::Ru), None);
+    // Не разобралось, но похоже на дату — показываем как есть.
+    assert_eq!(
+        date_value(&text("14.09.2025"), Lang::Ru).as_deref(),
+        Some("14.09.2025")
+    );
+    assert_eq!(
+        date_value(&text("2025:09:14 19:42:07"), Lang::En).as_deref(),
+        Some("14 Sep 2025, 19:42")
+    );
+}
+
+/// Время по часам GPS отвечает на «когда снято» только там, где даты съёмки
+/// нет: рядом с ней это то же мгновение по Гринвичу.
+#[test]
+fn gps_time_answers_when_only_without_the_date_taken() {
+    let gps = [
+        (0x0007, Val::Rationals(&[(15, 1), (42, 1), (7, 1)])),
+        (0x001D, Val::Ascii("2025:09:14")),
+    ];
+    let tags = read_tiff(&tiff(&[], &[], &gps, &[]));
+    assert_eq!(
+        with_role(&tags, TagRole::Taken),
+        [("Дата съёмки", "14 сен 2025, 15:42 UTC")]
+    );
+
+    let exif = [(0x9003, Val::Ascii("2025:09:14 19:42:07"))];
+    let tags = read_tiff(&tiff(&[], &exif, &gps, &[]));
+    assert_eq!(
+        with_role(&tags, TagRole::Taken),
+        [("Дата съёмки", "14 сен 2025, 19:42")]
+    );
+}
+
+/// Владелец и серийные номера — личные: номер связывает все снимки с одной
+/// камерой не хуже геометки.
+///
+/// Номер камеры живёт под двумя номерами записи. Стандартный 0xA431 пишут
+/// современные камеры, но Savio его прежде не знал вовсе — и серийный номер
+/// у большинства камер не показывался, хотя и стирался. Проверено красным:
+/// без 0xA431 в списке читаемых записей проверка падает.
+#[test]
+fn camera_owner_and_serial_numbers_are_personal() {
+    let exif = [
+        (0xA430, Val::Ascii("Эрик")),
+        (0xA431, Val::Ascii("C39XK0L2HG7F")),
+        (0xA435, Val::Ascii("LENS-4821")),
+        // DNG-шный номер с тем же значением — второй строкой он не нужен.
+        (0xC62F, Val::Ascii("C39XK0L2HG7F")),
+    ];
+    let tags = read_tiff(&tiff(&[], &exif, &[], &[]));
+    assert_eq!(
+        with_role(&tags, TagRole::Owner),
+        [("Владелец камеры", "Эрик")]
+    );
+    assert_eq!(
+        with_role(&tags, TagRole::Serial),
+        [
+            ("Серийный номер камеры", "C39XK0L2HG7F"),
+            ("Серийный номер объектива", "LENS-4821")
+        ]
+    );
+    assert!(tags.iter().all(|tag| tag.role.personal()), "{tags:?}");
+}
+
+/// Камера и программа — не личное, а размер кадра и пустые поля —
+/// служебное и ничто соответственно.
+#[test]
+fn the_rest_of_exif_gets_its_rows() {
+    let main = [
+        (0x010F, Val::Ascii("Apple")),
+        (0x0110, Val::Ascii("iPhone 14 Pro")),
+        (0x0131, Val::Ascii("18.6")),
+        // Пустые «Автор» и «Авторские права» — обычное дело у камер, и
+        // строка с пустым значением ничего бы не сообщила.
+        (0x013B, Val::Ascii("")),
+        (0x8298, Val::Ascii("   ")),
+    ];
+    let exif = [(0xA002, Val::Long(4032)), (0xA003, Val::Long(3024))];
+    let tags = read_tiff(&tiff(&main, &exif, &[], &[]));
+
+    assert_eq!(
+        with_role(&tags, TagRole::Camera),
+        [("Производитель", "Apple"), ("Модель камеры", "iPhone 14 Pro")]
+    );
+    assert_eq!(with_role(&tags, TagRole::Software), [("Программа", "18.6")]);
+    assert_eq!(
+        with_role(&tags, TagRole::Service),
+        [("Размер кадра", "4032 × 3024")]
+    );
+    assert!(with_role(&tags, TagRole::Named).is_empty(), "{tags:?}");
+}
+
+/// Миниатюра видна по своему объёму: в ней бывает то, что с самого снимка
+/// срезали.
+#[test]
+fn the_thumbnail_is_listed_by_its_size() {
+    let main = [(0x010F, Val::Ascii("Apple"))];
+    let thumb = [(0x0202, Val::Long(8192))];
+    let tags = read_tiff(&tiff(&main, &[], &[], &thumb));
+    assert_eq!(
+        with_role(&tags, TagRole::Service),
+        [("Миниатюра", "присутствует, 8.0 КБ")]
+    );
+}
+
 // ---------------------------------------------------------------------------
 // MP3
 // ---------------------------------------------------------------------------
@@ -459,6 +955,57 @@ fn mp3_without_tags_is_left_alone() {
     // Ни одного тега — границы совпадают с файлом, и переписывать его незачем.
     let file = sample_mp3(b"PURE AUDIO DATA", 0, false, 0);
     assert_eq!(bounds_of(&file), (0, file.len()));
+}
+
+/// Без ffprobe сами теги не прочитать, и сказать об этом надо словами —
+/// иначе строка «Объём тегов» выглядела бы всем, что в файле есть.
+///
+/// Дефект: пояснение не появлялось никогда. Условие «список пуст»
+/// проверялось уже после того, как в список лёг объём тегов. Проверено
+/// красным: с прежним порядком строки «Теги» в отчёте нет.
+#[test]
+fn mp3_without_ffprobe_says_why_its_tags_are_not_shown() {
+    let dir = std::env::temp_dir().join(format!("savio-mp3-no-ffprobe-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("song.mp3");
+    std::fs::write(&path, sample_mp3(b"AUDIOAUDIO", 60, false, 0)).unwrap();
+
+    let tags = read(&path, None);
+    let _ = std::fs::remove_dir_all(&dir);
+    let tags = tags.unwrap();
+
+    assert!(
+        tags.iter()
+            .any(|t| t.name == "Теги" && t.role == TagRole::Named),
+        "{tags:?}"
+    );
+    assert!(tags.iter().any(|t| t.name == "Объём тегов"), "{tags:?}");
+}
+
+/// Строка ID3 ложится туда же, куда и её двойник у снимков: кодировщик —
+/// в «Программу», своё поле программы — в служебные и как есть.
+#[test]
+fn id3_tags_get_their_rows() {
+    assert_eq!(
+        id3_tag("TITLE", Lang::Ru),
+        (TagRole::Named, "Название".to_owned())
+    );
+    assert_eq!(id3_tag("encoder", Lang::Ru).0, TagRole::Software);
+    assert_eq!(
+        id3_tag("iTunNORM", Lang::Ru),
+        (TagRole::Service, "iTunNORM".to_owned())
+    );
+}
+
+/// Песню узнают по названию, потом по исполнителю, — а ffprobe отдаёт теги
+/// по алфавиту английских ключей, и таблица начиналась бы с альбома.
+#[test]
+fn id3_tags_line_up_as_a_player_shows_them() {
+    let mut keys = [
+        "album", "artist", "comment", "date", "encoder", "genre", "title", "track",
+    ];
+    keys.sort_by_key(|key| id3_rank(key));
+    assert_eq!(keys[..5], ["title", "artist", "album", "date", "comment"]);
 }
 
 #[test]

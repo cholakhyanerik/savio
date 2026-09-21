@@ -1361,18 +1361,57 @@ strings! {
         "Press to choose an MP3 or an image.",
         "Սեղմեք՝ MP3 կամ պատկեր ընտրելու համար։";
     UiMetaPickFirst = "Сначала выберите файл.", "First choose a file.", "Նախ ընտրեք ֆայլ։";
-    UiMetaRead = "Прочитать", "Read", "Կարդալ";
+    /// «Снова» — потому что первый раз файл читается сам, как только выбран.
+    UiMetaReadAgain = "Прочитать снова", "Read again", "Կարդալ նորից";
     UiMetaWipe = "Стереть всё", "Wipe it all", "Ջնջել ամենը";
     UiMetaHowTo =
-        "Выберите MP3 или изображение. «Прочитать» покажет, что в нём записано, «Стереть \
+        "Выберите MP3 или изображение — Savio сразу покажет, что в нём записано. «Стереть \
          всё» уберёт это из самого файла.",
-        "Choose an MP3 or an image. “Read” will show what is written in it, “Wipe it all” \
-         will remove that from the file itself.",
-        "Ընտրեք MP3 կամ պատկեր։ «Կարդալ»-ը ցույց կտա, թե ինչ է գրված դրանում, «Ջնջել \
-         ամենը»-ն կհեռացնի դա հենց ֆայլից։";
+        "Choose an MP3 or an image — Savio will show right away what is written in it. \
+         “Wipe it all” will remove that from the file itself.",
+        "Ընտրեք MP3 կամ պատկեր՝ Savio-ն անմիջապես ցույց կտա, թե ինչ է գրված դրանում։ \
+         «Ջնջել ամենը»-ն կհեռացնի դա հենց ֆայլից։";
     UiMetaFileTags = "Метаданные файла", "File metadata", "Ֆայլի մետատվյալներ";
     UiMetaNothingFound = "Метаданные не найдены.", "No metadata was found.",
         "Մետատվյալներ չեն գտնվել։";
+    /// Плашка у заголовка таблицы: «2 личные записи». `{}` — число, `{}` —
+    /// слова в нужной форме (`UiMetaPersonalOne` и соседи).
+    UiMetaPersonalCount = "{} {}", "{} {}", "{} {}";
+    UiMetaPersonalOne = "личная запись", "personal record", "անձնական գրառում";
+    UiMetaPersonalFew = "личные записи", "personal records", "անձնական գրառում";
+    UiMetaPersonalMany = "личных записей", "personal records", "անձնական գրառում";
+    UiMetaPersonalNote =
+        "Жёлтым отмечено то, по чему вас можно найти: где и когда снято и чьей камерой. \
+         Остальное безобидно, но тоже уедет с файлом.",
+        "Yellow marks what you can be found by: where and when it was taken, and with whose \
+         camera. The rest is harmless, but it leaves with the file too.",
+        "Դեղինով նշված է այն, ինչով ձեզ կարելի է գտնել՝ որտեղ և երբ է նկարվել, և ում \
+         ֆոտոխցիկով։ Մնացածն անվնաս է, բայց նույնպես կգնա ֆայլի հետ։";
+    /// Под таблицей, в которой нет ни одной жёлтой строки. Про прочитанное,
+    /// а не про файл: XMP Savio показывает одним блоком и не разбирает, а
+    /// координаты там бывают.
+    UiMetaNoPersonalNote =
+        "Ни места, ни времени съёмки среди прочитанного нет. Остальное всё равно уедет \
+         с файлом.",
+        "Among what was read there is neither the place nor the time it was taken. The rest \
+         leaves with the file all the same.",
+        "Կարդացածի մեջ չկա ո՛չ նկարահանման վայրը, ո՛չ ժամանակը։ Մնացածը միևնույն է կգնա \
+         ֆայլի հետ։";
+    /// Поток работы с файлом кончился, не сказав ни «готово», ни «не вышло».
+    UiMetaNoAnswer =
+        "Работа с файлом оборвалась, не дав ответа. Попробуйте ещё раз.",
+        "Work on the file stopped without an answer. Try again.",
+        "Ֆայլի հետ աշխատանքն ընդհատվեց՝ առանց պատասխանի։ Փորձեք ևս մեկ անգամ։";
+    /// Под таблицей MP3. «Ни места, ни времени съёмки нет» про песню звучало
+    /// бы странно: таких записей у звука не бывает вовсе.
+    UiMetaTravelsNote =
+        "Всё, что в таблице, уедет вместе с файлом, когда вы отправите его дальше.",
+        "Everything in the table leaves with the file when you send it on.",
+        "Աղյուսակում եղած ամենը կգնա ֆայլի հետ, երբ այն ուղարկեք հետագա։";
+    /// Свёрнутая последняя строка таблицы метаданных.
+    UiMetaServiceRecords = "Служебные записи", "Service records", "Ծառայողական գրառումներ";
+    /// Её значение: `{}` — сколько записей свёрнуто, `{}` — первые из имён.
+    UiMetaServiceMore = "ещё {} — {}", "{} more — {}", "ևս {}՝ {}";
     UiClose = "Закрыть", "Close", "Փակել";
     UiMetaOverwriteTitle = "Перезаписать файл?", "Overwrite the file?", "Վերագրե՞լ ֆայլը։";
     UiMetaOverwriteText =
@@ -1392,9 +1431,25 @@ strings! {
          so Savio asks for confirmation before cleaning.",
         "Կողքին պատճեն չի ստեղծվում, ջնջվածը վերադարձնել հնարավոր չի լինի — դրա համար \
          մաքրելուց առաջ Savio-ն հարցնում է հաստատում։";
+    UiMetaKeepOriginal =
+        "Нужен исходник — сделайте копию файла заранее.",
+        "If you need the original, make a copy of the file beforehand.",
+        "Եթե բնօրինակը պետք է, նախապես պատճենեք ֆայլը։";
     UiMetaSupported = "Что поддерживается", "What is supported", "Ինչ է աջակցվում";
+    UiMetaSupportFull =
+        "JPEG, PNG, WebP, GIF и MP3 — чтение и очистка",
+        "JPEG, PNG, WebP, GIF and MP3 — reading and wiping",
+        "JPEG, PNG, WebP, GIF և MP3 — ընթերցում և մաքրում";
     UiMetaTiffReadOnly = "TIFF — только чтение", "TIFF — read only", "TIFF — միայն ընթերցում";
     UiMetaVideoNotYet = "видео — пока нет", "video — not yet", "տեսանյութ — առայժմ ոչ";
+    /// Указатель на соседний раздел: чистить здесь, а вшивать — там.
+    UiMetaEmbedPointer =
+        "Метаданные в скачанный ролик вшивает раздел «Загрузка» — галочки в строке «Вшить».",
+        "Metadata goes into a downloaded video from the “Download” section — the ticks in \
+         the “Embed” row.",
+        "Ներբեռնված տեսանյութի մեջ մետատվյալները ներկարում է «Բեռնում» բաժինը՝ «Ներկարել» \
+         տողի նշիչներով։";
+    UiMetaOpenDownload = "Открыть «Загрузку»", "Open “Download”", "Բացել «Բեռնում»-ը";
     UiMetaNothingToWipe =
         "Удалять было нечего: метаданных в файле нет.",
         "There was nothing to remove: the file has no metadata.",
@@ -2107,9 +2162,9 @@ strings! {
         "The GIF is damaged: it breaks off at the colour table.",
         "GIF-ը վնասված է. ընդհատում՝ գույների աղյուսակի վրա։";
 
-    /// `{}` — сколько байт занимает запись.
+    /// `{}` — сколько занимает запись, уже с единицей: «присутствует, 4.0 КБ».
     MetaPresentBytes =
-        "присутствует, {} Б", "present, {} B", "առկա է, {} Բ";
+        "присутствует, {}", "present, {}", "առկա է, {}";
     MetaTextCompressed = "текст (сжатый)", "text (compressed)", "տեքստ (սեղմված)";
     MetaTextUtf8 = "текст (UTF-8)", "text (UTF-8)", "տեքստ (UTF-8)";
     WordPresent = "присутствует", "present", "առկա է";
@@ -2122,13 +2177,28 @@ strings! {
         "Расширение приложения", "Application extension", "Ծրագրի ընդլայնում";
     TagTextBlock = "Текстовый блок", "Text block", "Տեքստային բլոկ";
 
-    TagGpsLatitudeRef = "GPS: широта (полушарие)", "GPS: latitude (hemisphere)", "GPS՝ լայնություն (կիսագունդ)";
-    TagGpsLatitude = "GPS: широта", "GPS: latitude", "GPS՝ լայնություն";
-    TagGpsLongitudeRef = "GPS: долгота (полушарие)", "GPS: longitude (hemisphere)", "GPS՝ երկայնություն (կիսագունդ)";
-    TagGpsLongitude = "GPS: долгота", "GPS: longitude", "GPS՝ երկայնություն";
-    TagGpsAltitude = "GPS: высота", "GPS: altitude", "GPS՝ բարձրություն";
-    TagGpsTime = "GPS: время съёмки (UTC)", "GPS: time taken (UTC)", "GPS՝ նկարահանման ժամ (UTC)";
-    TagGpsDate = "GPS: дата", "GPS: date", "GPS՝ ամսաթիվ";
+    /// Координаты и высота из каталога GPS — одной строкой.
+    TagPlace = "Координаты места", "Coordinates", "Վայրի կոորդինատներ";
+    /// Производитель и модель камеры — одной строкой.
+    TagCamera = "Камера", "Camera", "Ֆոտոխցիկ";
+    /// Фокусное расстояние, диафрагма, выдержка и ISO — одной строкой.
+    TagShot = "Объектив и выдержка", "Lens and exposure", "Օբյեկտիվ և ձգան";
+    /// Ширина и высота кадра одной строкой: «4032 × 3024».
+    TagDimensions = "Размер кадра", "Frame size", "Կադրի չափս";
+    /// Уменьшенная копия снимка внутри EXIF.
+    TagThumbnail = "Миниатюра", "Thumbnail", "Մանրապատկեր";
+    /// Когда создана картинка — так это называет PNG.
+    TagDateCreated = "Дата создания", "Date created", "Ստեղծման ամսաթիվ";
+    /// `{}` — число: «6.86 мм».
+    MetaMillimetres = "{} мм", "{} mm", "{} մմ";
+    /// `{}` — число: «1180 м».
+    MetaMetres = "{} м", "{} m", "{} մ";
+    /// Выдержка от трети секунды и дольше: «0.6 с». Короче пишется дробью.
+    MetaSeconds = "{} с", "{} s", "{} վ";
+    /// «14 сен 2025, 19:42»: `{}` — число с месяцем, `{}` — год, `{}` — время.
+    MetaDateTime = "{} {}, {}", "{} {}, {}", "{} {}, {}";
+    /// «14 сен 2025» — то же без времени.
+    MetaDate = "{} {}", "{} {}", "{} {}";
 
     TagDescription = "Описание", "Description", "Նկարագրություն";
     TagMaker = "Производитель", "Maker", "Արտադրող";
@@ -2152,11 +2222,11 @@ strings! {
     TagCameraSerial = "Серийный номер камеры", "Camera serial number", "Ֆոտոխցիկի սերիական համար";
 
     MetaTagBytes = "Объём тегов", "Tag size", "Պիտակների ծավալ";
-    /// `{}` — число байт.
+    /// `{}` — объём уже с единицей: «1.2 МБ».
     MetaTagBytesValue =
-        "{} Б (включая обложку, если она есть)",
-        "{} B (including the cover art, if there is any)",
-        "{} Բ (ներառյալ շապիկը, եթե այն կա)";
+        "{} (включая обложку, если она есть)",
+        "{} (including the cover art, if there is any)",
+        "{} (ներառյալ շապիկը, եթե այն կա)";
     TagTags = "Теги", "Tags", "Պիտակներ";
     MetaTagsUnreadable =
         "присутствуют, но прочитать их нечем: не найден ffprobe",
