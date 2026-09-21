@@ -873,6 +873,10 @@ strings! {
     // настроек, в котором непонятно, что из этого обязательно.
     UiStepLink = "Ссылка на ролик", "The video link", "Տեսանյութի հղումը";
     UiStepWhat = "Что скачать", "What to download", "Ինչ ներբեռնել";
+    UiStepWhatDefault =
+        "— по умолчанию видео в максимальном качестве",
+        "— video at maximum quality by default",
+        "— լռելյայն՝ տեսանյութ առավելագույն որակով";
     UiStepWhere = "Куда сохранить", "Where to save", "Ուր պահպանել";
     UiLinkSourcesNote =
         "YouTube, VK Видео, Rutube, Vimeo, SoundCloud и ещё полторы тысячи сайтов. \
@@ -1303,6 +1307,27 @@ strings! {
         "Наведите на значок — покажет погоду словами.",
         "Hover the icon — it shows the weather in words.",
         "Սավառնեք պատկերակի վրա՝ եղանակը ցույց կտա բառերով։";
+    /// Название, взятое в кавычки своего языка. Нужно там, где имя приходит
+    /// снаружи (название схемы питания от Windows) и кавычки к нему ставит
+    /// код: зашитые туда «ёлочки» уехали бы и в английский текст, а проверка
+    /// кавычек смотрит только эту таблицу.
+    QuotedName = "«{}»", "“{}”", "«{}»";
+    UiMachineWhy = "Зачем это здесь", "Why this is here", "Ինչու է սա այստեղ";
+    UiMachineWhyNote =
+        "Чтобы ответить на «какое у меня железо» без установки ещё одной программы — \
+         и чтобы этот ответ можно было приложить к письму в поддержку.",
+        "To answer “what hardware do I have” without installing another program — and \
+         so that this answer can be attached to a support email.",
+        "Որպեսզի պատասխանել «ինչ սարքավորում ունեմ» հարցին առանց ևս մեկ ծրագիր \
+         տեղադրելու, և որպեսզի այդ պատասխանը կցվի աջակցման նամակին։";
+    UiMachineDashTitle = "Если строка пустая", "If a row is empty", "Եթե տողը դատարկ է";
+    UiMachineDashNote =
+        "Прочерк значит, что система не сообщила это значение, а не что железа нет. \
+         «Проверить снова» спросит ещё раз.",
+        "A dash means the system did not report this value, not that the hardware is \
+         missing. “Check again” will ask once more.",
+        "Գծիկը նշանակում է, որ համակարգը չի հաղորդել այդ արժեքը, ոչ թե սարքավորում \
+         չկա։ «Ստուգել նորից»-ը կհարցնի ևս մեկ անգամ։";
     UiCpuWholeMachine =
         "Сто процентов — вся машина, а не одно ядро.",
         "A hundred per cent is the whole machine, not one core.",
@@ -1313,6 +1338,7 @@ strings! {
         "Այսքանն է վայրկյանում անցել սկավառակների և ցանցի միջով։";
     UiMetaFileStep = "Файл", "The file", "Ֆայլ";
     UiMetaFileStepNote = "— MP3 или изображение", "— MP3 or an image", "— MP3 կամ պատկեր";
+    UiMetaPickFile = "Выбрать файл", "Choose a file", "Ընտրել ֆայլ";
     UiMetaPickAnother = "Выбрать другой", "Choose another", "Ընտրել այլը";
     UiMetaWipeNote =
         "Savio спросит подтверждение: копия рядом не создаётся, вернуть стёртое будет нельзя.",
@@ -1599,6 +1625,10 @@ strings! {
     // баннером после полуминуты тишины (`UiShareHelp`), но это уже после
     // неудачи — а список стоит до старта, когда его ещё можно прочесть.
     UiShareChecklist = "Проверьте до старта", "Check before starting", "Ստուգեք մինչ մեկնարկը";
+    UiShareChecklistWhy =
+        "— три причины, по которым страница не открывается",
+        "— the three reasons the page does not open",
+        "— երեք պատճառ, որոնց համար էջը չի բացվում";
     UiShareCheckNetwork =
         "Телефон в той же сети Wi-Fi",
         "The phone is on the same Wi-Fi",

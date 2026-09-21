@@ -1537,8 +1537,12 @@ fn power_hint(state: &PowerState, lang: Lang) -> String {
     // Как назвать активную схему: по имени, если система его дала, и
     // обезличенно, если нет. Пустое место вместо названия читалось бы как
     // недорисованная строка, а выдуманное имя — как чужая схема.
+    // Кавычки — из таблицы строк, а не зашитые в код: `«»` в английском
+    // тексте выглядят опечаткой, а проверка кавычек смотрит только таблицу
+    // и зашитые в код не видит. Ровно так «ёлочки» и прожили в английской
+    // подсказке с 0.28.0 до переноса дизайна — нашлось глазами.
     let active = match state.active_name() {
-        Some(name) => format!("«{name}»"),
+        Some(name) => i18n::fill(i18n::t(lang, Key::QuotedName), &[name]),
         None => i18n::t(lang, Key::UiPowerOtherPlan).to_owned(),
     };
 
@@ -4956,7 +4960,7 @@ impl SavioApp {
         let found = matches!(self.preview.state, PreviewState::Ready);
 
         theme::card_rising(ui, pal, self.appear(0), |ui| {
-            step_header(ui, pal, 1, i18n::t(lang, Key::UiStepLink), |ui| {
+            step_header(ui, pal, 1, i18n::t(lang, Key::UiStepLink), None, |ui| {
                 if found {
                     status_pill(ui, pal, i18n::t(lang, Key::UiFoundVideo), pal.state_success);
                 }
@@ -4976,7 +4980,14 @@ impl SavioApp {
             self.preview_row(ui);
 
             ui.add_space(18.0);
-            step_header(ui, pal, 2, i18n::t(lang, Key::UiStepWhat), |_| {});
+            step_header(
+                ui,
+                pal,
+                2,
+                i18n::t(lang, Key::UiStepWhat),
+                Some(i18n::t(lang, Key::UiStepWhatDefault)),
+                |_| {},
+            );
             ui.add_space(8.0);
             labelled_row(ui, pal, self.t(Key::UiFormat), |ui| self.format_selector(ui));
 
@@ -5012,7 +5023,7 @@ impl SavioApp {
             self.advanced_group(ui);
 
             ui.add_space(18.0);
-            step_header(ui, pal, 3, i18n::t(lang, Key::UiStepWhere), |_| {});
+            step_header(ui, pal, 3, i18n::t(lang, Key::UiStepWhere), None, |_| {});
             ui.add_space(8.0);
             self.folder_row(ui);
             ui.add_space(12.0);
@@ -5046,45 +5057,12 @@ impl SavioApp {
 
     /// Содержимое «Машины» без оболочки появления.
     fn machine_body(&mut self, ui: &mut egui::Ui) {
-        let pal = self.palette;
-        const HALVES: [(MachineTab, Key); 2] = [
-            (MachineTab::Now, Key::MachineNow),
-            (MachineTab::Spec, Key::MachineSpec),
-        ];
-        let lang = self.lang;
-        let halves = HALVES.map(|(half, key)| (half, i18n::t(lang, key)));
-
-        let mut picked = None;
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 12.0;
-            picked = segment_track(
-                ui,
-                pal,
-                egui::Id::new("track:machine"),
-                self.speed,
-                self.machine_tab,
-                &halves,
-                false,
-            );
-
-            // Плашка про опрос стоит рядом с переключателем, а не под
-            // карточками: она объясняет ровно то, что человек включил,
-            // перейдя на эту половину.
-            if self.machine_tab == MachineTab::Now {
-                soft_pill(
-                    ui,
-                    pal,
-                    i18n::t(lang, Key::UiMachinePolling),
-                    pal.state_success,
-                    pal.success_soft,
-                );
-            }
-        });
-        if let Some(half) = picked {
-            self.machine_tab = half;
-        }
-
-        ui.add_space(14.0);
+        // Своей дорожки «Сейчас | Состав» здесь больше нет: обе половины —
+        // отдельные пункты рельса, и вторая дорожка над содержимым выбирала
+        // бы то же самое во второй раз. Две навигации к одному месту — это
+        // вопрос «а чем они отличаются», на который честный ответ «ничем».
+        // Плашка «Опрос идёт» ушла вместе с дорожкой: о том же говорит
+        // пояснение в строке заголовка раздела и первая карточка ниже.
         match self.machine_tab {
             MachineTab::Now => self.monitor_tab(ui),
             MachineTab::Spec => self.system_tab(ui),
@@ -6593,13 +6571,14 @@ impl SavioApp {
             note(ui, i18n::t(lang, Key::UiMetaNote), pal.text_muted);
 
             ui.add_space(16.0);
-            step_header(ui, pal, 1, i18n::t(lang, Key::UiMetaFileStep), |ui| {
-                ui.label(
-                    egui::RichText::new(i18n::t(lang, Key::UiMetaFileStepNote))
-                        .small()
-                        .color(pal.text_muted),
-                );
-            });
+            step_header(
+                ui,
+                pal,
+                1,
+                i18n::t(lang, Key::UiMetaFileStep),
+                Some(i18n::t(lang, Key::UiMetaFileStepNote)),
+                |_| {},
+            );
             ui.add_space(8.0);
             self.meta_file_row(ui);
 
@@ -6635,6 +6614,7 @@ impl SavioApp {
         let lang = self.lang;
         let speed = self.speed;
         let busy = self.meta.busy;
+        let has_file = self.meta.path.is_some();
         let display = self.meta.path_display.clone();
         let mut clicked = false;
 
@@ -6651,10 +6631,16 @@ impl SavioApp {
             egui::vec2(ui.available_width(), theme::CONTROL_HEIGHT),
             egui::Layout::right_to_left(egui::Align::Center),
             |ui| {
+                // «Выбрать другой» — только когда выбирать уже есть из чего:
+                // рядом с «файл не выбран» это слово звучит издёвкой, и
+                // человек ищет, где же выбрать первый. Найдено глазами.
+                let pick = if has_file {
+                    Key::UiMetaPickAnother
+                } else {
+                    Key::UiMetaPickFile
+                };
                 clicked = ui
-                    .add_enabled_ui(!busy, |ui| {
-                        pill_button(ui, i18n::t(lang, Key::UiMetaPickAnother), speed)
-                    })
+                    .add_enabled_ui(!busy, |ui| pill_button(ui, i18n::t(lang, pick), speed))
                     .inner
                     .on_hover_text(i18n::t(lang, Key::UiMetaPickHint))
                     .clicked();
@@ -7444,13 +7430,54 @@ impl SavioApp {
     /// экраном была бы лишним шагом: сюда заходят ровно за ответом, и
     /// нажимать «Проверить», чтобы его увидеть, незачем.
     fn system_tab(&mut self, ui: &mut egui::Ui) {
-        let pal = self.palette;
         if !self.system.asked {
             let ctx = ui.ctx().clone();
             let gpu = self.gpu.clone();
             self.system.start(gpu, self.lang, &ctx);
         }
 
+        // Две колонки, как у остальных разделов: отчёт — в главной, два
+        // пояснения — справа. Пояснения не про отдельный пункт, а про отчёт
+        // целиком, и в общем потоке карточек их пролистывали бы вместе
+        // с последним пунктом.
+        const GAP: f32 = 18.0;
+        if ui.available_width() < theme::TWO_COLUMN_MIN {
+            self.system_main(ui);
+            ui.add_space(GAP);
+            system_rail(ui, self.palette, self.lang);
+            return;
+        }
+
+        let total = ui.available_width();
+        let rail = theme::RAIL_WIDTH;
+        let main = total - rail - GAP;
+        let (pal, lang) = (self.palette, self.lang);
+
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = GAP;
+            for (width, which) in [(main, true), (rail, false)] {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(width, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        // Ширина с обеих сторон — по той же причине, что
+                        // у колонок `download_tab`.
+                        ui.set_min_width(width);
+                        ui.set_max_width(width);
+                        if which {
+                            self.system_main(ui);
+                        } else {
+                            system_rail(ui, pal, lang);
+                        }
+                    },
+                );
+            }
+        });
+    }
+
+    /// Главная колонка «Состава»: итог, кнопки и пункты отчёта.
+    fn system_main(&mut self, ui: &mut egui::Ui) {
+        let pal = self.palette;
         self.system_header(ui);
         ui.add_space(16.0);
 
@@ -7568,19 +7595,63 @@ impl SavioApp {
         });
     }
 
-    /// Вкладка «Монитор»: что происходит с машиной прямо сейчас.
+    /// Половина «Сейчас»: что происходит с машиной прямо сейчас.
+    ///
+    /// Две колонки, как у загрузки и «Телефона»: числа — в главной, оверлей
+    /// и питание — справа. Прежде питание стояло над числами, и причина была
+    /// честная: это единственный орган управления на всей половине, и ждать
+    /// первого замера, чтобы его показать, незачем. Правая колонка сохраняет
+    /// обе половины этой причины — питание видно сразу и без прокрутки, —
+    /// а числа, ради которых половину и открывают, встают первыми.
     fn monitor_tab(&mut self, ui: &mut egui::Ui) {
-        let pal = self.palette;
+        const GAP: f32 = 18.0;
+        if ui.available_width() < theme::TWO_COLUMN_MIN {
+            self.monitor_main(ui);
+            ui.add_space(GAP);
+            self.monitor_rail(ui);
+            return;
+        }
+
+        let total = ui.available_width();
+        let rail = theme::RAIL_WIDTH;
+        let main = total - rail - GAP;
+
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = GAP;
+            for (width, which) in [(main, true), (rail, false)] {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(width, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        // Ширина с обеих сторон — по той же причине, что
+                        // у колонок `download_tab`.
+                        ui.set_min_width(width);
+                        ui.set_max_width(width);
+                        if which {
+                            self.monitor_main(ui);
+                        } else {
+                            self.monitor_rail(ui);
+                        }
+                    },
+                );
+            }
+        });
+    }
+
+    /// Правая колонка «Сейчас»: оверлей и питание.
+    ///
+    /// Рисуется и тогда, когда первого замера ещё нет: главная колонка
+    /// в это время показывает «жду замер», а переключатели от него
+    /// не зависят вовсе.
+    fn monitor_rail(&mut self, ui: &mut egui::Ui) {
         self.monitor_header(ui);
         ui.add_space(14.0);
-
-        // Питание — до показаний, а не после: это единственный орган
-        // управления на всей половине, а показания под ним — ровно то, на
-        // что он влияет. И до ожидания первого замера тоже: ждать секунду,
-        // чтобы показать переключатель, незачем.
         self.power_card(ui);
-        ui.add_space(14.0);
+    }
 
+    /// Главная колонка «Сейчас»: процессор, память, ввод-вывод, процессы.
+    fn monitor_main(&mut self, ui: &mut egui::Ui) {
+        let pal = self.palette;
         let speed = self.speed;
         let lang = self.lang;
         // Фаза считается один раз на вкладку: карточек с графиком две, и
@@ -7601,7 +7672,11 @@ impl SavioApp {
 
         // Процессор и память рядом, когда есть место: это два одинаковых по
         // устройству показателя, и читать их проще парой, чем лестницей.
-        if ui.available_width() >= theme::TWO_COLUMN_MIN {
+        // Порог — по ширине главной колонки, а не окна: колонка теперь делит
+        // строку с правой, и две карточки по 280 точек — наименьшее, при
+        // котором число с подписью встают в ряд.
+        const PAIR_MIN: f32 = 280.0 * 2.0 + 12.0;
+        if ui.available_width() >= PAIR_MIN {
             ui.columns(2, |columns| {
                 metric_card(
                     &mut columns[0],
@@ -8615,7 +8690,7 @@ impl SavioApp {
             );
 
             ui.add_space(16.0);
-            step_header(ui, pal, 1, i18n::t(lang, Key::UiShareFolder), |_| {});
+            step_header(ui, pal, 1, i18n::t(lang, Key::UiShareFolder), None, |_| {});
             ui.add_space(8.0);
             ui.allocate_ui_with_layout(
                 egui::vec2(ui.available_width(), theme::CONTROL_HEIGHT),
@@ -8704,7 +8779,14 @@ impl SavioApp {
             // с экрана, и раздача кончится.
             if !running {
                 ui.add_space(16.0);
-                step_header(ui, pal, 2, i18n::t(lang, Key::UiShareChecklist), |_| {});
+                step_header(
+                    ui,
+                    pal,
+                    2,
+                    i18n::t(lang, Key::UiShareChecklist),
+                    Some(i18n::t(lang, Key::UiShareChecklistWhy)),
+                    |_| {},
+                );
                 ui.add_space(8.0);
                 for (ok, title, text) in [
                     (
@@ -10461,6 +10543,30 @@ fn section_title_row(
     row
 }
 
+/// Правая колонка «Состава»: зачем раздел здесь и что значит прочерк.
+///
+/// Второе важнее первого. Прочерк на месте значения человек читает как
+/// «железа нет» или «Savio сломался», хотя это молчание системы: без прав
+/// администратора половина сведений недоступна в принципе (Правило 6 про
+/// WMI). Сказать это надо рядом с отчётом, а не в справке.
+fn system_rail(ui: &mut egui::Ui, pal: theme::Palette, lang: Lang) {
+    for (title, text) in [
+        (Key::UiMachineWhy, Key::UiMachineWhyNote),
+        (Key::UiMachineDashTitle, Key::UiMachineDashNote),
+    ] {
+        theme::card(ui, pal, |ui| {
+            ui.label(
+                egui::RichText::new(i18n::t(lang, title))
+                    .font(theme::display(17.0))
+                    .color(pal.text_primary),
+            );
+            ui.add_space(8.0);
+            note(ui, i18n::t(lang, text), pal.text_muted);
+        });
+        ui.add_space(14.0);
+    }
+}
+
 /// Заголовок шага: номер в кружке и название дисплейным начертанием.
 ///
 /// Номер отвечает на «с чего начинать» раньше, чем человек прочтёт подписи.
@@ -10468,9 +10574,15 @@ fn section_title_row(
 /// непонятно, что обязательно, а что можно не трогать: поле ссылки, две
 /// дорожки, три галочки и свёрнутая группа выглядели одинаково важными.
 ///
-/// `right` рисует то, что встаёт у правого края строки, — плашку состояния
-/// шага. Закрытие, а не `Option`, чтобы вызывающему не приходилось собирать
-/// виджет заранее: рисовать его надо внутри нужной раскладки.
+/// `note` — короткое пояснение **рядом с названием**, мелким приглушённым
+/// шрифтом («— MP3 или изображение»). `right` — то, что встаёт у правого края
+/// строки: плашка состояния шага. Это два разных места, и путать их нельзя:
+/// первый вариант этой функции знал только `right`, и пояснение, переданное
+/// туда, уезжало к правой кромке карточки — в полуметре от названия, к
+/// которому относилось. Проверено глазами на «Метаданных».
+///
+/// `right` — замыкание, а не `Option`, чтобы вызывающему не приходилось
+/// собирать виджет заранее: рисовать его надо внутри нужной раскладки.
 ///
 /// Высота ряду задаётся явно. `with_layout` отдал бы потомку весь остаток
 /// высоты карточки, а центрирующая раскладка считает его занятым целиком —
@@ -10480,6 +10592,7 @@ fn step_header<R>(
     pal: theme::Palette,
     number: usize,
     title: &str,
+    note: Option<&str>,
     right: impl FnOnce(&mut egui::Ui) -> R,
 ) {
     const CIRCLE: f32 = 26.0;
@@ -10516,7 +10629,23 @@ fn step_header<R>(
                     .color(pal.text_primary),
             );
 
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), right);
+            // Правая часть кладётся **до** пояснения, и это не порядок ради
+            // порядка: пояснение обрезается, а обрезаемая метка занимает
+            // столько, сколько просит текст, и о соседе справа не знает.
+            // Положи её первой — и плашка «Ролик найден» уехала бы под неё.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                right(ui);
+                if let Some(note) = note {
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(note).small().color(pal.text_muted),
+                            )
+                            .truncate(),
+                        );
+                    });
+                }
+            });
         },
     );
 }
@@ -11790,7 +11919,12 @@ fn metric_card(
             // загрузке там не 400: доля уже поделена на число ядер.
             if let Some(means) = means {
                 ui.add_space(6.0);
-                note(ui, means, pal.text_muted);
+                // Явная раскладка: карточка часто стоит в колонке
+                // `ui.columns`, а там абзац, ушедший на вторую строку,
+                // выключается по ширине и набирается дырами.
+                ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                    note(ui, means, pal.text_muted);
+                });
             }
         });
 }
@@ -11896,8 +12030,6 @@ fn io_card(
 
             ui.add_space(8.0);
             stat_row(ui, pal, lang, i18n::t(lang, Key::UiNetwork), sample.net.as_deref());
-            ui.add_space(6.0);
-            note(ui, i18n::t(lang, Key::UiIoNote), pal.text_muted);
             stat_row(ui, pal, lang, i18n::t(lang, Key::UiDisks), sample.disk.as_deref());
             stat_row(
                 ui,
@@ -11915,6 +12047,12 @@ fn io_card(
                 i18n::t(lang, Key::HwGpu),
                 gpu.map(|gpu| gpu.name.as_str()),
             );
+
+            // Пояснение — под всеми строками, а не после первой: оно про
+            // карточку целиком. Поставленное за «Сетью», оно разрывало
+            // таблицу и читалось подписью к одной строке. Найдено глазами.
+            ui.add_space(6.0);
+            note(ui, i18n::t(lang, Key::UiIoNote), pal.text_muted);
         });
 }
 
@@ -13005,6 +13143,38 @@ mod tests {
         // непонятно, что менять, без второй — на что.
         assert!(hint.contains("Высокая производительность"), "{hint}");
         assert!(hint.contains("Сбалансированная"), "{hint}");
+    }
+
+    /// Название схемы в подсказке взято в кавычки своего языка.
+    ///
+    /// Кавычки ставит код, а не таблица строк: имя схемы приходит от Windows.
+    /// Зашитые в код «ёлочки» проверка кавычек таблицы не видит, и они
+    /// уехали в английскую подсказку — «right now «High performance» is
+    /// active». Прожило это с 0.28.0, нашлось глазами на снимке экрана.
+    ///
+    /// Проверено красным: с прежним `format!("«{name}»")` проверка падает
+    /// на английском.
+    #[test]
+    fn the_power_hint_quotes_the_scheme_in_its_own_language() {
+        let state = PowerState {
+            plans: plans(),
+            active: Some(high_performance()),
+            modes: PowerModes::Known {
+                effective: Some(PowerMode::Balanced),
+                ignored: None,
+            },
+            trouble: None,
+        };
+
+        let en = power_hint(&state, Lang::En);
+        assert!(
+            !en.contains('«') && !en.contains('»'),
+            "в английской подсказке русские кавычки: {en}"
+        );
+        assert!(en.contains('\u{201c}'), "английские кавычки пропали: {en}");
+
+        let ru = power_hint(&state, Lang::Ru);
+        assert!(ru.contains('«'), "русские кавычки пропали: {ru}");
     }
 
     /// Windows запомнила одно, а работает по-другому. Пока это не сказано
