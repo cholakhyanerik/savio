@@ -114,6 +114,7 @@
     <h1>Savio</h1>
     <span class="sub">{{Subtitle}}</span>
   </header>
+  <p class="note">{{FolderLine}}</p>
 
   <div id="stale" class="hidden">
     <section>
@@ -124,20 +125,22 @@
 
   <div id="app">
     <section>
-      <h2>{{ToComputer}}</h2>
+      <h2>&rarr; {{ToComputer}}</h2>
+      <p class="note">{{ToComputerNote}}</p>
       <p class="note">{{UploadNote}}</p>
       <label class="button primary" for="pick">{{PickFiles}}</label>
       <input id="pick" type="file" multiple>
       <div id="ios" class="banner hidden">{{IosNote}}</div>
-      <div id="awake" class="banner hidden">{{AwakeNote}}</div>
+      <div id="awake" class="banner">{{AwakeNote}}</div>
       <ul id="uploads"></ul>
     </section>
 
     <section>
       <div class="row">
-        <h2 class="grow">{{FromComputer}}</h2>
+        <h2 class="grow">&larr; {{FromComputer}}</h2>
         <button id="refresh" class="button small" type="button">{{Refresh}}</button>
       </div>
+      <p class="note">{{FromComputerNote}}</p>
       <p class="note" id="list-note">{{LoadingList}}</p>
       <ul id="files"></ul>
     </section>
@@ -214,12 +217,8 @@ $("pick").addEventListener("change", function (event) {
 function next() {
   if (busy) return;
   var job = queue.shift();
-  if (!job) {
-    $("awake").classList.add("hidden");
-    return;
-  }
+  if (!job) return;
   busy = true;
-  $("awake").classList.remove("hidden");
   send(job);
 }
 

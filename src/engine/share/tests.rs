@@ -23,7 +23,7 @@ fn scratch(name: &str) -> PathBuf {
 #[test]
 fn the_phone_page_has_no_slots_left() {
     for lang in Lang::ALL {
-        let html = page(lang);
+        let html = page(lang, "Загрузки");
         assert!(
             !html.contains("{{"),
             "{lang:?}: в странице осталось место подстановки"
@@ -488,7 +488,7 @@ fn a_phone_sends_lists_and_takes_files() {
     // Сверяем с собранной страницей, а не с шаблоном `PAGE`: в нём ещё
     // стоят `{{Слоты}}`, и равенство с ним значило бы, что подстановка не
     // сработала вовсе. Язык — тот, с каким запущен сервер (`live`).
-    assert_eq!(body, page(Lang::Ru).as_bytes());
+    assert_eq!(body, page(Lang::Ru, &folder_name(&shared)).as_bytes());
     // И отдельно: слотов в отданном теле не осталось ни одного. Без этой
     // строки забытый слот выглядел бы как исправная страница — `page`
     // и сервер брали бы его из одного места и сошлись бы на `{{…}}`.
@@ -635,4 +635,35 @@ fn stopping_cuts_an_upload_in_flight() {
     assert!(matches!(server.rx.recv_timeout(Duration::from_millis(200)), Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected)));
 
     let _ = fs::remove_dir_all(&dir);
+}
+
+/// Имя раздаваемой папки уходит на страницу экранированным.
+///
+/// Это не строка из таблицы, а данные пользователя, и проверка
+/// `the_phone_page_strings_are_safe_to_paste` про него не знает: она смотрит
+/// только таблицу строк. Папка по имени `<b>` иначе сломала бы разметку на
+/// телефоне, а `Tom & Jerry` — превратилась бы в неверную сущность.
+///
+/// Проверено красным: без `escape_html` проверка падает на первом же имени.
+#[test]
+fn the_folder_name_is_escaped_on_the_phone_page() {
+    let html = page(Lang::Ru, "<b>Tom & \"Jerry\"</b>");
+    assert!(!html.contains("<b>Tom"), "имя папки попало в разметку как есть");
+    assert!(
+        html.contains("&lt;b&gt;Tom &amp; &quot;Jerry&quot;&lt;/b&gt;"),
+        "имя папки не экранировано"
+    );
+}
+
+/// На страницу уходит имя папки, а не путь к ней.
+///
+/// Страницу видит любой, у кого есть адрес, а полный путь рассказал бы ему
+/// имя пользователя и букву диска. Имя нужно ровно затем, чтобы человек
+/// с телефона видел, куда уедут его файлы.
+#[test]
+fn only_the_folder_name_reaches_the_phone() {
+    let dir = std::path::Path::new("C:/Users/Вася/Загрузки");
+    assert_eq!(folder_name(dir), "Загрузки");
+    let html = page(Lang::Ru, &folder_name(dir));
+    assert!(!html.contains("Вася"), "в страницу утёк путь целиком");
 }

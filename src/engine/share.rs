@@ -511,7 +511,8 @@ fn route(
             "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; \
              img-src 'self' blob:; media-src 'self'",
         );
-        let _ = respond(writer, reply, page(server.lang).as_bytes());
+        let body = page(server.lang, &folder_name(&server.dir));
+        let _ = respond(writer, reply, body.as_bytes());
     } else if path == "/api/files" {
         if !reading {
             let _ = respond_text(writer, 405, server.text(Key::ShareMethodNotAllowed), head_only);
@@ -566,7 +567,7 @@ fn stale_page(lang: Lang) -> String {
 /// в самой разметке больше нигде не встречаются, и это проверяет тест:
 /// забытый токен виден на телефоне как `{{Имя}}` — молча и только у того,
 /// кто открыл страницу.
-const PAGE_SLOTS: [(&str, Key); 31] = [
+const PAGE_SLOTS: [(&str, Key); 33] = [
     ("{{LangTag}}", Key::PageLangTag),
     ("{{LocaleTag}}", Key::PageLocaleTag),
     ("{{Title}}", Key::PageTitle),
@@ -574,11 +575,13 @@ const PAGE_SLOTS: [(&str, Key); 31] = [
     ("{{StaleTitle}}", Key::ShareStaleTitle),
     ("{{StaleNote}}", Key::ShareStaleNote),
     ("{{ToComputer}}", Key::TransferToComputer),
+    ("{{ToComputerNote}}", Key::PageToComputerNote),
     ("{{UploadNote}}", Key::PageUploadNote),
     ("{{PickFiles}}", Key::PagePickFiles),
     ("{{IosNote}}", Key::PageIosNote),
     ("{{AwakeNote}}", Key::PageAwakeNote),
     ("{{FromComputer}}", Key::PageFromComputer),
+    ("{{FromComputerNote}}", Key::PageFromComputerNote),
     ("{{Refresh}}", Key::PageRefresh),
     ("{{LoadingList}}", Key::PageLoadingList),
     ("{{Offline}}", Key::PageOffline),
@@ -601,12 +604,49 @@ const PAGE_SLOTS: [(&str, Key); 31] = [
 ];
 
 /// Страница для телефона на выбранном языке.
-fn page(lang: Lang) -> String {
+///
+/// `folder` — имя раздаваемой папки, **только имя**, без пути: страницу
+/// видит любой, у кого есть адрес, и полный путь рассказал бы ему имя
+/// пользователя и устройство диска. Имя нужно затем, чтобы человек с
+/// телефона видел, куда именно уедут его файлы, — «в папку компьютера»
+/// без названия ничего не объясняет.
+fn page(lang: Lang, folder: &str) -> String {
     let mut out = PAGE.to_owned();
     for (slot, key) in PAGE_SLOTS {
         out = out.replace(slot, i18n::t(lang, key));
     }
+    // Имя папки — не строка из таблицы, а данные пользователя, и в разметку
+    // его можно класть только экранированным. Папка по имени `<b>` или
+    // `Tom & Jerry` иначе ломала бы страницу на телефоне, а проверка
+    // `the_phone_page_strings_are_safe_to_paste` про неё не знает: она
+    // смотрит только таблицу строк.
+    let line = i18n::fill(i18n::t(lang, Key::PageFolderLine), &[&escape_html(folder)]);
+    out.replace("{{FolderLine}}", &line)
+}
+
+/// Экранирует текст для вставки в HTML.
+fn escape_html(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
     out
+}
+
+/// Имя папки для страницы: последний сегмент пути, без самого пути.
+fn folder_name(dir: &std::path::Path) -> String {
+    dir.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        // У корня диска имени нет — тогда показываем путь целиком: это
+        // и есть имя, другого у него не бывает.
+        .unwrap_or_else(|| dir.display().to_string())
 }
 
 // ---------------------------------------------------------------------------

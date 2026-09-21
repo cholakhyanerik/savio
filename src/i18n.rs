@@ -712,14 +712,12 @@ strings! {
     // Окно: разделы, состояния, кнопки, подписи полей
     // -----------------------------------------------------------------------
 
-    // Подписи разделов стоят в дорожке шапки, а её ширина в окне 520
-    // выбрана впритык: по-русски запас — считаные точки. Поэтому здесь
-    // берутся самые короткие верные слова, как «Ещё» вместо «Ещё разделы».
-    // Держит это `the_header_fits_the_smallest_window`.
+    // Подписи разделов стоят в рельсе, и место у них ограничено
+    // (`theme::NAV_LABEL_WIDTH`): не влезшая подпись обрезается многоточием.
+    // Поэтому здесь берутся самые короткие верные слова. Держит это
+    // `the_rail_labels_fit_their_width`.
     TabDownload = "Загрузка", "Download", "Բեռնում";
     TabMetadata = "Метаданные", "Metadata", "Մետատվյալ";
-    TabMachine = "Машина", "Machine", "Մեքենա";
-    TabMore = "Ещё", "More", "Այլ";
     TabWeather = "Погода", "Weather", "Եղանակ";
     TabPhone = "Телефон", "Phone", "Հեռախոս";
 
@@ -761,6 +759,9 @@ strings! {
         "страница открыта, телефон подключился",
         "the page is open, the phone has connected",
         "էջը բաց է, հեռախոսը միացել է";
+    /// Кнопка, которая раскрывает нижний блок рельса, когда ему нет места:
+    /// подпись рядом с тремя точками и имя кнопки для экранного диктора.
+    NavSettings = "Настройки", "Settings", "Կարգավորումներ";
     /// Подсказка кнопки, которая раскрывает нижний блок свёрнутого рельса.
     NavMoreHint =
         "Обслуживание и настройки окна: версии инструментов, тема, язык, журнал.",
@@ -1236,11 +1237,6 @@ strings! {
 
     UiThemeDark = "Тёмная", "Dark", "Մուգ";
     UiThemeLight = "Светлая", "Light", "Բաց";
-    UiThemeHint =
-        "Тема окна. Выбор запоминается вместе с языком и папкой сохранения.",
-        "The window theme. The choice is remembered along with the language and the \
-         save folder.",
-        "Պատուհանի տեսքը։ Ընտրությունը հիշվում է լեզվի և պահպանման թղթապանակի հետ միասին։";
 
     UiSmooth = "Плавные переходы", "Smooth transitions", "Սահուն անցումներ";
     UiSmoothHint =
@@ -1299,6 +1295,20 @@ strings! {
         "Ֆոտոխցիկի մոդելը, նկարահանման ամսաթիվը, վայրի կոորդինատները, հեղինակը, շապիկը և \
          մեկ տասնյակ ծառայողական գրառումներ։ Այս ամենը գնում է ֆայլի հետ, երբ ուղարկում եք \
          այն հետագա։";
+    UiWeatherVpnShort =
+        "Место определено по IP. Через VPN это будет чужая страна — тогда найдите свой \
+         город поиском.",
+        "The place was found by IP. Through a VPN that is a foreign country — then find \
+         your city by search.",
+        "Տեղը որոշվել է IP-ով։ VPN-ի միջոցով դա կլինի օտար երկիր՝ այդ դեպքում գտեք ձեր \
+         քաղաքը որոնմամբ։";
+    UiWeatherFavoritesNote =
+        "Переключаться между ними — один щелчок. Убрать место — «В избранном» у его \
+         названия.",
+        "Switching between them is one click. To remove a place, press “In favourites” \
+         next to its name.",
+        "Դրանց միջև անցնելը մեկ սեղմում է։ Տեղը հեռացնելու համար՝ «Ընտրյալներում» \
+         նրա անվան կողքին։";
     UiWeatherHoursLegend =
         "Рамкой отмечен текущий час. Синим — вероятность осадков.",
         "The current hour is marked with a frame. In blue — the chance of precipitation.",
@@ -1408,9 +1418,7 @@ strings! {
     UiProjectPage = "Страница проекта", "Project page", "Նախագծի էջ";
     UiWhatChanged = "Что изменилось", "What changed", "Ինչ է փոխվել";
 
-    // Вкладка «Машина»: снимок и монитор.
-    UiMachinePolling = "Опрос идёт, пока открыт этот раздел",
-        "Polling runs while this section is open", "Հարցումն ընթանում է, քանի դեռ բաժինը բաց է";
+    // Разделы «Сейчас» и «Состав»: монитор и снимок.
     UiSystemNoAnswer =
         "Опрос не дал ответа. Попробуйте «Проверить снова».",
         "The poll gave no answer. Try “Check again”.",
@@ -1541,13 +1549,6 @@ strings! {
         "The place has not been worked out yet. Find your city with the search below, or \
          press “Locate by IP”.",
         "Վայրը դեռ որոշված չէ։ Գտեք ձեր քաղաքը ներքևի որոնմամբ կամ սեղմեք «Որոշել ըստ IP»։";
-    UiWeatherLocatedNote =
-        "Место определено по IP-адресу — с точностью до города. Через VPN это будет чужая \
-         страна: тогда найдите свой город поиском.",
-        "The place was worked out from the IP address — accurate to the city. Through a VPN \
-         it will be someone else's country: find your city with the search then.",
-        "Վայրը որոշվել է ըստ IP-հասցեի՝ քաղաքի ճշտությամբ։ VPN-ի միջոցով սա կլինի օտար \
-         երկիր. այդ դեպքում գտեք ձեր քաղաքը որոնմամբ։";
     UiWeatherFindCity = "Найти город", "Find a city", "Գտնել քաղաք";
     UiWeatherFind = "Найти", "Find", "Գտնել";
     UiWeatherSearchHint = "Например, Ереван", "For example, Yerevan", "Օրինակ՝ Երևան";
@@ -1567,16 +1568,19 @@ strings! {
     UiWeatherInFavorites = "В избранном", "In favourites", "Ընտրյալներում";
     UiWeatherToFavorites = "В избранное", "To favourites", "Ընտրյալներ";
     UiWeatherFavoritesFull =
-        "В избранном нет места: уберите оттуда одно из мест ниже.",
-        "There is no room in favourites: remove one of the places below from it.",
-        "Ընտրյալներում տեղ չկա. հեռացրեք այնտեղից ներքևի վայրերից մեկը։";
+        "В избранном нет места: откройте одно из избранных мест и уберите его кнопкой \
+         «В избранном».",
+        "There is no room in favourites: open one of the favourite places and remove it \
+         with “In favourites”.",
+        "Ընտրյալներում տեղ չկա. բացեք ընտրյալ վայրերից մեկը և հեռացրեք այն \
+         «Ընտրյալներում» կոճակով։";
     UiWeatherRemoveFavorite = "Нажмите, чтобы убрать это место из избранного.",
         "Press to remove this place from favourites.",
         "Սեղմեք՝ այս վայրը ընտրյալներից հեռացնելու համար։";
     UiWeatherAddFavorite =
-        "Место появится в списке ниже: переключаться между ними — один щелчок.",
-        "The place will appear in the list below: switching between them is one click.",
-        "Վայրը կհայտնվի ներքևի ցանկում. դրանց միջև անցնելը մեկ սեղմում է։";
+        "Место появится в карточке «Избранное»: переключаться между ними — один щелчок.",
+        "The place will appear in the “Favourites” card: switching between them is one click.",
+        "Վայրը կհայտնվի «Ընտրյալներ» քարտում. դրանց միջև անցնելը մեկ սեղմում է։";
     UiWeatherFavorites = "Избранное", "Favourites", "Ընտրյալներ";
     UiWeatherNoAir =
         "Сведения о качестве воздуха не пришли — на прогноз это не влияет.",
@@ -1610,6 +1614,19 @@ strings! {
     // Два направления словами. Абзац `UiShareNote` говорит про обмен вообще,
     // и из него не видно, что передача идёт в обе стороны: половина людей
     // так и не догадывалась, что с телефона можно отправить.
+    PageToComputerNote =
+        "Выберите файлы на телефоне — они уедут в папку компьютера.",
+        "Pick files on the phone — they will go into the computer's folder.",
+        "Ընտրեք ֆայլերը հեռախոսում՝ դրանք կգնան համակարգչի թղթապանակ։";
+    PageFromComputerNote =
+        "Нажмите на файл — телефон скачает его себе.",
+        "Tap a file — the phone will download it.",
+        "Հպեք ֆայլին՝ հեռախոսը այն կներբեռնի իրեն։";
+    /// `{}` — имя раздаваемой папки, без пути.
+    PageFolderLine =
+        "Папка на компьютере: {}",
+        "Folder on the computer: {}",
+        "Թղթապանակ համակարգչում՝ {}";
     UiShareToPhone = "На телефон", "To the phone", "Հեռախոսին";
     UiShareToPhoneNote =
         "Файлы из папки ниже телефон видит списком и забирает нажатием.",

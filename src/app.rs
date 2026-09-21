@@ -501,6 +501,67 @@ struct RailPicks {
     more_open: bool,
 }
 
+/// Как разложен рельс разделов.
+///
+/// Три вида, а не «свёрнут или развёрнут». Развёрнутому рельсу со всем
+/// блоком обслуживания нужно под 800 точек высоты, а окно ноутбука
+/// 1920×1080 при масштабе 125 % даёт меньше: свернуть там рельс целиком
+/// значило бы отнять подписи разделов у самого частого окна. Поэтому между
+/// крайностями есть середина — подписи на месте, а блок, как у свёрнутого,
+/// во всплывающем меню.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RailLayout {
+    /// Одни значки; нижний блок — во всплывающем меню.
+    Narrow,
+    /// Подписи на месте, нижний блок — во всплывающем меню.
+    Labels,
+    /// Подписи и нижний блок на месте.
+    Full,
+}
+
+impl RailLayout {
+    /// Вид рельса для окна такого размера.
+    ///
+    /// Ширина решает, есть ли место подписям (`theme::NAV_WIDE_MIN`), высота
+    /// — поместятся ли пункты и блок, не ложась друг на друга: прокрутки у
+    /// рельса нет, и в низком окне блок рисовался прямо поверх пунктов.
+    fn for_window(room: egui::Vec2) -> Self {
+        if room.x < theme::NAV_WIDE_MIN || room.y < theme::NAV_LABELS_MIN_HEIGHT {
+            Self::Narrow
+        } else if room.y < theme::NAV_WIDE_MIN_HEIGHT {
+            Self::Labels
+        } else {
+            Self::Full
+        }
+    }
+
+    /// Видны ли подписи пунктов.
+    fn labels(self) -> bool {
+        self != Self::Narrow
+    }
+
+    /// Ширина рельса.
+    fn width(self) -> f32 {
+        if self.labels() {
+            theme::NAV_WIDTH
+        } else {
+            theme::NAV_NARROW
+        }
+    }
+}
+
+impl RailPicks {
+    /// Нажато ли то, что открывает своё окно или панель.
+    ///
+    /// Меню свёрнутого рельса после такого закрывается само: оставшись
+    /// поверх, оно заслоняло бы то, ради чего нажимали. Переключатели темы
+    /// и плавности его не закрывают — в развёрнутом рельсе тот же блок стоит
+    /// на месте, и результат щелчка там видно сразу, без повторного захода.
+    fn opens_something(&self) -> bool {
+        self.about || self.welcome || self.toggle_log || self.update.is_some()
+    }
+}
+
 /// Всё, что рельсу нужно знать об окне, чтобы себя нарисовать.
 ///
 /// Группой, а не дюжиной аргументов подряд: столько позиционных аргументов
@@ -4517,23 +4578,19 @@ impl eframe::App for SavioApp {
         // на месте, пока содержимое едет. У панели это даром, а в прокрутке
         // пришлось бы отмерять ширину руками.
         //
-        // Свёрнут или развёрнут — решает ширина окна, и порог считается
-        // от того, что нужно содержимому (`theme::NAV_WIDE_MIN`): разворот
-        // отнимает у него 160 точек, и разворачиваться раньше, чем это
-        // можно себе позволить, значит ронять его во одну колонку ровно
-        // на том, что окно стало шире.
-        let wide = ui.max_rect().width() >= theme::NAV_WIDE_MIN;
-        let rail_width = if wide {
-            theme::NAV_WIDTH
-        } else {
-            theme::NAV_NARROW
-        };
+        // Свёрнут или развёрнут — решает прежде всего ширина окна, и порог
+        // считается от того, что нужно содержимому (`theme::NAV_WIDE_MIN`):
+        // разворот отнимает у него 160 точек, и разворачиваться раньше, чем
+        // это можно себе позволить, значит ронять его в одну колонку ровно
+        // на том, что окно стало шире. Высота решает остальное — см.
+        // `RailLayout`.
+        let layout = RailLayout::for_window(ui.max_rect().size());
         let rail = egui::Panel::left("savio-rail")
             .resizable(false)
             .show_separator_line(false)
-            .exact_size(rail_width)
+            .exact_size(layout.width())
             .frame(theme::rail_frame(pal))
-            .show(ui, |ui| self.rail(ui, wide));
+            .show(ui, |ui| self.rail(ui, layout));
         theme::paint_rail_edge(ui.painter(), pal, rail.response.rect);
 
         // Журнал — панель внизу и только когда он открыт. Панелью, а не
@@ -4741,7 +4798,7 @@ impl SavioApp {
     /// человек нажал. Всё применяется **после** отрисовки, а не по месту:
     /// смена языка пересобирает десяток заранее собранных строк, а `self`
     /// на время кадра занят рисованием.
-    fn rail(&mut self, ui: &mut egui::Ui, wide: bool) {
+    fn rail(&mut self, ui: &mut egui::Ui, layout: RailLayout) {
         let state = RailState {
             pal: self.palette,
             speed: self.speed,
@@ -4759,7 +4816,7 @@ impl SavioApp {
             busy: matches!(self.state, State::Running) || self.setup.busy(),
             more_open: self.more_open,
         };
-        let picks = rail_body(ui, &state, wide);
+        let picks = rail_body(ui, &state, layout);
 
         self.more_open = picks.more_open;
         if let Some((tab, half)) = picks.section {
@@ -6600,9 +6657,11 @@ impl SavioApp {
         });
     }
 
-    /// Какой файл разбираем: одна кнопка во всю ширину с самим путём —
-    /// как «Папка сохранения» на соседней вкладке. Одинаковые по смыслу
-    /// пары должны выглядеть одинаково.
+    /// Какой файл разбираем: путь подписью в рамке и кнопка выбора рядом.
+    ///
+    /// Не одной кнопкой с путём на ней, как «Папка сохранения» на «Загрузке»:
+    /// у кнопки обрезанный путь целиком не показать (дефект 48 реестра), а у
+    /// подписи это делает сам egui.
     fn meta_file_row(&mut self, ui: &mut egui::Ui) {
         let pal = self.palette;
         let color = if self.meta.path.is_some() {
@@ -6615,7 +6674,7 @@ impl SavioApp {
         let speed = self.speed;
         let busy = self.meta.busy;
         let has_file = self.meta.path.is_some();
-        let display = self.meta.path_display.clone();
+        let display = self.meta.path_display.as_str();
         let mut clicked = false;
 
         // Кнопка кладётся первой справа налево, имя файла — во вложенную
@@ -6654,10 +6713,8 @@ impl SavioApp {
                             egui::Layout::left_to_right(egui::Align::Center),
                             |ui| {
                                 ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(&display).color(color),
-                                    )
-                                    .truncate(),
+                                    egui::Label::new(egui::RichText::new(display).color(color))
+                                        .truncate(),
                                 );
                             },
                         );
@@ -8127,13 +8184,62 @@ impl SavioApp {
         }
     }
 
-    /// Правая колонка: неделя и единицы.
+    /// Правая колонка: неделя, избранное и единицы.
     fn weather_rail(&mut self, ui: &mut egui::Ui) {
         if self.weather.view.is_some() {
             self.weather_days_card(ui);
             ui.add_space(14.0);
         }
+        if !self.weather.favorites.is_empty() {
+            self.weather_favorites_card(ui);
+            ui.add_space(14.0);
+        }
         self.weather_units_card(ui);
+    }
+
+    /// Карточка избранных мест.
+    ///
+    /// Своей карточкой справа, а не хвостом карточки места: избранное —
+    /// это то, между чем переключаются, а не часть поиска, и в карточке
+    /// места оно отодвигало поиск вниз на высоту своего списка.
+    fn weather_favorites_card(&mut self, ui: &mut egui::Ui) {
+        let pal = self.palette;
+        let speed = self.speed;
+        let lang = self.lang;
+        let mut picked: Option<Place> = None;
+
+        theme::card(ui, pal, |ui| {
+            let panel = &self.weather;
+            ui.label(
+                egui::RichText::new(i18n::t(lang, Key::UiWeatherFavorites))
+                    .font(theme::display(17.0))
+                    .color(pal.text_primary),
+            );
+            ui.add_space(8.0);
+            // Своими таблетками с переносом, а не дорожкой: названий бывает
+            // десяток, и в колонку шириной 340 не встают даже три (см.
+            // `choice_pill` про перенос).
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+                for place in &panel.favorites {
+                    let on = panel
+                        .place
+                        .as_ref()
+                        .is_some_and(|current| current.same_as(place));
+                    if choice_pill(ui, pal, &place.name, on, speed).clicked() && !on {
+                        picked = Some(place.clone());
+                    }
+                }
+            });
+            ui.add_space(8.0);
+            note(ui, i18n::t(lang, Key::UiWeatherFavoritesNote), pal.text_muted);
+        });
+
+        if let Some(place) = picked {
+            let ctx = ui.ctx().clone();
+            self.weather.pick(Some(place), lang, &ctx);
+            self.remember();
+        }
     }
 
     /// Карточка места: где, когда обновлено, поиск и избранное.
@@ -8156,6 +8262,39 @@ impl SavioApp {
                 egui::vec2(ui.available_width(), theme::CONTROL_HEIGHT),
                 egui::Layout::right_to_left(egui::Align::Center),
                 |ui| {
+                    // «В избранном» — рядом с «Обновить», у названия места:
+                    // обе кнопки про это место, а не про поиск ниже.
+                    let on = panel.is_favorite();
+                    let full = !on && panel.favorites.len() >= FAVORITES_LIMIT;
+                    let response = ui.add_enabled_ui(panel.place.is_some() && !full, |ui| {
+                        toggle_pill(
+                            ui,
+                            pal,
+                            i18n::t(
+                                lang,
+                                if on {
+                                    Key::UiWeatherInFavorites
+                                } else {
+                                    Key::UiWeatherToFavorites
+                                },
+                            ),
+                            on,
+                            speed,
+                        )
+                    });
+                    favorite = response.inner.clicked();
+                    let hint = i18n::t(
+                        lang,
+                        if full {
+                            Key::UiWeatherFavoritesFull
+                        } else if on {
+                            Key::UiWeatherRemoveFavorite
+                        } else {
+                            Key::UiWeatherAddFavorite
+                        },
+                    );
+                    response.response.on_hover_text(hint);
+
                     refresh = ui
                         .add_enabled(
                             panel.place.is_some() && !panel.busy,
@@ -8209,12 +8348,15 @@ impl SavioApp {
             if panel.located {
                 // Молча подставленный чужой город хуже отсутствия функции:
                 // цифры правдоподобны, и им верят. Поэтому откуда место
-                // взялось, сказано прямо.
-                note(
-                    ui,
-                    i18n::t(lang, Key::UiWeatherLocatedNote),
-                    pal.text_muted,
-                );
+                // взялось, сказано прямо — и там же, под названием, а не
+                // ниже у кнопки: читают его, глядя на чужой город.
+                //
+                // Одной строкой, а не прежним абзацем: макет v2 просил
+                // короче, и просьба честная — абзац пролистывали. Но
+                // показывается строка по-прежнему только тогда, когда место
+                // вправду взято по IP: постоянная оговорка у кнопки стала бы
+                // шумом и перестала бы читаться ровно тогда, когда нужна.
+                note(ui, i18n::t(lang, Key::UiWeatherVpnShort), pal.text_muted);
             }
             if let Some(error) = &panel.error {
                 ui.add_space(10.0);
@@ -8235,6 +8377,14 @@ impl SavioApp {
                 egui::vec2(ui.available_width(), theme::CONTROL_HEIGHT),
                 egui::Layout::right_to_left(egui::Align::Center),
                 |ui| {
+                    // Обе кнопки кладутся первыми справа налево, поле — в
+                    // остаток: «Найти» и «Определить по IP» — два способа
+                    // сказать одно и то же «где я», и стоят они одной строкой.
+                    locate = ui
+                        .add_enabled(!panel.busy, pill(i18n::t(lang, Key::UiWeatherLocateByIp)))
+                        .on_hover_text(i18n::t(lang, Key::UiWeatherLocateHint))
+                        .on_disabled_hover_text(i18n::t(lang, Key::UiWaitForAnswer))
+                        .clicked();
                     search |= ui
                         .add_enabled(!panel.searching, pill(i18n::t(lang, Key::UiWeatherFind)))
                         .clicked();
@@ -8270,66 +8420,6 @@ impl SavioApp {
                 }
             }
 
-            ui.add_space(12.0);
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 10.0;
-                locate = ui
-                    .add_enabled(!panel.busy, pill(i18n::t(lang, Key::UiWeatherLocateByIp)))
-                    .on_hover_text(i18n::t(lang, Key::UiWeatherLocateHint))
-                    .on_disabled_hover_text(i18n::t(lang, Key::UiWaitForAnswer))
-                    .clicked();
-
-                let on = panel.is_favorite();
-                let full = !on && panel.favorites.len() >= FAVORITES_LIMIT;
-                let response = ui.add_enabled_ui(panel.place.is_some() && !full, |ui| {
-                    toggle_pill(
-                        ui,
-                        pal,
-                        i18n::t(
-                            lang,
-                            if on {
-                                Key::UiWeatherInFavorites
-                            } else {
-                                Key::UiWeatherToFavorites
-                            },
-                        ),
-                        on,
-                        speed,
-                    )
-                });
-                favorite = response.inner.clicked();
-                let hint = i18n::t(
-                    lang,
-                    if full {
-                        Key::UiWeatherFavoritesFull
-                    } else if on {
-                        Key::UiWeatherRemoveFavorite
-                    } else {
-                        Key::UiWeatherAddFavorite
-                    },
-                );
-                response.response.on_hover_text(hint);
-            });
-
-            if !panel.favorites.is_empty() {
-                ui.add_space(14.0);
-                field_label(ui, pal, i18n::t(lang, Key::UiWeatherFavorites));
-                // Своими таблетками с переносом, а не дорожкой: названий бывает
-                // десяток, и в строку окна 520 не встают даже три (см.
-                // `choice_pill` про перенос).
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
-                    for place in &panel.favorites {
-                        let on = panel
-                            .place
-                            .as_ref()
-                            .is_some_and(|current| current.same_as(place));
-                        if choice_pill(ui, pal, &place.name, on, speed).clicked() && !on {
-                            picked = Some(place.clone());
-                        }
-                    }
-                });
-            }
         });
 
         // Всё исполняем после карточки: внутри замыкания `self` одолжен,
@@ -8365,57 +8455,106 @@ impl SavioApp {
         };
 
         theme::card_rising(ui, pal, self.appear(1), |ui| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 14.0;
-                let (icon, _) =
-                    ui.allocate_exact_size(egui::vec2(BIG_ICON, BIG_ICON), egui::Sense::hover());
-                weather_icon(pal, ui.painter(), icon, view.sky, view.night);
+            // Температура с описанием — слева, подробности — справа через
+            // разделитель, когда карточке хватает ширины. Списком под
+            // температурой они оставляли пустой всю правую половину широкой
+            // карточки, а глаз, дочитав «пасмурно», упирался в пустоту и
+            // спускался за влажностью на строку ниже. В узком окне порядок
+            // прежний: колонкой.
+            const SIDE: f32 = 280.0;
+            const BESIDE_MIN: f32 = SIDE + 320.0;
+            let beside = ui.available_width() >= BESIDE_MIN;
 
-                // Своя вертикальная раскладка: в горизонтальной egui вытянул бы
-                // описание в одну строку за кромку окна (см. `preview_row`).
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    ui.label(
-                        egui::RichText::new(&view.temperature)
-                            .font(theme::display(36.0))
-                            .color(pal.text_primary),
+            let headline = |ui: &mut egui::Ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 14.0;
+                    let (icon, _) = ui.allocate_exact_size(
+                        egui::vec2(BIG_ICON, BIG_ICON),
+                        egui::Sense::hover(),
                     );
-                    if let Some(description) = view.description {
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(description).color(pal.text_primary),
-                            )
-                            .truncate(),
+                    weather_icon(pal, ui.painter(), icon, view.sky, view.night);
+
+                    // Своя вертикальная раскладка: в горизонтальной egui вытянул
+                    // бы описание в одну строку за кромку окна (см. `preview_row`).
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        ui.label(
+                            egui::RichText::new(&view.temperature)
+                                .font(theme::display(56.0))
+                                .color(pal.text_primary),
                         );
-                    }
-                    if let Some(feels) = &view.feels_like {
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(feels)
-                                    .small()
-                                    .color(pal.text_secondary),
-                            )
-                            .truncate(),
-                        );
-                    }
+                        if let Some(description) = view.description {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(description).color(pal.text_primary),
+                                )
+                                .truncate(),
+                            );
+                        }
+                        if let Some(feels) = &view.feels_like {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(feels)
+                                        .small()
+                                        .color(pal.text_secondary),
+                                )
+                                .truncate(),
+                            );
+                        }
+                    });
                 });
-            });
-
-            ui.add_space(12.0);
-            for (label, value) in &view.rows {
-                stat_row_with(ui, pal, label, value.as_deref(), missing);
-            }
-
-            ui.add_space(10.0);
-            if view.air.is_empty() {
-                // Частичный успех говорит о себе сам: пропавшие строки без
-                // объяснения выглядели бы недоделкой вкладки.
-                note(ui, i18n::t(lang, Key::UiWeatherNoAir), pal.text_muted);
-            } else {
-                field_label(ui, pal, i18n::t(lang, Key::UiWeatherAirQuality));
-                for (label, value) in &view.air {
+            };
+            // Воздух — продолжение той же таблицы, а не отдельный блок под
+            // карточкой: положенный под весь ряд, он начинал свою колонку
+            // значений от левого края, и в одной карточке стояли две таблицы
+            // с разными отступами.
+            let details = |ui: &mut egui::Ui| {
+                for (label, value) in &view.rows {
                     stat_row_with(ui, pal, label, value.as_deref(), missing);
                 }
+                ui.add_space(10.0);
+                if view.air.is_empty() {
+                    // Частичный успех говорит о себе сам: пропавшие строки без
+                    // объяснения выглядели бы недоделкой вкладки.
+                    note(ui, i18n::t(lang, Key::UiWeatherNoAir), pal.text_muted);
+                } else {
+                    field_label(ui, pal, i18n::t(lang, Key::UiWeatherAirQuality));
+                    for (label, value) in &view.air {
+                        stat_row_with(ui, pal, label, value.as_deref(), missing);
+                    }
+                }
+            };
+
+            if beside {
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = 18.0;
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(SIDE, 0.0),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            ui.set_min_width(SIDE);
+                            ui.set_max_width(SIDE);
+                            headline(ui);
+                        },
+                    );
+                    // Разделитель рисуется после колонки подробностей, а не
+                    // `ui.separator()` на своём месте: ряд растёт по ходу
+                    // раскладки, и в ту минуту его высота — высота одной
+                    // температуры. Черта обрывалась у «ощущается как», хотя
+                    // таблица справа шла ещё вдвое ниже.
+                    let (gap, _) =
+                        ui.allocate_exact_size(egui::vec2(1.0, 0.0), egui::Sense::hover());
+                    let column = ui.vertical(|ui| details(ui)).response.rect;
+                    ui.painter().vline(
+                        gap.center().x,
+                        column.y_range(),
+                        ui.visuals().widgets.noninteractive.bg_stroke,
+                    );
+                });
+            } else {
+                headline(ui);
+                ui.add_space(12.0);
+                details(ui);
             }
         });
     }
@@ -9753,7 +9892,6 @@ fn with_touch<R>(ui: &mut egui::Ui, speed: f32, add: impl FnOnce(&mut egui::Ui) 
     add(ui)
 }
 
-/// Вторичная кнопка.
 /// Названия групп рельса прописными, на выбранном языке.
 fn nav_groups(lang: Lang) -> [String; 3] {
     let mut out = [const { String::new() }; 3];
@@ -9768,12 +9906,13 @@ fn nav_groups(lang: Lang) -> [String; 3] {
 /// Свободной функцией ради проверки: рельс — единственная навигация окна,
 /// и его ширину на трёх языках надо мерить кадром без окна, а собрать
 /// [`RailState`] для этого дешевле, чем целый `SavioApp`.
-fn rail_body(ui: &mut egui::Ui, state: &RailState<'_>, wide: bool) -> RailPicks {
+fn rail_body(ui: &mut egui::Ui, state: &RailState<'_>, layout: RailLayout) -> RailPicks {
     let mut picks = RailPicks {
         more_open: state.more_open,
         ..RailPicks::default()
     };
     let pal = state.pal;
+    let wide = layout.labels();
 
     // Нижний блок кладём панелью, а не после распорки: панель сама прижмётся
     // к нижней кромке рельса, а распорке пришлось бы отмерять остаток высоты
@@ -9782,17 +9921,17 @@ fn rail_body(ui: &mut egui::Ui, state: &RailState<'_>, wide: bool) -> RailPicks 
         .resizable(false)
         .show_separator_line(false)
         .frame(egui::Frame::new().outer_margin(egui::Margin {
-            top: 12,
+            top: theme::NAV_BLOCK_GAP as i8,
             ..egui::Margin::ZERO
         }))
         .show(ui, |ui| {
-            if wide {
+            if layout == RailLayout::Full {
                 theme::rail_block_frame(pal).show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     rail_block(ui, state, &mut picks);
                 });
             } else {
-                rail_more_button(ui, state, &mut picks);
+                rail_more_button(ui, state, &mut picks, wide);
             }
         });
 
@@ -9859,6 +9998,13 @@ fn rail_item(
         egui::vec2(ui.available_width(), theme::NAV_ITEM_HEIGHT),
         egui::Sense::click(),
     );
+    // Пункт нарисован кистью, и для экранного диктора без этого безымянен,
+    // а в свёрнутом рельсе у него нет даже видимой подписи — один значок.
+    // Имя и «открыт ли» готовый `Button` сообщает сам; здесь их называют
+    // явно (о цене — у `choice_pill`).
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Button, true, open, label)
+    });
     let id = response.id;
 
     let touch = touch_at(ui, id, state.speed);
@@ -9900,28 +10046,11 @@ fn rail_item(
     );
     if wide {
         let icon = egui::Rect::from_center_size(
-            egui::pos2(rect.left() + 22.0, rect.center().y),
+            egui::pos2(rect.left() + NAV_ICON_CENTER, rect.center().y),
             egui::vec2(16.0, 16.0),
         );
         nav_icon(painter, icon, item.icon, ink);
-        // Подпись раскладывается с потолком по ширине, а не рисуется как
-        // есть: не влезшая в рельс уехала бы под кромку и наползла на
-        // содержимое — кисть о соседях ничего не знает. С потолком она
-        // честно обрежется многоточием. Что до этого не доходит ни на одном
-        // языке, держит `the_rail_labels_fit_their_width`.
-        let galley = ui.ctx().fonts_mut(|fonts| {
-            fonts.layout(
-                label.to_owned(),
-                egui::FontId::new(15.0, egui::FontFamily::Proportional),
-                ink,
-                theme::NAV_LABEL_WIDTH,
-            )
-        });
-        let at = egui::pos2(
-            rect.left() + theme::NAV_ICON_COLUMN,
-            rect.center().y - galley.size().y / 2.0,
-        );
-        ui.painter().galley(at, galley, ink);
+        paint_rail_label(ui, rect, label, ink);
     } else {
         let icon = egui::Rect::from_center_size(rect.center(), egui::vec2(18.0, 18.0));
         nav_icon(painter, icon, item.icon, ink);
@@ -9935,6 +10064,31 @@ fn rail_item(
         response.on_hover_text(label)
     };
     response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+}
+
+/// Середина значка пункта от левого края пункта.
+const NAV_ICON_CENTER: f32 = 22.0;
+
+/// Подпись пункта рельса — общая у пунктов и у кнопки «Настройки».
+///
+/// Раскладывается с потолком по ширине, а не рисуется как есть: не влезшая
+/// в рельс уехала бы под кромку и наползла на содержимое — кисть о соседях
+/// ничего не знает. С потолком она честно обрежется многоточием. Что до
+/// этого не доходит ни на одном языке, держит `the_rail_labels_fit_their_width`.
+fn paint_rail_label(ui: &egui::Ui, rect: egui::Rect, label: &str, ink: egui::Color32) {
+    let galley = ui.ctx().fonts_mut(|fonts| {
+        fonts.layout(
+            label.to_owned(),
+            egui::FontId::new(15.0, egui::FontFamily::Proportional),
+            ink,
+            theme::NAV_LABEL_WIDTH,
+        )
+    });
+    let at = egui::pos2(
+        rect.left() + theme::NAV_ICON_COLUMN,
+        rect.center().y - galley.size().y / 2.0,
+    );
+    ui.painter().galley(at, galley, ink);
 }
 
 /// Значок раздела, нарисованный кистью.
@@ -10100,17 +10254,28 @@ fn nav_icon(painter: &egui::Painter, rect: egui::Rect, icon: NavIcon, color: egu
     }
 }
 
-/// Кнопка, раскрывающая нижний блок в свёрнутом рельсе.
+/// Кнопка, раскрывающая нижний блок, когда ему нет места в самом рельсе.
 ///
 /// Три точки кистью, а не знак «⋯»: тот есть только в `Hack`, а `Hack` стоит
 /// лишь в `Monospace`, куда запасной глиф egui не заглядывает, — получился бы
 /// пустой прямоугольник, и молча.
-fn rail_more_button(ui: &mut egui::Ui, state: &RailState<'_>, picks: &mut RailPicks) {
+///
+/// `wide` — видны ли подписи пунктов (`RailLayout::Labels`): тогда и у этой
+/// кнопки точки встают на место значка, а рядом подпись, как у соседей.
+fn rail_more_button(
+    ui: &mut egui::Ui,
+    state: &RailState<'_>,
+    picks: &mut RailPicks,
+    wide: bool,
+) {
     let pal = state.pal;
+    let label = i18n::t(state.lang, Key::NavSettings);
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), theme::NAV_ITEM_HEIGHT),
         egui::Sense::click(),
     );
+    // Три точки — картинка, и без имени диктору кнопку не назвать.
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
     let touch = touch_at(ui, response.id, state.speed);
     let painter = ui.painter();
     painter.rect_filled(
@@ -10119,8 +10284,16 @@ fn rail_more_button(ui: &mut egui::Ui, state: &RailState<'_>, picks: &mut RailPi
         motion::mix(egui::Color32::TRANSPARENT, pal.card_inner, touch),
     );
     let ink = motion::mix(pal.text_secondary, pal.text_primary, touch);
+    let dots = if wide {
+        egui::pos2(rect.left() + NAV_ICON_CENTER, rect.center().y)
+    } else {
+        rect.center()
+    };
     for k in [-1.0_f32, 0.0, 1.0] {
-        painter.circle_filled(egui::pos2(rect.center().x + k * 6.0, rect.center().y), 1.8, ink);
+        painter.circle_filled(egui::pos2(dots.x + k * 6.0, dots.y), 1.8, ink);
+    }
+    if wide {
+        paint_rail_label(ui, rect, label, ink);
     }
 
     let response = response
@@ -10131,7 +10304,15 @@ fn rail_more_button(ui: &mut egui::Ui, state: &RailState<'_>, picks: &mut RailPi
     }
 
     // Меню над кнопкой: рельс прижат к низу окна, и раскрывать его вниз
-    // некуда. Закрывается любым щелчком после открытия и клавишей Esc.
+    // некуда. Закрывается щелчком мимо, клавишей Esc и действием, которое
+    // открывает своё окно (`RailPicks::opens_something`).
+    //
+    // Щелчок **внутри** его не закрывает, и это не вкус. Умолчание `Popup` —
+    // `CloseOnClick`, то есть любой щелчок, свой тоже, — и щелчок по кнопке
+    // языка закрывал меню вместе с только что открытым списком языков: в
+    // узком окне язык было не сменить вовсе. В широком всё работало, блок там
+    // стоит без меню вокруг, так что заметить это можно было только сузив
+    // окно. Держит `the_language_changes_from_the_narrow_rail`.
     let mut open = picks.more_open;
     egui::Popup::new(
         egui::Id::new("savio-rail-more"),
@@ -10140,6 +10321,7 @@ fn rail_more_button(ui: &mut egui::Ui, state: &RailState<'_>, picks: &mut RailPi
         ui.layer_id(),
     )
     .kind(egui::PopupKind::Menu)
+    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
     .layout(egui::Layout::top_down(egui::Align::Min))
     // Штатный стиль меню здесь не годится, и это видно только глазами:
     // `menu_style` снимает у виджетов кромку — кнопки «Обновить движок»
@@ -10156,8 +10338,14 @@ fn rail_more_button(ui: &mut egui::Ui, state: &RailState<'_>, picks: &mut RailPi
         ui.set_max_width(theme::NAV_BLOCK_WIDTH);
         rail_block(ui, state, picks);
     });
+    if picks.opens_something() {
+        open = false;
+    }
     picks.more_open = open;
 }
+
+/// Зазор между кнопками в рядах нижнего блока рельса.
+const RAIL_ROW_GAP: f32 = 6.0;
 
 /// Нижний блок рельса: обслуживание и настройки окна.
 ///
@@ -10185,17 +10373,31 @@ fn rail_block(ui: &mut egui::Ui, state: &RailState<'_>, picks: &mut RailPicks) {
                 .small()
                 .color(pal.text_secondary),
         );
+        // «?» — первый вход в приветствие — живёт в этой строке, справа,
+        // маленьким кружком. Таблеткой в ряду языка и журнала он не
+        // помещался уже по-русски (ряд в 197 точек при 168 доступных), а
+        // по-армянски тем более: ряд вылезал за кромку блока и раздвигал за
+        // собой соседей. Рядом с «О программе» — тоже нет: та от тесноты
+        // переносилась на две строки. Держит `the_rail_labels_fit_their_width`.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if help_button(ui, pal, lang, speed).clicked() {
+                picks.welcome = true;
+            }
+        });
     });
 
     // Строка версий. Подсказку с полным текстом вешает сама обрезанная метка
     // (`show_tooltip_when_elided`), поэтому своего `on_hover_text` здесь нет —
     // он дал бы вторую коробку с тем же текстом (дефект 22).
+    //
+    // `text_muted`, а не `text_faint`: блок — вложенная подложка, и там
+    // `text_faint` даёт 4.23:1, ниже порога (см. поле палитры).
     if known {
         ui.add(
             egui::Label::new(
                 egui::RichText::new(state.tools)
                     .small()
-                    .color(pal.text_faint),
+                    .color(pal.text_muted),
             )
             .truncate(),
         );
@@ -10225,10 +10427,8 @@ fn rail_block(ui: &mut egui::Ui, state: &RailState<'_>, picks: &mut RailPicks) {
     });
 
     ui.add_space(8.0);
-    let themes: Vec<(Appearance, &str)> = Appearance::ALL
-        .iter()
-        .map(|choice| (*choice, choice.label(lang)))
-        .collect();
+    // Массивом, а не `Vec`: блок рисуется каждый кадр, и куча здесь ни к чему.
+    let themes = Appearance::ALL.map(|choice| (choice, choice.label(lang)));
     let picked = segment_track(
         ui,
         pal,
@@ -10244,22 +10444,13 @@ fn rail_block(ui: &mut egui::Ui, state: &RailState<'_>, picks: &mut RailPicks) {
     ui.add_space(2.0);
 
     ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 6.0;
+        ui.spacing_mut().item_spacing.x = RAIL_ROW_GAP;
         // Язык — одной подписью с текущим выбором, список открывается меню.
         // Три подписи подряд в 216 точек не влезают ни на одном языке.
         //
         // Открытость меню живёт в `Context::data`, а не полем окна: она
         // нужна ровно здесь и ровно на время показа, а поле пришлось бы
         // тащить через `RailState` и `RailPicks` туда и обратно.
-        // «?» — первый вход в приветствие, и стоит он первым в ряду:
-        // человек, который ищет объяснение, ищет его слева направо.
-        if pill_button(ui, "?", speed)
-            .on_hover_text(i18n::t(lang, Key::UiHelpButtonHint))
-            .clicked()
-        {
-            picks.welcome = true;
-        }
-
         let response = pill_button(ui, lang.label(), speed)
             .on_hover_text(i18n::t(lang, Key::UiLanguageHint));
         let mut open = ui
@@ -10317,6 +10508,37 @@ fn rail_block(ui: &mut egui::Ui, state: &RailState<'_>, picks: &mut RailPicks) {
     {
         picks.smooth = Some(smooth);
     }
+}
+
+/// Круглая кнопка «?» в строке состояния рельса: вход в приветствие.
+///
+/// Нарисована кистью, а не таблеткой: в строку высотой с подпись таблетка
+/// штатной высоты не встаёт, и строка раздулась бы ради одного знака. Кромка
+/// и знак — те же роли, что у вторичной кнопки (`border_strong` и
+/// `text_secondary`), так что контраст на подложке блока уже проверен.
+fn help_button(ui: &mut egui::Ui, pal: theme::Palette, lang: Lang, speed: f32) -> egui::Response {
+    const SIZE: f32 = 20.0;
+    let hint = i18n::t(lang, Key::UiHelpButtonHint);
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(SIZE, SIZE), egui::Sense::click());
+    // Знак вопроса — картинка, и назвать кнопку диктору нечем, кроме подсказки.
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, hint));
+    let touch = touch_at(ui, response.id, speed);
+    let painter = ui.painter();
+    painter.circle_stroke(
+        rect.center(),
+        SIZE / 2.0 - 0.5,
+        egui::Stroke::new(1.0, motion::mix(pal.border_strong, pal.border_hover, touch)),
+    );
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "?",
+        egui::FontId::new(12.0, egui::FontFamily::Proportional),
+        motion::mix(pal.text_secondary, pal.text_primary, touch),
+    );
+    response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(hint)
 }
 
 /// Две карточки направления в ряд: «На телефон» и «На компьютер».
@@ -10672,6 +10894,7 @@ fn wide_pill(ui: &mut egui::Ui, label: &str, speed: f32) -> egui::Response {
     })
 }
 
+/// Вторичная кнопка.
 fn pill_button(ui: &mut egui::Ui, label: &str, speed: f32) -> egui::Response {
     ui.scope(|ui| with_touch(ui, speed, |ui| ui.add(pill(label))))
         .inner
@@ -10695,7 +10918,6 @@ fn sized_with_touch<R>(
     )
     .inner
 }
-
 
 /// Кнопка-выключатель: нажатая заливается мягким акцентом.
 ///
@@ -11516,6 +11738,14 @@ fn choice_pill(
 
     let size = egui::vec2(PAD * 2.0 + galley.size().x, theme::CONTROL_HEIGHT);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    // Подпись нарисована кистью, и для экранного диктора таблетка без этого
+    // безымянна: имя и «выбрана ли» готовый `Button` сообщает сам, а здесь
+    // их надо назвать явно. Замыкание зовётся, только когда дерево
+    // доступности кто-то читает или по таблетке щёлкнули, так что в обычном
+    // кадре аллокации нет.
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), on, label)
+    });
     if !ui.is_rect_visible(rect) {
         return response;
     }
@@ -14111,12 +14341,12 @@ mod tests {
     #[test]
     fn the_content_never_loses_room_as_the_window_grows() {
         /// Сколько места достаётся содержимому при такой ширине окна.
+        ///
+        /// Высота — с запасом, чтобы решала одна ширина; вид рельса берётся
+        /// у того же `RailLayout::for_window`, что и в окне, а не копией
+        /// условия: копия разъехалась бы с ним при первой же правке.
         fn content(window: f32) -> f32 {
-            let rail = if window >= theme::NAV_WIDE_MIN {
-                theme::NAV_WIDTH
-            } else {
-                theme::NAV_NARROW
-            };
+            let rail = RailLayout::for_window(egui::vec2(window, 2000.0)).width();
             window - rail - theme::CONTENT_MARGIN * 2.0
         }
 
@@ -14153,13 +14383,21 @@ mod tests {
     /// не переносится и не обрезается сама — она рисуется кистью, то есть
     /// просто уезжает под кромку и наползает на содержимое.
     ///
-    /// Меряется разложенный текст, а не пункт: пункт занимает всю ширину
-    /// рельса всегда, и на сломанной раскладке тоже, — проверял бы сам себя.
-    /// Числа берутся из темы, а не копией: своя копия разъехалась бы
-    /// с раскладкой при первой же правке.
+    /// Пункты меряются разложенным текстом, а не самим пунктом: пункт
+    /// занимает всю ширину рельса всегда, и на сломанной раскладке тоже, —
+    /// проверял бы сам себя. Числа берутся из темы, а не копией: своя копия
+    /// разъехалась бы с раскладкой при первой же правке.
     ///
-    /// Проверено красным: с `NAV_WIDTH` 150 вместо 216 падают и армянские
-    /// подписи пунктов, и русские кнопки обновления.
+    /// А нижний блок меряется настоящим кадром. Прежде и он считался
+    /// арифметикой по каждой кнопке в отдельности, и ряд «?», язык, журнал
+    /// она пропустила: каждая подпись влезала, а все три вместе — нет, и ряд
+    /// вылезал за кромку блока. Вылезший ряд к тому же раздвигает раскладку
+    /// и тянет за собой соседей снизу, так что проверяется место каждой
+    /// кнопки, а не только этого ряда.
+    ///
+    /// Проверено красным: с `NAV_WIDTH` 150 вместо 216 не влезают подписи
+    /// пунктов, а с прежним рядом из трёх кнопок «Журнал» вылезает из блока
+    /// уже по-русски.
     #[test]
     fn the_rail_labels_fit_their_width() {
         let pal = theme::Palette::dark();
@@ -14169,58 +14407,267 @@ mod tests {
 
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
             let item_font = egui::FontId::new(15.0, egui::FontFamily::Proportional);
-            let button_font = egui::TextStyle::Button.resolve(ui.style());
-            let width = |ui: &egui::Ui, text: &str, font: &egui::FontId| {
-                ui.painter()
-                    .layout_no_wrap(text.to_owned(), font.clone(), pal.text_primary)
-                    .size()
-                    .x
-            };
-
             for lang in Lang::ALL {
-                for (_, items) in NAV {
-                    for item in items {
-                        let label = i18n::t(lang, item.label);
-                        let w = width(ui, label, &item_font);
-                        assert!(
-                            w <= theme::NAV_LABEL_WIDTH,
-                            "{lang:?}: пункт «{label}» не влезает в рельс: \
-                             {w} при {}",
-                            theme::NAV_LABEL_WIDTH
-                        );
-                    }
-                }
-
-                // Нижний блок: кнопки там во всю ширину и с переносом, так
-                // что вопрос не «влезла ли подпись в строку», а «во сколько
-                // строк она развернулась». Две — предел: на третьей блок
-                // вырастает настолько, что выдавливает пункты рельса за
-                // верхнюю кромку окна минимальной высоты.
-                let room = theme::NAV_BLOCK_WIDTH - 16.0 * 2.0;
-                for key in [Key::UiUpdateEngine, Key::UiUpdateFfmpeg, Key::UiAbout] {
+                // Подпись «Настройки» стоит в том же ряду, что и пункты, и
+                // рисуется тем же `paint_rail_label`.
+                let items = NAV
+                    .iter()
+                    .flat_map(|(_, items)| items.iter().map(|item| item.label))
+                    .chain([Key::NavSettings]);
+                for key in items {
                     let label = i18n::t(lang, key);
-                    let galley = ui.ctx().fonts_mut(|fonts| {
-                        fonts.layout(
-                            label.to_owned(),
-                            button_font.clone(),
-                            pal.text_primary,
-                            room,
-                        )
-                    });
+                    let w = ui
+                        .painter()
+                        .layout_no_wrap(label.to_owned(), item_font.clone(), pal.text_primary)
+                        .size()
+                        .x;
                     assert!(
-                        galley.rows.len() <= 2,
-                        "{lang:?}: кнопка «{label}» разворачивается в {} строки при ширине {room}",
-                        galley.rows.len()
-                    );
-                    assert!(
-                        galley.size().x <= room + 0.5,
-                        "{lang:?}: кнопка «{label}» не уместилась даже с переносом: {} при {room}",
-                        galley.size().x
+                        w <= theme::NAV_LABEL_WIDTH,
+                        "{lang:?}: пункт «{label}» не влезает в рельс: {w} при {}",
+                        theme::NAV_LABEL_WIDTH
                     );
                 }
             }
         });
         output.textures_delta.clear();
+
+        // Колонка нижнего блока: рельс начинается у левой кромки окна.
+        let left = theme::NAV_PADDING + theme::NAV_BLOCK_MARGIN;
+        let right = left + theme::NAV_BLOCK_WIDTH;
+        for lang in Lang::ALL {
+            // Свой контекст на язык: общий помнит размеры от прошлого
+            // и искажает первый кадр следующего.
+            let ctx = rail_test_ctx();
+            let tall = egui::vec2(theme::NAV_WIDE_MIN, 1200.0);
+            let mut named = Vec::new();
+            for _ in 0..3 {
+                named = rail_test_frame(&ctx, lang, tall, RailLayout::Full, false, Vec::new()).1;
+            }
+
+            // Кнопки с переносом разворачиваются меньше чем в три строки: на
+            // третьей блок вырастает настолько, что порог высоты окна для
+            // развёрнутого рельса уезжает вверх. Порог — между двумя и тремя
+            // строками, а не ровно две: строка кириллицы чуть выше латинской
+            // (другая гарнитура), и точное число на ней промахивалось бы.
+            let style = ctx.global_style();
+            let row = ctx.fonts_mut(|f| f.row_height(&egui::TextStyle::Button.resolve(&style)));
+            let three_lines = 3.0 * row + 2.0 * style.spacing.button_padding.y;
+            let wrapping = [Key::UiUpdateEngine, Key::UiUpdateFfmpeg, Key::UiAbout];
+
+            let block = [Key::UiUpdateEngine, Key::UiUpdateFfmpeg, Key::UiLog, Key::UiAbout]
+                .into_iter()
+                .chain([Key::UiHelpButtonHint])
+                .map(|key| (Some(key), i18n::t(lang, key)))
+                .chain([(None, lang.label())]);
+            for (key, label) in block {
+                let Some((_, rect)) = named.iter().find(|(name, _)| name == label) else {
+                    panic!("{lang:?}: в нижнем блоке нет «{label}»");
+                };
+                assert!(
+                    rect.min.x >= left - 0.5 && rect.max.x <= right + 0.5,
+                    "{lang:?}: «{label}» вылезает из колонки блока {left}…{right}: {rect:?}"
+                );
+                if key.is_some_and(|key| wrapping.contains(&key)) {
+                    assert!(
+                        rect.height() < three_lines - 1.0,
+                        "{lang:?}: «{label}» разворачивается в три строки: {} при {three_lines}",
+                        rect.height()
+                    );
+                }
+            }
+
+            // «?» делит строку с «всё на месте» и не ложится на подпись.
+            let find = |label: &str| {
+                named
+                    .iter()
+                    .find(|(name, _)| name == label)
+                    .map(|(_, rect)| *rect)
+                    .unwrap_or_else(|| panic!("{lang:?}: в блоке нет «{label}»"))
+            };
+            let status = find(i18n::t(lang, Key::UiAllInPlaceShort));
+            let help = find(i18n::t(lang, Key::UiHelpButtonHint));
+            assert!(
+                !status.intersects(help),
+                "{lang:?}: «?» лёг на строку состояния: {status:?} и {help:?}"
+            );
+        }
+    }
+
+    /// Развёрнутый рельс не ложится нижним блоком на свои же пункты.
+    ///
+    /// Дефект: рельс разворачивался по одной ширине окна, а прокрутки у
+    /// него нет — в окне 1400×420 блок обслуживания рисовался прямо поверх
+    /// пунктов, и половина подписей читалась одна сквозь другую. Теперь вид
+    /// рельса выбирает и высота (`RailLayout::for_window`), и проверка рисует
+    /// оба развёрнутых вида ровно на их пороге: пункты обязаны кончиться
+    /// выше того, что под ними, с зазором, на всех трёх языках — по-армянски
+    /// блок выше всех.
+    ///
+    /// Проверено красным: с порогами на 60 точек ниже и то и другое
+    /// налезает на пункты.
+    #[test]
+    fn the_wide_rail_does_not_cover_its_own_items() {
+        for lang in Lang::ALL {
+            // Под пунктами: весь блок, а в окне пониже — одна кнопка
+            // «Настройки». Верх блока — от его первой строки, «всё на месте»,
+            // минус поле самого блока.
+            let cases = [
+                (
+                    RailLayout::Full,
+                    theme::NAV_WIDE_MIN_HEIGHT,
+                    Key::UiAllInPlaceShort,
+                    theme::NAV_BLOCK_MARGIN,
+                ),
+                (RailLayout::Labels, theme::NAV_LABELS_MIN_HEIGHT, Key::NavSettings, 0.0),
+            ];
+            for (layout, height, below, margin) in cases {
+                let window = egui::vec2(theme::NAV_WIDE_MIN, height);
+                assert_eq!(RailLayout::for_window(window), layout, "порог {height}");
+
+                let ctx = rail_test_ctx();
+                let mut named = Vec::new();
+                for _ in 0..3 {
+                    named = rail_test_frame(&ctx, lang, window, layout, false, Vec::new()).1;
+                }
+                let find = |label: &str| {
+                    named
+                        .iter()
+                        .find(|(name, _)| name == label)
+                        .map(|(_, rect)| *rect)
+                        .unwrap_or_else(|| panic!("{lang:?}, {layout:?}: в рельсе нет «{label}»"))
+                };
+                let items_bottom = NAV
+                    .iter()
+                    .flat_map(|(_, items)| items.iter())
+                    .map(|item| find(i18n::t(lang, item.label)).max.y)
+                    .fold(f32::MIN, f32::max);
+                let under_top = find(i18n::t(lang, below)).min.y - margin;
+                let overlap = items_bottom + theme::NAV_BLOCK_GAP - under_top;
+                assert!(
+                    overlap <= 0.5,
+                    "{lang:?}, {layout:?}: при высоте окна {height} низ рельса налезает \
+                     на пункты на {overlap}"
+                );
+            }
+        }
+    }
+
+    /// Окно минимального размера, в котором меряется свёрнутый рельс.
+    const SMALLEST_WINDOW: egui::Rect =
+        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(520.0, 420.0));
+
+    /// Контекст для кадров рельса: тема, шрифты и дерево доступности.
+    fn rail_test_ctx() -> egui::Context {
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, theme::Palette::dark());
+        ctx.enable_accesskit();
+        ctx
+    }
+
+    /// Виджеты кадра по дереву доступности: имя и место на экране.
+    ///
+    /// Кнопку ищут по имени, а не по координатам, списанным в тест: её место
+    /// зависит от шрифтов и языка, и число разъехалось бы с ним при первой
+    /// же правке. Заодно проверка держит и сами имена: виджет, который
+    /// диктору не назван, не найдётся и здесь.
+    fn named_widgets(output: &mut egui::FullOutput) -> Vec<(String, egui::Rect)> {
+        let Some(update) = output.platform_output.accesskit_update.take() else {
+            return Vec::new();
+        };
+        update
+            .nodes
+            .into_iter()
+            .filter_map(|(_, node)| {
+                // У подписи текст лежит в `value`, у кнопки — в `label`.
+                let name = node.label().or_else(|| node.value())?.to_owned();
+                let b = node.bounds()?;
+                let rect = egui::Rect::from_min_max(
+                    egui::pos2(b.x0 as f32, b.y0 as f32),
+                    egui::pos2(b.x1 as f32, b.y1 as f32),
+                );
+                Some((name, rect))
+            })
+            .collect()
+    }
+
+    /// Один кадр свёрнутого рельса в окне 520×420.
+    fn narrow_rail_frame(
+        ctx: &egui::Context,
+        lang: Lang,
+        more_open: bool,
+        events: Vec<egui::Event>,
+    ) -> (RailPicks, Vec<(String, egui::Rect)>) {
+        let window = SMALLEST_WINDOW.size();
+        assert_eq!(RailLayout::for_window(window), RailLayout::Narrow);
+        rail_test_frame(ctx, lang, window, RailLayout::Narrow, more_open, events)
+    }
+
+    /// Один кадр рельса в окне заданного размера.
+    ///
+    /// Вид передаётся явно, а не выводится из окна: проверке высоты нужен
+    /// развёрнутый рельс ровно на пороге, где решение как раз меняется.
+    fn rail_test_frame(
+        ctx: &egui::Context,
+        lang: Lang,
+        window: egui::Vec2,
+        layout: RailLayout,
+        more_open: bool,
+        events: Vec<egui::Event>,
+    ) -> (RailPicks, Vec<(String, egui::Rect)>) {
+        let pal = theme::Palette::dark();
+        let groups = nav_groups(lang);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, window)),
+            events,
+            ..Default::default()
+        };
+        let mut picks = None;
+        let mut output = ctx.run_ui(input, |ui| {
+            let state = RailState {
+                pal,
+                speed: 1.0,
+                lang,
+                tab: Tab::Download,
+                half: MachineTab::Now,
+                appearance: Appearance::Dark,
+                groups: &groups,
+                tools: "yt-dlp 2026.07.04",
+                smooth: true,
+                has_log: true,
+                log_open: false,
+                busy: false,
+                more_open,
+            };
+            egui::Panel::left("рельс")
+                .resizable(false)
+                .exact_size(layout.width())
+                .frame(theme::rail_frame(pal))
+                .show(ui, |ui| picks = Some(rail_body(ui, &state, layout)));
+        });
+        output.textures_delta.clear();
+        let named = named_widgets(&mut output);
+        (picks.expect("рельс не нарисовался"), named)
+    }
+
+    /// Щелчок левой кнопкой: нажатие одним кадром, отпускание следующим —
+    /// egui засчитывает щелчок на отпускании.
+    fn click_at(at: egui::Pos2) -> [Vec<egui::Event>; 2] {
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        [vec![egui::Event::PointerMoved(at), button(true)], vec![button(false)]]
+    }
+
+    /// Середина виджета с этим именем, если он есть в кадре.
+    fn center_of(named: &[(String, egui::Rect)], name: &str) -> Option<egui::Pos2> {
+        named
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, rect)| rect.center())
     }
 
     /// В окне минимальной ширины рельс свёрнут, и всё, что в нём было,
@@ -14229,80 +14676,86 @@ mod tests {
     /// Прежде это держал `the_header_fits_the_smallest_window`: шапка с
     /// дорожкой разделов в 520 точек сходилась впритык. Шапки больше нет,
     /// и вопрос сменился — не «влезло ли», а «не пропало ли»: в свёрнутом
-    /// рельсе подписи спрятаны, и если пункт или нижний блок перестанут
-    /// рисоваться, окно от этого не сломается, просто часть программы
-    /// станет недостижимой.
+    /// рельсе подписи спрятаны, и если пункт или кнопка нижнего блока
+    /// перестанут рисоваться или уедут за нижнюю кромку, окно от этого не
+    /// сломается, просто часть программы станет недостижимой.
+    ///
+    /// Меряются нарисованные пункты, а не сумма высот из темы: сумма
+    /// сходилась бы и тогда, когда пункт не рисуется вовсе. Проверено
+    /// красным дважды: с `NAV_ITEM_HEIGHT` 60 вместо 38 «Телефон» уезжает
+    /// за кромку окна 420, а пункт без имени для диктора не находится.
     #[test]
     fn the_narrow_rail_keeps_every_section_reachable() {
         for lang in Lang::ALL {
-            let pal = theme::Palette::dark();
             // Свой контекст на язык: общий помнит размеры от прошлого
             // и искажает первый кадр следующего.
-            let ctx = egui::Context::default();
-            theme::install_fonts(&ctx);
-            theme::apply(&ctx, pal);
-
-            let groups = nav_groups(lang);
-            let mut items = 0;
-            let mut rail = egui::Rect::NOTHING;
-
+            let ctx = rail_test_ctx();
+            let mut named = Vec::new();
             for _ in 0..3 {
-                let input = egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        egui::vec2(520.0, 420.0),
-                    )),
-                    ..Default::default()
-                };
-                let mut output = ctx.run_ui(input, |ui| {
-                    let state = RailState {
-                        pal,
-                        speed: 1.0,
-                        lang,
-                        tab: Tab::Download,
-                        half: MachineTab::Now,
-                        appearance: Appearance::Dark,
-                        groups: &groups,
-                        tools: "yt-dlp 2026.07.04",
-                        smooth: true,
-                        has_log: true,
-                        log_open: false,
-                        busy: false,
-                        more_open: false,
-                    };
-                    let panel = egui::Panel::left("рельс")
-                        .resizable(false)
-                        .exact_size(theme::NAV_NARROW)
-                        .frame(theme::rail_frame(pal))
-                        .show(ui, |ui| {
-                            let before = ui.min_rect();
-                            rail_body(ui, &state, false);
-                            let _ = before;
-                        });
-                    rail = panel.response.rect;
-                    // Пунктов должно быть ровно шесть — столько их в `NAV`.
-                    items = NAV.iter().map(|(_, list)| list.len()).sum();
-                });
-                output.textures_delta.clear();
+                named = narrow_rail_frame(&ctx, lang, false, Vec::new()).1;
             }
 
-            assert_eq!(items, 6, "{lang:?}: состав рельса изменился");
-            assert!(
-                (rail.width() - theme::NAV_NARROW).abs() < 1.0,
-                "{lang:?}: свёрнутый рельс шире полосы значков: {}",
-                rail.width()
-            );
-            // Шесть пунктов, точка сверху и кнопка нижнего блока обязаны
-            // помещаться в окно минимальной высоты — иначе часть разделов
-            // окажется за нижней кромкой, и добраться до них будет нечем.
-            let needed = 9.0 + 14.0 + 6.0 * theme::NAV_ITEM_HEIGHT + 3.0 * 10.0
-                + theme::NAV_ITEM_HEIGHT
-                + 12.0;
-            assert!(
-                needed <= 420.0 - 18.0 * 2.0,
-                "{lang:?}: рельс не помещается в окно 420 по высоте: {needed}"
-            );
+            let more = i18n::t(lang, Key::NavSettings);
+            let labels = NAV
+                .iter()
+                .flat_map(|(_, items)| items.iter())
+                .map(|item| i18n::t(lang, item.label))
+                .chain([more]);
+            for label in labels {
+                let Some((_, rect)) = named.iter().find(|(name, _)| name == label) else {
+                    panic!("{lang:?}: в свёрнутом рельсе нет «{label}»");
+                };
+                assert!(
+                    SMALLEST_WINDOW.contains_rect(*rect),
+                    "{lang:?}: «{label}» за кромкой окна 520×420: {rect:?}"
+                );
+                assert!(
+                    rect.max.x <= theme::NAV_NARROW + 0.5,
+                    "{lang:?}: «{label}» шире свёрнутого рельса: {rect:?}"
+                );
+            }
         }
+    }
+
+    /// В окне минимальной ширины язык меняется из меню свёрнутого рельса.
+    ///
+    /// Дефект: меню «ещё» закрывалось от любого щелчка, в том числе внутри
+    /// себя (`CloseOnClick` — умолчание `Popup`), и щелчок по кнопке языка
+    /// закрывал его вместе с только что открытым списком языков. В узком
+    /// окне язык было не сменить вовсе, а в широком всё работало: блок там
+    /// стоит на месте, без меню вокруг. Проверено красным: с прежним
+    /// умолчанием меню закрывается на щелчке по кнопке языка.
+    #[test]
+    fn the_language_changes_from_the_narrow_rail() {
+        let lang = Lang::En;
+        let ctx = rail_test_ctx();
+
+        // Меню открыто; первый кадр всплывающего окна — примерочный и
+        // невидимый, поэтому кадров несколько.
+        let mut named = Vec::new();
+        for _ in 0..3 {
+            named = narrow_rail_frame(&ctx, lang, true, Vec::new()).1;
+        }
+        let button = center_of(&named, lang.label()).expect("в меню нет кнопки языка");
+
+        let mut open = true;
+        for events in click_at(button) {
+            open = narrow_rail_frame(&ctx, lang, open, events).0.more_open;
+        }
+        assert!(open, "щелчок по кнопке языка закрыл меню свёрнутого рельса");
+
+        for _ in 0..2 {
+            named = narrow_rail_frame(&ctx, lang, open, Vec::new()).1;
+        }
+        let russian = center_of(&named, Lang::Ru.label()).expect("список языков не открылся");
+
+        let mut picked = None;
+        for events in click_at(russian) {
+            let (picks, _) = narrow_rail_frame(&ctx, lang, open, events);
+            open = picks.more_open;
+            picked = picked.or(picks.lang);
+        }
+        assert_eq!(picked, Some(Lang::Ru), "язык из списка не выбрался");
     }
 
     /// Строка недельного прогноза занимает свою высоту, а не весь экран.
