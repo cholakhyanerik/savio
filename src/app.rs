@@ -3227,6 +3227,10 @@ pub struct SavioApp {
     /// Когда скопировали адрес для отзывов — ради той же подписи
     /// «Скопировано», что у журнала, только в окне «О программе».
     about_copied_at: Option<f64>,
+    /// Когда главная кнопка ряда загрузки сменила «Скачать» на «Отмену» или
+    /// обратно: полсекунды после этого она не принимает щелчков (задача 54,
+    /// см. [`SwapPause`]).
+    swap_pause: SwapPause,
     /// Показанная вкладка.
     tab: Tab,
     /// Половина вкладки «Машина».
@@ -3444,6 +3448,7 @@ impl SavioApp {
             log_copied_at: None,
             about_open: false,
             about_copied_at: None,
+            swap_pause: SwapPause::default(),
             tab: Tab::Download,
             machine_tab: MachineTab::Now,
             rail_tab: RailTab::Queue,
@@ -6284,95 +6289,33 @@ impl SavioApp {
 
     /// Главная кнопка ряда: «Отмена» во время загрузки, «Скачать» в остальное
     /// время. Возвращает `true`, когда её нажали.
+    ///
+    /// Здесь решается только, что на ней показать; рисует её [`cta_button`].
     fn primary_button(&mut self, ui: &mut egui::Ui, width: f32) -> bool {
-        let pal = self.palette;
         let lang = self.lang;
-        if matches!(self.state, State::Running) {
-            return ui
-                .add_sized(
-                    [width, theme::CTA_HEIGHT],
-                    egui::Button::new(i18n::t(lang, Key::UiCancel)),
-                )
-                .on_hover_text(i18n::t(lang, Key::UiCancelHint))
-                .clicked();
-        }
-
-        let enabled = self.can_start();
-        // Подсказка выключенной кнопке нужна не меньше, чем соседней: до
-        // очереди она молча гасла, и понять почему было неоткуда.
-        let hint = i18n::t(
-            lang,
-            if self.setup_error.is_some() {
-                Key::UiNeedYtdlp
-            } else if self.section_error.is_some() {
-                Key::UiFixSection
-            } else if self.out_dir.is_none() {
-                Key::UiPickFolderFirst
-            } else {
-                Key::UiPasteOrQueue
-            },
-        );
-
-        ui.scope(|ui| {
-            let v = ui.visuals_mut();
-            // `ui.disable()` не переключает виджет на `noninteractive`,
-            // а только глушит прозрачность. Поэтому выключенный вид
-            // задаём сами: все три состояния красим приглушённым жёлтым,
-            // навести на выключенную кнопку всё равно нельзя.
-            // Подпись выключенной кнопки берётся отдельным полем палитры.
-            // В тёмной теме она совпадает с обычной, и это сбивает с толку;
-            // в светлой включённая кнопка тёмная и подписана белым, а
-            // выключенная — пастельная, и белым по ней выходит 1.9:1.
-            let (rest, hover, press, ink) = if enabled {
-                (
-                    pal.accent,
-                    pal.accent_hover,
-                    pal.accent_active,
-                    pal.text_on_accent,
-                )
-            } else {
-                (
-                    pal.accent_disabled,
-                    pal.accent_disabled,
-                    pal.accent_disabled,
-                    pal.text_on_accent_disabled,
-                )
-            };
-
-            // Нажатие у кнопки из egui задаётся не своим прямоугольником,
-            // а `expansion` (приём 02): рисует её `Button`, и подменить ему
-            // рамку нечем. Полтора процента ширины на CTA — это около трёх
-            // точек; берём их отрицательным полем, так что раскладка не едет.
-            let squeeze = -width * motion::PRESS;
-
-            for (state, fill, expansion) in [
-                (&mut v.widgets.inactive, rest, 0.0),
-                (&mut v.widgets.hovered, hover, 0.0),
-                (&mut v.widgets.active, press, squeeze),
-            ] {
-                state.weak_bg_fill = fill;
-                state.bg_stroke = egui::Stroke::NONE;
-                state.fg_stroke = egui::Stroke::new(1.0, ink);
-                state.corner_radius = egui::CornerRadius::same(theme::RADIUS_PILL);
-                state.expansion = expansion;
+        let cta = if matches!(self.state, State::Running) {
+            Cta::Cancel
+        } else {
+            // Подсказка выключенной кнопке нужна не меньше, чем соседней: до
+            // очереди она молча гасла, и понять почему было неоткуда.
+            let hint = i18n::t(
+                lang,
+                if self.setup_error.is_some() {
+                    Key::UiNeedYtdlp
+                } else if self.section_error.is_some() {
+                    Key::UiFixSection
+                } else if self.out_dir.is_none() {
+                    Key::UiPickFolderFirst
+                } else {
+                    Key::UiPasteOrQueue
+                },
+            );
+            Cta::Download {
+                enabled: self.can_start(),
+                hint,
             }
-            // Двойное ослабление не нужно: приглушённый оранжевый уже задан
-            // явно, а поверх него прозрачность съела бы кнопку целиком.
-            v.disabled_alpha = 1.0;
-
-            ui.add_enabled(
-                enabled,
-                egui::Button::new(
-                    egui::RichText::new(i18n::t(lang, Key::UiDownload))
-                        .font(theme::display(17.0))
-                        .color(ink),
-                )
-                .min_size(egui::vec2(width, theme::CTA_HEIGHT)),
-            )
-            .on_disabled_hover_text(hint)
-            .clicked()
-        })
-        .inner
+        };
+        cta_button(ui, self.palette, lang, width, cta, &mut self.swap_pause)
     }
 
     /// Карточка хода работы: что сейчас происходит с загрузкой.
@@ -9774,9 +9717,187 @@ fn qr_image(ui: &mut egui::Ui, texture: Option<&egui::TextureHandle>) {
     }
 }
 
+/// Сколько секунд главная кнопка ряда загрузки не принимает щелчков после
+/// того, как сменила смысл (см. [`SwapPause`]).
+///
+/// Полсекунды — это окно двойного щелчка в Windows по умолчанию и с запасом
+/// то, за что долетает щелчок, задуманный ещё до смены: дефект
+/// воспроизводили двумя щелчками с промежутком в 250 мс. Дольше держать
+/// незачем: кнопка, которая не отвечает, когда её уже видно, — та же
+/// поломка, только с другой стороны.
+///
+/// На `speed` не умножается: это не движение, а защита, и выключенные
+/// переходы её не отменяют.
+const SWAP_PAUSE_SECS: f64 = 0.5;
+
+/// Пауза главной кнопки после смены смысла (задача 54).
+///
+/// «Скачать» и «Отмена» — одна кнопка на одном месте, и после щелчка под
+/// неподвижным курсором тут же стоит кнопка с противоположным смыслом.
+/// egui засчитывает оба щелчка двойного нажатия — `clicked()` приходит на
+/// каждом отпускании, — так что второй щелчок, по привычке или от
+/// нетерпения (снятие мгновенное и ничем не подтверждается), попадал уже
+/// в неё: две «Отмены» подряд снимали 4K-ролик и тут же качали его заново,
+/// а двойной щелчок по «Скачать» снимал только что начатую загрузку.
+///
+/// Щелчок, нажатый в паузе и отпущенный после неё, не пройдёт тоже:
+/// выключенная кнопка egui нажатия не ловит (`hit_test.rs`), а без нажатия
+/// отпускание щелчком не считается.
+#[derive(Default)]
+struct SwapPause {
+    /// Смысл кнопки на прошлом проходе: `true` — «Отмена».
+    cancels: bool,
+    /// Когда смысл сменился у кнопки на экране, по часам egui. `None` —
+    /// не менялся вовсе или сменился, пока кнопку не рисовали.
+    since: Option<f64>,
+    /// Номер прохода egui, на котором кнопку рисовали в последний раз.
+    pass: u64,
+}
+
+impl SwapPause {
+    /// Отмечает смысл кнопки на этом проходе и отвечает, сколько секунд
+    /// ей ещё не принимать щелчков. `None` — нажимать можно.
+    fn left(&mut self, cancels: bool, now: f64, pass: u64) -> Option<f64> {
+        // Смена у кнопки, которую на прошлом проходе не рисовали, паузы не
+        // заводит: человек был в другом разделе, и под курсором её не было.
+        // Иначе загрузка, кончившаяся у него за спиной, встретила бы его
+        // выключенной «Скачать» ни с того ни с сего.
+        let shown = self.pass + 1 == pass;
+        self.pass = pass;
+        if cancels != self.cancels {
+            self.cancels = cancels;
+            self.since = shown.then_some(now);
+        }
+        let left = SWAP_PAUSE_SECS - (now - self.since?);
+        (left > 0.0).then_some(left)
+    }
+}
+
+/// Что стоит на главной кнопке ряда загрузки.
+enum Cta<'a> {
+    /// Идёт загрузка — «Отмена».
+    Cancel,
+    /// Всё остальное время — «Скачать»: можно ли нажать и, если нельзя,
+    /// почему.
+    Download { enabled: bool, hint: &'a str },
+}
+
+/// Главная кнопка ряда загрузки: «Отмена» во время загрузки, «Скачать»
+/// в остальное время. Возвращает `true`, когда её нажали.
+///
+/// Свободной функцией, а не методом `SavioApp`, ради проверки кадром без
+/// окна: щелчок сквозь смену смысла виден только на живой кнопке, а
+/// `SavioApp` в тесте не собрать. Что на ней показать, решает
+/// `SavioApp::primary_button`.
+fn cta_button(
+    ui: &mut egui::Ui,
+    pal: theme::Palette,
+    lang: Lang,
+    width: f32,
+    cta: Cta<'_>,
+    pause: &mut SwapPause,
+) -> bool {
+    let now = ui.input(|i| i.time);
+    let pass = ui.ctx().cumulative_pass_nr();
+    let left = pause.left(matches!(cta, Cta::Cancel), now, pass);
+    if let Some(left) = left {
+        // Оживает кнопка только на кадре, а кадр без ввода egui не рисует:
+        // без этой строки она ожила бы при первом движении мыши, а если
+        // руки убрали — не ожила бы вовсе.
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_secs_f64(left));
+    }
+    let settled = left.is_none();
+
+    let (enabled, hint) = match cta {
+        Cta::Cancel => {
+            // Выключенный вид у «Отмены» штатный, тот же, что у выключенной
+            // «В очередь»: контурная таблетка, приглушённая прозрачностью.
+            // Свой понадобился только акцентной заливке ниже.
+            return ui
+                .add_enabled_ui(settled, |ui| {
+                    ui.add_sized(
+                        [width, theme::CTA_HEIGHT],
+                        egui::Button::new(i18n::t(lang, Key::UiCancel)),
+                    )
+                    .on_hover_text(i18n::t(lang, Key::UiCancelHint))
+                    .clicked()
+                })
+                .inner;
+        }
+        Cta::Download { enabled, hint } => (enabled && settled, hint),
+    };
+
+    ui.scope(|ui| {
+        let v = ui.visuals_mut();
+        // `ui.disable()` не переключает виджет на `noninteractive`,
+        // а только глушит прозрачность. Поэтому выключенный вид
+        // задаём сами: все три состояния красим приглушённым жёлтым,
+        // навести на выключенную кнопку всё равно нельзя.
+        // Подпись выключенной кнопки берётся отдельным полем палитры.
+        // В тёмной теме она совпадает с обычной, и это сбивает с толку;
+        // в светлой включённая кнопка тёмная и подписана белым, а
+        // выключенная — пастельная, и белым по ней выходит 1.9:1.
+        let (rest, hover, press, ink) = if enabled {
+            (
+                pal.accent,
+                pal.accent_hover,
+                pal.accent_active,
+                pal.text_on_accent,
+            )
+        } else {
+            (
+                pal.accent_disabled,
+                pal.accent_disabled,
+                pal.accent_disabled,
+                pal.text_on_accent_disabled,
+            )
+        };
+
+        // Нажатие у кнопки из egui задаётся не своим прямоугольником,
+        // а `expansion` (приём 02): рисует её `Button`, и подменить ему
+        // рамку нечем. Полтора процента ширины на CTA — это около трёх
+        // точек; берём их отрицательным полем, так что раскладка не едет.
+        let squeeze = -width * motion::PRESS;
+
+        for (state, fill, expansion) in [
+            (&mut v.widgets.inactive, rest, 0.0),
+            (&mut v.widgets.hovered, hover, 0.0),
+            (&mut v.widgets.active, press, squeeze),
+        ] {
+            state.weak_bg_fill = fill;
+            state.bg_stroke = egui::Stroke::NONE;
+            state.fg_stroke = egui::Stroke::new(1.0, ink);
+            state.corner_radius = egui::CornerRadius::same(theme::RADIUS_PILL);
+            state.expansion = expansion;
+        }
+        // Двойное ослабление не нужно: приглушённый оранжевый уже задан
+        // явно, а поверх него прозрачность съела бы кнопку целиком.
+        v.disabled_alpha = 1.0;
+
+        let response = ui.add_enabled(
+            enabled,
+            egui::Button::new(
+                egui::RichText::new(i18n::t(lang, Key::UiDownload))
+                    .font(theme::display(17.0))
+                    .color(ink),
+            )
+            .min_size(egui::vec2(width, theme::CTA_HEIGHT)),
+        );
+        // В паузе кнопку держит не ссылка и не папка, и подсказка о них
+        // соврала бы.
+        if settled {
+            response.on_disabled_hover_text(hint).clicked()
+        } else {
+            response.clicked()
+        }
+    })
+    .inner
+}
+
 /// Главная кнопка экрана в акцентной заливке. Возвращает `true`, когда нажали.
 ///
-/// Вид тот же, что у «Скачать» (`SavioApp::primary_button`): состояния заданы
+/// Вид тот же, что у «Скачать» ([`cta_button`]): состояния заданы
 /// через `visuals`, выключенная — приглушённым оранжевым явно, потому что
 /// `ui.disable()` сам её от включённой не отличает (Правило 4).
 fn accent_button(
@@ -15529,6 +15650,215 @@ mod tests {
             picked = picked.or(picks.lang);
         }
         assert_eq!(picked, Some(Lang::Ru), "язык из списка не выбрался");
+    }
+
+    /// Главная кнопка ряда загрузки в кадрах без окна и со своими часами.
+    ///
+    /// Щелчок по ней делает то же, что `action_button`: «Отмена» снимает
+    /// загрузку, «Скачать» запускает, — так что со следующего кадра на том
+    /// же месте стоит кнопка с другим смыслом, ровно как в окне.
+    struct CtaRig {
+        ctx: egui::Context,
+        pause: SwapPause,
+        /// Идёт ли загрузка, то есть «Отмена» ли на кнопке.
+        running: bool,
+        time: f64,
+    }
+
+    impl CtaRig {
+        /// Три кадра покоя, чтобы кнопка встала на место, и её середина.
+        ///
+        /// Пауза с самого начала помнит тот смысл, с которым кнопка стоит:
+        /// стенд изображает кнопку, висящую так давно, а не только что
+        /// сменившуюся. Иначе «Отмена» на первом кадре выглядела бы сменой,
+        /// и тесты молча опирались бы на правило про невидимую кнопку.
+        fn new(running: bool) -> (Self, egui::Pos2) {
+            let mut rig = Self {
+                ctx: rail_test_ctx(),
+                pause: SwapPause {
+                    cancels: running,
+                    ..SwapPause::default()
+                },
+                running,
+                time: 0.0,
+            };
+            let mut named = Vec::new();
+            for _ in 0..3 {
+                named = rig.frame(0.1, Vec::new()).0;
+            }
+            let name = i18n::t(Lang::Ru, if running { Key::UiCancel } else { Key::UiDownload });
+            let at = center_of(&named, name).unwrap_or_else(|| panic!("в кадре нет «{name}»"));
+            (rig, at)
+        }
+
+        /// Кадр через `step` секунд после прошлого. Возвращает имена
+        /// виджетов и то, через сколько кадр попросил следующий.
+        fn frame(
+            &mut self,
+            step: f64,
+            events: Vec<egui::Event>,
+        ) -> (Vec<(String, egui::Rect)>, std::time::Duration) {
+            self.time += step;
+            let input = egui::RawInput {
+                screen_rect: Some(SMALLEST_WINDOW),
+                time: Some(self.time),
+                events,
+                ..Default::default()
+            };
+            let (pause, running) = (&mut self.pause, self.running);
+            let mut clicked = false;
+            let mut output = self.ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let cta = if running {
+                            Cta::Cancel
+                        } else {
+                            Cta::Download {
+                                enabled: true,
+                                hint: "",
+                            }
+                        };
+                        clicked = cta_button(ui, theme::Palette::dark(), Lang::Ru, 300.0, cta, pause);
+                    });
+                });
+            });
+            if clicked {
+                self.running = !self.running;
+            }
+            output.textures_delta.clear();
+            let asked = output
+                .viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .map_or(std::time::Duration::MAX, |viewport| viewport.repaint_delay);
+            (named_widgets(&mut output), asked)
+        }
+
+        /// Кадр, в котором кнопки нет: человек в другом разделе.
+        fn away(&mut self, step: f64) {
+            self.time += step;
+            let input = egui::RawInput {
+                screen_rect: Some(SMALLEST_WINDOW),
+                time: Some(self.time),
+                ..Default::default()
+            };
+            let mut output = self.ctx.run_ui(input, |_| {});
+            output.textures_delta.clear();
+        }
+
+        /// Щелчок в точке `at`: нажатие через `after` секунд после прошлого
+        /// кадра, отпускание через `hold` после нажатия и кадр следом — на
+        /// нём, как и в окне, кнопка впервые рисуется с новым смыслом.
+        fn click(&mut self, at: egui::Pos2, after: f64, hold: f64) {
+            let [press, release] = click_at(at);
+            self.frame(after, press);
+            self.frame(hold, release);
+            self.frame(0.016, Vec::new());
+        }
+    }
+
+    /// Второй щелчок по «Отмене» не запускает снятую загрузку заново
+    /// (задача 54).
+    ///
+    /// «Скачать» и «Отмена» — одна кнопка на одном месте: после первого
+    /// щелчка под курсором уже «Скачать», и второй, нетерпеливый, попадал
+    /// в неё. Вживую — два щелчка с промежутком в 250 мс, и 4K-ролик
+    /// качался по новой. Пауза при этом не навсегда: дождавшись её конца,
+    /// «Скачать» запускает, как и раньше.
+    ///
+    /// Проверено красным: без паузы в `cta_button` второй щелчок проходит.
+    #[test]
+    fn a_second_cancel_does_not_restart_the_download() {
+        let (mut rig, at) = CtaRig::new(true);
+        rig.click(at, 0.1, 0.05);
+        assert!(!rig.running, "«Отмена» не сняла загрузку");
+        rig.click(at, 0.2, 0.05);
+        assert!(!rig.running, "второй щелчок по «Отмене» запустил загрузку заново");
+
+        rig.frame(SWAP_PAUSE_SECS, Vec::new());
+        rig.click(at, 0.1, 0.05);
+        assert!(rig.running, "«Скачать» не ожила после паузы");
+    }
+
+    /// Двойной щелчок по «Скачать» не снимает только что начатую загрузку.
+    ///
+    /// Та же беда в обратную сторону: egui засчитывает оба щелчка двойного
+    /// нажатия, и второй приходился уже на «Отмену».
+    ///
+    /// Проверено красным: без паузы в `cta_button` загрузка снимается.
+    #[test]
+    fn a_double_click_on_download_does_not_cancel_it() {
+        let (mut rig, at) = CtaRig::new(false);
+        rig.click(at, 0.1, 0.05);
+        assert!(rig.running, "«Скачать» не запустила загрузку");
+        rig.click(at, 0.1, 0.05);
+        assert!(
+            rig.running,
+            "двойной щелчок по «Скачать» снял только что начатую загрузку"
+        );
+    }
+
+    /// Щелчок, нажатый в паузе и отпущенный после неё, не засчитывается.
+    ///
+    /// Держит это уже egui, а не Savio: выключенная кнопка нажатия не ловит
+    /// (`hit_test.rs`), а отпускание без нажатия щелчком не считается. Потому
+    /// кнопка в паузе и выключается, а не «пропускает мимо ушей» щелчки при
+    /// включённом виде: так отпущенный после паузы щелчок засчитался бы. И
+    /// если обновление egui это правило поменяет, заметно станет отсюда.
+    ///
+    /// Проверено красным дважды: без паузы в `cta_button` и с паузой,
+    /// которая не выключает кнопку, а только гасит её щелчки, — вторая
+    /// держит оба теста выше и пропускает этот.
+    #[test]
+    fn a_click_pressed_in_the_pause_does_not_count() {
+        let (mut rig, at) = CtaRig::new(true);
+        rig.click(at, 0.1, 0.05);
+        assert!(!rig.running, "«Отмена» не сняла загрузку");
+        // Нажали за 50 мс до конца паузы, отпустили через 50 мс после.
+        rig.click(at, SWAP_PAUSE_SECS - 0.05, 0.1);
+        assert!(!rig.running, "щелчок, нажатый ещё в паузе, запустил загрузку");
+    }
+
+    /// Главная кнопка оживает после паузы сама, без движения мыши.
+    ///
+    /// egui рисует кадр по вводу и по просьбе, а не по таймеру: не попроси
+    /// кнопка кадр к концу паузы, она осталась бы выключенной, пока человек
+    /// не шевельнёт мышью. Меряется кадр без ввода через 0.2 с после щелчка,
+    /// пока пауза ещё идёт, а не кадр сразу за щелчком: тот egui просит сам,
+    /// и нулевую задержку он показывает и без кнопки — тест на нём прошёл бы
+    /// со сломанной починкой, так и было.
+    ///
+    /// Проверено красным: без `request_repaint_after` в `cta_button` этот
+    /// кадр следующего не просит вовсе (`Duration::MAX`).
+    #[test]
+    fn the_main_button_wakes_up_after_the_pause_by_itself() {
+        let (mut rig, at) = CtaRig::new(true);
+        rig.click(at, 0.1, 0.05);
+        assert!(!rig.running, "«Отмена» не сняла загрузку");
+        let (_, asked) = rig.frame(0.2, Vec::new());
+        assert!(
+            asked <= std::time::Duration::from_secs_f64(SWAP_PAUSE_SECS),
+            "кнопка в паузе не попросила кадр к её концу: {asked:?}"
+        );
+    }
+
+    /// Смена смысла, пока главную кнопку не рисовали, паузы не заводит.
+    ///
+    /// Загрузка кончается и тогда, когда человек в другом разделе, а под
+    /// курсором кнопки при этом нет, и ловить нечего. С паузой на любую
+    /// смену вернувшийся застал бы «Скачать» выключенной ни с того ни с сего.
+    ///
+    /// Проверено красным: с паузой на любую смену щелчок сразу после
+    /// возвращения не проходит.
+    #[test]
+    fn a_swap_out_of_sight_leaves_the_main_button_alone() {
+        let (mut rig, at) = CtaRig::new(true);
+
+        rig.away(0.1);
+        rig.running = false;
+        rig.away(0.1);
+        rig.frame(0.1, Vec::new());
+        rig.click(at, 0.1, 0.05);
+        assert!(rig.running, "вернувшись, «Скачать» не приняла щелчка");
     }
 
     /// Строка недельного прогноза занимает свою высоту, а не весь экран.

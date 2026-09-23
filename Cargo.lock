@@ -2912,7 +2912,7 @@ dependencies = [
 
 [[package]]
 name = "savio"
-version = "0.36.1"
+version = "0.36.2"
 dependencies = [
  "eframe",
  "image",
