@@ -829,18 +829,21 @@ strings! {
     /// буквами.
     UiAuthor = "Эрик Чолахян", "Erik Cholakhyan", "Էրիկ Չոլախյան";
     UiAboutText =
-        "Savio — это кроссплатформенное десктопное приложение для скачивания видео и аудио \
-         с популярных онлайн-платформ. Приложение позволяет быстро загружать контент по \
-         ссылке: по умолчанию — в максимально доступном качестве, а при желании можно \
-         выбрать разрешение видео или битрейт звука самому.",
-        "Savio is a cross-platform desktop application for downloading video and audio from \
-         popular online platforms. It lets you fetch content quickly by link: by default in \
-         the best quality available, and if you like you can pick the video resolution or \
-         the audio bitrate yourself.",
-        "Savio-ն բազմահարթակ սեղանադիր ծրագիր է՝ հայտնի առցանց հարթակներից տեսանյութ և \
-         ձայն ներբեռնելու համար։ Ծրագիրը թույլ է տալիս արագ ներբեռնել բովանդակությունը \
-         հղումով՝ լռելյայն առավելագույն հասանելի որակով, իսկ ցանկության դեպքում կարելի է \
-         ինքնուրույն ընտրել տեսանյութի լուծաչափը կամ ձայնի բիթրեյթը։";
+        "Savio — настольное приложение для Windows, Linux и macOS: шесть инструментов \
+         в одном окне. Оно скачивает видео и звук по ссылке, показывает и стирает то, что \
+         фотографии и музыка рассказывают о вас, следит за нагрузкой на компьютер \
+         и рассказывает, из чего он собран, показывает погоду и передаёт файлы между \
+         телефоном и компьютером по своей сети Wi-Fi.",
+        "Savio is a desktop application for Windows, Linux and macOS: six tools in one \
+         window. It downloads video and audio by link, shows and wipes what your photos and \
+         music tell about you, keeps an eye on the computer's load and tells what it is made \
+         of, shows the weather and moves files between your phone and your computer over \
+         your own Wi-Fi.",
+        "Savio-ն սեղանադիր ծրագիր է Windows-ի, Linux-ի և macOS-ի համար՝ վեց գործիք մեկ \
+         պատուհանում։ Այն ներբեռնում է տեսանյութ և ձայն հղումով, ցույց է տալիս և ջնջում \
+         այն, ինչ լուսանկարներն ու երաժշտությունը պատմում են ձեր մասին, հետևում է \
+         համակարգչի բեռնվածությանը և պատմում, թե ինչից է այն բաղկացած, ցույց է տալիս \
+         եղանակը և ֆայլեր է փոխանցում հեռախոսի և համակարգչի միջև ձեր Wi-Fi ցանցով։";
 
     // Экран загрузки: поле ссылки, предпросмотр, фрагмент, вшивание.
     UiUrlHint = "Вставьте ссылку: https://…", "Paste a link: https://…", "Տեղադրեք հղում՝ https://…";
