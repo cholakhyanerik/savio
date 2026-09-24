@@ -398,7 +398,7 @@ impl Setup {
 /// в разрезе «сейчас» и «состав»), «История» переехала в правую колонку
 /// экрана загрузки, к очереди, а всё, что сверх трёх, живёт в меню «Ещё»
 /// (см. [`MORE_TABS`]).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tab {
     Download,
     Metadata,
@@ -443,7 +443,7 @@ enum NavIcon {
     Phone,
 }
 
-/// Пункт рельса: раздел, его подпись, значок и пояснение в строке заголовка.
+/// Пункт рельса: раздел, его подпись и значок.
 #[derive(Clone, Copy)]
 struct NavItem {
     tab: Tab,
@@ -451,6 +451,12 @@ struct NavItem {
     half: Option<MachineTab>,
     label: Key,
     icon: NavIcon,
+    /// Строка «что это даёт» под названием раздела в приветствии.
+    ///
+    /// Полем пункта, а не своим списком у приветствия: раздел, добавленный
+    /// в рельс без этой строки, не соберётся — а свой список отстал бы от
+    /// рельса молча, и новый раздел просто не попал бы в приветствие.
+    pitch: Key,
 }
 
 impl NavItem {
@@ -476,12 +482,14 @@ const NAV: [(Key, &[NavItem]); 3] = [
                 half: None,
                 label: Key::TabDownload,
                 icon: NavIcon::Download,
+                pitch: Key::WelcomeDownloadPitch,
             },
             NavItem {
                 tab: Tab::Metadata,
                 half: None,
                 label: Key::TabMetadata,
                 icon: NavIcon::Metadata,
+                pitch: Key::WelcomeMetadataPitch,
             },
         ],
     ),
@@ -493,12 +501,14 @@ const NAV: [(Key, &[NavItem]); 3] = [
                 half: Some(MachineTab::Now),
                 label: Key::MachineNow,
                 icon: NavIcon::Gauge,
+                pitch: Key::WelcomeMachineNowPitch,
             },
             NavItem {
                 tab: Tab::Machine,
                 half: Some(MachineTab::Spec),
                 label: Key::MachineSpec,
                 icon: NavIcon::Chip,
+                pitch: Key::WelcomeMachineSpecPitch,
             },
         ],
     ),
@@ -510,12 +520,14 @@ const NAV: [(Key, &[NavItem]); 3] = [
                 half: None,
                 label: Key::TabWeather,
                 icon: NavIcon::Sky,
+                pitch: Key::WelcomeWeatherPitch,
             },
             NavItem {
                 tab: Tab::Phone,
                 half: None,
                 label: Key::TabPhone,
                 icon: NavIcon::Phone,
+                pitch: Key::WelcomePhonePitch,
             },
         ],
     ),
@@ -632,7 +644,7 @@ struct RailState<'a> {
 }
 
 /// Какая половина вкладки «Машина» показана.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum MachineTab {
     /// Что происходит с машиной прямо сейчас — бывшая вкладка «Монитор».
     Now,
@@ -3489,7 +3501,7 @@ impl SavioApp {
             maximize_pending: true,
             saver: settings::Saver::spawn(),
             gpu_errors: Arc::default(),
-            welcome_open: !binaries::welcome_seen(),
+            welcome_open: !binaries::welcome_seen(WELCOME_EDITION),
             rail_labels: (String::new(), String::new()),
             rail_counts: None,
             nav_groups: nav_groups(lang),
@@ -4985,6 +4997,17 @@ impl SavioApp {
         }
     }
 
+    /// Открывает раздел рельса, у «Машины» — и нужную её половину.
+    ///
+    /// Общее у рельса и приветствия: карточка приветствия открывает ровно
+    /// то, что пункт рельса с тем же названием, и разойтись им нельзя.
+    fn open_section(&mut self, tab: Tab, half: Option<MachineTab>, ctx: &egui::Context) {
+        if let Some(half) = half {
+            self.machine_tab = half;
+        }
+        self.switch_tab(tab, ctx);
+    }
+
     /// Рельс разделов слева.
     ///
     /// Собирает состояние, отдаёт его [`rail_body`] и применяет то, что
@@ -5013,10 +5036,7 @@ impl SavioApp {
 
         self.more_open = picks.more_open;
         if let Some((tab, half)) = picks.section {
-            if let Some(half) = half {
-                self.machine_tab = half;
-            }
-            self.switch_tab(tab, ui.ctx());
+            self.open_section(tab, half, ui.ctx());
         }
         if picks.about {
             self.about_open = true;
@@ -5044,21 +5064,27 @@ impl SavioApp {
         }
     }
 
-    /// Приветствие: что это за программа и три шага до файла на диске.
+    /// Приветствие: что это за программа и все её разделы.
     ///
-    /// Закрывается кнопкой «Начать», щелчком мимо окна и клавишей Esc —
-    /// любой из трёх способов считается «показали». Запирать человека
-    /// в окне нельзя, а объяснение, которое нельзя закрыть, из объяснения
-    /// превращается в препятствие.
+    /// Закрывается кнопкой «Начать», щелчком по карточке раздела, щелчком
+    /// мимо окна и клавишей Esc — любой из способов считается «показали».
+    /// Запирать человека в окне нельзя, а объяснение, которое нельзя
+    /// закрыть, из объяснения превращается в препятствие.
     fn welcome_modal(&mut self, ctx: &egui::Context, arrival: ModalArrival) {
         arrival.veil(self.palette, ctx, "welcome");
-        let window = welcome_window(self.palette, ctx, self.lang);
+        let window = welcome_window(self.palette, ctx, self.lang, &self.nav_groups, self.speed);
         arrival.apply(ctx, &window.response);
 
-        if window.inner == Some(true) || window.should_close() {
+        let action = window.inner;
+        if action.is_some() || window.should_close() {
             self.welcome_open = false;
             // Метку ставим здесь, а не при запуске: закрыл — значит, видел.
-            binaries::mark_welcome_seen();
+            binaries::mark_welcome_seen(WELCOME_EDITION);
+        }
+        // Приветствие работает оглавлением: щелчок по разделу его и
+        // открывает, а не отсылает искать тот же раздел в рельсе.
+        if let Some(WelcomeAction::Open(tab, half)) = action {
+            self.open_section(tab, half, ctx);
         }
     }
 
@@ -7104,34 +7130,44 @@ enum AboutAction {
     Close,
 }
 
-/// Окно «О программе»: что за приложение, кто сделал, куда писать.
+/// Какое издание приветствия в этой версии программы.
 ///
-/// Свободной функцией, а не методом, ради теста раскладки
-/// (`the_about_window_fits_the_smallest_window`): `SavioApp` в тесте не
-/// собрать — конструктор читает настройки с диска и спрашивает версии у
-/// внешних программ, — а окну из всего состояния нужно одно: горит ли
-/// «Скопировано».
-/// Окно приветствия.
+/// Метка «показали» хранит номер издания (`binaries::welcome_seen`), и
+/// приветствие с номером больше записанного при запуске показывается ещё
+/// раз — тем, кто закрыл прежнее. Поднимать номер, когда приветствие
+/// рассказывает о Savio заметно другое, а не при правке запятой: повторный
+/// показ стоит человеку лишнего окна на запуске.
 ///
-/// Свободной функцией, как и `about_window`, ради проверки раскладки:
-/// три карточки в ряд — первое, что ломается в узком окне.
+/// Первое издание — три шага загрузки (до 0.37.0), второе — обзор всех
+/// разделов.
+const WELCOME_EDITION: u32 = 2;
+
+/// Что нажали в приветствии.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WelcomeAction {
+    /// «Начать»: закрыть и остаться там, где был.
+    Start,
+    /// Карточка раздела: закрыть и открыть его, у «Машины» — нужную половину.
+    Open(Tab, Option<MachineTab>),
+}
+
+/// Промежуток между карточками разделов в приветствии — и по ширине, и по
+/// высоте.
+const WELCOME_GAP: f32 = 12.0;
+
+/// Окно приветствия: что такое Savio и все его разделы по группам рельса.
 ///
-/// Возвращает `Some(true)`, если нажали «Начать».
+/// Свободной функцией, как и `about_window`, ради проверок кадром без окна:
+/// помещается ли оно в окно 520×420, назван ли в нём каждый пункт рельса
+/// и открывает ли его карточка то, что обещает.
 fn welcome_window(
     pal: theme::Palette,
     ctx: &egui::Context,
     lang: Lang,
-) -> egui::ModalResponse<Option<bool>> {
-    // Ширина от окна, как у «О программе»: фиксированная вылезла бы
-    // за кромку окна минимального размера. Вычитаются и поля рамки (24
-    // с каждой стороны), и её кромка: без последней модалка выходила за
-    // кромку окна ровно на два пикселя — незаметно глазом, но проверка
-    // размера это ловит, и правильно делает.
-    let width = 620.0_f32.min(ctx.content_rect().width() - 52.0);
-    // Ниже этой ширины три карточки в ряд не помещаются, и шаги встают
-    // колонкой. Число — из самой раскладки: карточке шага нужно около
-    // 170 точек, чтобы «Нажмите „Скачать"» не заворачивалось в три строки.
-    const STEPS_IN_ROW: f32 = 170.0 * 3.0 + 12.0 * 2.0;
+    groups: &[String; 3],
+    speed: f32,
+) -> egui::ModalResponse<Option<WelcomeAction>> {
+    let width = welcome_width(ctx.content_rect().width());
 
     egui::Modal::new(egui::Id::new("savio-welcome"))
         .backdrop_color(egui::Color32::TRANSPARENT)
@@ -7144,7 +7180,7 @@ fn welcome_window(
         )
         .show(ctx, |ui| {
             ui.set_width(width);
-            let mut started = None;
+            let mut action = None;
 
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 9.0;
@@ -7167,11 +7203,11 @@ fn welcome_window(
             note(ui, i18n::t(lang, Key::WelcomeNote), pal.text_secondary);
             ui.add_space(16.0);
 
-            // Шаги — в прокрутке с потолком по высоте. В окне 420 точек они
-            // встают колонкой, и без потолка окно вырастало выше экрана:
-            // заголовок уходил за верхнюю кромку, «Начать» — за нижнюю, и
-            // приветствие, которое нельзя ни дочитать, ни закрыть кнопкой,
-            // превращалось из объяснения в препятствие. Числом, а не
+            // Разделы — в прокрутке с потолком по высоте. В окне 420 точек
+            // они в неё не помещаются, и без потолка окно вырастало выше
+            // экрана: заголовок уходил за верхнюю кромку, «Начать» — за
+            // нижнюю, и приветствие, которое нельзя ни дочитать, ни закрыть
+            // кнопкой, превращалось из объяснения в препятствие. Числом, а не
             // остатком: прокрутка внутри растущего контейнера берёт высоту
             // от его прошлого кадра и схлопывается (дефект 27).
             // Потолок прокрутки считается от того, что уже занято, а не
@@ -7182,35 +7218,34 @@ fn welcome_window(
             const BUTTON_BLOCK: f32 = 16.0 + theme::CTA_HEIGHT + 6.0;
             let inner = (ctx.content_rect().height() - 56.0).max(200.0);
             let room = (inner - ui.min_rect().height() - BUTTON_BLOCK).max(80.0);
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, true])
-                .max_height(room)
-                .show(ui, |ui| {
-                    ui.set_width(width);
+            ui.scope(|ui| {
+                // Полоса прокрутки видна и в покое, когда разделы не
+                // помещаются. У плавающей полосы egui в покое её нет вовсе,
+                // а штатное затухание у кромки рисуется цветом фона — над
+                // пустым промежутком между группами оно невидимо. Так и
+                // вышло в окне 645×520: обрез пришёлся ровно между группами,
+                // и «Рядом» с двумя разделами пропала без следа, а окно
+                // выглядело законченным. Полоса плавающая, места не
+                // занимает, и раскладку разделов это не трогает.
+                ui.spacing_mut().scroll.dormant_handle_opacity = 0.6;
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, true])
+                    .max_height(room)
+                    .show(ui, |ui| {
+                        ui.set_width(width);
+                        if let Some((tab, half)) = welcome_sections(ui, pal, lang, groups, speed)
+                        {
+                            action = Some(WelcomeAction::Open(tab, half));
+                        }
+                    });
+            });
 
-            const STEPS: [(Key, Key); 3] = [
-                (Key::WelcomeStepLinkTitle, Key::WelcomeStepLinkNote),
-                (Key::WelcomeStepPickTitle, Key::WelcomeStepPickNote),
-                (Key::WelcomeStepGoTitle, Key::WelcomeStepGoNote),
-            ];
-            if ui.available_width() >= STEPS_IN_ROW {
-                ui.columns(3, |columns| {
-                    for (column, (number, (title, text))) in
-                        columns.iter_mut().zip(STEPS.into_iter().enumerate())
-                    {
-                        welcome_step(column, pal, lang, number + 1, title, text);
-                    }
-                });
-            } else {
-                for (number, (title, text)) in STEPS.into_iter().enumerate() {
-                    if number > 0 {
-                        ui.add_space(10.0);
-                    }
-                    welcome_step(ui, pal, lang, number + 1, title, text);
-                }
-            }
-                });
-
+            // «Начать» — под прокруткой, а не в ней, и это не для вида: оно
+            // же и растит модалку. Примерочный проход берёт высоту окна из
+            // `default_area_size` (400 точек), прокрутка в неё вписывается,
+            // а не переполняет, — и модалка, у которой в прокрутке лежит
+            // всё, так и осталась бы в 400 точек при окне любого размера
+            // (задача 69: так «О программе» прячет свои кнопки).
             ui.add_space(16.0);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 14.0;
@@ -7222,7 +7257,7 @@ fn welcome_window(
                     true,
                     "",
                 ) {
-                    started = Some(true);
+                    action = Some(WelcomeAction::Start);
                 }
                 ui.add(
                     egui::Label::new(
@@ -7234,61 +7269,287 @@ fn welcome_window(
                 );
             });
 
-            started
+            action
         })
 }
 
-/// Одна карточка шага в приветствии: номер в кружке, заголовок, два-три
-/// предложения.
-fn welcome_step(
+/// Наибольшая ширина содержимого приветствия.
+const WELCOME_WIDTH: f32 = 620.0;
+
+/// Ширина содержимого приветствия в окне шириной `window`.
+///
+/// От окна, как у «О программе»: фиксированная вылезла бы за кромку окна
+/// минимального размера. Вычитаются и поля рамки (24 с каждой стороны), и
+/// её кромка: без последней модалка выходила за кромку окна ровно на два
+/// пикселя — незаметно глазом, но проверка размера это ловит, и правильно
+/// делает.
+fn welcome_width(window: f32) -> f32 {
+    WELCOME_WIDTH.min(window - 52.0)
+}
+
+/// Сколько места нужно строке «что это даёт» в карточке раздела.
+///
+/// Снято замером, а не выбрано на глаз: при 160 точках самая длинная из
+/// строк на любом из трёх языков укладывается в четыре строки, при 150
+/// армянская «Сейчас» занимает уже пять (замер 2026-09-24). Уже этого
+/// карточка не бывает ни в одной из раскладок: по нему выбирается, стоять
+/// ли группам колонками (`welcome_sections`), а в строках по две карточка
+/// и в самом узком окне шире. Правка перевода сдвигает число, и держит его
+/// `the_welcome_cards_stay_readable`.
+const PITCH_MIN_WIDTH: f32 = 160.0;
+
+/// Кружок со значком раздела в карточке приветствия.
+const WELCOME_BADGE: f32 = 26.0;
+/// Промежуток между кружком и названием раздела.
+const WELCOME_BADGE_GAP: f32 = 10.0;
+
+/// Шрифт названия раздела в карточке приветствия.
+///
+/// Функцией, а не на месте: по нему же меряет название проверка
+/// `the_welcome_cards_stay_readable`, и своя копия в ней разъехалась бы
+/// с карточкой при первой правке.
+fn welcome_title_font() -> egui::FontId {
+    theme::bold(14.0)
+}
+
+/// Разделы в приветствии: группы рельса и по карточке на каждый пункт.
+///
+/// Состав и порядок берутся у самого рельса (`NAV`), а не своим списком:
+/// раздел, появившийся в рельсе, появляется и здесь. Раскладок две. В
+/// широком окне группа — колонка, и три колонки стоят рядом: так
+/// приветствие ниже и помещается без прокрутки в окно по умолчанию.
+/// Когда карточке в колонке не остаётся [`PITCH_MIN_WIDTH`] под текст,
+/// группа становится строкой: подпись, под ней карточки по две в ряд.
+///
+/// Возвращает раздел, по карточке которого щёлкнули.
+fn welcome_sections(
     ui: &mut egui::Ui,
     pal: theme::Palette,
     lang: Lang,
-    number: usize,
-    title: Key,
-    text: Key,
-) {
-    // Раскладку задаём явно, и это не перестраховка. `ui.columns` отдаёт
-    // колонкам `Layout::top_down_justified`, а `Label` превращает выключку
-    // раскладки в выключку **текста**: `layout_job.justify` становится
-    // истиной, и абзац растягивается пробелами до кромки — «MP4 is video,
-    // MP3 is sound    only» с дырами в полслова. Ни сборка, ни `clippy`,
-    // ни тесты этого не видят; видно только глазами и только там, где
-    // абзац не занял строку целиком.
-    let width = ui.available_width();
-    ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-        ui.set_width(width);
-    theme::inner_frame(pal).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        // Номер в кружке — тот же приём, что у шагов экрана загрузки:
-        // кружок рисуется кистью, а цифра кладётся в его середину.
-        let (circle, _) = ui.allocate_exact_size(egui::vec2(26.0, 26.0), egui::Sense::hover());
-        ui.painter()
-            .circle_filled(circle.center(), 13.0, pal.accent_soft);
-        ui.painter().circle_stroke(
-            circle.center(),
-            13.0,
-            egui::Stroke::new(1.0, pal.accent),
-        );
-        ui.painter().text(
-            circle.center(),
-            egui::Align2::CENTER_CENTER,
-            number,
-            theme::display(13.0),
-            pal.accent_text,
-        );
-        ui.add_space(8.0);
-        ui.label(
-            egui::RichText::new(i18n::t(lang, title))
-                .font(theme::bold(14.0))
-                .color(pal.text_primary),
-        );
-        ui.add_space(4.0);
-        note(ui, i18n::t(lang, text), pal.text_muted);
+    groups: &[String; 3],
+    speed: f32,
+) -> Option<(Tab, Option<MachineTab>)> {
+    // Промежутки здесь все заданы явно: у темы они по 9 точек на всё
+    // подряд, а подписи группы положено стоять ближе к своим карточкам,
+    // чем к чужим.
+    ui.spacing_mut().item_spacing.y = 0.0;
+    let mut picked = None;
+
+    let margin = theme::inner_frame(pal).total_margin().sum().x;
+    let columns =
+        welcome_cell_width(ui.available_width(), NAV.len()) - margin >= PITCH_MIN_WIDTH;
+    if columns {
+        welcome_cells::<{ NAV.len() }>(ui, |ui, g| nav_group_label(ui, pal, &groups[g]));
+        let rows = NAV.iter().map(|(_, items)| items.len()).max().unwrap_or(0);
+        for row in 0..rows {
+            ui.add_space(if row == 0 { 6.0 } else { WELCOME_GAP });
+            let cells = std::array::from_fn::<_, { NAV.len() }, _>(|g| NAV[g].1.get(row));
+            picked = picked.or(welcome_row(ui, pal, lang, cells, speed));
+        }
+    } else {
+        for (g, (group, (_, items))) in groups.iter().zip(NAV).enumerate() {
+            if g > 0 {
+                ui.add_space(18.0);
+            }
+            nav_group_label(ui, pal, group);
+            for (row, chunk) in items.chunks(WELCOME_PER_ROW).enumerate() {
+                ui.add_space(if row == 0 { 6.0 } else { WELCOME_GAP });
+                let cells = std::array::from_fn::<_, WELCOME_PER_ROW, _>(|i| chunk.get(i));
+                picked = picked.or(welcome_row(ui, pal, lang, cells, speed));
+            }
+        }
+    }
+    picked
+}
+
+/// Сколько карточек в ряду, когда группы разделов стоят строками.
+///
+/// Две, и третьей раскладки «по одной» нет: даже в самом узком окне
+/// (520 точек) у карточки из пары под текст остаётся больше
+/// [`PITCH_MIN_WIDTH`] — это проверяет `the_welcome_cards_stay_readable`.
+const WELCOME_PER_ROW: usize = 2;
+
+/// Ряд карточек разделов: равной ширины и равной высоты.
+///
+/// Высота — по самой длинной строке «что это даёт» в ряду: строки разной
+/// длины, и без выравнивания низ ряда шёл бы лесенкой. Поэтому строки
+/// раскладываются заранее, до первой карточки, и рисуются потом ровно
+/// теми же раскладками — мерить одно, а рисовать другое значило бы
+/// разъехаться на пиксель при первой же правке шрифта.
+///
+/// Пустая ячейка (`None`) оставляет своё место пустым: карточки соседних
+/// рядов обязаны стоять друг под другом.
+fn welcome_row<const N: usize>(
+    ui: &mut egui::Ui,
+    pal: theme::Palette,
+    lang: Lang,
+    cells: [Option<&NavItem>; N],
+    speed: f32,
+) -> Option<(Tab, Option<MachineTab>)> {
+    let text = welcome_cell_width(ui.available_width(), N)
+        - theme::inner_frame(pal).total_margin().sum().x;
+    let font = egui::TextStyle::Small.resolve(ui.style());
+    // Строку egui берёт во владение, как у любой подписи, — а раскладка
+    // кэшируется по самой строке, так что в покое кадр считает только хеш.
+    // Приветствие к тому же на экране редко и недолго.
+    let mut pitches = cells.map(|item| {
+        item.map(|item| {
+            ui.painter().layout(
+                i18n::t(lang, item.pitch).to_owned(),
+                font.clone(),
+                pal.text_muted,
+                text,
+            )
+        })
     });
+    let height = pitches
+        .iter()
+        .flatten()
+        .map(|pitch| pitch.size().y)
+        .fold(0.0, f32::max);
+
+    let mut picked = None;
+    welcome_cells::<N>(ui, |ui, i| {
+        if let (Some(item), Some(pitch)) = (cells[i], pitches[i].take())
+            && welcome_card(ui, pal, lang, item, pitch, height, speed)
+        {
+            picked = Some((item.tab, item.half));
+        }
+    });
+    picked
+}
+
+/// Ширина одной из `n` ячеек ряда шириной `width`.
+fn welcome_cell_width(width: f32, n: usize) -> f32 {
+    (width - WELCOME_GAP * n.saturating_sub(1) as f32) / n as f32
+}
+
+/// Кладёт рядом `N` ячеек равной ширины и рисует в каждой своё.
+///
+/// Ширина задаётся ячейке с обеих сторон — по той же причине, что у колонок
+/// `download_tab`: `allocate_ui_with_layout` двигает курсор на то, что занял
+/// потомок, и без нижней границы короткая ячейка съехала бы к соседке.
+///
+/// Раскладка ячейки — `top_down(Min)`, и не `ui.columns`: тот отдаёт
+/// колонкам `top_down_justified`, а `Label` переносит выключку раскладки
+/// в выключку **текста** — абзац растягивается пробелами до кромки, и
+/// посреди фразы зияет дыра в полслова (Правило 4).
+fn welcome_cells<const N: usize>(ui: &mut egui::Ui, mut add: impl FnMut(&mut egui::Ui, usize)) {
+    let cell = welcome_cell_width(ui.available_width(), N);
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = WELCOME_GAP;
+        for i in 0..N {
+            ui.allocate_ui_with_layout(
+                egui::vec2(cell, 0.0),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.set_min_width(cell);
+                    ui.set_max_width(cell);
+                    add(ui, i);
+                },
+            );
+        }
     });
 }
 
+/// Карточка раздела в приветствии: значок, как в рельсе, название и строка
+/// «что это даёт». Щёлкается целиком; возвращает `true`, если щёлкнули.
+///
+/// Вложенной карточкой, а не кнопкой, — как строка места в погоде: у
+/// кнопки egui одна строка текста, а здесь их несколько. Отклик под
+/// курсором — акцентная кромка: без него карточка читалась бы надписью,
+/// а не переходом.
+///
+/// `pitch` — строка, уже разложенная по ширине карточки, а `height` —
+/// высота самой длинной в ряду: до неё карточка добирается пустым местом.
+fn welcome_card(
+    ui: &mut egui::Ui,
+    pal: theme::Palette,
+    lang: Lang,
+    item: &NavItem,
+    pitch: Arc<egui::Galley>,
+    height: f32,
+    speed: f32,
+) -> bool {
+    let name = i18n::t(lang, item.label);
+
+    let frame = theme::inner_frame(pal).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        // Выделяемые подписи съедали бы щелчок по карточке.
+        ui.style_mut().interaction.selectable_labels = false;
+        // Ряд значка с названием — высотой ровно в кружок, и задана она
+        // явно: `ui.horizontal` берёт высоту элемента управления, и
+        // название встало бы по её середине, а не по середине кружка.
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), WELCOME_BADGE),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = WELCOME_BADGE_GAP;
+                let (badge, _) = ui.allocate_exact_size(
+                    egui::vec2(WELCOME_BADGE, WELCOME_BADGE),
+                    egui::Sense::hover(),
+                );
+                // Значок тот же, что у пункта рельса: по нему раздел потом
+                // и находится в свёрнутом рельсе, где подписей нет.
+                let painter = ui.painter();
+                let radius = WELCOME_BADGE / 2.0;
+                painter.circle_filled(badge.center(), radius, pal.accent_soft);
+                painter.circle_stroke(badge.center(), radius, egui::Stroke::new(1.0, pal.accent));
+                nav_icon(
+                    painter,
+                    egui::Rect::from_center_size(badge.center(), egui::vec2(14.0, 14.0)),
+                    item.icon,
+                    pal.accent_text,
+                );
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(name)
+                            .font(welcome_title_font())
+                            .color(pal.text_primary),
+                    )
+                    .truncate(),
+                );
+            },
+        );
+        ui.add_space(6.0);
+        let short = height - pitch.size().y;
+        ui.add(egui::Label::new(pitch));
+        if short > 0.0 {
+            ui.add_space(short);
+        }
+    });
+
+    let rect = frame.response.rect;
+    let response = ui
+        .interact(rect, frame.response.id.with("open"), egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    // Карточка нарисована рамкой с подписями, и кнопкой для диктора она
+    // становится только так. По этому же имени её находит и проверка.
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, name));
+    let touch =
+        ui.ctx()
+            .animate_bool_with_time(response.id, response.hovered(), motion::TOUCH * speed);
+    if touch > 0.0 {
+        ui.painter().rect_stroke(
+            rect,
+            egui::CornerRadius::same(theme::RADIUS_INNER),
+            egui::Stroke::new(
+                1.0,
+                motion::mix(egui::Color32::TRANSPARENT, pal.accent, touch),
+            ),
+            egui::StrokeKind::Inside,
+        );
+    }
+    response.clicked()
+}
+
+/// Окно «О программе»: что за приложение, кто сделал, куда писать.
+///
+/// Свободной функцией, а не методом, ради теста раскладки
+/// (`the_about_window_fits_the_smallest_window`): `SavioApp` в тесте не
+/// собрать — конструктор читает настройки с диска и спрашивает версии у
+/// внешних программ, — а окну из всего состояния нужно одно: горит ли
+/// «Скопировано».
 fn about_window(pal: theme::Palette,
     ctx: &egui::Context,
     lang: Lang,
@@ -10676,15 +10937,7 @@ fn rail_body(ui: &mut egui::Ui, state: &RailState<'_>, layout: RailLayout) -> Ra
         for (group, (_, items)) in state.groups.iter().zip(NAV) {
             if wide {
                 ui.add_space(8.0);
-                ui.label(
-                    egui::RichText::new(group)
-                        .font(egui::FontId::new(11.5, egui::FontFamily::Proportional))
-                        // Разрядка — из макета. У `RichText` она есть, а вот
-                        // прописные приходится готовить заранее: `to_uppercase`
-                        // в кадре — это аллокация на каждую группу, каждый кадр.
-                        .extra_letter_spacing(0.9)
-                        .color(pal.text_faint),
-                );
+                nav_group_label(ui, pal, group);
                 ui.add_space(4.0);
             } else {
                 ui.add_space(10.0);
@@ -10700,6 +10953,26 @@ fn rail_body(ui: &mut egui::Ui, state: &RailState<'_>, layout: RailLayout) -> Ra
     });
 
     picks
+}
+
+/// Название группы разделов: прописными, мелко и с разрядкой.
+///
+/// Общее у рельса и приветствия: приветствие повторяет группы рельса, и
+/// выглядеть они обязаны одинаково — разъехавшись, одна и та же подпись
+/// читалась бы двумя разными вещами.
+///
+/// Прописными строку готовят заранее ([`nav_groups`]): `to_uppercase`
+/// в кадре — это аллокация на каждую группу, каждый кадр. Цвет `text_faint`
+/// разрешён на фоне окна, рельсе, карточке и модалке, но не во вложенном
+/// блоке — туда эту подпись не класть.
+fn nav_group_label(ui: &mut egui::Ui, pal: theme::Palette, group: &str) {
+    ui.label(
+        egui::RichText::new(group)
+            .font(egui::FontId::new(11.5, egui::FontFamily::Proportional))
+            // Разрядка — из макета.
+            .extra_letter_spacing(0.9)
+            .color(pal.text_faint),
+    );
 }
 
 /// Один пункт рельса.
@@ -15178,13 +15451,16 @@ mod tests {
     /// Приветствие помещается в окно минимальной ширины на всех языках.
     ///
     /// Та же проверка, что у «О программе», и та же причина: модалка растёт
-    /// по содержимому, а три карточки шагов в узком окне встают колонкой —
-    /// без потолка по высоте заголовок уходит за верхнюю кромку, а «Начать»
-    /// за нижнюю. Приветствие, которое нельзя ни дочитать, ни закрыть
-    /// кнопкой, — худшее из первых впечатлений, и увидеть это можно только
-    /// глазами: окно рисуется больше экрана без единой жалобы.
+    /// по содержимому, а шесть карточек разделов в узком окне встают тремя
+    /// группами одна под другой — без потолка по высоте заголовок уходит за
+    /// верхнюю кромку, а «Начать» за нижнюю. Приветствие, которое нельзя ни
+    /// дочитать, ни закрыть кнопкой, — худшее из первых впечатлений, и
+    /// увидеть это можно только глазами: окно рисуется больше экрана без
+    /// единой жалобы.
     ///
-    /// Проверено красным: без прокрутки проверка падает на всех трёх языках.
+    /// Проверено красным дважды: на трёх шагах загрузки и заново на шести
+    /// разделах — без потолка прокрутки модалка по-русски вырастает до 601
+    /// точки при окне в 420.
     #[test]
     fn the_welcome_window_fits_the_smallest_window() {
         let pal = theme::Palette::dark();
@@ -15196,6 +15472,7 @@ mod tests {
             let ctx = egui::Context::default();
             theme::install_fonts(&ctx);
             theme::apply(&ctx, pal);
+            let groups = nav_groups(lang);
             let mut rect = egui::Rect::NOTHING;
 
             for _ in 0..3 {
@@ -15204,7 +15481,7 @@ mod tests {
                     ..Default::default()
                 };
                 let mut output = ctx.run_ui(input, |ui| {
-                    rect = welcome_window(pal, ui.ctx(), lang).response.rect;
+                    rect = welcome_window(pal, ui.ctx(), lang, &groups, 1.0).response.rect;
                 });
                 output.textures_delta.clear();
             }
@@ -15215,6 +15492,206 @@ mod tests {
                 "{lang:?}: приветствие не влезает в 520×420: {rect:?}"
             );
         }
+    }
+
+    /// Кадры приветствия в окне заданного размера: что в нём нажали, где
+    /// легла модалка и кнопки последнего кадра по дереву доступности.
+    ///
+    /// Кадров обычно нужно несколько: первый проход модалки примерочный, и до
+    /// своего размера она дорастает не сразу.
+    fn welcome_frames(
+        ctx: &egui::Context,
+        lang: Lang,
+        window: egui::Vec2,
+        frames: Vec<Vec<egui::Event>>,
+    ) -> (Option<WelcomeAction>, egui::Rect, Vec<(String, egui::Rect)>) {
+        let pal = theme::Palette::dark();
+        let groups = nav_groups(lang);
+        let mut action = None;
+        let mut rect = egui::Rect::NOTHING;
+        let mut buttons = Vec::new();
+        for events in frames {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, window)),
+                events,
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                let window = welcome_window(pal, ui.ctx(), lang, &groups, 1.0);
+                rect = window.response.rect;
+                action = action.or(window.inner);
+            });
+            output.textures_delta.clear();
+            buttons = named_buttons(&mut output);
+        }
+        (action, rect, buttons)
+    }
+
+    /// Место кнопки с этим именем; нет такой — проверка падает с `what`.
+    fn button_rect(buttons: &[(String, egui::Rect)], name: &str, what: &str) -> egui::Rect {
+        buttons
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, rect)| *rect)
+            .unwrap_or_else(|| panic!("{what}: нет кнопки «{name}»"))
+    }
+
+    /// Каждый пункт рельса назван в приветствии и открывается его карточкой.
+    ///
+    /// Приветствие строится по `NAV`, а не своим списком, и проверка держит
+    /// ровно это: раздел, добавленный в рельс, обязан появиться и здесь —
+    /// кнопкой, которая открывает именно его, а у «Машины» — именно ту
+    /// половину. Карточка ищется по имени в дереве доступности, как её
+    /// найдёт экранный диктор, и на всех трёх языках: имя — это перевод.
+    ///
+    /// Раскладки обе, и какая где — проверяется тут же: у колонок и у строк
+    /// свой обход `NAV`, потерять пункт может любой, а после правки порога
+    /// два окна молча проверяли бы одну и ту же раскладку. Узкое окно
+    /// высокое, чтобы ни одна карточка не ушла под прокрутку: щелчок по
+    /// спрятанной пришёлся бы не в неё.
+    ///
+    /// Проверено красным трижды: с одним рядом карточек в колонках пропадают
+    /// «Метаданные», со строками по одной карточке из пары — тоже, а без
+    /// половины в ответе карточка «Сейчас» открывает «Машину» вообще, а не
+    /// свою половину.
+    #[test]
+    fn every_rail_item_is_named_and_opened_by_the_welcome() {
+        // Окно и пункт, который в этой раскладке стоит рядом с «Загрузкой».
+        let cases = [
+            (egui::vec2(1280.0, 800.0), Key::MachineNow),
+            (egui::vec2(600.0, 1000.0), Key::TabMetadata),
+        ];
+        for (window, beside) in cases {
+            for lang in Lang::ALL {
+                let what = format!("{lang:?}, окно {window:?}");
+                let ctx = rail_test_ctx();
+                let (_, _, buttons) = welcome_frames(&ctx, lang, window, vec![Vec::new(); 6]);
+
+                let first = button_rect(&buttons, i18n::t(lang, Key::TabDownload), &what);
+                let next = button_rect(&buttons, i18n::t(lang, beside), &what);
+                assert!(
+                    (first.top() - next.top()).abs() < 0.5 && next.left() > first.right(),
+                    "{what}: рядом с «Загрузкой» не «{}» — раскладка не та: {first:?} и {next:?}",
+                    i18n::t(lang, beside)
+                );
+
+                for item in NAV.iter().flat_map(|(_, items)| items.iter()) {
+                    let name = i18n::t(lang, item.label);
+                    let card = button_rect(&buttons, name, &what);
+                    let (action, _, _) =
+                        welcome_frames(&ctx, lang, window, click_at(card.center()).to_vec());
+                    assert_eq!(
+                        action,
+                        Some(WelcomeAction::Open(item.tab, item.half)),
+                        "{what}: карточка «{name}» открывает не свой раздел"
+                    );
+                }
+            }
+        }
+    }
+
+    /// В окне по умолчанию приветствие видно целиком, без прокрутки.
+    ///
+    /// 720×560 — размер, к которому окно возвращается из развёрнутого
+    /// (`with_inner_size` в main.rs). Модалка, которую приходится
+    /// прокручивать в окне обычного размера, перестаёт быть приветствием:
+    /// нижний ряд карточек уходит под кромку, и о двух-трёх разделах
+    /// человек не узнает, если не догадается крутить. Ради этого группы
+    /// в широком окне и стоят колонками.
+    ///
+    /// Прокрутку видно по зазору между последней карточкой и «Начать»: пока
+    /// всё помещается, он тот же, что в заведомо высоком окне, а стоит
+    /// содержимому уйти под кромку прокрутки — «Начать» поднимается над
+    /// карточками, и зазор сжимается. Высота самой модалки тут ничего не
+    /// скажет: с потолком прокрутки она помещается в окно всегда.
+    ///
+    /// Проверено красным: с `PITCH_MIN_WIDTH` 200 группы в этом окне встают
+    /// строками, и по-русски 68 точек разделов уходят под прокрутку.
+    #[test]
+    fn the_welcome_needs_no_scrolling_in_the_default_window() {
+        let window = egui::vec2(720.0, 560.0);
+        let tall = egui::vec2(window.x, 2000.0);
+        for lang in Lang::ALL {
+            let gap = |window: egui::Vec2| {
+                let what = format!("{lang:?}, окно {window:?}");
+                let ctx = rail_test_ctx();
+                let (_, rect, buttons) = welcome_frames(&ctx, lang, window, vec![Vec::new(); 8]);
+                assert!(
+                    egui::Rect::from_min_size(egui::Pos2::ZERO, window).contains_rect(rect),
+                    "{what}: приветствие не влезает в окно: {rect:?}"
+                );
+                let start = button_rect(&buttons, i18n::t(lang, Key::WelcomeStart), &what);
+                let bottom = NAV
+                    .iter()
+                    .flat_map(|(_, items)| items.iter())
+                    .map(|item| button_rect(&buttons, i18n::t(lang, item.label), &what).bottom())
+                    .fold(f32::MIN, f32::max);
+                start.top() - bottom
+            };
+            let (here, free) = (gap(window), gap(tall));
+            assert!(
+                here >= free - 0.5,
+                "{lang:?}: в окне {window:?} разделы уходят под прокрутку на {}",
+                free - here
+            );
+        }
+    }
+
+    /// Карточки разделов в приветствии читаются в окне любого размера:
+    /// название — в одну строку рядом со значком, строка «что это даёт» —
+    /// не длиннее четырёх строк, на всех трёх языках.
+    ///
+    /// Уже [`PITCH_MIN_WIDTH`] текст карточки не бывает ни в одной
+    /// раскладке, поэтому и мерить достаточно на нём: колонки выбираются
+    /// по нему же, а что в строках по две карточка шире и в самом узком
+    /// окне, проверяется здесь арифметикой из тех же чисел, что у раскладки.
+    ///
+    /// Меряется разложенный текст, а не карточка: карточка занимает свою
+    /// ширину всегда, и на сломанной раскладке тоже, — проверяла бы сама себя.
+    ///
+    /// Проверено красным: с `PITCH_MIN_WIDTH` 150 армянская строка «Сейчас»
+    /// занимает пять строк.
+    #[test]
+    fn the_welcome_cards_stay_readable() {
+        const MAX_ROWS: usize = 4;
+        let pal = theme::Palette::dark();
+        let ctx = rail_test_ctx();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let font = egui::TextStyle::Small.resolve(ui.style());
+            for lang in Lang::ALL {
+                for item in NAV.iter().flat_map(|(_, items)| items.iter()) {
+                    let pitch = i18n::t(lang, item.pitch);
+                    let rows = ui
+                        .painter()
+                        .layout(pitch.to_owned(), font.clone(), pal.text_muted, PITCH_MIN_WIDTH)
+                        .rows
+                        .len();
+                    assert!(
+                        rows <= MAX_ROWS,
+                        "{lang:?}: «{pitch}» занимает {rows} строк при {PITCH_MIN_WIDTH}"
+                    );
+
+                    let name = i18n::t(lang, item.label);
+                    let width = ui
+                        .painter()
+                        .layout_no_wrap(name.to_owned(), welcome_title_font(), pal.text_primary)
+                        .size()
+                        .x;
+                    assert!(
+                        WELCOME_BADGE + WELCOME_BADGE_GAP + width <= PITCH_MIN_WIDTH,
+                        "{lang:?}: «{name}» не помещается рядом со значком: {width}"
+                    );
+                }
+            }
+        });
+        output.textures_delta.clear();
+
+        let margin = theme::inner_frame(pal).total_margin().sum().x;
+        let narrowest = welcome_cell_width(welcome_width(520.0), WELCOME_PER_ROW) - margin;
+        assert!(
+            narrowest >= PITCH_MIN_WIDTH,
+            "в окне 520 точек карточке из пары остаётся под текст {narrowest}"
+        );
     }
 
     /// Разворот рельса не отнимает у содержимого вторую колонку.
@@ -15466,12 +15943,30 @@ mod tests {
     /// же правке. Заодно проверка держит и сами имена: виджет, который
     /// диктору не назван, не найдётся и здесь.
     fn named_widgets(output: &mut egui::FullOutput) -> Vec<(String, egui::Rect)> {
+        named_nodes(output, |_| true)
+    }
+
+    /// Только кнопки кадра — имя и место, как у [`named_widgets`].
+    ///
+    /// Нужны там, где у кнопки то же имя, что у подписи рядом: карточка
+    /// раздела в приветствии называется так же, как название внутри неё, и
+    /// поиск по одному имени нашёл бы подпись, а кнопку счёл бы найденной.
+    fn named_buttons(output: &mut egui::FullOutput) -> Vec<(String, egui::Rect)> {
+        named_nodes(output, |role| role == egui::accesskit::Role::Button)
+    }
+
+    /// Узлы дерева доступности с именем и местом, отобранные по роли.
+    fn named_nodes(
+        output: &mut egui::FullOutput,
+        keep: impl Fn(egui::accesskit::Role) -> bool,
+    ) -> Vec<(String, egui::Rect)> {
         let Some(update) = output.platform_output.accesskit_update.take() else {
             return Vec::new();
         };
         update
             .nodes
             .into_iter()
+            .filter(|(_, node)| keep(node.role()))
             .filter_map(|(_, node)| {
                 // У подписи текст лежит в `value`, у кнопки — в `label`.
                 let name = node.label().or_else(|| node.value())?.to_owned();
