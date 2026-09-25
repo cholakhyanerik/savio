@@ -3136,9 +3136,10 @@ pub struct SavioApp {
     /// Указателя два, и работают они в разное время. Жёлтая оговорка под
     /// списком видна только при раскрытых «Тонких настройках», а при запуске
     /// `advanced` = `false`, то есть группа свёрнута. Поэтому весь груз при
-    /// запуске несёт `advanced_summary` — слова «вход на сайт» в заголовке
-    /// группы. Это же и слабое место: заглушка заголовка перечисляет ровно
-    /// те же слова (задача 51 реестра).
+    /// запуске несёт `advanced_summary` — «вход на сайт» в заголовке группы,
+    /// и несёт его видом, а не словами: жёлтой точкой и цветом. Словами
+    /// не вышло бы — заглушка нетронутой группы перечисляет те же слова
+    /// (задача 51 реестра, подробности у [`advanced_summary`]).
     cookies: CookieSource,
     /// Выбранный файл cookies. Осмыслен только при `CookieSource::File`,
     /// но переживает переключение списка: вернувшись к «Из файла…», человек
@@ -3213,13 +3214,14 @@ pub struct SavioApp {
     /// Оговорка под списком языков: субтитров, которые просят, у ролика нет.
     /// Пустая строка — всё в порядке или сказать пока нечего.
     subs_note: String,
-    /// Что стоит в свёрнутых тонких настройках — одной строкой в их заголовке.
+    /// Что стоит в свёрнутых тонких настройках — одной строкой в их заголовке,
+    /// с меткой, если там включено хоть что-то.
     ///
     /// Готовой строкой, а не сборкой в кадре: `ui()` зовут 60 раз в секунду,
     /// а меняется она от щелчка. И она обязательна: свёрнутая группа без
     /// сводки прячет включённую обрезку, а человек потом ищет, почему ролик
     /// скачался куском.
-    advanced_summary: String,
+    advanced_summary: GroupSummary,
     /// Версии инструментов одной строкой для нижнего блока рельса.
     ///
     /// Одна, а не две: в рельсе она обрезается по ширине, и вторая строка
@@ -3455,7 +3457,7 @@ impl SavioApp {
             // пока их не спросили, — «неизвестно» там было бы враньём
             // на те доли секунды, что идёт опрос.
             tools_line: String::new(),
-            advanced_summary: String::new(),
+            advanced_summary: GroupSummary::default(),
             url_invalid: false,
             log_copied_at: None,
             about_open: false,
@@ -4227,15 +4229,26 @@ impl SavioApp {
     /// перестанут замечать настоящую строку.
     ///
     /// Зовётся из обработчиков — правки полей фрагмента, выбора браузера,
-    /// выбора языка, — а не из кадра: `ui()` идёт 60 раз в секунду.
+    /// выбора языка, галочки субтитров и формата, — а не из кадра: `ui()`
+    /// идёт 60 раз в секунду.
     fn rebuild_advanced_summary(&mut self) {
         self.advanced_summary = advanced_summary(
             self.section_error.is_some(),
             self.section.any(),
             self.cookies.any(),
-            &self.sub_lang,
+            self.subs_requested().then_some(&self.sub_lang),
             self.lang,
         );
+    }
+
+    /// Просят ли субтитры: галочка стоит, и положить их есть куда.
+    ///
+    /// Одним методом на два места, которые обязаны отвечать одинаково: поле
+    /// языка внутри тонких настроек и пункт «субтитры» в их заголовке.
+    /// Разъедься условия — и свёрнутая группа называла бы то, чего, раскрыв
+    /// её, не найти.
+    fn subs_requested(&self) -> bool {
+        self.format == Format::Mp4 && self.options.embed_subs
     }
 
     /// Короткая подпись состояния для плашки. Строки статические —
@@ -4599,6 +4612,22 @@ impl SavioApp {
     }
 }
 
+/// Сводка свёрнутой группы: что написать в её заголовке и чем это отметить.
+///
+/// Текст и метка — одно значение, а не два поля `SavioApp` рядом: считаются
+/// они из одного и того же, и текст, пересобранный без метки, выглядел бы
+/// исправным. Метка — роль, а не `Color32`, по той же причине, что у
+/// [`Tone`]: сводка лежит в поле до следующей правки и обязана пережить
+/// смену темы.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+struct GroupSummary {
+    text: String,
+    /// `None` — всё по умолчанию, и текст перечисляет, что лежит внутри.
+    /// Иначе заголовок ставит перед текстом точку этого тона и красит им
+    /// сам текст.
+    mark: Option<Tone>,
+}
+
 /// Сводка тонких настроек: перечисление того, что в них включено.
 ///
 /// Свободная и чистая функция, а не кусок метода: сводка — единственное, что
@@ -4609,13 +4638,28 @@ impl SavioApp {
 /// вход не используется» смысла нет: это состояние у почти всех и почти
 /// всегда, и в заголовке оно превратилось бы в шум, за которым перестанут
 /// замечать настоящую строку.
+///
+/// **Включённое отличается от заглушки видом, а не словами** (задача 51
+/// реестра). Заглушка говорит, что лежит внутри, и «вход на сайт» стоит
+/// в ней теми же словами, что у включённого входа, — иначе его и не назвать.
+/// Пока вид был один, заголовок со входом, запомненным неделю назад, взглядом
+/// не отличался от заголовка нетронутой группы, а при запуске он —
+/// единственный указатель на вход: жёлтая оговорка под списком лежит внутри,
+/// группа свёрнута. Поэтому у включённого есть метка — точка и жёлтый цвет
+/// той самой оговорки: свёрнутая группа показывает, что оговорка внутри есть.
+/// Зелёный, как у включённых галочек «Вшить», сказал бы «всё хорошо», а вход
+/// с cookies на YouTube — ровно тот случай, когда не всё.
+///
+/// `subs` — язык субтитров, если субтитры просят, и `None`, если нет: без
+/// `--embed-subs` язык в yt-dlp не уходит вовсе, и «субтитры: de» с горящей
+/// точкой объявляли бы включённым то, что на загрузку не влияет.
 fn advanced_summary(
     section_broken: bool,
     section_set: bool,
     cookies: bool,
-    subs: &SubLang,
+    subs: Option<&SubLang>,
     lang: Lang,
-) -> String {
+) -> GroupSummary {
     let section = match (section_broken, section_set) {
         (true, _) => Some(i18n::t(lang, Key::UiSummarySectionBad).to_owned()),
         (false, true) => Some(i18n::t(lang, Key::UiSummarySection).to_owned()),
@@ -4625,15 +4669,24 @@ fn advanced_summary(
     // Код языка, а не подпись: подпись бывает длинной («Русский
     // (автоматические)»), а места в заголовке ровно одна строка.
     let subs = match subs {
-        SubLang::Code(code) => Some(i18n::fill(i18n::t(lang, Key::UiSummarySubs), &[code])),
-        SubLang::Original => None,
+        Some(SubLang::Code(code)) => Some(i18n::fill(i18n::t(lang, Key::UiSummarySubs), &[code])),
+        Some(SubLang::Original) | None => None,
     };
 
     let parts: Vec<String> = [section, cookies, subs].into_iter().flatten().collect();
     if parts.is_empty() {
-        i18n::t(lang, Key::UiSummaryPlaceholder).to_owned()
-    } else {
-        parts.join(" · ")
+        return GroupSummary {
+            text: i18n::t(lang, Key::UiSummaryPlaceholder).to_owned(),
+            mark: None,
+        };
+    }
+    // Неверный фрагмент — уже не оговорка, а причина: пока он такой,
+    // «Скачать» выключена. Отсюда тон ошибки, как у объяснения под полем,
+    // и он перекрывает остальное: сначала чинят то, что не даёт начать.
+    let tone = if section_broken { Tone::Bad } else { Tone::Warn };
+    GroupSummary {
+        text: parts.join(" · "),
+        mark: Some(tone),
     }
 }
 
@@ -5577,9 +5630,11 @@ impl SavioApp {
             // Подписи сегментов качества и оговорки под ними зависят от
             // формата — пересобрать их надо здесь, а не в кадре отрисовки.
             // Субтитры в том же списке: в MP3 их класть некуда, и оговорка
-            // про них при переключении на звук обязана исчезнуть.
+            // про них при переключении на звук обязана исчезнуть — а с ней
+            // и их язык из заголовка тонких настроек.
             self.rebuild_quality_note();
             self.rebuild_subtitles();
+            self.rebuild_advanced_summary();
             self.remember();
         }
     }
@@ -5875,7 +5930,7 @@ impl SavioApp {
 
                             // Список языков нужен, только если субтитры просят:
                             // в остальное время он не значит ничего.
-                            if self.format == Format::Mp4 && self.options.embed_subs {
+                            if self.subs_requested() {
                                 ui.add_space(14.0);
                                 field_label(ui, pal, i18n::t(lang, Key::UiSubtitleLanguage));
                                 if self.sub_lang_selector(ui) {
@@ -12313,14 +12368,21 @@ fn collapsing_body(
 /// Треугольник рисуется кистью по той же причине, что и галочка в [`chip`]:
 /// стрелок и треугольников в наших шрифтах нет. Подписи внутри намеренно
 /// невыделяемые — иначе выделение текста съедало бы щелчок по строке.
+///
+/// Сводка с меткой (см. [`GroupSummary`]) горит точкой и цветом метки. Это
+/// тот же знак «точка плюс подпись», что у [`status_pill`], и тех же
+/// размеров: два размера одного знака читались бы как два разных знака.
 fn disclosure_row(
     ui: &mut egui::Ui,
     pal: theme::Palette,
     open: bool,
     title: &str,
-    summary: &str,
+    summary: &GroupSummary,
     speed: f32,
 ) -> bool {
+    const DOT: f32 = 7.0;
+    const GAP: f32 = 7.0;
+
     let inner = ui.horizontal(|ui| {
         ui.style_mut().interaction.selectable_labels = false;
         ui.spacing_mut().item_spacing.x = 10.0;
@@ -12357,13 +12419,52 @@ fn disclosure_row(
         // второй коробкой).
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add_space(8.0);
-            ui.add(
-                egui::Label::new(
-                    egui::RichText::new(summary)
-                        .small()
-                        .color(pal.text_muted),
-                )
-                .truncate(),
+            ui.spacing_mut().item_spacing.x = GAP;
+
+            // Цвет переливается, а точка проявляется, — и спрашивается это
+            // на каждом кадре, а не только у горящей сводки: иначе первый
+            // вопрос пришёлся бы на кадр, когда вход включили, и точка
+            // возникла бы сразу целиком (Правило 6).
+            let id = ui.id().with(title);
+            let ink = motion::tint(
+                ui.ctx(),
+                id.with("ink"),
+                summary.mark.map_or(pal.text_muted, |tone| tone.color(pal)),
+                motion::MOVE * speed,
+            );
+            let lit = ui.ctx().animate_bool_with_time(
+                id.with("lit"),
+                summary.mark.is_some(),
+                motion::MOVE * speed,
+            );
+
+            let label = egui::Label::new(
+                egui::RichText::new(summary.text.as_str())
+                    .small()
+                    .color(ink),
+            )
+            .truncate();
+            if lit <= 0.0 {
+                ui.add(label);
+                return;
+            }
+
+            // Точка стоит левее подписи, а кладётся после неё: справа налево
+            // первым идёт то, что правее. Обрезаемая метка забрала бы весь
+            // остаток строки, и точка легла бы поверх названия группы, —
+            // поэтому её место вычитается заранее. Порядком, как у
+            // `process_row`, тут не спастись: точке положено стоять слева.
+            let room = (ui.available_width() - DOT - GAP).max(0.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(room, ui.available_height()),
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| ui.add(label),
+            );
+            let (spot, _) = ui.allocate_exact_size(egui::vec2(DOT, DOT), egui::Sense::hover());
+            ui.painter().circle_filled(
+                spot.center(),
+                DOT / 2.0,
+                motion::mix(egui::Color32::TRANSPARENT, ink, lit),
             );
         });
     });
@@ -14302,35 +14403,28 @@ mod tests {
         assert_eq!(gpu_error_line(TOO_LARGE, Lang::Ru), gpu_error_line(viewport, Lang::Ru));
     }
 
-    /// Кадр без ошибок не должен ничего забирать: `ui()` зовут 60 раз
-    /// в секунду, и пустой разбор обязан оставаться пустым.
     #[test]
     fn a_folded_group_admits_what_it_hides() {
         // Язык назван явно, а не взят по умолчанию: проверка сравнивает
         // с русским текстом, и молча сменившееся умолчание превратило бы
         // её в проверку перевода вместо проверки сводки.
         let ru = Lang::Ru;
+        let text = |summary: GroupSummary| summary.text;
         // Заданный фрагмент обязан быть виден в заголовке: свёрнутая группа —
         // единственное место, где о нём вообще можно узнать, а скачанный
         // кусок вместо ролика человек заметит уже в плеере.
+        assert_eq!(text(advanced_summary(false, true, false, None, ru)), "фрагмент");
         assert_eq!(
-            advanced_summary(false, true, false, &SubLang::Original, ru),
-            "фрагмент"
-        );
-        assert_eq!(
-            advanced_summary(true, false, false, &SubLang::Original, ru),
+            text(advanced_summary(true, false, false, None, ru)),
             "фрагмент задан неверно"
         );
+        assert_eq!(text(advanced_summary(false, false, true, None, ru)), "вход на сайт");
         assert_eq!(
-            advanced_summary(false, false, true, &SubLang::Original, ru),
-            "вход на сайт"
-        );
-        assert_eq!(
-            advanced_summary(false, false, false, &SubLang::Code("ru".to_owned()), ru),
+            text(advanced_summary(false, false, false, Some(&SubLang::Code("ru".to_owned())), ru)),
             "субтитры: ru"
         );
         assert_eq!(
-            advanced_summary(false, true, true, &SubLang::Code("de".to_owned()), ru),
+            text(advanced_summary(false, true, true, Some(&SubLang::Code("de".to_owned())), ru)),
             "фрагмент · вход на сайт · субтитры: de"
         );
     }
@@ -14344,9 +14438,8 @@ mod tests {
     fn the_folded_group_speaks_in_every_language() {
         for lang in Lang::ALL {
             for state in [(false, false, false), (false, true, true), (true, false, false)] {
-                let summary =
-                    advanced_summary(state.0, state.1, state.2, &SubLang::Original, lang);
-                assert!(!summary.trim().is_empty(), "{lang:?} {state:?}: пусто");
+                let summary = advanced_summary(state.0, state.1, state.2, None, lang);
+                assert!(!summary.text.trim().is_empty(), "{lang:?} {state:?}: пусто");
             }
         }
     }
@@ -14356,11 +14449,77 @@ mod tests {
         // Ничего не включено — перечисляем содержимое, а не «ничего не
         // задано»: заголовок обязан объяснять, зачем группу вообще открывать.
         assert_eq!(
-            advanced_summary(false, false, false, &SubLang::Original, Lang::Ru),
-            "фрагмент, вход на сайт, язык субтитров"
+            advanced_summary(false, false, false, None, Lang::Ru),
+            GroupSummary {
+                text: "фрагмент, вход на сайт, язык субтитров".to_owned(),
+                mark: None,
+            }
         );
     }
 
+    /// Включённый вход отличается от заглушки меткой, а не только словами
+    /// (задача 51).
+    ///
+    /// Заглушка нетронутой группы перечисляет, что лежит внутри, и «вход на
+    /// сайт» стоит в ней теми же словами, что у включённого входа. Пока вид
+    /// был один, заголовок со входом, запомненным с прошлого запуска, взглядом
+    /// не отличался от заголовка нетронутой группы, а при запуске он —
+    /// единственный указатель на вход. Поэтому проверяется не текст, а метка,
+    /// и на каждом языке: без метки у заглушки, с меткой у всего включённого.
+    /// Что метку заголовок вправду рисует — отдельная проверка,
+    /// `the_folded_header_lights_up_only_when_something_is_on`.
+    ///
+    /// Проверено красным: с `mark: None` у включённого проверка падает на
+    /// первом же языке.
+    #[test]
+    fn a_login_left_on_does_not_look_like_the_placeholder() {
+        let de = SubLang::Code("de".to_owned());
+        for lang in Lang::ALL {
+            assert_eq!(
+                advanced_summary(false, false, false, None, lang).mark,
+                None,
+                "{lang:?}: заглушка выглядит включённой"
+            );
+            for (what, summary) in [
+                ("вход", advanced_summary(false, false, true, None, lang)),
+                ("фрагмент", advanced_summary(false, true, false, None, lang)),
+                ("субтитры", advanced_summary(false, false, false, Some(&de), lang)),
+            ] {
+                assert_eq!(
+                    summary.mark,
+                    Some(Tone::Warn),
+                    "{lang:?}: {what} выглядит как заглушка"
+                );
+            }
+            // Неверный фрагмент держит «Скачать» выключенной — это уже не
+            // оговорка, и его тон перекрывает соседей.
+            assert_eq!(
+                advanced_summary(true, false, true, Some(&de), lang).mark,
+                Some(Tone::Bad),
+                "{lang:?}: неверный фрагмент не выглядит ошибкой"
+            );
+        }
+    }
+
+    /// Язык субтитров, о которых не просили, в заголовок не попадает.
+    ///
+    /// Без `--embed-subs` язык в yt-dlp не уходит, а поле выбора внутри
+    /// группы спрятано, — и «субтитры: de» называло бы то, чего, раскрыв
+    /// группу, не найти. С горящей точкой это ещё и ложная тревога, а к
+    /// ложной тревоге привыкают и перестают замечать настоящую.
+    #[test]
+    fn the_folded_group_keeps_quiet_about_subtitles_nobody_asked_for() {
+        let unasked = advanced_summary(false, false, false, None, Lang::Ru);
+        assert_eq!(unasked.mark, None);
+        assert_eq!(
+            unasked,
+            advanced_summary(false, false, false, Some(&SubLang::Original), Lang::Ru),
+            "«язык ролика» — умолчание, и называть его в заголовке незачем"
+        );
+    }
+
+    /// Кадр без ошибок не должен ничего забирать: `ui()` зовут 60 раз
+    /// в секунду, и пустой разбор обязан оставаться пустым.
     #[test]
     fn quiet_frame_takes_nothing() {
         let errors = GpuErrors::default();
@@ -14954,6 +15113,51 @@ mod tests {
         );
     }
 
+    /// Каждая фигура кадра, включая вложенные в `Shape::Vec`.
+    fn each_shape(shapes: &[egui::epaint::ClippedShape], mut visit: impl FnMut(&egui::Shape)) {
+        fn walk(shape: &egui::Shape, visit: &mut impl FnMut(&egui::Shape)) {
+            if let egui::Shape::Vec(list) = shape {
+                for shape in list {
+                    walk(shape, visit);
+                }
+            } else {
+                visit(shape);
+            }
+        }
+        for clipped in shapes {
+            walk(&clipped.shape, &mut visit);
+        }
+    }
+
+    /// Цвет, которым в кадре написан этот текст.
+    ///
+    /// Проверка палитры говорит, что нужный цвет в ней есть и проходит
+    /// порог, а не то, что виджет его взял, — это видно только по кадру.
+    fn ink(shapes: &[egui::epaint::ClippedShape], text: &str) -> Option<egui::Color32> {
+        let mut found = None;
+        each_shape(shapes, |shape| {
+            if let egui::Shape::Text(t) = shape
+                && t.galley.job.text.trim() == text
+            {
+                found = t
+                    .override_text_color
+                    .or_else(|| t.galley.job.sections.first().map(|s| s.format.color));
+            }
+        });
+        found
+    }
+
+    /// Закрашенные круги кадра: середина, радиус и заливка.
+    fn dots(shapes: &[egui::epaint::ClippedShape]) -> Vec<(egui::Pos2, f32, egui::Color32)> {
+        let mut found = Vec::new();
+        each_shape(shapes, |shape| {
+            if let egui::Shape::Circle(circle) = shape {
+                found.push((circle.center, circle.radius, circle.fill));
+            }
+        });
+        found
+    }
+
     /// Выключенная главная кнопка подписана своим цветом, а не цветом
     /// включённой.
     ///
@@ -14971,29 +15175,6 @@ mod tests {
     /// падает на светлой теме.
     #[test]
     fn a_disabled_main_button_keeps_its_own_ink() {
-        fn ink(shapes: &[egui::epaint::ClippedShape], text: &str) -> Option<egui::Color32> {
-            fn walk(shape: &egui::Shape, text: &str, found: &mut Option<egui::Color32>) {
-                match shape {
-                    egui::Shape::Text(t) if t.galley.job.text.trim() == text => {
-                        *found = t
-                            .override_text_color
-                            .or_else(|| t.galley.job.sections.first().map(|s| s.format.color));
-                    }
-                    egui::Shape::Vec(list) => {
-                        for shape in list {
-                            walk(shape, text, found);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            let mut found = None;
-            for clipped in shapes {
-                walk(&clipped.shape, text, &mut found);
-            }
-            found
-        }
-
         for (theme, pal) in [("тёмная", theme::Palette::dark()), ("светлая", theme::Palette::light())]
         {
             let ctx = egui::Context::default();
@@ -15021,6 +15202,169 @@ mod tests {
                 "{theme}: включённая кнопка подписана не своим цветом"
             );
         }
+    }
+
+    /// Заголовок группы вправду рисует метку сводки: точку и цвет у
+    /// включённого, ни того ни другого у заглушки (задача 51).
+    ///
+    /// `a_login_left_on_does_not_look_like_the_placeholder` проверяет, что
+    /// метка есть в сводке, а не то, что заголовок её взял, — та же пара,
+    /// что у палитры с `a_disabled_main_button_keeps_its_own_ink`. Обе темы,
+    /// и светлая тут важнее: приглушённый серый и цвет предупреждения в ней
+    /// почти одной яркости, так что взглядом их различает прежде всего точка.
+    ///
+    /// Проверено красным: с `pal.text_muted` вместо тона метки проверка
+    /// падает на цвете, без точки — на её подсчёте.
+    #[test]
+    fn the_folded_header_lights_up_only_when_something_is_on() {
+        for (theme, pal) in [("тёмная", theme::Palette::dark()), ("светлая", theme::Palette::light())]
+        {
+            let ctx = egui::Context::default();
+            theme::install_fonts(&ctx);
+            theme::apply(&ctx, pal);
+            let idle = GroupSummary {
+                text: "что лежит внутри".to_owned(),
+                mark: None,
+            };
+            let lit = GroupSummary {
+                text: "вход на сайт".to_owned(),
+                mark: Some(Tone::Warn),
+            };
+
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    disclosure_row(ui, pal, false, "Нетронутая", &idle, 1.0);
+                    disclosure_row(ui, pal, false, "Включённая", &lit, 1.0);
+                });
+            });
+            let idle_ink = ink(&output.shapes, &idle.text);
+            let lit_ink = ink(&output.shapes, &lit.text);
+            let spots = dots(&output.shapes);
+            output.textures_delta.clear();
+
+            assert_eq!(idle_ink, Some(pal.text_muted), "{theme}: заглушка не того цвета");
+            assert_eq!(
+                lit_ink,
+                Some(pal.state_warning),
+                "{theme}: включённое не того цвета"
+            );
+            let fills: Vec<egui::Color32> = spots.iter().map(|&(_, _, fill)| fill).collect();
+            assert_eq!(
+                fills,
+                [pal.state_warning],
+                "{theme}: точка должна гореть одна и цветом метки"
+            );
+        }
+    }
+
+    /// Точка у обрезанной сводки держится своей сводки и не налезает на
+    /// название группы — ни на одном языке.
+    ///
+    /// Сводка обрезается сама и в раскладке справа налево забирает весь
+    /// остаток строки, а точка стоит левее неё и потому кладётся после.
+    /// Без места, вычтенного заранее, ей его не остаётся, и она ложится
+    /// на название, — только в узком окне и только с длинной сводкой, то
+    /// есть там, куда глазной прогон заглядывает реже всего. Места ищутся
+    /// по именам, а не по координатам, списанным в тест: они зависят от
+    /// шрифтов и языка.
+    ///
+    /// Требование — «ближе к сводке, чем к названию», а не «не налезает»,
+    /// и дело не в строгости. Обрезанная метка оставляет у своего края
+    /// хвост короче одного знака, и насколько точка сдвинется на название,
+    /// решает длина этого хвоста, то есть шрифт и язык. Проверено красным:
+    /// без вычтенного места точка залезает на название по-английски на 3
+    /// точки, по-русски на 0.125, а по-армянски не залезает вовсе — ложится
+    /// в 2.4 точки от него при 7 до своей сводки. Проверка «не налезает»
+    /// армянский пропустила бы, а точка, прижатая к названию, читается его
+    /// меткой и без перекрытия. С вычетом до названия не меньше 10 точек.
+    #[test]
+    fn the_dot_keeps_clear_of_the_title_in_a_narrow_row() {
+        const WIDTH: f32 = 320.0;
+        let pal = theme::Palette::dark();
+        let de = SubLang::Code("de".to_owned());
+        let mut failures = Vec::new();
+
+        for lang in Lang::ALL {
+            // Свой контекст на язык: общий помнит размеры от прошлого кадра
+            // и исказил бы первый кадр следующего.
+            let ctx = egui::Context::default();
+            theme::install_fonts(&ctx);
+            theme::apply(&ctx, pal);
+            ctx.enable_accesskit();
+
+            let title = i18n::t(lang, Key::UiAdvanced);
+            // Самая длинная сводка, какая бывает: включено всё, и фрагмент
+            // вдобавок задан неверно.
+            let summary = advanced_summary(true, false, true, Some(&de), lang);
+            let (mut named, mut spots, mut natural) = (Vec::new(), Vec::new(), 0.0);
+
+            for _ in 0..2 {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(WIDTH, 200.0),
+                    )),
+                    ..Default::default()
+                };
+                let mut output = ctx.run_ui(input, |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        natural = ui
+                            .painter()
+                            .layout_no_wrap(
+                                summary.text.clone(),
+                                egui::TextStyle::Small.resolve(ui.style()),
+                                egui::Color32::PLACEHOLDER,
+                            )
+                            .size()
+                            .x;
+                        disclosure_row(ui, pal, false, title, &summary, 1.0);
+                    });
+                });
+                spots = dots(&output.shapes);
+                named = named_widgets(&mut output);
+                output.textures_delta.clear();
+            }
+
+            let find = |name: &str| {
+                named
+                    .iter()
+                    .find(|(found, _)| found == name)
+                    .map(|&(_, rect)| rect)
+                    .unwrap_or_else(|| panic!("{lang:?}: в кадре нет «{name}»"))
+            };
+            let title_rect = find(title);
+            let text_rect = find(&summary.text);
+            // Сторож самой проверки: необрезанная сводка оставила бы точке
+            // место и без вычета, и проверка прошла бы на сломанном коде.
+            assert!(
+                text_rect.width() + 1.0 < natural,
+                "{lang:?}: сводка не обрезана ({} из {natural}) — строка слишком широка \
+                 для этой проверки",
+                text_rect.width()
+            );
+            let [(center, radius, _)] = spots[..] else {
+                panic!("{lang:?}: точек {} вместо одной", spots.len());
+            };
+            let to_title = center.x - radius - title_rect.right();
+            let to_text = text_rect.left() - (center.x + radius);
+            if to_text < 0.0 {
+                failures.push(format!("{lang:?}: точка налезает на сводку на {}", -to_text));
+            }
+            if to_title <= to_text {
+                failures.push(format!(
+                    "{lang:?}: до названия {to_title}, до сводки {to_text} — точка \
+                     прижата к названию"
+                ));
+            }
+            if text_rect.right() > WIDTH {
+                failures.push(format!(
+                    "{lang:?}: сводка вылезла за кромку: {}",
+                    text_rect.right()
+                ));
+            }
+        }
+
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     /// Дорожка переключателя идёт слева направо, куда бы её ни поставили.
@@ -15203,14 +15547,23 @@ mod tests {
         assert!(process > 30.0, "строка процесса обрезана: {process}");
         assert!(process < 100.0, "строка процесса во весь экран: {process}");
 
-        let disclosure = card_height(|ui| {
-            disclosure_row(ui, pal, false, "Тонкие настройки", "по умолчанию", 1.0);
-        });
-        assert!(disclosure > 20.0, "заголовок группы обрезан: {disclosure}");
-        assert!(
-            disclosure < 100.0,
-            "заголовок группы во весь экран: {disclosure}"
-        );
+        // Обе сводки, и горящая тут не для полноты: у неё подпись лежит
+        // в своём ряду с заданной высотой, и забери он остаток — заголовок
+        // вырос бы ровно так, как ловит эта проверка.
+        for mark in [None, Some(Tone::Warn)] {
+            let summary = GroupSummary {
+                text: "по умолчанию".to_owned(),
+                mark,
+            };
+            let disclosure = card_height(|ui| {
+                disclosure_row(ui, pal, false, "Тонкие настройки", &summary, 1.0);
+            });
+            assert!(disclosure > 20.0, "{mark:?}: заголовок группы обрезан: {disclosure}");
+            assert!(
+                disclosure < 100.0,
+                "{mark:?}: заголовок группы во весь экран: {disclosure}"
+            );
+        }
     }
 
     /// Описание в окне «О программе» — дословно вступление README.
