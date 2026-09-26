@@ -7300,7 +7300,7 @@ fn welcome_window(
             // `default_area_size` (400 точек), прокрутка в неё вписывается,
             // а не переполняет, — и модалка, у которой в прокрутке лежит
             // всё, так и осталась бы в 400 точек при окне любого размера
-            // (задача 69: так «О программе» прячет свои кнопки).
+            // (задача 69: так прятало свои кнопки «О программе»).
             ui.add_space(16.0);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 14.0;
@@ -7600,12 +7600,13 @@ fn welcome_card(
 
 /// Окно «О программе»: что за приложение, кто сделал, куда писать.
 ///
-/// Свободной функцией, а не методом, ради теста раскладки
-/// (`the_about_window_fits_the_smallest_window`): `SavioApp` в тесте не
-/// собрать — конструктор читает настройки с диска и спрашивает версии у
-/// внешних программ, — а окну из всего состояния нужно одно: горит ли
-/// «Скопировано».
-fn about_window(pal: theme::Palette,
+/// Свободной функцией, а не методом, ради тестов раскладки
+/// (`the_about_window_fits_the_smallest_window`,
+/// `the_about_buttons_stay_in_sight`): `SavioApp` в тесте не собрать —
+/// конструктор читает настройки с диска и спрашивает версии у внешних
+/// программ, — а окну из всего состояния нужно одно: горит ли «Скопировано».
+fn about_window(
+    pal: theme::Palette,
     ctx: &egui::Context,
     lang: Lang,
     speed: f32,
@@ -7636,63 +7637,90 @@ fn about_window(pal: theme::Palette,
             );
             ui.add_space(8.0);
 
-            // Всё ниже заголовка — в прокрутке, и потолок ей задаётся числом,
-            // а не остатком. Без потолка `Modal` растёт по содержимому, и
-            // в окне 420 точек высотой оно уходит за верхнюю и нижнюю кромки
-            // разом: кнопки «Написать» и «Закрыть» становятся недостижимы,
-            // причём молча — модалка просто нарисована больше экрана.
-            // Числом, а не `available_height()`, по той же причине, что
-            // у журнала (дефект 27): прокрутка внутри растущего контейнера
-            // берёт высоту от его прошлого кадра и схлопывается.
-            let room = (ctx.content_rect().height() - 48.0 - 56.0).max(160.0);
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, true])
-                .max_height(room)
-                .show(ui, |ui| {
-                    ui.set_width(width);
-            note(ui, i18n::t(lang, ABOUT_TEXT), pal.text_secondary);
-            ui.add_space(14.0);
+            // Описание и сведения — в прокрутке, и потолок ей задаётся
+            // числом, а не остатком. Без потолка `Modal` растёт по
+            // содержимому, и в окне 420 точек высотой оно уходит за верхнюю
+            // и нижнюю кромки разом, причём молча — модалка просто нарисована
+            // больше экрана. Числом, а не `available_height()`, по той же
+            // причине, что у журнала (дефект 27): прокрутка внутри растущего
+            // контейнера берёт высоту от его прошлого кадра и схлопывается.
+            // Считается потолок так же, как у приветствия: от уже занятого
+            // заголовком и от рядов кнопок, которые встанут под прокруткой, —
+            // теми же числами, какими ряды кладутся ниже. 56 — это рамка
+            // модалки (поля и кромка, 50) и по три точки до краёв окна.
+            const ABOVE_ROWS: f32 = 12.0;
+            const BETWEEN_ROWS: f32 = 18.0;
+            let step = ui.spacing().item_spacing.y;
+            let rows = ABOVE_ROWS + BETWEEN_ROWS + 2.0 * (step + theme::CONTROL_HEIGHT);
+            let inner = (ctx.content_rect().height() - 56.0).max(200.0);
+            let room = (inner - ui.min_rect().height() - rows).max(80.0);
+            ui.scope(|ui| {
+                // Полоса прокрутки видна и в покое — по той же причине, что
+                // у приветствия: в окне 520×420 под кромкой остаются целые
+                // пункты («Показать приветствие» и подпись к кнопкам), а обрез,
+                // пришедшийся на промежуток между строками, выглядел бы концом
+                // окна.
+                ui.spacing_mut().scroll.dormant_handle_opacity = 0.6;
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, true])
+                    .max_height(room)
+                    .show(ui, |ui| {
+                        ui.set_width(width);
+                        note(ui, i18n::t(lang, ABOUT_TEXT), pal.text_secondary);
+                        ui.add_space(14.0);
 
-            // Строки те же, что в карточках «Машины»: одинаковые по смыслу
-            // таблицы должны и выглядеть одинаково.
-            stat_row(ui, pal, lang, i18n::t(lang, Key::UiVersion), Some(VERSION));
-            stat_row(
-                ui,
-                pal,
-                lang,
-                i18n::t(lang, Key::UiDeveloper),
-                Some(i18n::t(lang, AUTHOR)),
-            );
-            stat_row(ui, pal, lang, i18n::t(lang, Key::UiLicense), Some(LICENSE));
-            stat_row(
-                ui,
-                pal,
-                lang,
-                i18n::t(lang, Key::UiFeedback),
-                Some(FEEDBACK_EMAIL),
-            );
+                        // Строки те же, что в карточках «Машины»: одинаковые
+                        // по смыслу таблицы должны и выглядеть одинаково.
+                        stat_row(ui, pal, lang, i18n::t(lang, Key::UiVersion), Some(VERSION));
+                        stat_row(
+                            ui,
+                            pal,
+                            lang,
+                            i18n::t(lang, Key::UiDeveloper),
+                            Some(i18n::t(lang, AUTHOR)),
+                        );
+                        stat_row(ui, pal, lang, i18n::t(lang, Key::UiLicense), Some(LICENSE));
+                        stat_row(
+                            ui,
+                            pal,
+                            lang,
+                            i18n::t(lang, Key::UiFeedback),
+                            Some(FEEDBACK_EMAIL),
+                        );
 
-            // «Показать приветствие» — своей строкой, а не пятой кнопкой
-            // в ряду: впятером они не помещаются в окно минимальной ширины
-            // (проверка `the_about_window_fits_the_smallest_window` поймала
-            // это сразу). Перенос ряда тут не годится — `pill_button`
-            // заворачивает кнопку в `ui.scope`, а тот сообщает занятое место
-            // задним числом, мимо всей логики переноса.
-            ui.add_space(12.0);
-            if accent_button(
-                ui,
-                pal,
-                i18n::t(lang, Key::UiShowWelcome),
-                ui.available_width(),
-                true,
-                "",
-            ) {
-                action = Some(AboutAction::Welcome);
-            }
-            ui.add_space(6.0);
-            note(ui, i18n::t(lang, Key::UiAboutButtonsNote), pal.text_muted);
+                        // «Показать приветствие» — своей строкой, а не пятой
+                        // кнопкой в ряду: впятером они не помещаются в окно
+                        // минимальной ширины (проверка
+                        // `the_about_window_fits_the_smallest_window` поймала
+                        // это сразу). Перенос ряда тут не годится —
+                        // `pill_button` заворачивает кнопку в `ui.scope`, а тот
+                        // сообщает занятое место задним числом, мимо всей
+                        // логики переноса.
+                        ui.add_space(12.0);
+                        if accent_button(
+                            ui,
+                            pal,
+                            i18n::t(lang, Key::UiShowWelcome),
+                            ui.available_width(),
+                            true,
+                            "",
+                        ) {
+                            action = Some(AboutAction::Welcome);
+                        }
+                        ui.add_space(6.0);
+                        note(ui, i18n::t(lang, Key::UiAboutButtonsNote), pal.text_muted);
+                    });
+            });
 
-            ui.add_space(12.0);
+            // Ряды кнопок — под прокруткой, а не в ней, и это не только ради
+            // того, чтобы «Написать» было видно в окне 520×420 без прокрутки.
+            // Они же и растят модалку: примерочный проход берёт высоту окна
+            // из `default_area_size` (400 точек), прокрутка в неё вписывается,
+            // а не переполняет, — и пока кнопки лежали в прокрутке, модалка
+            // так и оставалась в 400 точек в окне любого размера, а «Написать»
+            // и «Закрыть» — под кромкой прокрутки даже во весь экран
+            // (задача 69).
+            ui.add_space(ABOVE_ROWS);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
                 // Копирование рядом с «Написать» обязательно, а не для
@@ -7719,7 +7747,7 @@ fn about_window(pal: theme::Palette,
                 }
             });
 
-            ui.add_space(18.0);
+            ui.add_space(BETWEEN_ROWS);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
                 // Полный адрес — в подсказке: куда ведёт кнопка, лучше знать
@@ -7742,7 +7770,6 @@ fn about_window(pal: theme::Palette,
                     }
                 });
             });
-                });
 
             action
         })
@@ -15674,6 +15701,96 @@ mod tests {
                 "{lang:?}: окно «О программе» не влезает в 520×420: {rect:?}"
             );
         }
+    }
+
+    /// Кадры «О программе» в окне заданного размера: где легла модалка и её
+    /// кнопки в последнем кадре по дереву доступности.
+    ///
+    /// Кадров восемь, с запасом: первый проход модалки примерочный, и до
+    /// своего размера она дорастает не сразу, а на высоту рядов кнопок
+    /// за кадр (сейчас ей хватает двух).
+    fn about_frames(
+        ctx: &egui::Context,
+        lang: Lang,
+        window: egui::Vec2,
+    ) -> (egui::Rect, Vec<(String, egui::Rect)>) {
+        let pal = theme::Palette::dark();
+        let mut rect = egui::Rect::NOTHING;
+        let mut buttons = Vec::new();
+        for _ in 0..8 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, window)),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                // «Скопировано» горит: так ряд с адресом самый широкий.
+                rect = about_window(pal, ui.ctx(), lang, 1.0, true).response.rect;
+            });
+            output.textures_delta.clear();
+            buttons = named_buttons(&mut output);
+        }
+        (rect, buttons)
+    }
+
+    /// Кнопки «О программе» видны без прокрутки в окне любого размера.
+    ///
+    /// Дефект (задача 69): всё под заголовком, кнопки тоже, лежало в
+    /// прокрутке, а примерочный проход модалки берёт высоту из
+    /// `default_area_size` — 400 точек. Прокрутка в них вписывалась, а не
+    /// переполняла, и модалка так и оставалась в 400 точек даже во весь
+    /// экран: «Написать» и «Закрыть» лежали под кромкой прокрутки, а подпись
+    /// над ними рассказывала про кнопку, которой не видно.
+    ///
+    /// Меряется место кнопки относительно модалки, а не модалка относительно
+    /// экрана: зажатая модалка помещается в окно всегда, и проверка размера
+    /// этого дефекта не видит. Окно 520×420 здесь же: в нём прокрутка нужна
+    /// по-настоящему, и кнопки обязаны уместиться под ней вместе с заголовком
+    /// на всех трёх языках.
+    ///
+    /// Проверено красным дважды: с кнопками в прокрутке модалка во всех трёх
+    /// окнах остаётся в 400 точек и все пять кнопок на всех языках лежат
+    /// ниже её кромки, а без запаса под ряды в потолке прокрутки модалка
+    /// в окне 520×420 вылезает за кромку окна на всех трёх языках.
+    #[test]
+    fn the_about_buttons_stay_in_sight() {
+        const BUTTONS: [Key; 5] = [
+            Key::UiWrite,
+            Key::UiCopyAddress,
+            Key::UiProjectPage,
+            Key::UiWhatChanged,
+            Key::UiClose,
+        ];
+        let windows = [
+            egui::vec2(520.0, 420.0),
+            egui::vec2(1280.0, 900.0),
+            egui::vec2(2560.0, 1369.0),
+        ];
+
+        // Провалы копятся и выдаются разом: язык, упавший первым, не должен
+        // заслонять остальные.
+        let mut failures = Vec::new();
+        for window in windows {
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, window);
+            for lang in Lang::ALL {
+                // Свой контекст на язык и окно: модалка помнит размер.
+                let ctx = rail_test_ctx();
+                let (modal, buttons) = about_frames(&ctx, lang, window);
+                if !screen.contains_rect(modal) {
+                    failures.push(format!("{lang:?}, окно {window}: модалка {modal:?}"));
+                }
+                for key in BUTTONS {
+                    let name = i18n::t(lang, key);
+                    match buttons.iter().find(|(n, _)| n == name) {
+                        None => failures.push(format!("{lang:?}, окно {window}: нет «{name}»")),
+                        Some((_, rect)) if !modal.contains_rect(*rect) => failures.push(format!(
+                            "{lang:?}, окно {window}: «{name}» {rect:?} вне модалки {modal:?}"
+                        )),
+                        Some(_) => {}
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
     }
 
     /// Подписи кнопок запуска умещаются в свою долю карточки.
