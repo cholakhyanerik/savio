@@ -171,13 +171,13 @@ const GPU_ERROR_LIMIT: usize = 4;
 /// и `Surface::configure` отдаёт ошибку проверки, которую по умолчанию никто не
 /// ловит: wgpu роняет процесс паникой. Программный размер окна приходит откуда
 /// угодно — от оконного менеджера, удалённого рабочего стола, смены
-/// разрешения, — и предотвратить его приложение не может: `max_inner_size`
-/// система спрашивает только при перетаскивании рамки. Значит, остаётся
-/// пережить: с этим обработчиком процесс остаётся жив, старая цепочка кадров
-/// продолжает работать (wgpu-core выходит из `configure` до подмены
-/// поверхности), а когда размер снова становится законным, рисование
-/// восстанавливается само. Идущая загрузка при этом не теряется — ровно то,
-/// ради чего всё и делается.
+/// разрешения, — и `max_inner_size` его не остановит: пределы winit ставит
+/// только перетаскиванию рамки, а `WM_WINDOWPOSCHANGING`, где `DefWindowProc`
+/// подрезал бы и программный размер, оставляет себе (задача 73). Значит,
+/// остаётся пережить: с этим обработчиком процесс жив, старая цепочка кадров
+/// работает (wgpu-core выходит из `configure` до подмены поверхности), а когда
+/// размер снова законен, рисование восстанавливается само. Идущая загрузка при
+/// этом не теряется — ровно то, ради чего всё и делается.
 ///
 /// Проверено вживую: без обработчика окно с клиентом 504×8193 убивает процесс,
 /// с ним — приложение живо и после возврата обычного размера рисует дальше.
@@ -2848,8 +2848,8 @@ impl MonitorPanel {
         let builder = egui::ViewportBuilder::default()
             .with_title(i18n::t(lang, Key::UiOverlayTitle))
             .with_inner_size(OVERLAY_SIZE)
-            // Оба предела равны размеру: окно без рамки всё равно нечем
-            // тянуть, а верхний предел заодно закрывает дорогу дефекту 13.
+            // Пределы равны размеру: окно без рамки нечем тянуть. Дефекта 13
+            // они не закрывают (задача 73): оверлей держит перехват ошибок GPU.
             .with_min_inner_size(OVERLAY_SIZE)
             .with_max_inner_size(OVERLAY_SIZE)
             .with_resizable(false)
@@ -5795,6 +5795,7 @@ impl SavioApp {
     /// нарисована галочка — см. [`chip`].
     fn embed_options(&mut self, ui: &mut egui::Ui) {
         let pal = self.palette;
+        let lang = self.lang;
         // Субтитры бывают только у видео: в MP3 их положить некуда. Чип
         // гасим, но причину говорим по наведению — молча выключенный элемент
         // выглядит поломкой, а не запретом.
@@ -5802,64 +5803,9 @@ impl SavioApp {
         // Два флага, а не один, и разница не в экономии. `subs` пересобирает
         // подписи, и трогать их от «Метаданных» незачем; `any` запоминает
         // выбор, и вот его пропуск как раз ничем себя не выдаст — настройка
-        // просто перестанет переживать перезапуск. Оба применяются **после**
-        // отрисовки: `self` до конца замыкания занят.
-        let mut subs_changed = false;
-        let mut any_changed = false;
-        // Копией, а не `self.speed` по месту: внутри замыкания `self` занят
-        // изменяемо — там же правятся сами галочки.
-        let speed = self.speed;
-        let lang = self.lang;
-
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
-
-            any_changed |= chip(
-                ui,
-                pal,
-                &mut self.options.embed_metadata,
-                i18n::t(lang, Key::UiEmbedMetadata),
-                true,
-                speed,
-            )
-            .on_hover_text(i18n::t(lang, Key::UiEmbedMetadataHint))
-            .changed();
-            any_changed |= chip(
-                ui,
-                pal,
-                &mut self.options.embed_thumbnail,
-                i18n::t(lang, Key::UiEmbedThumbnail),
-                true,
-                speed,
-            )
-            .on_hover_text(i18n::t(lang, Key::UiEmbedThumbnailHint))
-            .changed();
-            subs_changed |= chip(
-                ui,
-                pal,
-                &mut self.options.embed_subs,
-                i18n::t(lang, Key::UiEmbedSubs),
-                subs_enabled,
-                speed,
-            )
-            .on_disabled_hover_text(i18n::t(lang, Key::UiEmbedSubsDisabled))
-            .changed();
-
-            // Подчинённый чип появляется вместе с субтитрами, а не висит
-            // выключенным рядом: без «Субтитров» он не значит ничего.
-            if subs_enabled && self.options.embed_subs {
-                subs_changed |= chip(
-                    ui,
-                    pal,
-                    &mut self.options.auto_subs,
-                    i18n::t(lang, Key::UiAutoSubs),
-                    true,
-                    speed,
-                )
-                .on_hover_text(i18n::t(lang, Key::UiAutoSubsHint))
-                .changed();
-            }
-        });
+        // просто перестанет переживать перезапуск.
+        let (any_changed, subs_changed) =
+            embed_chips(ui, pal, lang, self.speed, &mut self.options, subs_enabled);
 
         // Оговорка про ffmpeg — статическая строка: в кадре ничего не собирается.
         if self.ffmpeg_missing && self.options.any() {
@@ -12147,6 +12093,79 @@ fn soft_pill(
     );
 }
 
+/// Ряд чипов «Вшить в файл»: три независимых и подчинённый четвёртый.
+///
+/// Отдаёт `(any, subs)` — изменился ли выбор вообще и изменились ли именно
+/// субтитры; зачем флагов два, сказано у места вызова.
+///
+/// Свободной функцией, а не телом `SavioApp::embed_options`, ради проверки
+/// переноса (`the_embed_chips_wrap_inside_the_card`): она рисует тот же ряд,
+/// что и окно, а копия подписей, их порядка и промежутка разъехалась бы
+/// с раскладкой при первой же правке.
+fn embed_chips(
+    ui: &mut egui::Ui,
+    pal: theme::Palette,
+    lang: Lang,
+    speed: f32,
+    options: &mut DownloadOptions,
+    subs_enabled: bool,
+) -> (bool, bool) {
+    let mut any_changed = false;
+    let mut subs_changed = false;
+
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+
+        any_changed |= chip(
+            ui,
+            pal,
+            &mut options.embed_metadata,
+            i18n::t(lang, Key::UiEmbedMetadata),
+            true,
+            speed,
+        )
+        .on_hover_text(i18n::t(lang, Key::UiEmbedMetadataHint))
+        .changed();
+        any_changed |= chip(
+            ui,
+            pal,
+            &mut options.embed_thumbnail,
+            i18n::t(lang, Key::UiEmbedThumbnail),
+            true,
+            speed,
+        )
+        .on_hover_text(i18n::t(lang, Key::UiEmbedThumbnailHint))
+        .changed();
+        subs_changed |= chip(
+            ui,
+            pal,
+            &mut options.embed_subs,
+            i18n::t(lang, Key::UiEmbedSubs),
+            subs_enabled,
+            speed,
+        )
+        .on_disabled_hover_text(i18n::t(lang, Key::UiEmbedSubsDisabled))
+        .changed();
+
+        // Подчинённый чип появляется вместе с субтитрами, а не висит
+        // выключенным рядом: без «Субтитров» он не значит ничего.
+        if subs_enabled && options.embed_subs {
+            subs_changed |= chip(
+                ui,
+                pal,
+                &mut options.auto_subs,
+                i18n::t(lang, Key::UiAutoSubs),
+                true,
+                speed,
+            )
+            .on_hover_text(i18n::t(lang, Key::UiAutoSubsHint))
+            .changed();
+        }
+    });
+
+    (any_changed, subs_changed)
+}
+
 /// Переключатель-«чип»: галочка и подпись в одной «таблетке».
 ///
 /// Своими руками, а не `Checkbox` в рамке, и рисуется здесь всё, включая
@@ -12157,6 +12176,18 @@ fn soft_pill(
 ///
 /// Галочка обязательна, а не украшение: без неё включённость чипа была бы
 /// сказана одним цветом, а этого мало.
+///
+/// Гасится чип через `add_enabled`, а не `add_enabled_ui`, и разница —
+/// в переносе строки (дефект 47). `add_enabled_ui` — это `scope`, то есть
+/// дочерний `Ui`, и заводится он при любом `enabled`. Курсор у потомка стоит
+/// на левой кромке его собственной области, а `horizontal_wrapped` переносит
+/// только то, что просится не с начала строки (egui 0.36.2, layout.rs:517),
+/// — так что в узком окне чипы не уезжали на вторую строку, а вылезали
+/// за кромку карточки и раздвигали всё, что под ними. `add_enabled` гасит
+/// виджет на том же `Ui` и возвращает прежнее, так что место просится
+/// у самой переносящей раскладки. Рисовать выключенный вид руками вместо
+/// этого нельзя: `Response::enabled` остался бы `true`, и у «Субтитров»
+/// пропала бы подсказка при MP3, а щелчок по погашенному чипу проходил бы.
 fn chip(
     ui: &mut egui::Ui,
     pal: theme::Palette,
@@ -12169,7 +12200,7 @@ fn chip(
     const GAP: f32 = 8.0;
     const MARK: f32 = 14.0;
 
-    ui.add_enabled_ui(enabled, |ui| {
+    ui.add_enabled(enabled, |ui: &mut egui::Ui| {
         let font = egui::TextStyle::Button.resolve(ui.style());
         // Раскладка текста у egui кэшируется по самой строке, так что
         // повторный вызов с той же подписью считает только хеш.
@@ -12187,6 +12218,12 @@ fn chip(
             *checked = !*checked;
             response.mark_changed();
         }
+        // Подпись нарисована кистью, и без этого чип для экранного диктора
+        // безымянен — как и для проверки, которая ищет его по имени. Состояние
+        // называется уже после щелчка: иначе диктор прочёл бы прежнее.
+        response.widget_info(|| {
+            egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), *checked, label)
+        });
 
         if !ui.is_rect_visible(rect) {
             return response;
@@ -12286,7 +12323,6 @@ fn chip(
 
         response
     })
-    .inner
 }
 
 /// Содержимое, показанное на долю `t` своей высоты.
@@ -16824,6 +16860,177 @@ mod tests {
         rig.frame(0.1, Vec::new());
         rig.click(at, 0.1, 0.05);
         assert!(rig.running, "вернувшись, «Скачать» не приняла щелчка");
+    }
+
+    /// Кадр ряда «Вшить» в карточке окна 520×420: правая кромка карточки
+    /// и виджеты кадра по дереву доступности.
+    ///
+    /// Окно собирается из тех же частей, что в `SavioApp::ui`: свёрнутый
+    /// рельс, раздел в [`content_frame`], прокрутка и карточка, — а ряд
+    /// рисует тот же [`embed_chips`], что и окно.
+    fn embed_chips_frame(
+        ctx: &egui::Context,
+        lang: Lang,
+        subs_enabled: bool,
+        options: &mut DownloadOptions,
+        time: f64,
+        events: Vec<egui::Event>,
+    ) -> (f32, Vec<(String, egui::Rect)>) {
+        let pal = theme::Palette::dark();
+        let window = SMALLEST_WINDOW.size();
+        let input = egui::RawInput {
+            screen_rect: Some(SMALLEST_WINDOW),
+            time: Some(time),
+            events,
+            ..Default::default()
+        };
+        let mut edge = f32::INFINITY;
+        let mut output = ctx.run_ui(input, |ui| {
+            egui::Panel::left("рельс")
+                .resizable(false)
+                .exact_size(RailLayout::for_window(window).width())
+                .show(ui, |_| {});
+            egui::CentralPanel::default()
+                .frame(content_frame())
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            theme::card(ui, pal, |ui| {
+                                // Кромка снимается до ряда: вылезший чип
+                                // раздвигает карточку, и снятая после
+                                // кромка уехала бы вместе с ним.
+                                edge = ui.max_rect().right();
+                                embed_chips(ui, pal, lang, 1.0, options, subs_enabled);
+                            });
+                        });
+                });
+        });
+        output.textures_delta.clear();
+        (edge, named_widgets(&mut output))
+    }
+
+    /// Чипы «Вшить» переносятся на новую строку, а не вылезают за кромку
+    /// карточки (дефект 47).
+    ///
+    /// `chip` гасил себя через `add_enabled_ui`, то есть в дочернем `Ui`,
+    /// и `horizontal_wrapped` его не переносил никогда: в окне 520×420 при
+    /// включённых субтитрах «Можно автоматические» обрезалось кромкой окна,
+    /// а по-армянски кромку пересекали уже «Субтитры». Меряются нарисованные
+    /// чипы, найденные по имени, а не сумма ширин подписей: сумма сходилась
+    /// бы и на сломанном коде.
+    ///
+    /// Вторая проверка — что ряд вправду перенёсся. Встань однажды все
+    /// четыре чипа в одну строку (перевод короче, карточка шире), первой
+    /// станет нечего проверять, и тест скажет об этом, а не пройдёт молча.
+    ///
+    /// Проверено красным по каждому языку: с прежним `add_enabled_ui`
+    /// в [`chip`] за кромку выходят чипы на всех трёх.
+    #[test]
+    fn the_embed_chips_wrap_inside_the_card() {
+        const CHIPS: [Key; 4] = [
+            Key::UiEmbedMetadata,
+            Key::UiEmbedThumbnail,
+            Key::UiEmbedSubs,
+            Key::UiAutoSubs,
+        ];
+        // Провалы собираются по всем языкам и выдаются в конце: `assert!`
+        // в цикле показал бы только первый.
+        let mut failures = Vec::new();
+        for lang in Lang::ALL {
+            // Свой контекст на язык: общий помнит размеры от прошлого
+            // и искажает первый кадр следующего.
+            let ctx = rail_test_ctx();
+            // Все четыре включены — при этом дефект и виден: четвёртый
+            // чип появляется только вместе с субтитрами.
+            let mut options = DownloadOptions {
+                embed_metadata: true,
+                embed_thumbnail: true,
+                embed_subs: true,
+                auto_subs: true,
+            };
+            // Кадров несколько: и прокрутка, и карточка узнают размер
+            // по прошлому кадру.
+            let (mut edge, mut named) = (0.0, Vec::new());
+            for frame in 0..3 {
+                (edge, named) =
+                    embed_chips_frame(&ctx, lang, true, &mut options, f64::from(frame), Vec::new());
+            }
+
+            let mut tops = Vec::new();
+            for key in CHIPS {
+                let label = i18n::t(lang, key);
+                let Some((_, rect)) = named.iter().find(|(name, _)| name == label) else {
+                    failures.push(format!("{lang:?}: в ряду нет чипа «{label}»"));
+                    continue;
+                };
+                if rect.max.x > edge + 0.5 {
+                    failures.push(format!(
+                        "{lang:?}: чип «{label}» за кромкой карточки: {} при кромке {edge}",
+                        rect.max.x
+                    ));
+                }
+                tops.push(rect.min.y);
+            }
+            if tops.windows(2).all(|pair| (pair[0] - pair[1]).abs() < 0.5) {
+                failures.push(format!(
+                    "{lang:?}: все чипы встали в одну строку — переносу здесь нечего проверять"
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Погашенные при MP3 «Субтитры» объясняют себя по наведению и щелчком
+    /// не включаются.
+    ///
+    /// Обе половины держит `Response::enabled`, который `chip` получает от
+    /// egui, а не рисует сам. Соблазн при дефекте 47 был ровно обратный:
+    /// убрать дочерний `Ui` и гасить чип цветом. Тогда подсказка «выберите
+    /// MP4» пропадает молча — egui показывает её только погашенному виджету
+    /// (tooltip.rs:66), — а щелчок включает субтитры, которых у MP3 не бывает.
+    ///
+    /// Проверено красным: с чипом, погашенным одним цветом, нет подсказки
+    /// и проходит щелчок.
+    #[test]
+    fn a_greyed_out_subtitles_chip_explains_itself_and_ignores_clicks() {
+        let lang = Lang::Ru;
+        let ctx = rail_test_ctx();
+        let mut options = DownloadOptions::default();
+        let mut time = 0.0;
+        let mut frame = |options: &mut DownloadOptions, step: f64, events| {
+            time += step;
+            embed_chips_frame(&ctx, lang, false, options, time, events).1
+        };
+
+        let mut named = Vec::new();
+        for _ in 0..3 {
+            named = frame(&mut options, 0.1, Vec::new());
+        }
+        let subs = center_of(&named, i18n::t(lang, Key::UiEmbedSubs))
+            .expect("в ряду нет «Субтитров»");
+
+        // Подсказка ждёт, пока курсор постоит (`tooltip_delay`, полсекунды):
+        // навели одним кадром и держим ещё два.
+        frame(&mut options, 1.0, vec![egui::Event::PointerMoved(subs)]);
+        for _ in 0..2 {
+            named = frame(&mut options, 0.6, Vec::new());
+        }
+        // Провалы собираются, а не обрывают проверку на первом: у чипа,
+        // погашенного цветом, ломаются обе половины, и видно должно быть обе.
+        let mut failures = Vec::new();
+        let hint = i18n::t(lang, Key::UiEmbedSubsDisabled);
+        if !named.iter().any(|(name, _)| name == hint) {
+            failures.push("у погашенных «Субтитров» нет подсказки");
+        }
+
+        for events in click_at(subs) {
+            frame(&mut options, 0.1, events);
+        }
+        if options.embed_subs {
+            failures.push("щелчок включил погашенные «Субтитры»");
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     /// Строка недельного прогноза занимает свою высоту, а не весь экран.
