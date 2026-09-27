@@ -25,8 +25,8 @@ use crate::model::{
     ShareAddress, ShareEvent, Sky, SubLang, SystemReport, TRACE_LIMIT, TRANSFER_LIMIT, TempUnit,
     Thumbnail,
     Trace, TransferDirection, VISITOR_LIMIT, WeatherReport, WeatherUnits, WeatherView, WindUnit,
-    human_bytes, human_duration, human_speed, looks_like_url, meta_kind, parse_section, qr_modules,
-    transfer_line, weather_view,
+    human_bytes, human_duration, human_speed, looks_like_url, meta_kind, parse_section, pasted_link,
+    qr_modules, transfer_line, weather_view,
 };
 use crate::motion;
 use crate::theme;
@@ -3076,6 +3076,86 @@ impl Preview {
     }
 }
 
+/// Сколько кадров ждать вставки, попросив её у eframe.
+///
+/// Цепочка ровно такая: `RequestPaste` уходит с кадром N, eframe читает буфер
+/// после отрисовки кадра N+1 (`ActionRequested::Paste` в wgpu_integration.rs
+/// eframe 0.36) и кладёт `Event::Paste` во ввод кадра N+2. Третий кадр — запас
+/// на случай, если кадры на медленной машине лягут не так ровно. Считать надо
+/// кадрами, а не секундами: вставка приезжает с номером кадра, а не по часам,
+/// и за полсекунды ожидания окно успело бы перерисоваться тридцать раз зря.
+const PASTE_WAIT_FRAMES: u64 = 3;
+
+/// Вставка кнопкой «Вставить»: попросили у eframe и ждём (задача 40).
+///
+/// Сам egui буфер обмена не читает, но **попросить** его прочитать может:
+/// `ViewportCommand::RequestPaste` делает ровно то же, что Ctrl+V, — тот же
+/// arboard внутри eframe, тот же поток, то же `Event::Paste`. Поэтому для
+/// кнопки не понадобилось ни своей зависимости, ни своего потока: чтение
+/// занимает около 0.08 мс (замер 2026-09-27, arboard 3.6.1, Windows 11), а
+/// занятый чужой программой буфер arboard перестаёт ждать через пять попыток
+/// по 5 мс. На Linux буфер отдаёт другая программа, и ждать её arboard готов
+/// до 4 с (X11), а smithay на Wayland — без предела; но ровно так же ждёт и
+/// Ctrl+V в любом поле egui, так что нового риска кнопка не добавляет.
+/// Платить за всё это приходится тем, что вставка приезжает не сразу, а через
+/// кадр, — см. [`PASTE_WAIT_FRAMES`].
+#[derive(Default)]
+struct Paste {
+    /// В каком кадре попросили вставку. `None` — ничего не ждём.
+    asked: Option<u64>,
+    /// Прошлая просьба вернулась ни с чем: eframe не нашёл в буфере текста
+    /// (там картинка, файлы или пусто) и `Event::Paste` не прислал вовсе.
+    /// Без оговорки кнопка в этом случае выглядела бы сломанной.
+    missed: bool,
+}
+
+impl Paste {
+    /// Просит eframe прочитать буфер обмена.
+    fn ask(&mut self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+        self.asked = Some(ctx.cumulative_frame_nr());
+        self.missed = false;
+    }
+
+    /// Забирает вставленный текст, если он приехал.
+    ///
+    /// Зовётся на каждом кадре и **до всех виджетов**. Событие уходит из ввода
+    /// кадра, а не только читается: если поле ссылки в фокусе (кнопку нажали
+    /// с клавиатуры или диктором, мимо мыши), оно само вставило бы тот же
+    /// текст ещё раз — у курсора, в середину только что положенной ссылки.
+    ///
+    /// Пока ждём, кадр просим сами: egui перерисовывает окно по вводу, а не
+    /// по таймеру, и вставка, положенная eframe во ввод следующего кадра,
+    /// пролежала бы там до первого движения мыши. Ждём не дольше
+    /// [`PASTE_WAIT_FRAMES`]: пустой буфер не пришлёт ничего, и опрос без
+    /// предела будил бы окно шестьдесят раз в секунду до конца сеанса.
+    fn take(&mut self, ctx: &egui::Context) -> Option<String> {
+        let asked = self.asked?;
+        let mut pasted = None;
+        ctx.input_mut(|input| {
+            input.events.retain_mut(|event| {
+                if pasted.is_none()
+                    && let egui::Event::Paste(text) = event
+                {
+                    pasted = Some(std::mem::take(text));
+                    return false;
+                }
+                true
+            });
+        });
+
+        if pasted.is_some() {
+            self.asked = None;
+        } else if ctx.cumulative_frame_nr() >= asked + PASTE_WAIT_FRAMES {
+            self.asked = None;
+            self.missed = true;
+        } else {
+            ctx.request_repaint();
+        }
+        pasted
+    }
+}
+
 pub struct SavioApp {
     /// Язык интерфейса. Запоминается между запусками (`settings::Settings`).
     ///
@@ -3233,6 +3313,8 @@ pub struct SavioApp {
     tools_line: String,
     /// Ссылка не похожа на ссылку. Только подсветка поля — кнопку не блокирует.
     url_invalid: bool,
+    /// Вставка кнопкой «Вставить», которую попросили у eframe и ждут.
+    paste: Paste,
     /// Когда журнал скопировали, по часам egui. Нужно только для подписи
     /// «Скопировано»: она живёт `COPIED_NOTICE_SECS` и гаснет сама.
     log_copied_at: Option<f64>,
@@ -3459,6 +3541,7 @@ impl SavioApp {
             tools_line: String::new(),
             advanced_summary: GroupSummary::default(),
             url_invalid: false,
+            paste: Paste::default(),
             log_copied_at: None,
             about_open: false,
             about_copied_at: None,
@@ -4570,6 +4653,31 @@ impl SavioApp {
         self.rebuild_subtitles();
     }
 
+    /// Текст в поле ссылки сменился — правкой или кнопкой «Вставить».
+    ///
+    /// Обработчик на оба пути один, и не ради краткости: вставленная кнопкой
+    /// ссылка обязана пройти ровно те же проверки, что набранная. Разъехавшись,
+    /// два обработчика однажды по-разному подсветили бы одну и ту же ссылку.
+    fn url_edited(&mut self, ctx: &egui::Context) {
+        let url = self.url.trim();
+        self.url_invalid = !url.is_empty() && !looks_like_url(url);
+        // Оговорка про пустой буфер — о прошлой попытке, а поле уже другое.
+        self.paste.missed = false;
+        self.retarget_preview(ctx);
+    }
+
+    /// Кладёт в поле то, что принесла кнопка «Вставить», если уже принесла.
+    ///
+    /// Поле заменяется целиком, а не дополняется у курсора, как при Ctrl+V:
+    /// ссылка в поле одна, и кнопка рядом с ним читается как «положить сюда
+    /// то, что скопировал», а не «приклеить к тому, что уже набрано».
+    fn take_paste(&mut self, ctx: &egui::Context) {
+        if let Some(text) = self.paste.take(ctx) {
+            self.url = pasted_link(&text);
+            self.url_edited(ctx);
+        }
+    }
+
     /// Добавляет строку в журнал, соблюдая его потолок.
     fn push_log(&mut self, line: String) {
         self.log.push(line);
@@ -4760,6 +4868,12 @@ impl eframe::App for SavioApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_events(ui.ctx());
+        // Вставку кнопкой «Вставить» забираем раньше всех виджетов — иначе
+        // поле ссылки в фокусе вставило бы тот же текст второй раз — и раньше
+        // предпросмотра: вставленная ссылка назначает ему срок, и попросить
+        // кадр к этому сроку он успевает в том же кадре, а не в следующем,
+        // которого без ввода может и не быть.
+        self.take_paste(ui.ctx());
         self.tick_preview(ui.ctx());
         self.meta.drain(self.lang, ui.ctx());
         self.system.drain();
@@ -5491,34 +5605,19 @@ impl SavioApp {
         let invalid = self.url_invalid;
         let lang = self.lang;
 
-        let response = ui
-            .scope(|ui| {
-                if invalid {
-                    mark_invalid(pal, ui);
-                }
-
-                // Поле выше остальных и без подписи над ним: это первое, к
-                // чему тянется рука на экране, и подсказка внутри говорит
-                // ровно то же, что сказала бы подпись.
-                ui.add_sized(
-                    [ui.available_width(), theme::FIELD_HEIGHT],
-                    egui::TextEdit::singleline(&mut self.url)
-                        .hint_text(i18n::t(lang, Key::UiUrlHint))
-                        .text_color(pal.text_primary)
-                        // Поля широкие: у «таблетки» текст обязан отступать
-                        // от полукруглых торцов, иначе он в них упирается.
-                        .margin(egui::Margin::symmetric(18, 8)),
-                )
-            })
-            .inner;
-
+        let field = url_input(ui, pal, lang, self.speed, &mut self.url, invalid);
         // Пересчитываем только при правке текста, а не каждый кадр.
-        if response.changed() {
-            let url = self.url.trim();
-            self.url_invalid = !url.is_empty() && !looks_like_url(url);
-            self.retarget_preview(ui.ctx());
+        if field.changed {
+            self.url_edited(ui.ctx());
+        }
+        if field.paste {
+            self.paste.ask(ui.ctx());
         }
 
+        if self.paste.missed {
+            ui.add_space(6.0);
+            note(ui, i18n::t(lang, Key::UiPasteNothing), pal.text_muted);
+        }
         if invalid {
             ui.add_space(6.0);
             ui.label(
@@ -12893,6 +12992,158 @@ fn mark_invalid(pal: theme::Palette, ui: &mut egui::Ui) {
     v.selection.stroke = error;
 }
 
+/// Поля поля ссылки внутри его «таблетки».
+///
+/// Слева широко: текст обязан отступать от полукруглого торца, иначе он в него
+/// упирается. Справа узко: там стоит кнопка «Вставить», и от торца отступает
+/// уже её подложка.
+const URL_MARGIN: egui::Margin = egui::Margin {
+    left: 18,
+    right: 5,
+    top: 8,
+    bottom: 8,
+};
+/// Поля кнопки «Вставить» по бокам от подписи.
+const PASTE_PAD: f32 = 12.0;
+/// На сколько подложка кнопки «Вставить» отступает от кромки поля сверху
+/// и снизу.
+const PASTE_INSET: f32 = 6.0;
+
+/// Что случилось с полем ссылки за кадр.
+struct UrlInput {
+    /// Текст правили в самом поле.
+    changed: bool,
+    /// Нажали «Вставить».
+    paste: bool,
+    /// Где лёг текст поля: ему остаётся место левее кнопки.
+    ///
+    /// Читает его только проверка — подсказка в пустом поле обязана уместиться
+    /// рядом с кнопкой на всех трёх языках, а мерить это надо разложенным
+    /// текстом против места, которое отвело ему само поле. Своя арифметика
+    /// полей в тесте разъехалась бы с раскладкой при первой же правке.
+    #[cfg_attr(not(test), allow(dead_code))]
+    text: egui::Rect,
+}
+
+/// Поле ссылки с кнопкой «Вставить» в правом краю (задача 40).
+///
+/// Место под кнопку отводит само поле: она стоит в нём суффиксом
+/// (`Atom::custom`), внутри рамки, — поэтому длинная ссылка обрезается у
+/// кнопки, а не уезжает под неё, и подсказка в пустом поле сокращается
+/// многоточием там же. Сама кнопка кладётся поверх отведённого места уже после
+/// поля: из двух наложенных виджетов egui считает верхним добавленный
+/// последним.
+///
+/// Слышит кнопка не только щелчок, но и перетаскивание, хотя таскать её
+/// нечего. Поле под ней слышит и то и другое, а кнопке, которая слышит одни
+/// щелчки, egui отдаёт наведение и нажатие **вместе** с полем — как кнопке
+/// поверх прокрутки (hit_test.rs:381 в egui 0.36). Поле тогда зажигает кромку,
+/// пока курсор над кнопкой, забирает фокус с кареткой, пока кнопка нажата, а
+/// протянутое от кнопки нажатие выделяет в нём текст. Слыша и перетаскивание,
+/// кнопка забирает всё это целиком (hit_test.rs:370).
+///
+/// Подпись нарисована кистью, как у [`chip`]: рамки у кнопки нет ни в покое,
+/// ни под курсором — контур второй «таблетки» внутри первой читался бы вторым
+/// полем, — а откликается она подложкой и светлеющей подписью. Имя для
+/// экранного диктора кнопка поэтому сообщает сама.
+fn url_input(
+    ui: &mut egui::Ui,
+    pal: theme::Palette,
+    lang: Lang,
+    speed: f32,
+    url: &mut String,
+    invalid: bool,
+) -> UrlInput {
+    let label = i18n::t(lang, Key::UiPaste);
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    // Раскладка текста у egui кэшируется по самой строке, так что повторный
+    // вызов с той же подписью считает только хеш.
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), font, egui::Color32::PLACEHOLDER);
+    let id = egui::Id::new("savio-url-paste");
+    let slot_id = id.with("slot");
+    let slot = egui::Atom::custom(
+        slot_id,
+        egui::vec2(galley.size().x + PASTE_PAD * 2.0, galley.size().y),
+    );
+
+    let edit = ui
+        .scope(|ui| {
+            if invalid {
+                mark_invalid(pal, ui);
+            }
+            // Поле выше остальных и без подписи над ним: это первое, к чему
+            // тянется рука на экране, и подсказка внутри говорит ровно то же,
+            // что сказала бы подпись. Раскладка та же, что у `add_sized`, —
+            // `show` вместо `add` нужен, чтобы узнать, где лёг суффикс.
+            let main_dir = ui.layout().main_dir();
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), theme::FIELD_HEIGHT),
+                egui::Layout::centered_and_justified(main_dir),
+                |ui| {
+                    egui::TextEdit::singleline(url)
+                        .hint_text(i18n::t(lang, Key::UiUrlHint))
+                        .text_color(pal.text_primary)
+                        .margin(URL_MARGIN)
+                        .suffix(slot)
+                        .show(ui)
+                },
+            )
+            .inner
+        })
+        .inner;
+
+    let mut paste = false;
+    // Прямоугольника нет, только когда поле не рисовалось вовсе, — тогда
+    // и нажимать нечего.
+    if let Some(slot) = edit.response.rect(slot_id) {
+        let field = edit.response.rect;
+        let rect = egui::Rect::from_x_y_ranges(slot.x_range(), field.y_range().shrink(PASTE_INSET));
+        let response = ui
+            .interact(rect, id, egui::Sense::click_and_drag())
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+        });
+        paste = response.clicked();
+
+        if ui.is_rect_visible(rect) {
+            let ctx = ui.ctx();
+            let touch =
+                ctx.animate_bool_with_time(response.id, response.hovered(), motion::TOUCH * speed);
+            // Нажатие приминает подложку так же, как у чипа (приём 02).
+            let press = motion::glide(ctx.animate_bool_with_time(
+                response.id.with("press"),
+                response.is_pointer_button_down_on(),
+                motion::TOUCH * 0.75 * speed,
+            ));
+            let rect = motion::pressed(rect, press);
+
+            // Подпись — акцент на поле ввода: 9.47:1 в тёмной теме и 6.13:1
+            // в светлой. Под курсором — светлее на подложке: не ниже 7.09:1
+            // (`the_paste_button_reads_on_the_link_field`).
+            let painter = ui.painter();
+            painter.rect_filled(
+                rect,
+                egui::CornerRadius::same(theme::RADIUS_PILL),
+                motion::mix(egui::Color32::TRANSPARENT, pal.card_inner, touch),
+            );
+            painter.galley(
+                rect.center() - galley.size() / 2.0,
+                galley,
+                motion::mix(pal.accent, pal.accent_hover, touch),
+            );
+        }
+    }
+
+    UrlInput {
+        changed: edit.response.changed(),
+        paste,
+        text: edit.text_clip_rect,
+    }
+}
+
 /// Поле ввода времени: «1:30», «1:02:03» или число секунд.
 ///
 /// Возвращает `true`, когда текст правили: разбирать строку в кадре отрисовки
@@ -16796,6 +17047,368 @@ mod tests {
             rig.running,
             "двойной щелчок по «Скачать» снял только что начатую загрузку"
         );
+    }
+
+    /// Поле ссылки с кнопкой «Вставить» в кадрах без окна и со своими часами.
+    ///
+    /// Кадр устроен так же, как в окне: вставка забирается до всех виджетов
+    /// (`SavioApp::take_paste`), поле рисуется в карточке окна 520×420,
+    /// щелчок по кнопке просит вставку. За eframe и буфер обмена играет сама
+    /// проверка: `Event::Paste` она кладёт во ввод того кадра, в который его
+    /// положил бы eframe, — второго после просьбы.
+    struct PasteRig {
+        ctx: egui::Context,
+        lang: Lang,
+        url: String,
+        paste: Paste,
+        time: f64,
+        /// Попросить вставку на следующем кадре мимо кнопки — так её просят
+        /// клавиатура и экранный диктор: без нажатия мышью.
+        ask: bool,
+    }
+
+    /// Что осталось от кадра стенда.
+    struct PasteFrame {
+        named: Vec<(String, egui::Rect)>,
+        /// Поле целиком.
+        field: egui::Rect,
+        /// Где лёг текст поля.
+        text: egui::Rect,
+        /// Правая кромка карточки.
+        edge: f32,
+        /// Ширина подсказки пустого поля, разложенной в одну строку.
+        hint: f32,
+        /// Попросил ли кадр вставку у eframe.
+        asked_paste: bool,
+        /// Через сколько кадр попросил следующий.
+        repaint: std::time::Duration,
+    }
+
+    impl PasteRig {
+        fn new(lang: Lang) -> Self {
+            Self {
+                ctx: rail_test_ctx(),
+                lang,
+                url: String::new(),
+                paste: Paste::default(),
+                time: 0.0,
+                ask: false,
+            }
+        }
+
+        /// Кадр через `step` секунд после прошлого.
+        fn frame(&mut self, step: f64, events: Vec<egui::Event>) -> PasteFrame {
+            self.time += step;
+            let input = egui::RawInput {
+                screen_rect: Some(SMALLEST_WINDOW),
+                time: Some(self.time),
+                events,
+                ..Default::default()
+            };
+            let window = SMALLEST_WINDOW.size();
+            let pal = theme::Palette::dark();
+            let Self {
+                ctx,
+                lang,
+                url,
+                paste,
+                ask,
+                ..
+            } = self;
+            let lang = *lang;
+            let (mut field, mut text, mut edge, mut hint) =
+                (egui::Rect::NOTHING, egui::Rect::NOTHING, 0.0, 0.0);
+            let mut output = ctx.run_ui(input, |ui| {
+                // Как `SavioApp::take_paste`: до всех виджетов.
+                if let Some(pasted) = paste.take(ui.ctx()) {
+                    *url = pasted_link(&pasted);
+                }
+                if std::mem::take(ask) {
+                    paste.ask(ui.ctx());
+                }
+                egui::Panel::left("рельс")
+                    .resizable(false)
+                    .exact_size(RailLayout::for_window(window).width())
+                    .show(ui, |_| {});
+                egui::CentralPanel::default()
+                    .frame(content_frame())
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                theme::card(ui, pal, |ui| {
+                                    edge = ui.max_rect().right();
+                                    let drawn =
+                                        ui.scope(|ui| url_input(ui, pal, lang, 1.0, url, false));
+                                    field = drawn.response.rect;
+                                    text = drawn.inner.text;
+                                    if drawn.inner.paste {
+                                        paste.ask(ui.ctx());
+                                    }
+                                    // Подсказку поле раскладывает основным
+                                    // шрифтом, так же меряем и мы.
+                                    let font = egui::TextStyle::Body.resolve(ui.style());
+                                    hint = ui
+                                        .painter()
+                                        .layout_no_wrap(
+                                            i18n::t(lang, Key::UiUrlHint).to_owned(),
+                                            font,
+                                            egui::Color32::PLACEHOLDER,
+                                        )
+                                        .size()
+                                        .x;
+                                });
+                            });
+                    });
+            });
+            output.textures_delta.clear();
+            let root = output.viewport_output.get(&egui::ViewportId::ROOT);
+            let asked_paste = root.is_some_and(|viewport| {
+                viewport
+                    .commands
+                    .iter()
+                    .any(|command| matches!(command, egui::ViewportCommand::RequestPaste))
+            });
+            let repaint = root.map_or(std::time::Duration::MAX, |viewport| viewport.repaint_delay);
+            PasteFrame {
+                named: named_widgets(&mut output),
+                field,
+                text,
+                edge,
+                hint,
+                asked_paste,
+                repaint,
+            }
+        }
+
+        /// Три кадра покоя. Возвращает середину кнопки «Вставить» и поле.
+        fn settle(&mut self) -> (egui::Pos2, egui::Rect) {
+            let mut shot = self.frame(0.1, Vec::new());
+            for _ in 0..2 {
+                shot = self.frame(0.1, Vec::new());
+            }
+            let name = i18n::t(self.lang, Key::UiPaste);
+            let at = center_of(&shot.named, name).unwrap_or_else(|| panic!("в поле нет «{name}»"));
+            (at, shot.field)
+        }
+
+        /// Щелчок в поле и набранный текст: поле в фокусе, и в нём что-то есть.
+        fn type_into_field(&mut self, field: egui::Rect, text: &str) -> egui::Id {
+            for events in click_at(egui::pos2(field.left() + 40.0, field.center().y)) {
+                self.frame(0.1, events);
+            }
+            self.frame(0.1, vec![egui::Event::Text(text.to_owned())]);
+            assert_eq!(self.url, text, "набранное не легло в поле");
+            self.ctx
+                .memory(|memory| memory.focused())
+                .expect("поле не взяло фокус от щелчка")
+        }
+    }
+
+    /// «Вставить» кладёт в поле то, что лежит в буфере обмена, — заменяя
+    /// набранное, а не дописывая к нему (задача 40).
+    ///
+    /// Сам egui буфер не читает, а просит вставку у eframe
+    /// (`ViewportCommand::RequestPaste`), и та приезжает `Event::Paste` через
+    /// кадр. Проверка играет за eframe: смотрит, что кадр со щелчком вправду
+    /// попросил вставку, и кладёт событие во ввод второго кадра после него.
+    ///
+    /// Заодно — что поле под кнопкой не отзывается на неё. Слышь кнопка одни
+    /// щелчки, egui отдавал бы наведение и нажатие и полю, как прокрутке под
+    /// кнопкой: курсор над «Вставить» зажигал бы кромку поля, а пока кнопка
+    /// нажата, поле забирало бы фокус и ставило каретку. Отпускание фокус всё
+    /// равно снимает (у egui 0.36 фокус уходит по щелчку, а не по нажатию),
+    /// поэтому смотреть надо на наведение и на само нажатие.
+    ///
+    /// Проверено красным: с `Sense::click()` у кнопки поле подсвечивается
+    /// под курсором и берёт фокус на нажатии.
+    #[test]
+    fn paste_replaces_the_field_with_the_clipboard() {
+        let mut rig = PasteRig::new(Lang::Ru);
+        let (button, field) = rig.settle();
+        let edit = rig.type_into_field(field, "abc");
+        // Фокус снимаем: на нажатии кнопки его не должно брать поле.
+        rig.frame(
+            0.1,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(rig.ctx.memory(|memory| memory.focused()), None);
+
+        rig.frame(0.1, vec![egui::Event::PointerMoved(button)]);
+        assert!(
+            !rig.ctx.read_response(edit).is_some_and(|field| field.hovered()),
+            "курсор над «Вставить» подсвечивает и поле под ней"
+        );
+        let [press, release] = click_at(button);
+        rig.frame(0.1, press);
+        assert_ne!(
+            rig.ctx.memory(|memory| memory.focused()),
+            Some(edit),
+            "нажатие на «Вставить» досталось полю под кнопкой"
+        );
+        assert!(
+            rig.frame(0.05, release).asked_paste,
+            "щелчок по «Вставить» не попросил вставку"
+        );
+
+        rig.frame(0.016, Vec::new());
+        rig.frame(
+            0.016,
+            vec![egui::Event::Paste("  https://youtu.be/dQw4w9WgXcQ\n".to_owned())],
+        );
+        assert_eq!(rig.url, "https://youtu.be/dQw4w9WgXcQ");
+    }
+
+    /// Вставка, попрошенная мимо мыши, не ложится в поле второй раз.
+    ///
+    /// С клавиатуры или экранным диктором «Вставить» нажимают, не трогая
+    /// поле, и если оно было в фокусе, `Event::Paste` увидело бы и оно — и
+    /// вставило бы тот же текст ещё раз, у своего курсора, в середину только
+    /// что положенной ссылки. Поэтому `Paste::take` событие из ввода
+    /// забирает, а не только читает.
+    ///
+    /// Проверено красным: с событием, оставленным во вводе, в поле оказалось
+    /// «htt», вся ссылка и остаток первой.
+    #[test]
+    fn a_paste_asked_past_the_mouse_is_not_inserted_twice() {
+        let mut rig = PasteRig::new(Lang::Ru);
+        let (_, field) = rig.settle();
+        let edit = rig.type_into_field(field, "abc");
+
+        rig.ask = true;
+        assert!(rig.frame(0.1, Vec::new()).asked_paste);
+        assert_eq!(
+            rig.ctx.memory(|memory| memory.focused()),
+            Some(edit),
+            "поле потеряло фокус — проверять нечего"
+        );
+        rig.frame(0.016, Vec::new());
+        rig.frame(
+            0.016,
+            vec![egui::Event::Paste("https://youtu.be/dQw4w9WgXcQ".to_owned())],
+        );
+        assert_eq!(rig.url, "https://youtu.be/dQw4w9WgXcQ");
+    }
+
+    /// Пустой буфер обмена не оставляет кнопку немой и не будит окно без
+    /// конца.
+    ///
+    /// Картинку или пустоту eframe не вставляет вовсе — `Event::Paste` не
+    /// приходит, — и ждать его надо с пределом: кадры, которые просит
+    /// ожидание, иначе шли бы до конца сеанса (Правило 1). А пока ждём,
+    /// просить кадры обязательно: без ввода egui окно не перерисует, и
+    /// вставка пролежала бы во вводе до первого движения мыши.
+    ///
+    /// Вставку здесь просят мимо кнопки, и это не упрощение. Отклик кнопки
+    /// под курсором сам просит кадры, пока доигрывает, — в том числе кадр
+    /// после ухода курсора, — и заслонил бы собой ожидание: первая версия
+    /// проверки со щелчком проходила и без просьбы о кадре. Что щелчок
+    /// вставку просит, держит `paste_replaces_the_field_with_the_clipboard`.
+    ///
+    /// Проверено красным дважды: без просьбы о кадре второй кадр ожидания
+    /// ничего не просит, без предела оговорки нет, а кадры просятся дальше.
+    #[test]
+    fn an_empty_clipboard_says_so_and_lets_the_window_rest() {
+        let mut rig = PasteRig::new(Lang::Ru);
+        rig.settle();
+        rig.ask = true;
+        assert!(rig.frame(0.1, Vec::new()).asked_paste);
+
+        // Первый кадр после просьбы просит и сама просьба (`send_viewport_cmd`
+        // заказывает перерисовку), так что смотреть надо на второй.
+        rig.frame(0.1, Vec::new());
+        let waiting = rig.frame(0.1, Vec::new());
+        assert_eq!(
+            waiting.repaint,
+            std::time::Duration::ZERO,
+            "ожидание вставки не попросило кадр"
+        );
+        assert!(!rig.paste.missed, "оговорка раньше срока");
+
+        rig.frame(0.1, Vec::new());
+        assert!(rig.paste.missed, "пустой буфер ничем не объяснён");
+        // Последнюю просьбу egui исполняет дважды (`outstanding`), так что
+        // тишина наступает со следующего кадра, а не с этого.
+        assert_eq!(
+            rig.frame(0.1, Vec::new()).repaint,
+            std::time::Duration::MAX,
+            "окно будится и после того, как ждать перестали"
+        );
+    }
+
+    /// «Вставить» стоит внутри поля ссылки, длинная ссылка обрывается у
+    /// кнопки, а не уходит под неё, и подсказке пустого поля хватает места —
+    /// в окне наименьшего размера и на всех трёх языках.
+    ///
+    /// Место текста отдаёт само поле (`TextEditOutput::text_clip_rect`), а
+    /// кнопка находится по имени: сумма ширин из констант сошлась бы и на
+    /// сломанной раскладке. Случаев два, и не для полноты. У пустого поля
+    /// место текста — это ровно разложенная подсказка, так что там видно,
+    /// не обрезана ли она, но не видно наложения; у длинной ссылки текст
+    /// занимает всё отведённое ему место — и наложение видно там. Провалы
+    /// собираются по всем языкам и выдаются в конце.
+    ///
+    /// Проверено красным по каждому языку дважды: без суффикса в поле
+    /// кнопка, положенная поверх его правого края, накрывает длинную ссылку
+    /// на всех трёх (первая версия проверки, мерившая одно пустое поле, это
+    /// пропустила), а с местом под кнопку на 200 точек шире обрезается
+    /// подсказка — тоже на всех трёх.
+    #[test]
+    fn the_paste_button_sits_inside_the_link_field() {
+        const LONG: &str = "https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PL0123456789abcdef&index=42";
+        let mut failures = Vec::new();
+        for lang in Lang::ALL {
+            let label = i18n::t(lang, Key::UiPaste);
+            for url in ["", LONG] {
+                // Свой контекст на каждый случай: общий помнит размеры от
+                // прошлого и искажает первый кадр следующего.
+                let mut rig = PasteRig::new(lang);
+                rig.url = url.to_owned();
+                let mut shot = rig.frame(0.1, Vec::new());
+                for _ in 0..2 {
+                    shot = rig.frame(0.1, Vec::new());
+                }
+                let Some((_, button)) = shot.named.iter().find(|(name, _)| name == label) else {
+                    failures.push(format!("{lang:?}: в поле нет кнопки «{label}»"));
+                    continue;
+                };
+                if !shot.field.expand(0.5).contains_rect(*button) {
+                    failures.push(format!(
+                        "{lang:?}: кнопка вылезла из поля: {button:?} при поле {:?}",
+                        shot.field
+                    ));
+                }
+                if shot.field.right() > shot.edge + 0.5 {
+                    failures.push(format!(
+                        "{lang:?}: поле за кромкой карточки: {} при кромке {}",
+                        shot.field.right(),
+                        shot.edge
+                    ));
+                }
+                if url.is_empty() {
+                    if shot.hint > shot.text.width() + 0.5 {
+                        failures.push(format!(
+                            "{lang:?}: подсказка обрезана кнопкой: ей нужно {}, а места {}",
+                            shot.hint,
+                            shot.text.width()
+                        ));
+                    }
+                } else if shot.text.right() > button.left() + 0.5 {
+                    failures.push(format!(
+                        "{lang:?}: длинная ссылка уходит под кнопку: текст до {}, кнопка с {}",
+                        shot.text.right(),
+                        button.left()
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     /// Щелчок, нажатый в паузе и отпущенный после неё, не засчитывается.
