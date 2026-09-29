@@ -19,8 +19,8 @@ use crate::engine::weather;
 use crate::model::{
     Appearance, BALANCED_PLAN, CheckStatus, CookieSource, DownloadId, DownloadOptions, Event,
     FAVORITES_LIMIT,
-    Format, GpuInfo, MediaInfo, MetaKind, MetaSummary, Metric, PerfSample, Place, PowerMode,
-    PowerModes,
+    Format, GpuInfo, MediaInfo, MetaKind, MetaSummary, Metric, PciId, PerfSample, Place,
+    PowerMode, PowerModes,
     PowerState, PressureUnit, Progress, Quality, Request, Section, SectionError, SectionPlan,
     ShareAddress, ShareEvent, Sky, SubLang, SystemReport, TRACE_LIMIT, TRANSFER_LIMIT, TempUnit,
     Thumbnail,
@@ -2696,21 +2696,30 @@ impl MonitorPanel {
     /// открыта вкладка или включён оверлей — есть кому смотреть; во всех
     /// прочих случаях поток обязан остановиться, иначе загрузчик греет
     /// ноутбук в фоне.
-    fn set_running(&mut self, wanted: bool, lang: Lang, ctx: &egui::Context) {
+    ///
+    /// `gpu` — видеокарта, которой рисует окно (`SavioApp::gpu_pci`): её
+    /// загрузку и спрашивает опрос.
+    fn set_running(
+        &mut self,
+        wanted: bool,
+        lang: Lang,
+        gpu: Option<PciId>,
+        ctx: &egui::Context,
+    ) {
         if wanted == self.running() {
             return;
         }
         if wanted {
-            self.start(lang, ctx);
+            self.start(lang, gpu, ctx);
         } else {
             self.stop();
         }
     }
 
-    fn start(&mut self, lang: Lang, ctx: &egui::Context) {
+    fn start(&mut self, lang: Lang, gpu: Option<PciId>, ctx: &egui::Context) {
         let (tx, rx) = channel();
         let notify_ctx = ctx.clone();
-        self.handle = Some(monitor::start(lang, tx, move || {
+        self.handle = Some(monitor::start(lang, gpu, tx, move || {
             notify_ctx.request_repaint()
         }));
         self.rx = Some(rx);
@@ -3699,7 +3708,20 @@ impl SavioApp {
                 (None, None) => None,
             },
             backend: info.backend.to_string(),
+            // Ноль у `AdapterInfo` значит «не назвал» (так бывает у GL),
+            // и сверять по нему нечего: монитор тогда возьмёт видеокарту,
+            // только если она в системе одна.
+            pci: (info.vendor != 0).then_some(PciId {
+                vendor: info.vendor,
+                device: info.device,
+            }),
         });
+    }
+
+    /// Производитель и модель видеокарты, которой рисует окно, — для опроса
+    /// монитора.
+    fn gpu_pci(&self) -> Option<PciId> {
+        self.gpu.as_ref().and_then(|gpu| gpu.pci)
     }
 
     /// Переносит пойманное в журнал. Зовётся из кадра, где это уже безопасно:
@@ -3944,8 +3966,9 @@ impl SavioApp {
         // «13.1 ГБ из 31.9 ГБ») собирает поток, и сменить их на ходу нечем.
         // Свежий замер приедет через секунду.
         if self.monitor.running() {
+            let gpu = self.gpu_pci();
             self.monitor.stop();
-            self.monitor.start(lang, ctx);
+            self.monitor.start(lang, gpu, ctx);
         }
         // Питание — по той же причине: «Питанием Savio управляет только
         // в Windows» собрано потоком и на месте не переводится. Перечитываем
@@ -4896,7 +4919,8 @@ impl eframe::App for SavioApp {
         // было бы некому.
         let now_open = self.tab == Tab::Machine && self.machine_tab == MachineTab::Now;
         let watched = now_open || self.monitor.overlay;
-        self.monitor.set_running(watched, self.lang, ui.ctx());
+        let gpu = self.gpu_pci();
+        self.monitor.set_running(watched, self.lang, gpu, ui.ctx());
         // Питание перечитывается по открытию половины, а не по кадру: оно
         // меняется раз в день, но меняют его и мимо Savio. Место здесь, а не
         // во вкладке, по той же причине, что и у опроса: закрытая половина
@@ -8291,12 +8315,10 @@ impl SavioApp {
         theme::card(ui, pal, |ui| {
             note(ui, i18n::t(lang, Key::UiMonitorNote), pal.text_secondary);
 
-            ui.add_space(6.0);
-            // Та же оговорка, что и в «Составе», и по той же причине: без неё
-            // отсутствие видеокарты в списке выглядит недоделкой Savio,
-            // а не отказом системы.
-            note(ui, i18n::t(lang, Key::UiMonitorNoGpuLoad), pal.text_muted);
-
+            // Оговорки «загрузки видеокарты здесь нет» больше нет: загрузка
+            // стоит строкой в «Вводе-выводе», а там, где система её не
+            // отдала, прочерк объясняет себя сам по наведению. Оговорка
+            // на все случаи врала бы там, где число есть.
             ui.add_space(14.0);
             checkbox(
                 ui,
@@ -13738,14 +13760,36 @@ fn io_card(
                 i18n::t(lang, Key::HwSwap),
                 sample.swap.detail.as_deref(),
             );
-            // Видеокарта здесь только именем: загрузку у неё не спросить,
-            // а имя уже снято с адаптера, которым eframe рисует окно.
+            // Имя видеокарты и её загрузка приходят с разных сторон: имя
+            // снято с адаптера, которым eframe рисует окно, а загрузку
+            // принёс опрос — про тот же адаптер (`GpuInfo::pci`). Потому
+            // и строки разные, а не одна склеенная: склеивать пришлось бы
+            // в кадре.
             stat_row(
                 ui,
                 pal,
                 lang,
                 i18n::t(lang, Key::HwGpu),
                 gpu.map(|gpu| gpu.name.as_str()),
+            );
+            // Прочерк у загрузки объясняется своими словами: «система не
+            // сообщила» здесь врало бы на macOS, где Savio её не спрашивает,
+            // и молчало бы о второй причине — видеокарт несколько, и какая
+            // рисует окно, не понять.
+            let gpu_missing = i18n::t(lang, Key::UiGpuMissing);
+            stat_row_with(
+                ui,
+                pal,
+                i18n::t(lang, Key::UiGpuLoad),
+                sample.gpu_load.as_deref(),
+                gpu_missing,
+            );
+            stat_row_with(
+                ui,
+                pal,
+                i18n::t(lang, Key::UiVideoMemory),
+                sample.gpu_memory.as_deref(),
+                gpu_missing,
             );
 
             // Пояснение — под всеми строками, а не после первой: оно про
@@ -15835,6 +15879,105 @@ mod tests {
             measured < 220.0,
             "карточка показателя во весь экран: {measured}"
         );
+    }
+
+    /// Подписи «Ввода-вывода» не обрезаются в самых узких колонках — на всех
+    /// трёх языках.
+    ///
+    /// Задача 37 добавила туда две строки про видеокарту, и армянская
+    /// подпись загрузки — самая длинная в карточке. Колонка подписей у
+    /// `stat_row` — доля ширины строки, и не влезшая подпись молча
+    /// обрезается в «…»: глазами это видно только на выбранном языке.
+    /// Меряется разложенный текст, а не ячейка: ячейка сжимается до своей
+    /// ширины всегда и проверяла бы сама себя. Провалы собираются по всем
+    /// языкам и ширинам и выдаются разом: `assert!` в цикле показал бы
+    /// только первый.
+    ///
+    /// Проверено красным — первым же прогоном, на настоящем переводе:
+    /// полная армянская подпись «Վիդեոքարտի բեռնվածություն» — 187 точек при
+    /// ячейке 153, и проверка падала на ней одной в обеих колонках. И ещё раз
+    /// с удлинёнными подписями на всех трёх языках: провал назван у каждого
+    /// языка и каждой ширины.
+    #[test]
+    fn the_io_card_labels_fit_the_narrowest_column() {
+        let pal = theme::Palette::dark();
+        let gpu = GpuInfo {
+            name: "NVIDIA Quadro P2200".to_owned(),
+            kind: Key::HwGpuDiscrete,
+            vendor: None,
+            driver: None,
+            backend: "dx12".to_owned(),
+            pci: None,
+        };
+        let sample = PerfSample {
+            net: Some("Приём 1.2 МБ/с · Отдача 128.0 КБ/с".to_owned()),
+            disk: Some("Чтение 4.0 МБ/с · Запись 512.0 КБ/с".to_owned()),
+            swap: Metric::new(0.0, Some("0 Б из 2.0 ГБ".to_owned())),
+            gpu_load: Some("37%".to_owned()),
+            gpu_memory: Some("1.4 ГБ из 4.9 ГБ".to_owned()),
+            ..Default::default()
+        };
+        let labels = [
+            Key::UiNetwork,
+            Key::UiDisks,
+            Key::HwSwap,
+            Key::HwGpu,
+            Key::UiGpuLoad,
+            Key::UiVideoMemory,
+        ];
+        let mut cut = Vec::new();
+
+        for width in main_columns() {
+            for lang in Lang::ALL {
+                // Свой контекст на язык: общий помнит размеры от прошлого и
+                // искажает первый кадр следующего.
+                let ctx = rail_test_ctx();
+                let size = egui::vec2(width, SMALLEST_WINDOW.height());
+                let mut named = Vec::new();
+                let mut needed = Vec::new();
+                // Кадров несколько: и панель, и прокрутка узнают свой размер
+                // по прошлому кадру.
+                for _ in 0..3 {
+                    let input = egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                        ..Default::default()
+                    };
+                    needed.clear();
+                    let mut output = ctx.run_ui(input, |ui| {
+                        let font = egui::TextStyle::Small.resolve(ui.style());
+                        for key in labels {
+                            let label = i18n::t(lang, key);
+                            let width = ui
+                                .painter()
+                                .layout_no_wrap(label.to_owned(), font.clone(), pal.text_muted)
+                                .size()
+                                .x;
+                            needed.push((label, width));
+                        }
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(ui, |ui| {
+                                egui::ScrollArea::vertical()
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| io_card(ui, pal, &sample, Some(&gpu), lang));
+                            });
+                    });
+                    output.textures_delta.clear();
+                    named = named_widgets(&mut output);
+                }
+
+                for &(label, text) in &needed {
+                    let cell = rect_named(&named, lang, label);
+                    if text > cell.width() + 0.5 {
+                        cut.push(format!(
+                            "{lang:?}, {width}: «{label}» — {text} при {}",
+                            cell.width()
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(cut.is_empty(), "подписи обрезаны:\n{}", cut.join("\n"));
     }
 
     /// Те же ряды, что уже лежат в `ui.horizontal`, не растягиваются и так.

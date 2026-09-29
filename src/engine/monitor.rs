@@ -32,6 +32,11 @@
 //! **накопительный** счётчик: суммарные с загрузки байты у живой машины нулём
 //! не бывают, и ноль в них означает, что счётчиков нет вовсе. Проверяем это
 //! на каждом замере, а не однажды при запуске: том могли подключить на ходу.
+//!
+//! У видеокарты ноль тоже законен, но накопительного счётчика нет, и «нет
+//! данных» там узнаётся по отказу самого запроса — подробности в `gpu`.
+
+mod gpu;
 
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
@@ -39,7 +44,7 @@ use std::time::{Duration, Instant};
 
 use crate::i18n::{self, Key, Lang};
 use crate::model::{
-    Event, Metric, PROC_LIMIT, PerfSample, ProcRow, human_bytes, human_mhz, human_percent,
+    Event, Metric, PROC_LIMIT, PciId, PerfSample, ProcRow, human_bytes, human_mhz, human_percent,
     human_speed,
 };
 
@@ -110,12 +115,24 @@ impl Stop {
 /// Первый замер приезжает через `INTERVAL`, а не сразу, и это не задержка,
 /// а необходимость: загрузка процессора — разница между двумя точками, и
 /// показать её раньше, чем набралась вторая, нельзя ничем, кроме нуля.
-pub fn start(lang: Lang, tx: Sender<Event>, notify: impl Fn() + Send + 'static) -> Handle {
+///
+/// `gpu` — видеокарта, которой рисует окно: загрузку показываем её, а не
+/// первой попавшейся. `None` — адаптер своих чисел не назвал.
+pub fn start(
+    lang: Lang,
+    gpu: Option<PciId>,
+    tx: Sender<Event>,
+    notify: impl Fn() + Send + 'static,
+) -> Handle {
     let stop = Arc::new(Stop::default());
     let mine = Arc::clone(&stop);
 
     std::thread::spawn(move || {
-        let mut sampler = Sampler::new(lang);
+        // Заводится в самом потоке, а не снаружи: опрос видеокарты держит
+        // дескрипторы системы (запрос PDH на Windows), а сырые указатели
+        // не `Send` — снаружи сюда его и не передать. Заодно заведение,
+        // спрашивающее DXGI и счётчики, не ложится на кадр.
+        let mut sampler = Sampler::new(lang, gpu);
 
         loop {
             if mine.wait(INTERVAL) {
@@ -155,6 +172,10 @@ struct Sampler {
     /// меняется — `SavioApp` перезапускает поток при смене языка, иначе
     /// половина монитора осталась бы на прежнем до следующего открытия.
     lang: Lang,
+    /// Опрос видеокарты. Его состояние — запрос к счётчикам на Windows —
+    /// тоже живёт между замерами: открывается один раз, при заведении, и
+    /// закрывается вместе с опросом.
+    gpu: gpu::Probe,
 }
 
 impl Sampler {
@@ -162,8 +183,10 @@ impl Sampler {
     ///
     /// Первый замер каждого счётчика ничего не значит: у процессора он
     /// сравнивать не с чем, у сети и дисков `sysinfo` отдаёт всё накопленное
-    /// с загрузки машины. Поэтому его снимаем здесь и выбрасываем.
-    fn new(lang: Lang) -> Self {
+    /// с загрузки машины. Поэтому его снимаем здесь и выбрасываем. Счётчик
+    /// загрузки видеокарты — такой же разностный, и его нулевую точку
+    /// `gpu::Probe::new` снимает сам.
+    fn new(lang: Lang, gpu: Option<PciId>) -> Self {
         let mut sys = sysinfo::System::new_with_specifics(
             sysinfo::RefreshKind::nothing()
                 .with_cpu(cpu_kind())
@@ -181,6 +204,7 @@ impl Sampler {
             disks: sysinfo::Disks::new_with_refreshed_list_specifics(disk_kind()),
             last: Instant::now(),
             lang,
+            gpu: gpu::Probe::new(gpu),
         }
     }
 
@@ -201,6 +225,7 @@ impl Sampler {
         );
         self.nets.refresh(false);
         self.disks.refresh_specifics(false, disk_kind());
+        let (gpu_load, gpu_memory) = self.gpu();
 
         PerfSample {
             cpu: self.cpu(),
@@ -208,8 +233,24 @@ impl Sampler {
             swap: self.swap(),
             net: self.network(elapsed),
             disk: self.disk(elapsed),
+            gpu_load,
+            gpu_memory,
             procs: self.processes(),
         }
+    }
+
+    /// Загрузка видеокарты и её занятая память — строками.
+    ///
+    /// Доля идёт через `human_percent`, как у процессора: нечисло там
+    /// становится «нет данных», а не «NaN%».
+    fn gpu(&mut self) -> (Option<String>, Option<String>) {
+        let reading = self.gpu.take();
+        let load = reading.load.and_then(human_percent);
+        let memory = reading.memory.map(|memory| match memory.total {
+            Some(total) => self.amount_of_total(memory.used, total),
+            None => human_bytes(memory.used, self.lang),
+        });
+        (load, memory)
     }
 
     fn cpu(&self) -> Metric {
@@ -481,7 +522,9 @@ mod tests {
     #[test]
     #[ignore = "спрашивает живую систему и занимает две секунды"]
     fn real_sample_from_this_machine() {
-        let mut sampler = Sampler::new(Lang::Ru);
+        // Видеокарта без чисел адаптера: на машине с одной настоящей картой
+        // это она и есть, на машине с двумя — честный прочерк.
+        let mut sampler = Sampler::new(Lang::Ru, None);
         std::thread::sleep(INTERVAL);
         let sample = sampler.take();
 
@@ -490,6 +533,7 @@ mod tests {
         println!("Подкачка: {:?}", sample.swap.detail);
         println!("Сеть:     {:?}", sample.net);
         println!("Диски:    {:?}", sample.disk);
+        println!("ГП:       {:?} / {:?}", sample.gpu_load, sample.gpu_memory);
         println!("Процессов в списке: {}", sample.procs.len());
         for row in &sample.procs {
             println!("  {:>7}  {:>10}  {}", row.cpu_text, row.mem_text, row.name);
