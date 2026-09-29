@@ -2445,6 +2445,10 @@ strings! {
     HwDischarging = "разряжается", "discharging", "լիցքաթափվում է";
     HwDrained = "разряжена", "drained", "լիցքաթափված է";
     HwOnMains = "от сети, зарядка не идёт", "on mains, not charging", "ցանցից, լիցքավորում չկա";
+    HwChargeLimit =
+        "от сети, заряд держится на заданном пределе",
+        "on mains, held at the charge limit",
+        "ցանցից, լիցքը պահվում է սահմանված շեմին";
     HwStateUnknown = "неизвестно", "unknown", "անհայտ";
     HwCapacityNow = "Ёмкость сейчас", "Capacity now", "Ընթացիկ տարողություն";
     HwCapacityDesign = "Ёмкость проектная", "Design capacity", "Նախագծային տարողություն";

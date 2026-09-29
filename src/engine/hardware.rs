@@ -509,6 +509,11 @@ fn battery_check(lang: Lang) -> Check {
                 starship_battery::State::Discharging => Key::HwDischarging,
                 starship_battery::State::Empty => Key::HwDrained,
                 starship_battery::State::Full => Key::HwOnMains,
+                // С 0.12 крейта: зарядку остановил предел, выставленный
+                // человеком (Linux пишет «Not Charging», macOS различает
+                // так же). Батарея при этом не полна, и подпись `Full`
+                // соврала бы о заряде; до 0.12 здесь выходило «неизвестно».
+                starship_battery::State::Paused => Key::HwChargeLimit,
                 // `Unknown` — и умолчание крейта, и «драйвер не сказал».
                 // Перечислено полностью, без `_`: enum не помечен
                 // `#[non_exhaustive]`, и новый вариант должен ломать сборку.
