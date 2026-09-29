@@ -391,6 +391,430 @@ fn gif_strip_removes_comment_keeps_frame() {
 }
 
 // ---------------------------------------------------------------------------
+// XMP
+// ---------------------------------------------------------------------------
+
+/// Объявления пространств с привычными префиксами.
+const XMP_SPACES: &str = "xmlns:exif=\"http://ns.adobe.com/exif/1.0/\" \
+    xmlns:photoshop=\"http://ns.adobe.com/photoshop/1.0/\" \
+    xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\" \
+    xmlns:aux=\"http://ns.adobe.com/exif/1.0/aux/\" \
+    xmlns:exifEX=\"http://cipa.jp/exif/1.0/\"";
+
+/// Пакет XMP с одним `rdf:Description`: объявления и свойства-атрибуты —
+/// в открывающем теге, свойства-элементы — внутри. Обёртка та же, что
+/// пишут Adobe и ExifTool, вместе с `xpacket` и BOM в его атрибуте.
+fn xmp_packet_with(spaces: &str, attributes: &str, elements: &str) -> String {
+    format!(
+        "<?xpacket begin=\"\u{feff}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n\
+         <x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n\
+         <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n\
+         <rdf:Description rdf:about=\"\"\n {spaces}\n {attributes}>\n\
+         {elements}\n\
+         </rdf:Description>\n\
+         </rdf:RDF>\n\
+         </x:xmpmeta>\n\
+         <?xpacket end=\"w\"?>"
+    )
+}
+
+fn xmp_packet(attributes: &str, elements: &str) -> String {
+    xmp_packet_with(XMP_SPACES, attributes, elements)
+}
+
+/// JPEG из данных сегментов, «сжатых данных» и конца.
+fn jpeg_with(segments: &[Vec<u8>]) -> Vec<u8> {
+    let mut jpeg = vec![0xFF, 0xD8];
+    for seg in segments {
+        jpeg.extend_from_slice(seg);
+    }
+    jpeg.extend(segment(0xDA, &[0x01, 0x00, 0x00, 0x00]));
+    jpeg.extend_from_slice(b"\xFF\xD9");
+    jpeg
+}
+
+fn xmp_segment(packet: &[u8]) -> Vec<u8> {
+    segment(0xE1, &[JPEG_XMP, packet].concat())
+}
+
+fn exif_segment(tiff: &[u8]) -> Vec<u8> {
+    segment(0xE1, &[b"Exif\x00\x00".as_slice(), tiff].concat())
+}
+
+fn xmp_jpeg(packet: &str) -> Vec<Tag> {
+    read_jpeg(&jpeg_with(&[xmp_segment(packet.as_bytes())])).unwrap()
+}
+
+/// Личные записи — роль, имя и значение, — в том порядке, в каком пришли.
+fn personal(tags: &[Tag]) -> Vec<(TagRole, &str, &str)> {
+    tags.iter()
+        .filter(|tag| tag.role.personal())
+        .map(|tag| (tag.role, tag.name.as_str(), tag.value.as_str()))
+        .collect()
+}
+
+/// Строка места у пакета с «40,10.632N» и «44,30.21E»: тот же вид, что
+/// у EXIF, и помета, откуда она.
+fn xmp_place_row() -> Vec<(TagRole, &'static str, &'static str)> {
+    vec![(
+        TagRole::Place,
+        "Координаты места (XMP)",
+        "40.1772, 44.5035",
+    )]
+}
+
+/// Место, время, владелец и номера внутри XMP — личные записи, записаны ли
+/// они атрибутом или элементом, в том числе с `rdf:Alt` внутри.
+///
+/// Прежде XMP показывался одним блоком «XMP: присутствует», и под таблицей
+/// снимка, у которого программа срезала EXIF, а XMP оставила, стояло «Ни
+/// места, ни времени съёмки нет» — при координатах в файле.
+#[test]
+fn xmp_place_time_and_serials_are_personal() {
+    let packet = xmp_packet(
+        "exif:GPSLatitude=\"40,10.632N\" exif:GPSAltitude=\"1180/1\" \
+         exif:GPSAltitudeRef=\"0\" xmp:CreateDate=\"2025-10-01T08:05Z\" \
+         exifEX:LensSerialNumber=\"LENS&amp;4821\"",
+        "<exif:GPSLongitude>44,30,12.6E</exif:GPSLongitude>\n\
+         <exif:DateTimeOriginal>2025-09-14T19:42:07+04:00</exif:DateTimeOriginal>\n\
+         <aux:OwnerName>Эрик</aux:OwnerName>\n\
+         <aux:SerialNumber>\n\
+          <rdf:Alt><rdf:li xml:lang=\"x-default\">C39XK0L2HG7F</rdf:li></rdf:Alt>\n\
+         </aux:SerialNumber>",
+    );
+    let tags = xmp_jpeg(&packet);
+    assert_eq!(
+        personal(&tags),
+        [
+            (
+                TagRole::Place,
+                "Координаты места (XMP)",
+                "40.1772, 44.5035 · 1180 м"
+            ),
+            (TagRole::Taken, "Дата съёмки (XMP)", "14 сен 2025, 19:42"),
+            // «Z» — время по Гринвичу: без пометы оно разошлось бы с местным
+            // на часы.
+            (
+                TagRole::Taken,
+                "Дата создания (XMP)",
+                "1 окт 2025, 08:05 UTC"
+            ),
+            (TagRole::Owner, "Владелец камеры (XMP)", "Эрик"),
+            (
+                TagRole::Serial,
+                "Серийный номер камеры (XMP)",
+                "C39XK0L2HG7F"
+            ),
+            (
+                TagRole::Serial,
+                "Серийный номер объектива (XMP)",
+                "LENS&4821"
+            ),
+        ],
+        "{tags:?}"
+    );
+    // Строка «XMP» остаётся служебной: она про объём.
+    assert!(
+        tags.iter()
+            .any(|tag| tag.name == "XMP" && tag.role == TagRole::Service),
+        "{tags:?}"
+    );
+}
+
+/// Обе формы координат XMP — «градусы,минуты,секунды» и «градусы,минуты.доли»
+/// — дают тот же вид, что у EXIF; юг и запад — минусом.
+#[test]
+fn xmp_coordinates_read_in_both_forms() {
+    let place = |latitude: &str, longitude: &str| {
+        let attributes =
+            format!("exif:GPSLatitude=\"{latitude}\" exif:GPSLongitude=\"{longitude}\"");
+        let tags = xmp_jpeg(&xmp_packet(&attributes, ""));
+        tags.iter()
+            .find(|tag| tag.role == TagRole::Place)
+            .map(|tag| tag.value.clone())
+    };
+    assert_eq!(
+        place("40,10,38N", "44,30,12.6E").as_deref(),
+        Some("40.1772, 44.5035")
+    );
+    assert_eq!(
+        place("40,10.632N", "44,30.21E").as_deref(),
+        Some("40.1772, 44.5035")
+    );
+    assert_eq!(
+        place("33,52.128S", "70,40W").as_deref(),
+        Some("−33.8688, −70.6667")
+    );
+    assert_eq!(place("91,0N", "181,0E"), None, "за пределами — не место");
+}
+
+/// Пакет без места, времени и номеров — ни одной личной записи, только
+/// служебная строка «XMP».
+#[test]
+fn xmp_without_place_or_time_has_nothing_personal() {
+    let packet = xmp_packet(
+        "xmp:CreatorTool=\"Adobe Lightroom\" exif:ExposureTime=\"1/120\" \
+         aux:Lens=\"24-70mm\"",
+        "<xmp:Rating>5</xmp:Rating>",
+    );
+    let tags = xmp_jpeg(&packet);
+    assert!(personal(&tags).is_empty(), "{tags:?}");
+    assert_eq!(tags.len(), 1, "{tags:?}");
+}
+
+/// Пустое или неразборчивое свойство — не запись: «нашли слово
+/// GPSLatitude» — ещё не место, а жёлтая строка ни о чём обесценила бы
+/// жёлтые строки по делу.
+#[test]
+fn empty_or_unreadable_xmp_properties_are_not_records() {
+    let packet = xmp_packet(
+        "exif:GPSLatitude=\"\" exif:GPSLongitude=\"  \" aux:SerialNumber=\"\" \
+         exifEX:LensSerialNumber=\" \" exif:GPSAltitude=\"0/1\" \
+         photoshop:DateCreated=\"0000-00-00T00:00:00\" xmp:CreateDate=\"сегодня\"",
+        "<exif:DateTimeOriginal/>\n\
+         <exif:DateTimeDigitized></exif:DateTimeDigitized>\n\
+         <aux:OwnerName>   </aux:OwnerName>\n\
+         <exif:GPSTimeStamp>2025-13-45T10:00:00Z</exif:GPSTimeStamp>",
+    );
+    let tags = xmp_jpeg(&packet);
+    assert!(personal(&tags).is_empty(), "{tags:?}");
+
+    // Слова вместо чисел и нули «спутник не пойман» — тоже не место.
+    for (latitude, longitude) in [("north", "east"), ("0,0,0N", "0,0,0E")] {
+        let attributes =
+            format!("exif:GPSLatitude=\"{latitude}\" exif:GPSLongitude=\"{longitude}\"");
+        let tags = xmp_jpeg(&xmp_packet(&attributes, ""));
+        assert!(personal(&tags).is_empty(), "{latitude}, {longitude}: {tags:?}");
+    }
+}
+
+/// Свойство узнаётся по пространству, к которому привязан префикс, а не по
+/// самому префиксу: `e:` бывает EXIF, а `exif:` — чужим пространством.
+///
+/// Адрес пространства сравнивается целиком: адрес `aux` начинается с адреса
+/// `exif`, и широта под префиксом `aux` — не широта EXIF.
+#[test]
+fn xmp_properties_are_found_by_namespace_not_prefix() {
+    let spaces = "xmlns:a=\"http://ns.adobe.com/exif/1.0/aux/\" \
+        xmlns:e=\"http://ns.adobe.com/exif/1.0/\" \
+        xmlns:exif=\"http://example.com/not-exif/\"";
+    let packet = xmp_packet_with(
+        spaces,
+        "a:GPSLatitude=\"10,0N\" e:GPSLatitude=\"40,10.632N\" \
+         exif:GPSLongitude=\"1,0E\"",
+        "<e:GPSLongitude>44,30.21E</e:GPSLongitude>\n\
+         <exif:DateTimeOriginal>2025-09-14T19:42</exif:DateTimeOriginal>",
+    );
+    let tags = xmp_jpeg(&packet);
+    assert_eq!(personal(&tags), xmp_place_row(), "{tags:?}");
+}
+
+/// Совпавшее с EXIF не задваивается: сравниваются значения, приведённые к
+/// одному виду, — «40,10.632N» и три дроби EXIF дают одну и ту же строку.
+/// Разошедшееся показывается рядом, с пометой «(XMP)».
+#[test]
+fn xmp_repeating_exif_is_not_doubled() {
+    let gps = [
+        (0x0001, Val::Ascii("N")),
+        (0x0002, Val::Rationals(&[(40, 1), (10, 1), (3792, 100)])),
+        (0x0003, Val::Ascii("E")),
+        (0x0004, Val::Rationals(&[(44, 1), (30, 1), (1260, 100)])),
+        (0x0005, Val::Byte(0)),
+        (0x0006, Val::Rationals(&[(1180, 1)])),
+    ];
+    let exif = [
+        (0x9003, Val::Ascii("2025:09:14 19:42:07")),
+        (0xA431, Val::Ascii("C39XK0L2HG7F")),
+    ];
+    let exif = exif_segment(&tiff(&[], &exif, &gps, &[]));
+    let exif_rows = [
+        (
+            TagRole::Place,
+            "Координаты места",
+            "40.1772, 44.5035 · 1180 м",
+        ),
+        (TagRole::Taken, "Дата съёмки", "14 сен 2025, 19:42"),
+        (TagRole::Serial, "Серийный номер камеры", "C39XK0L2HG7F"),
+    ];
+
+    // То же самое — иначе записанное: координаты без высоты, дата с поясом,
+    // дата без времени у Photoshop и номер под другим именем.
+    let same = xmp_packet(
+        "exif:GPSLatitude=\"40,10.632N\" exif:GPSLongitude=\"44,30.21E\" \
+         exif:DateTimeOriginal=\"2025-09-14T19:42:07+04:00\" \
+         photoshop:DateCreated=\"2025-09-14\" xmp:CreateDate=\"2025-09-14T19:42\" \
+         exifEX:BodySerialNumber=\"C39XK0L2HG7F\"",
+        "",
+    );
+    let tags = read_jpeg(&jpeg_with(&[exif.clone(), xmp_segment(same.as_bytes())])).unwrap();
+    assert_eq!(personal(&tags), exif_rows, "{tags:?}");
+
+    let other = xmp_packet(
+        "exif:GPSLatitude=\"40,11N\" exif:GPSLongitude=\"44,30.21E\" \
+         exif:DateTimeOriginal=\"2025-09-15T08:05:00\"",
+        "",
+    );
+    let tags = read_jpeg(&jpeg_with(&[exif, xmp_segment(other.as_bytes())])).unwrap();
+    let mut expected = exif_rows.to_vec();
+    expected.extend([
+        (
+            TagRole::Place,
+            "Координаты места (XMP)",
+            "40.1833, 44.5035",
+        ),
+        (TagRole::Taken, "Дата съёмки (XMP)", "15 сен 2025, 08:05"),
+    ]);
+    assert_eq!(personal(&tags), expected, "{tags:?}");
+}
+
+/// Пакет в UTF-16 — с BOM и без него, по нулевым байтам.
+#[test]
+fn utf16_xmp_is_read() {
+    let packet = xmp_packet(
+        "exif:GPSLatitude=\"40,10.632N\" exif:GPSLongitude=\"44,30.21E\"",
+        "",
+    );
+    let little: Vec<u8> = [0xFF, 0xFE]
+        .into_iter()
+        .chain(packet.encode_utf16().flat_map(u16::to_le_bytes))
+        .collect();
+    let big: Vec<u8> = packet.encode_utf16().flat_map(u16::to_be_bytes).collect();
+    for (name, bytes) in [("UTF-16LE с BOM", little), ("UTF-16BE без BOM", big)] {
+        let tags = read_jpeg(&jpeg_with(&[xmp_segment(&bytes)])).unwrap();
+        assert_eq!(personal(&tags), xmp_place_row(), "{name}: {tags:?}");
+    }
+}
+
+/// Координаты, лежащие только в продолжении большого XMP, — находятся:
+/// куски собираются по смещению, даже если свойство разрезано между ними
+/// и куски пришли не по порядку.
+#[test]
+fn jpeg_xmp_extension_is_read() {
+    let guid = b"0123456789ABCDEF0123456789ABCDEF";
+    let main = xmp_packet_with(
+        "xmlns:xmpNote=\"http://ns.adobe.com/xmp/note/\"",
+        "xmpNote:HasExtendedXMP=\"0123456789ABCDEF0123456789ABCDEF\"",
+        "",
+    );
+    let extension = xmp_packet(
+        "exif:GPSLatitude=\"40,10.632N\" exif:GPSLongitude=\"44,30.21E\"",
+        "",
+    );
+    let whole = extension.as_bytes();
+    let cut = extension.find("10.632").unwrap();
+    let chunk = |offset: usize, part: &[u8]| {
+        let mut body = JPEG_XMP_EXTENSION.to_vec();
+        body.extend_from_slice(guid);
+        body.extend_from_slice(&(whole.len() as u32).to_be_bytes());
+        body.extend_from_slice(&(offset as u32).to_be_bytes());
+        body.extend_from_slice(part);
+        segment(0xE1, &body)
+    };
+    let jpeg = jpeg_with(&[
+        xmp_segment(main.as_bytes()),
+        chunk(cut, &whole[cut..]),
+        chunk(0, &whole[..cut]),
+    ]);
+    let tags = read_jpeg(&jpeg).unwrap();
+    assert_eq!(personal(&tags), xmp_place_row(), "{tags:?}");
+}
+
+/// GIF с XMP в расширении приложения «XMP DataXMP»: пакет сырыми байтами и
+/// магический хвост за ним.
+fn gif_with_xmp(packet: &[u8]) -> Vec<u8> {
+    let mut out = Vec::from(b"GIF89a".as_slice());
+    out.extend_from_slice(&[0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]);
+    out.extend_from_slice(&[0x21, 0xFF, 0x0B]);
+    out.extend_from_slice(b"XMP DataXMP");
+    out.extend_from_slice(packet);
+    // Магический хвост: 0x01, затем 0xFF … 0x00, затем 0x00.
+    out.push(0x01);
+    out.extend((0..=255u8).rev());
+    out.push(0x00);
+    out.extend_from_slice(&[0x2C, 0, 0, 0, 0, 0x01, 0, 0x01, 0, 0x00]);
+    out.extend_from_slice(&[0x02, 0x02, 0x44, 0x01, 0x00]);
+    out.push(0x3B);
+    out
+}
+
+/// XMP у GIF и WebP разбирается так же, как у JPEG.
+///
+/// У GIF пакет лежит не подблоками: склеенный как комментарий, он теряет
+/// по байту через каждые 33–123 байта текста (байт буквы принимается за
+/// длину). Координаты такая склейка задевает не всегда — проверено красным:
+/// с `unblock` строка места уцелела, — поэтому в пакете длинный номер
+/// камеры: в 160 байтах ASCII выпавший байт есть обязательно.
+#[test]
+fn gif_and_webp_xmp_are_read() {
+    let serial = "0123456789".repeat(16);
+    let packet = xmp_packet(
+        &format!(
+            "exif:GPSLatitude=\"40,10.632N\" exif:GPSLongitude=\"44,30.21E\" \
+             aux:SerialNumber=\"{serial}\""
+        ),
+        "",
+    );
+    let mut expected = xmp_place_row();
+    expected.push((
+        TagRole::Serial,
+        "Серийный номер камеры (XMP)",
+        serial.as_str(),
+    ));
+
+    let gif = gif_with_xmp(packet.as_bytes());
+    let tags = read_gif(&gif).unwrap();
+    assert_eq!(personal(&tags), expected, "GIF: {tags:?}");
+    // Стирается XMP вместе с расширением, и после очистки место не видно.
+    let cleaned = strip_gif(&gif).unwrap();
+    assert!(!contains(&cleaned, b"GPSLatitude"), "XMP уцелел в GIF");
+    assert!(read_gif(&cleaned).unwrap().is_empty());
+
+    let mut body = riff_chunk(b"VP8X", &[0x04, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    body.extend(riff_chunk(b"VP8 ", b"COMPRESSED PIXELS"));
+    body.extend(riff_chunk(b"XMP ", packet.as_bytes()));
+    let mut webp = Vec::from(b"RIFF".as_slice());
+    webp.extend_from_slice(&((body.len() + 4) as u32).to_le_bytes());
+    webp.extend_from_slice(b"WEBP");
+    webp.extend_from_slice(&body);
+    let tags = read_webp(&webp).unwrap();
+    assert_eq!(personal(&tags), expected, "WebP: {tags:?}");
+}
+
+/// У PNG XMP живёт в записи iTXt. Несжатый разбирается; сжатый — zlib,
+/// распаковщика у Savio нет, и такой пакет остаётся строкой «XMP» без
+/// разбора, а не превращается в мусор, разобранный как текст.
+#[test]
+fn png_xmp_is_read_unless_compressed() {
+    let packet = xmp_packet(
+        "exif:GPSLatitude=\"40,10.632N\" exif:GPSLongitude=\"44,30.21E\"",
+        "",
+    );
+    let png = |compressed: u8| {
+        // Ключ, ноль, флаг сжатия, способ, язык и перевод ключа — пустые.
+        let mut itxt = b"XML:com.adobe.xmp\x00".to_vec();
+        itxt.extend_from_slice(&[compressed, 0, 0, 0]);
+        itxt.extend_from_slice(packet.as_bytes());
+        let mut out = Vec::from(PNG_SIGNATURE);
+        out.extend(png_chunk(b"IHDR", &[0u8; 13]));
+        out.extend(png_chunk(b"iTXt", &itxt));
+        out.extend(png_chunk(b"IDAT", b"PIXELDATA"));
+        out.extend(png_chunk(b"IEND", b""));
+        out
+    };
+
+    let tags = read_png(&png(0)).unwrap();
+    assert_eq!(personal(&tags), xmp_place_row(), "{tags:?}");
+    assert!(
+        tags.iter()
+            .any(|tag| tag.name == "XMP" && tag.role == TagRole::Service),
+        "{tags:?}"
+    );
+
+    let tags = read_png(&png(1)).unwrap();
+    assert!(personal(&tags).is_empty(), "сжатый разобран как текст: {tags:?}");
+}
+
+// ---------------------------------------------------------------------------
 // EXIF
 // ---------------------------------------------------------------------------
 

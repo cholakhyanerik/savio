@@ -34,6 +34,8 @@ use std::process::{Command, Stdio};
 use crate::i18n::{self, Key, Lang};
 use crate::model::{self, MetaKind, Tag, TagRole, meta_kind};
 
+mod xmp;
+
 /// Сколько байт значения показываем. XMP-пакет занимает килобайты, и целиком
 /// он в списке не нужен — важно, что он есть, а не его содержимое.
 const VALUE_LIMIT: usize = 200;
@@ -195,6 +197,10 @@ fn jpeg_is_metadata(marker: u8) -> bool {
     marker == 0xE1 || (0xE3..=0xED).contains(&marker) || marker == 0xEF || marker == 0xFE
 }
 
+/// Подписи сегментов APP1 с XMP: основной пакет и продолжение большого.
+const JPEG_XMP: &[u8] = b"http://ns.adobe.com/xap/1.0/\x00";
+const JPEG_XMP_EXTENSION: &[u8] = b"http://ns.adobe.com/xmp/extension/\x00";
+
 fn read_jpeg(data: &[u8], lang: Lang) -> Result<Vec<Tag>, String> {
     let (segments, _) = jpeg_segments(data, lang)?;
     let mut tags = Vec::new();
@@ -202,18 +208,23 @@ fn read_jpeg(data: &[u8], lang: Lang) -> Result<Vec<Tag>, String> {
     // XMP больше 64 КБ в один сегмент не влезает и продолжается сегментами
     // `xmp/extension`. Стираются они вместе с основным, и показывать их надо
     // вместе с ним — одной строкой с общим объёмом, иначе таблица занижала бы
-    // то, что уйдёт при очистке.
-    let mut xmp = 0;
+    // то, что уйдёт при очистке. Разбираются тоже вместе: координаты бывают
+    // и в продолжении.
+    let mut xmp_bytes = 0;
+    let mut xmp = xmp::Facts::default();
+    let mut extensions = xmp::Extensions::default();
     for seg in &segments {
         let body = &data[seg.body.clone()];
         match seg.marker {
             0xE1 => {
                 if let Some(exif) = body.strip_prefix(b"Exif\x00\x00") {
                     tags.extend(read_tiff(exif, lang));
-                } else if body.starts_with(b"http://ns.adobe.com/xap/1.0/\x00")
-                    || body.starts_with(b"http://ns.adobe.com/xmp/extension/\x00")
-                {
-                    xmp += body.len();
+                } else if let Some(packet) = body.strip_prefix(JPEG_XMP) {
+                    xmp_bytes += body.len();
+                    xmp.scan(packet);
+                } else if let Some(part) = body.strip_prefix(JPEG_XMP_EXTENSION) {
+                    xmp_bytes += body.len();
+                    extensions.add(part);
                 }
             }
             // «IPTC / Photoshop» — названия форматов, а не слова: переводу
@@ -231,9 +242,14 @@ fn read_jpeg(data: &[u8], lang: Lang) -> Result<Vec<Tag>, String> {
             _ => {}
         }
     }
-    if xmp > 0 {
-        tags.push(Tag::new(TagRole::Service, "XMP", present_bytes(xmp, lang)));
+    if xmp_bytes > 0 {
+        tags.push(Tag::new(TagRole::Service, "XMP", present_bytes(xmp_bytes, lang)));
     }
+    // Сборка продолжений не больше самого файла: полную длину заявляет файл.
+    extensions.scan_into(&mut xmp, data.len());
+    // Личное из XMP — последним: сверяется оно со всем, что уже прочитано.
+    let personal = xmp.tags(&tags, lang);
+    tags.extend(personal);
 
     Ok(tags)
 }
@@ -325,6 +341,9 @@ fn png_chunks(
     Ok(())
 }
 
+/// Ключ текстовой записи PNG, под которым лежит XMP.
+const PNG_XMP: &str = "XML:com.adobe.xmp";
+
 fn read_png(data: &[u8], lang: Lang) -> Result<Vec<Tag>, String> {
     let mut tags = Vec::new();
     let mut text = |key: &[u8], value: String| {
@@ -332,22 +351,33 @@ fn read_png(data: &[u8], lang: Lang) -> Result<Vec<Tag>, String> {
         tags.push(Tag::new(role, name, value));
     };
     let mut rest = Vec::new();
+    let mut xmp = xmp::Facts::default();
     png_chunks(data, lang, |kind, body, _| match kind {
         // tEXt: ключ, ноль, значение — обе части в Latin-1.
         b"tEXt" => {
             let mut parts = body.splitn(2, |b| *b == 0);
             let key = parts.next().unwrap_or_default();
             let value = parts.next().unwrap_or_default();
+            // По стандарту XMP живёт в iTXt, но программы кладут его и сюда.
+            if key == PNG_XMP.as_bytes() {
+                xmp.scan(value);
+            }
             text(key, text_value(value));
         }
         // zTXt и iTXt держат значение сжатым или в UTF-8 со служебными полями.
-        // Распаковывать ради показа незачем — важно, что запись есть.
+        // Распаковывать ради показа незачем — важно, что запись есть. Кроме
+        // XMP: внутри него бывают место и время, и несжатый он разбирается.
         b"zTXt" => {
             let key = body.split(|b| *b == 0).next().unwrap_or_default();
             text(key, i18n::t(lang, Key::MetaTextCompressed).to_owned());
         }
         b"iTXt" => {
             let key = body.split(|b| *b == 0).next().unwrap_or_default();
+            if key == PNG_XMP.as_bytes()
+                && let Some(packet) = xmp::itxt_plain(body)
+            {
+                xmp.scan(packet);
+            }
             text(key, i18n::t(lang, Key::MetaTextUtf8).to_owned());
         }
         b"eXIf" => rest.extend(read_tiff(body, lang)),
@@ -375,6 +405,8 @@ fn read_png(data: &[u8], lang: Lang) -> Result<Vec<Tag>, String> {
         _ => {}
     })?;
     tags.append(&mut rest);
+    let personal = xmp.tags(&tags, lang);
+    tags.extend(personal);
     Ok(tags)
 }
 
@@ -400,7 +432,7 @@ fn png_keyword(key: &str, lang: Lang) -> (TagRole, String) {
     };
     match known {
         Some((role, key)) => (role, i18n::t(lang, key).to_owned()),
-        None if key == "XML:com.adobe.xmp" => (TagRole::Service, "XMP".to_owned()),
+        None if key == PNG_XMP => (TagRole::Service, "XMP".to_owned()),
         None => (TagRole::Service, key.to_owned()),
     }
 }
@@ -426,18 +458,25 @@ fn strip_png(data: &[u8], lang: Lang) -> Result<Vec<u8>, String> {
 
 fn read_webp(data: &[u8], lang: Lang) -> Result<Vec<Tag>, String> {
     let mut tags = Vec::new();
+    let mut xmp = xmp::Facts::default();
     riff_chunks(data, lang, |kind, body| {
         match kind {
             b"EXIF" => tags.extend(read_tiff(body, lang)),
-            b"XMP " => tags.push(Tag::new(
-                TagRole::Service,
-                "XMP",
-                present_bytes(body.len(), lang),
-            )),
+            b"XMP " => {
+                xmp.scan(body);
+                tags.push(Tag::new(
+                    TagRole::Service,
+                    "XMP",
+                    present_bytes(body.len(), lang),
+                ));
+            }
             _ => {}
         }
         true
     })?;
+    // После обхода: чанк EXIF бывает и после XMP, а сверяется XMP с ним.
+    let personal = xmp.tags(&tags, lang);
+    tags.extend(personal);
     Ok(tags)
 }
 
@@ -588,6 +627,7 @@ fn gif_blocks(
 
 fn read_gif(data: &[u8], lang: Lang) -> Result<Vec<Tag>, String> {
     let mut tags = Vec::new();
+    let mut xmp = xmp::Facts::default();
     gif_blocks(data, lang, |label, body, _| match label {
         // Подблоки идут с байтом длины перед каждым — для показа его убираем.
         Some(0xFE) => tags.push(Tag::new(
@@ -595,11 +635,17 @@ fn read_gif(data: &[u8], lang: Lang) -> Result<Vec<Tag>, String> {
             i18n::t(lang, Key::TagComment),
             text_value(&unblock(body)),
         )),
-        Some(0xFF) => tags.push(Tag::new(
-            TagRole::Service,
-            i18n::t(lang, Key::TagAppExtension),
-            text_value(body.get(1..12).unwrap_or_default()),
-        )),
+        // У XMP подблоков нет — пакет лежит сырыми байтами (см. `gif_packet`).
+        Some(0xFF) => {
+            if let Some(packet) = xmp::gif_packet(body) {
+                xmp.scan(packet);
+            }
+            tags.push(Tag::new(
+                TagRole::Service,
+                i18n::t(lang, Key::TagAppExtension),
+                text_value(body.get(1..12).unwrap_or_default()),
+            ));
+        }
         Some(0x01) => tags.push(Tag::new(
             TagRole::Service,
             i18n::t(lang, Key::TagTextBlock),
@@ -607,6 +653,8 @@ fn read_gif(data: &[u8], lang: Lang) -> Result<Vec<Tag>, String> {
         )),
         _ => {}
     })?;
+    let personal = xmp.tags(&tags, lang);
+    tags.extend(personal);
     Ok(tags)
 }
 
@@ -1215,17 +1263,12 @@ fn gps_field(entries: &[Entry], tag: u16) -> Option<&Raw> {
         .map(|entry| &entry.raw)
 }
 
-/// Место съёмки одной строкой: «40.1772, 44.5035 · 1180 м».
+/// Место съёмки из каталога GPS одной строкой: «40.1772, 44.5035 · 1180 м».
 ///
 /// Одна строка вместо шести записей каталога, и это не ради краткости:
 /// градусы, минуты и секунды порознь («40, 10, 37.92» и «N» отдельной
 /// строкой) не читаются как место вовсе, а ответить на «где снято» таблица
-/// обязана с одного взгляда. Десятичные градусы понимает любая карта;
-/// четыре знака после точки — около десяти метров, то есть дом.
-///
-/// Города рядом с координатами нет, и это решение, а не недоделка: узнать
-/// его можно только у чужого сервиса, то есть отправив туда координаты
-/// снимка, — ровно то, от чего этот раздел и защищает.
+/// обязана с одного взгляда.
 fn gps_place(entries: &[Entry], lang: Lang) -> Option<Tag> {
     let coordinate = |value: u16, hemisphere: u16, negative: char| {
         let degrees = gps_field(entries, value).and_then(dms)?;
@@ -1239,6 +1282,32 @@ fn gps_place(entries: &[Entry], lang: Lang) -> Option<Tag> {
         coordinate(0x0002, 0x0001, 'S'),
         coordinate(0x0004, 0x0003, 'W'),
     ];
+    // 0x0005 — знак высоты: единица значит «ниже уровня моря».
+    let below = gps_field(entries, 0x0005).and_then(first_number) == Some(1);
+    let metres = gps_field(entries, 0x0006)
+        .and_then(ratio)
+        .map(|metres| if below { -metres } else { metres });
+    place_value(found, metres, lang)
+        .map(|value| Tag::new(TagRole::Place, i18n::t(lang, Key::TagPlace), value))
+}
+
+/// Разделитель частей строки места: координаты · высота. По нему же разбор
+/// XMP делит строку обратно, сверяя, не сказано ли его место уже в EXIF.
+const PLACE_JOIN: &str = " · ";
+
+/// Место одной строкой из уже посчитанных чисел: широта и долгота
+/// в градусах (юг и запад — с минусом) и высота в метрах.
+///
+/// Общее у EXIF и XMP, и это не ради краткости: одно и то же место обязано
+/// читаться в обоих одинаково, иначе сверка «не повторяет ли XMP уже
+/// показанное» сравнивала бы две записи одного числа и находила разницу
+/// там, где её нет. Десятичные градусы понимает любая карта; четыре знака
+/// после точки — около десяти метров, то есть дом.
+///
+/// Города рядом с координатами нет, и это решение, а не недоделка: узнать
+/// его можно только у чужого сервиса, то есть отправив туда координаты
+/// снимка, — ровно то, от чего этот раздел и защищает.
+fn place_value(found: [Option<f64>; 2], metres: Option<f64>, lang: Lang) -> Option<String> {
     // Одни нули — не место, а заглушка «спутник не пойман»: так пишут
     // устройства без фиксации (на картах это «нулевой остров»). Жёлтая
     // строка «0.0000, 0.0000» выглядела бы находкой ровно там, где находить
@@ -1261,25 +1330,16 @@ fn gps_place(entries: &[Entry], lang: Lang) -> Option<Tag> {
     }
     // Нулевая высота без координат — та же заглушка; рядом с настоящими
     // координатами ноль законен: это уровень моря.
-    if let Some(metres) = gps_field(entries, 0x0006).and_then(ratio)
+    if let Some(metres) = metres
         && (metres != 0.0 || !degrees.is_empty())
     {
-        // 0x0005 — знак высоты: единица значит «ниже уровня моря».
-        let below = gps_field(entries, 0x0005).and_then(first_number) == Some(1);
-        let metres = if below { -metres } else { metres };
         parts.push(i18n::fill(
             i18n::t(lang, Key::MetaMetres),
             &[&signed(metres, 0)],
         ));
     }
 
-    (!parts.is_empty()).then(|| {
-        Tag::new(
-            TagRole::Place,
-            i18n::t(lang, Key::TagPlace),
-            parts.join(" · "),
-        )
-    })
+    (!parts.is_empty()).then(|| parts.join(PLACE_JOIN))
 }
 
 /// Градусы, минуты и секунды — одним числом градусов.
