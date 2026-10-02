@@ -44,7 +44,19 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Выпуск собирается тем же компилятором, что проверял CI: `rust-version`
+      # из Cargo.toml, а не `@stable` (почему — в ci.yml).
+      - name: Версия Rust из Cargo.toml
+        id: rust
+        shell: bash
+        run: |
+          v=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)
+          test -n "$v" || { echo "::error::В Cargo.toml нет rust-version"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.rust.outputs.version }}
 
       - uses: Swatinem/rust-cache@v2
 

@@ -33,8 +33,22 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Компилятор — ровно тот, что записан в `rust-version` в Cargo.toml,
+      # а не `@stable`: stable обгоняет систему разработчика, и новый линт
+      # clippy ронял бы CI в день выпуска Rust, хотя на машине всё зелено, —
+      # красный прогон выглядел бы поломкой последней задачи. Число берём
+      # из Cargo.toml, а не пишем здесь второй копией (CLAUDE.md, Правило 3).
+      - name: Версия Rust из Cargo.toml
+        id: rust
+        shell: bash
+        run: |
+          v=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)
+          test -n "$v" || { echo "::error::В Cargo.toml нет rust-version"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ steps.rust.outputs.version }}
           components: clippy
 
       - uses: Swatinem/rust-cache@v2
