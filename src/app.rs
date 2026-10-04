@@ -2605,20 +2605,47 @@ impl SharePanel {
 // Монитор производительности
 // ---------------------------------------------------------------------------
 
-/// Размер окна оверлея.
+/// Высота окна оверлея.
 ///
-/// Фиксированный, и окно неизменяемое: содержимое у него — четыре строки
+/// Окно фиксированное и неизменяемое: содержимое у него — пять строк
 /// известной длины, и растягивать его некуда. Заодно это снимает целый класс
 /// бед из дефекта 13: у окна, которому нельзя менять размер, не бывает
 /// клиентской части шире 8192 пикселей.
 ///
-/// Ширина подобрана по самой длинной строке — «Приём 1.2 МБ/с · Отдача
-/// 128.0 КБ/с». На 230 точках она обрезалась многоточием, то есть оверлей
-/// показывал половину того, ради чего его открыли. Высота — под четыре
-/// строки и заголовок ровно с теми отступами, что заданы в `overlay_ui`:
-/// со штатными отступами темы (строка виджета 32 точки) четвёртая строка
-/// не влезала и молча пропадала.
-const OVERLAY_SIZE: [f32; 2] = [300.0, 122.0];
+/// Высота — под пять строк и заголовок ровно с теми отступами, что заданы
+/// в `overlay_ui`: строка там 19 точек, а со штатными отступами темы
+/// (строка виджета 32 точки) последняя строка не влезала и молча
+/// пропадала. Держит это `the_overlay_fits_its_window`.
+const OVERLAY_HEIGHT: f32 = 141.0;
+
+/// Размер окна оверлея на этом языке.
+///
+/// Ширина у каждого языка своя, потому что подобрана по самой длинной
+/// строке — скорости дисков с четырьмя цифрами до точки: «Чтение 1023.9 КБ/с
+/// · Запись 1023.9 КБ/с» просит 301 точку окна, а армянская та же строка —
+/// 395. Общая ширина по армянской оставила бы русскому и английскому
+/// оверлею сотню пустых точек поверх игры, а по русской резала бы армянскую
+/// скорость в «…» почти при любых числах — так и было до задачи 78, при
+/// общих трёхстах. На 230 точках строка обрезалась и по-русски, то есть
+/// оверлей показывал половину того, ради чего его открыли.
+///
+/// Смена языка при открытом оверлее окно не пересоздаёт: egui сравнивает
+/// построитель с прошлым кадром и шлёт `InnerSize`, а место окна остаётся
+/// (проверено вживую в Windows: тот же дескриптор, то же место). Первый
+/// кадр в новом размере, правда, приходит секунды через две, и до него
+/// система растягивает прежний — задача 81.
+fn overlay_size(lang: Lang) -> egui::Vec2 {
+    let width = match lang {
+        Lang::Ru | Lang::En => 304.0,
+        Lang::Am => 400.0,
+    };
+    egui::vec2(width, OVERLAY_HEIGHT)
+}
+
+/// Поля рамки оверлея. Константой, а не числами у `Frame`: по ним
+/// `the_overlay_fits_its_window` считает, где у окна кончается место, —
+/// копия в тесте разъехалась бы с раскладкой при первой же правке.
+const OVERLAY_MARGIN: egui::Margin = egui::Margin::symmetric(12, 10);
 
 /// Состояние вкладки «Монитор».
 ///
@@ -2730,6 +2757,14 @@ impl MonitorPanel {
         self.sample = None;
         self.cpu_trace.clear();
         self.mem_trace.clear();
+        // Ячейку оверлея — тоже: без этого он до первого свежего замера
+        // показывал прежние числа, а после смены языка — ещё и прежними
+        // словами («Приём 330 Б/с» под армянскими подписями, проверено
+        // глазами при задаче 78), хотя главное окно в это время честно
+        // пишет «Измеряю…».
+        if let Ok(mut slot) = self.overlay_sample.lock() {
+            *slot = None;
+        }
     }
 
     fn stop(&mut self) {
@@ -2854,13 +2889,14 @@ impl MonitorPanel {
             return;
         }
 
+        let size = overlay_size(lang);
         let builder = egui::ViewportBuilder::default()
             .with_title(i18n::t(lang, Key::UiOverlayTitle))
-            .with_inner_size(OVERLAY_SIZE)
+            .with_inner_size(size)
             // Пределы равны размеру: окно без рамки нечем тянуть. Дефекта 13
             // они не закрывают (задача 73): оверлей держит перехват ошибок GPU.
-            .with_min_inner_size(OVERLAY_SIZE)
-            .with_max_inner_size(OVERLAY_SIZE)
+            .with_min_inner_size(size)
+            .with_max_inner_size(size)
             .with_resizable(false)
             .with_decorations(false)
             .with_always_on_top()
@@ -13930,7 +13966,7 @@ fn overlay_ui(
             egui::Frame::new()
                 .fill(pal.modal_fill)
                 .stroke(egui::Stroke::new(1.0, pal.border_strong))
-                .inner_margin(egui::Margin::symmetric(12, 10)),
+                .inner_margin(OVERLAY_MARGIN),
         )
         .show(ui, |ui| {
             // Отступы темы рассчитаны на окно, а не на полоску в треть его
@@ -14015,22 +14051,43 @@ fn overlay_ui(
                 return;
             };
 
-            let row = |ui: &mut egui::Ui, key, value| {
-                overlay_row(ui, pal, i18n::t(lang, key), value)
+            let row = |ui: &mut egui::Ui, key, value, detail| {
+                overlay_row(ui, pal, i18n::t(lang, key), value, detail)
             };
-            row(ui, Key::UiOverlayCpu, sample.cpu.percent_text.as_deref());
-            row(ui, Key::UiOverlayRam, sample.mem.percent_text.as_deref());
-            row(ui, Key::UiNetwork, sample.net.as_deref());
-            row(ui, Key::UiOverlayDisk, sample.disk.as_deref());
+            row(ui, Key::UiOverlayCpu, sample.cpu.percent_text.as_deref(), None);
+            row(ui, Key::UiOverlayRam, sample.mem.percent_text.as_deref(), None);
+            row(ui, Key::UiNetwork, sample.net.as_deref(), None);
+            row(ui, Key::UiOverlayDisk, sample.disk.as_deref(), None);
+            // Загрузка и видеопамять — двумя подписями в одной строке, а не
+            // одной склеенной «37% · 1.4 ГБ»: склеивать пришлось бы в кадре
+            // (Правило 1), а обе строки движок и так отдаёт готовыми. И не
+            // двумя строками: окно оверлея фиксированное, и шестая строка
+            // стоила бы ещё девятнадцати точек высоты поверх игры.
+            row(
+                ui,
+                Key::UiOverlayGpu,
+                sample.gpu_load.as_deref(),
+                sample.gpu_memory.as_deref(),
+            );
         });
 }
 
 /// Одна строка оверлея.
 ///
 /// Своя, а не `stat_row`: там подпись занимает 42% ширины ради колонки из
-/// длинных названий, а здесь подписи в три буквы и места всего 230 точек —
-/// колонка съела бы половину окна.
-fn overlay_row(ui: &mut egui::Ui, pal: theme::Palette, label: &str, value: Option<&str>) {
+/// длинных названий, а здесь подписи в три буквы и всё окно в три-четыре
+/// сотни точек — колонка съела бы половину окна.
+///
+/// `detail` — приглушённое пояснение после значения (видеопамять рядом
+/// с загрузкой видеокарты); `None` — пояснения у строки нет. Обрезается оно
+/// первым: значение стоит раньше и место берёт раньше.
+fn overlay_row(
+    ui: &mut egui::Ui,
+    pal: theme::Palette,
+    label: &str,
+    value: Option<&str>,
+    detail: Option<&str>,
+) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
         ui.add(
@@ -14049,6 +14106,12 @@ fn overlay_row(ui: &mut egui::Ui, pal: theme::Palette, label: &str, value: Optio
             )
             .truncate(),
         );
+        if let Some(detail) = detail {
+            ui.add(
+                egui::Label::new(egui::RichText::new(detail).small().color(pal.text_muted))
+                    .truncate(),
+            );
+        }
     });
 }
 
@@ -15978,6 +16041,123 @@ mod tests {
             }
         }
         assert!(cut.is_empty(), "подписи обрезаны:\n{}", cut.join("\n"));
+    }
+
+    /// Оверлей вмещает все свои строки на всех трёх языках.
+    ///
+    /// Окно у него фиксированное (`overlay_size`) и по содержимому не
+    /// растёт: не влезшая по высоте строка молча пропадает за кромкой, не
+    /// влезшая по ширине — обрезается в «…». Глазами это видно только на
+    /// выбранном языке, а армянские строки длиннее русских.
+    ///
+    /// Кадр рисуется в окне втрое больше оверлея, и это не небрежность: в
+    /// настоящем подписи обрезались бы по его кромке, и проверка мерила бы
+    /// сама себя. Так каждая подпись занимает столько, сколько просит её
+    /// текст, а сравнивается с местом внутри рамки (`OVERLAY_MARGIN`).
+    /// Числа — самые длинные из тех, что отдаёт движок: четыре цифры до
+    /// точки и у скорости, и у видеопамяти. Провалы собираются по всем
+    /// языкам и выдаются разом.
+    ///
+    /// Проверено красным: с прежней высотой 122 строка видеокарты кончалась
+    /// на 131 при месте до 112 — на всех трёх языках; с прежней общей
+    /// шириной 300 армянская скорость дисков кончалась на 383 при месте до
+    /// 288, а русская — на 288.7.
+    #[test]
+    fn the_overlay_fits_its_window() {
+        let pal = theme::Palette::dark();
+        let speed = 1023.9 * 1024.0;
+        // 1023.9 МБ: на гигабайт без сотни килобайт единица ещё не сменилась.
+        let vram = 1024 * 1024 * 1024 - 100 * 1024;
+        let mut out = Vec::new();
+
+        for lang in Lang::ALL {
+            let window = overlay_size(lang);
+            let right = window.x - f32::from(OVERLAY_MARGIN.right);
+            let bottom = window.y - f32::from(OVERLAY_MARGIN.bottom);
+            let speeds = |key| {
+                i18n::fill(
+                    i18n::t(lang, key),
+                    &[&human_speed(speed, lang), &human_speed(speed, lang)],
+                )
+            };
+            let memory = i18n::fill(
+                i18n::t(lang, Key::AmountOfTotal),
+                &[&human_bytes(vram, lang), &human_bytes(vram, lang)],
+            );
+            let sample = PerfSample {
+                cpu: Metric::new(99.0, None),
+                mem: Metric::new(98.0, None),
+                net: Some(speeds(Key::MonNetworkLine)),
+                disk: Some(speeds(Key::MonDiskLine)),
+                gpu_load: Some("100%".to_owned()),
+                gpu_memory: Some(memory.clone()),
+                ..Default::default()
+            };
+            let texts = [
+                i18n::t(lang, Key::UiOverlayCpu).to_owned(),
+                "99%".to_owned(),
+                i18n::t(lang, Key::UiOverlayRam).to_owned(),
+                "98%".to_owned(),
+                i18n::t(lang, Key::UiNetwork).to_owned(),
+                speeds(Key::MonNetworkLine),
+                i18n::t(lang, Key::UiOverlayDisk).to_owned(),
+                speeds(Key::MonDiskLine),
+                i18n::t(lang, Key::UiOverlayGpu).to_owned(),
+                "100%".to_owned(),
+                memory,
+            ];
+
+            // Свой контекст на язык: общий помнит размеры от прошлого и
+            // искажает первый кадр следующего.
+            let ctx = rail_test_ctx();
+            let slot = Mutex::new(Some(sample));
+            let closing = AtomicBool::new(false);
+            let mut named = Vec::new();
+            for _ in 0..3 {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, window * 3.0)),
+                    ..Default::default()
+                };
+                let mut output = ctx.run_ui(input, |ui| {
+                    overlay_ui(ui, pal, egui::ViewportClass::Deferred, lang, &slot, &closing);
+                });
+                output.textures_delta.clear();
+                named = named_widgets(&mut output);
+            }
+
+            for text in &texts {
+                let rect = rect_named(&named, lang, text);
+                if rect.right() > right + 0.5 || rect.bottom() > bottom + 0.5 {
+                    out.push(format!(
+                        "{lang:?}: «{text}» кончается в {:.1}×{:.1}, а место — до {right}×{bottom}",
+                        rect.right(),
+                        rect.bottom()
+                    ));
+                }
+            }
+        }
+        assert!(out.is_empty(), "оверлей не вмещает:\n{}", out.join("\n"));
+    }
+
+    /// Перезапущенный опрос забывает и то, что показывал оверлей.
+    ///
+    /// Перезапуск — это смена языка или новое включение монитора, и замер
+    /// в ячейке оверлея в обоих случаях уже не про то: собран прежними
+    /// словами или снят сколько угодно времени назад. Гонки тут нет: в ячейку
+    /// кладёт `accept` на потоке окна, а не поток опроса.
+    ///
+    /// Проверено красным: без очистки в `MonitorPanel::start` проверка падает.
+    #[test]
+    fn a_restarted_monitor_forgets_what_the_overlay_showed() {
+        let ctx = egui::Context::default();
+        let mut panel = MonitorPanel::new();
+        if let Ok(mut slot) = panel.overlay_sample.lock() {
+            *slot = Some(PerfSample::default());
+        }
+        panel.start(Lang::Am, None, &ctx);
+        let forgotten = panel.overlay_sample.lock().is_ok_and(|slot| slot.is_none());
+        panel.stop();
+        assert!(forgotten, "оверлей остался с прежним замером");
     }
 
     /// Те же ряды, что уже лежат в `ui.horizontal`, не растягиваются и так.
