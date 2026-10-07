@@ -3,6 +3,7 @@
 
 mod app;
 mod engine;
+mod fonts;
 mod i18n;
 mod model;
 mod motion;

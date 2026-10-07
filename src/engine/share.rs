@@ -34,9 +34,25 @@
 //! сети. Поэтому `Handle::stop` не просит, а обрывает — и ожидание в `accept`,
 //! и каждое открытое подключение вместе с идущей передачей (подробности
 //! у `Shared`).
+//!
+//! # Куда ложатся файлы с телефона
+//!
+//! В папку раздачи — или в одну из системных папок (`model::Destination`),
+//! если её выбрали на странице. Телефон называет код папки, а не путь: путь
+//! с телефона значил бы, что любой, у кого есть адрес, кладёт файл куда
+//! угодно, в том числе в автозагрузку. Забирать файлы можно по-прежнему
+//! только из папки раздачи.
+//!
+//! # Отмена с телефона
+//!
+//! Телефон, передумав, шлёт `POST /api/cancel` с меткой отправки (`t`),
+//! которую сам приложил к `PUT`. Оборвать подключение со своей стороны ему
+//! мало: обрыв сервер видит как «телефон перестал отправлять», то есть как
+//! беду, а отмена — решение человека (`ShareEvent::Cancelled`), и ошибкой
+//! на экране компьютера она выглядеть не должна. Подробности у `Uploads`.
 
-use std::collections::HashMap;
 use std::collections::hash_map::RandomState;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::hash::{BuildHasher, Hasher};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -47,12 +63,45 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::fonts;
 use crate::i18n::{self, Key, Lang};
-use crate::model::{Event, ShareAddress, ShareEvent, TransferDirection};
+use crate::model::{Destination, Event, ShareAddress, ShareEvent, TransferDirection};
+
+mod folders;
 
 /// Страница для телефона. Одна, со встроенными стилями и скриптом: всё,
 /// что лежит отдельным файлом, пришлось бы раздавать отдельным маршрутом.
+/// Исключение — шрифты (`PAGE_FONTS`): вписанные в разметку, они утяжелили
+/// бы её втрое, причём на каждом открытии, а отдельным файлом браузер их
+/// кэширует.
 const PAGE: &str = include_str!("../../assets/share/index.html");
+
+/// Шрифты страницы: имя в адресе `/fonts/…` и байты.
+///
+/// Те же, что в окне, — без них страница на телефоне была бы набрана
+/// системным шрифтом и выглядела бы чужой. Какой файл какому алфавиту,
+/// страница говорит браузеру через `unicode-range`, и скачивает он только
+/// нужные языку страницы: русской — около 460 КБ из 620.
+///
+/// Отдаются без ключа, как значок вкладки: это открытые шрифты из
+/// репозитория, тайны в них нет, а ключ в адресе шрифта пришлось бы
+/// вписывать в стили, то есть собирать их заново на каждом запросе.
+const PAGE_FONTS: [(&str, &[u8]); 9] = [
+    ("caprasimo.ttf", fonts::CAPRASIMO),
+    ("kelly-slab.ttf", fonts::KELLY_SLAB),
+    ("armenian-display.ttf", fonts::ARMENIAN_DISPLAY),
+    ("figtree.ttf", fonts::FIGTREE),
+    ("figtree-bold.ttf", fonts::FIGTREE_BOLD),
+    ("nunito.ttf", fonts::NUNITO),
+    ("nunito-bold.ttf", fonts::NUNITO_BOLD),
+    ("armenian.ttf", fonts::ARMENIAN),
+    ("armenian-bold.ttf", fonts::ARMENIAN_BOLD),
+];
+
+/// Сколько браузер держит шрифт у себя. Неделя, а не «навсегда»: в адресе
+/// стоит версия Savio (`?v=`), так что новый шрифт приедет с новой версией
+/// и без этого, а старый кэш сам себя уберёт.
+const FONT_CACHE: &str = "public, max-age=604800";
 
 /// Какие порты пробуем по порядку.
 ///
@@ -110,6 +159,15 @@ const LIST_LIMIT: usize = 2000;
 /// не показывает нигде. Недокачанный файл не должен выглядеть готовым —
 /// приём тот же, что в `engine::cut`.
 const TEMP_PREFIX: &str = ".savio-upload-";
+
+/// Сколько отменённых меток помним на случай, если отмена обогнала сам файл
+/// (см. `Uploads`). Потолок по Правилу 1: метки шлёт телефон, и конец их
+/// списку задаём мы, а не он.
+const CANCELLED_LIMIT: usize = 64;
+
+/// Длина метки отправки: от и до. Страница шлёт 24 знака; короткая метка
+/// угадывалась бы, длинная — повод для чужой машины забить память.
+const TAG_LEN: std::ops::RangeInclusive<usize> = 8..=32;
 
 /// Ручка раздачи: пока её не попросили, сервер работает.
 pub struct Handle {
@@ -222,14 +280,19 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 struct Server {
     shared: Arc<Shared>,
     dir: PathBuf,
+    /// Куда телефону можно класть файлы: папка раздачи первой, за ней
+    /// системные, нашедшиеся на диске. Ищутся один раз, при запуске.
+    folders: Vec<DropFolder>,
+    /// Идущие приёмы и отменённые метки — всё, что нужно отмене с телефона.
+    uploads: Mutex<Uploads>,
     tx: Sender<Event>,
     notify: Arc<dyn Fn() + Send + Sync>,
     /// На каком языке говорить и с окном, и с телефоном.
     ///
     /// Телефон отвечает тем же языком, что и окно, намеренно: это один и тот
     /// же человек, и разводить его устройства по языкам было бы странностью
-    /// без причины. Поле, а не аргумент: язык у идущей раздачи не меняется —
-    /// `SavioApp` перезапускает её при смене языка.
+    /// без причины. Поле, а не аргумент: язык у идущей раздачи не меняется,
+    /// страница на телефоне остаётся на том, с которым раздачу запустили.
     lang: Lang,
 }
 
@@ -247,6 +310,126 @@ impl Server {
             (self.notify)();
         }
     }
+
+    /// Отменяет отправку с меткой `tag`: идущую — обрывает, ещё не начавшуюся —
+    /// запоминает, чтобы не начать. `true` — нашлась идущая.
+    ///
+    /// Порядок тот же, что у остановки (`Shared`), только под одним замком:
+    /// отмена записывает метку и ищет приём, приём записывает себя и ищет
+    /// метку. Разминуться им негде.
+    fn cancel(&self, tag: &str) -> bool {
+        let mut uploads = lock(&self.uploads);
+        if !uploads.cancelled.iter().any(|known| known == tag) {
+            if uploads.cancelled.len() >= CANCELLED_LIMIT {
+                uploads.cancelled.pop_front();
+            }
+            uploads.cancelled.push_back(tag.to_owned());
+        }
+        let mut found = false;
+        for going in uploads.going.values().filter(|going| going.tag == tag) {
+            going.cancelled.store(true, Ordering::SeqCst);
+            // Флаг поток увидит между кусками, а `shutdown` будит его, если он
+            // уснул в `read`, — на Windows не будит (см. `Shared`), но там
+            // телефон сам закроет подключение, получив ответ на отмену.
+            let _ = going.stream.shutdown(Shutdown::Both);
+            found = true;
+        }
+        found
+    }
+}
+
+/// Папка, куда телефон может положить файл.
+struct DropFolder {
+    which: Destination,
+    path: PathBuf,
+    /// Подпись на странице, уже экранированная для HTML: имя папки раздачи
+    /// — данные пользователя.
+    label: String,
+}
+
+/// Куда телефону можно класть файлы: папка раздачи первой, за ней системные,
+/// которые есть на диске.
+///
+/// Системная папка, совпавшая с папкой раздачи, отдельной кнопкой не
+/// показывается — зато одалживает ей своё название. По умолчанию раздаются
+/// «Загрузки», и на странице им лучше называться «Загрузками», чем
+/// `Downloads`, как папка записана на диске.
+///
+/// Пути сравниваются после разворота ссылок: на Linux «Рабочий стол»
+/// бывает ссылкой на домашнюю папку, а две кнопки, ведущие в одно место,
+/// сбивали бы с толку.
+fn drop_folders(dir: &Path, lang: Lang, system: Vec<(Destination, PathBuf)>) -> Vec<DropFolder> {
+    let shared_real = dir.canonicalize().unwrap_or_else(|_| dir.to_owned());
+    let mut seen = vec![shared_real];
+    let mut alias = None;
+    let mut found = Vec::new();
+
+    for (which, path) in system {
+        let Ok(real) = path.canonicalize() else {
+            continue;
+        };
+        if !real.is_dir() {
+            continue;
+        }
+        if real == seen[0] {
+            alias = alias.or(which.label(lang));
+            continue;
+        }
+        if seen.contains(&real) {
+            continue;
+        }
+        seen.push(real);
+        if let Some(label) = which.label(lang) {
+            found.push(DropFolder { which, path, label: escape_html(label) });
+        }
+    }
+
+    let shared = DropFolder {
+        which: Destination::Shared,
+        path: dir.to_owned(),
+        label: escape_html(&alias.map_or_else(|| folder_name(dir), str::to_owned)),
+    };
+    std::iter::once(shared).chain(found).collect()
+}
+
+/// Идущие приёмы, которые телефон может отменить, и метки, уже отменённые.
+///
+/// Вторая половина нужна из-за гонки, которой иначе не избежать. Отмена
+/// приходит отдельным подключением, и бывает, что раньше самого файла:
+/// человек нажал «Отменить все» в первую же долю секунды, когда `PUT` ещё
+/// летит. Не запомни сервер метку — приём начался бы после отмены, телефон
+/// оборвал бы его, и экран компьютера показал бы беду там, где было решение.
+#[derive(Default)]
+struct Uploads {
+    going: HashMap<u64, Going>,
+    /// Старые спереди. Потолок — `CANCELLED_LIMIT`.
+    cancelled: VecDeque<String>,
+}
+
+/// Идущий приём, который можно отменить.
+struct Going {
+    tag: String,
+    cancelled: Arc<AtomicBool>,
+    /// Своя ручка подключения — чтобы оборвать его из потока отмены.
+    stream: TcpStream,
+}
+
+/// Вычёркивает приём из `Uploads` при любом выходе, включая панику.
+struct GoingGuard<'a> {
+    uploads: &'a Mutex<Uploads>,
+    id: u64,
+}
+
+impl Drop for GoingGuard<'_> {
+    fn drop(&mut self) {
+        lock(self.uploads).going.remove(&self.id);
+    }
+}
+
+/// Годится ли строка в метки отправки: только латиница и цифры, длина
+/// в пределах `TAG_LEN`. Чужую строку в список отменённых не кладём.
+fn is_tag(text: &str) -> bool {
+    TAG_LEN.contains(&text.len()) && text.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
 /// Запускает раздачу папки `dir` в отдельном потоке.
@@ -263,6 +446,7 @@ pub fn start(
             bind: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             ports: &PORTS,
             find: find_addresses,
+            folders: |_| folders::system_folders(),
         },
         dir,
         lang,
@@ -271,12 +455,16 @@ pub fn start(
     )
 }
 
-/// Где слушать и как назвать адреса. Отдельно ради тестов: они слушают
-/// петлю, а не всю сеть, — иначе каждый прогон спрашивал бы брандмауэр.
+/// Где слушать, как назвать адреса и где системные папки. Отдельно ради
+/// тестов: они слушают петлю, а не всю сеть, — иначе каждый прогон спрашивал
+/// бы брандмауэр, — и кладут файлы во временный каталог, а не на настоящий
+/// рабочий стол.
 struct Listen {
     bind: IpAddr,
     ports: &'static [u16],
     find: fn(u16, &str) -> Vec<ShareAddress>,
+    /// Получает папку раздачи: тестам от неё и строить свои «системные».
+    folders: fn(&Path) -> Vec<(Destination, PathBuf)>,
 }
 
 fn start_with(
@@ -287,17 +475,28 @@ fn start_with(
     notify: impl Fn() + Send + Sync + 'static,
 ) -> Handle {
     let shared = Arc::new(Shared::new(generate_key()));
-    let server = Arc::new(Server {
+    let handle = Handle {
         shared: Arc::clone(&shared),
-        dir,
-        tx,
-        notify: Arc::new(notify),
-        lang,
+    };
+    let notify: Arc<dyn Fn() + Send + Sync> = Arc::new(notify);
+
+    std::thread::spawn(move || {
+        // Папки ищутся здесь, а не в `start`: это реестр и диск, а `start`
+        // зовут из кадра отрисовки (Правило 1).
+        let folders = drop_folders(&dir, lang, (listen.folders)(&dir));
+        let server = Arc::new(Server {
+            shared,
+            dir,
+            folders,
+            uploads: Mutex::new(Uploads::default()),
+            tx,
+            notify,
+            lang,
+        });
+        serve(&server, &listen);
     });
 
-    std::thread::spawn(move || serve(&server, &listen));
-
-    Handle { shared }
+    handle
 }
 
 fn serve(server: &Arc<Server>, listen: &Listen) {
@@ -319,7 +518,9 @@ fn serve(server: &Arc<Server>, listen: &Listen) {
         return;
     }
 
-    sweep_temp_files(&server.dir);
+    for folder in &server.folders {
+        sweep_temp_files(&folder.path);
+    }
 
     let addresses = (listen.find)(port, &server.shared.key);
     if addresses.is_empty() {
@@ -486,6 +687,23 @@ fn route(
         let _ = respond_text(writer, 404, server.text(Key::ShareNothingHere), head_only);
         return;
     }
+    // Шрифты — без ключа, см. `PAGE_FONTS`.
+    if let Some(file) = path.strip_prefix("/fonts/") {
+        if !reading {
+            let _ = respond_text(writer, 405, server.text(Key::ShareMethodNotAllowed), head_only);
+            return;
+        }
+        match PAGE_FONTS.iter().find(|(name, _)| *name == file) {
+            Some((_, bytes)) => {
+                let reply = Reply::new(200, "font/ttf", head_only).cache(FONT_CACHE);
+                let _ = respond(writer, reply, bytes);
+            }
+            None => {
+                let _ = respond_text(writer, 404, server.text(Key::ShareNothingHere), head_only);
+            }
+        }
+        return;
+    }
 
     let given = query_param(query, "k").unwrap_or_default();
     if !same_key(&given, &server.shared.key) {
@@ -506,12 +724,14 @@ fn route(
             let device = device_name(head.header("user-agent").unwrap_or_default(), server.lang);
             server.send(ShareEvent::Visitor(format!("{device} · {}", peer.ip())));
         }
+        // Шрифты и запросы — со своего же адреса, и это `default-src 'self'`
+        // покрывает: отдельных `font-src` и `connect-src` не нужно.
         let reply = Reply::new(200, "text/html; charset=utf-8", head_only).header(
             "Content-Security-Policy",
             "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; \
              img-src 'self' blob:; media-src 'self'",
         );
-        let body = page(server.lang, &folder_name(&server.dir));
+        let body = page(server.lang, &server.folders);
         let _ = respond(writer, reply, body.as_bytes());
     } else if path == "/api/files" {
         if !reading {
@@ -536,7 +756,36 @@ fn route(
             let _ = respond_text(writer, 405, server.text(Key::ShareMethodNotAllowed), head_only);
             return;
         }
-        receive_file(server, head, name, reader, writer);
+        // Без `to` — папка раздачи: так отправляла страница до выбора папки,
+        // и так же поступит `curl` без лишних вопросов.
+        let folder = match query_param(query, "to").as_deref() {
+            None | Some("") => server.folders.first(),
+            Some(code) => Destination::from_code(code)
+                .and_then(|which| server.folders.iter().find(|folder| folder.which == which)),
+        };
+        let Some(folder) = folder else {
+            let _ = respond_text(writer, 404, server.text(Key::ShareNoSuchFolder), false);
+            return;
+        };
+        // Метки может и не быть — тогда отправку просто нечем отменить.
+        let tag = query_param(query, "t").filter(|tag| is_tag(tag));
+        receive_file(server, head, name, folder, tag, reader, writer);
+    } else if path == "/api/cancel" {
+        if head.method != "POST" {
+            let _ = respond_text(writer, 405, server.text(Key::ShareMethodNotAllowed), head_only);
+            return;
+        }
+        let Some(tag) = query_param(query, "t").filter(|tag| is_tag(tag)) else {
+            let _ = respond_text(writer, 400, server.text(Key::ShareBadRequest), false);
+            return;
+        };
+        let found = server.cancel(&tag);
+        let body = serde_json::json!({ "cancelled": found }).to_string();
+        let _ = respond(
+            writer,
+            Reply::new(200, "application/json; charset=utf-8", false),
+            body.as_bytes(),
+        );
     } else {
         let _ = respond_text(writer, 404, server.text(Key::ShareNoSuchPage), head_only);
     }
@@ -545,14 +794,17 @@ fn route(
 /// Что показать тому, кто пришёл без ключа или со старым.
 ///
 /// Своя крошечная разметка, а не `PAGE`: на той странице живёт скрипт, а
-/// объяснять человеку тут нечего, кроме двух строк.
+/// объяснять человеку тут нечего, кроме двух строк. Цвета — `bg`
+/// и `text_primary` обеих тем из `theme.rs`, тема — как у телефона.
 fn stale_page(lang: Lang) -> String {
     format!(
         "<!doctype html><html lang=\"{}\"><meta charset=utf-8>\
          <meta name=viewport content=\"width=device-width,initial-scale=1\">\
+         <meta name=color-scheme content=\"dark light\">\
          <title>Savio</title>\
-         <body style=\"font:17px system-ui,sans-serif;background:#100e0c;\
-         color:#f9f4ed;padding:24px\">\
+         <style>body{{font:17px/1.45 system-ui,sans-serif;background:#121514;\
+         color:#f2f5f4;padding:24px}}@media (prefers-color-scheme:light)\
+         {{body{{background:#f4f2ec;color:#171b1b}}}}</style>\
          <h1 style=\"font-size:22px\">{}</h1><p>{}</p>",
         i18n::t(lang, Key::PageLangTag),
         i18n::t(lang, Key::ShareStaleTitle),
@@ -567,7 +819,7 @@ fn stale_page(lang: Lang) -> String {
 /// в самой разметке больше нигде не встречаются, и это проверяет тест:
 /// забытый токен виден на телефоне как `{{Имя}}` — молча и только у того,
 /// кто открыл страницу.
-const PAGE_SLOTS: [(&str, Key); 33] = [
+const PAGE_SLOTS: [(&str, Key); 37] = [
     ("{{LangTag}}", Key::PageLangTag),
     ("{{LocaleTag}}", Key::PageLocaleTag),
     ("{{Title}}", Key::PageTitle),
@@ -577,7 +829,11 @@ const PAGE_SLOTS: [(&str, Key); 33] = [
     ("{{ToComputer}}", Key::TransferToComputer),
     ("{{ToComputerNote}}", Key::PageToComputerNote),
     ("{{UploadNote}}", Key::PageUploadNote),
+    ("{{WhereTo}}", Key::PageWhereTo),
     ("{{PickFiles}}", Key::PagePickFiles),
+    ("{{CancelAll}}", Key::PageCancelAll),
+    ("{{Cancelled}}", Key::PageCancelled),
+    ("{{FilesLeft}}", Key::PageFilesLeft),
     ("{{IosNote}}", Key::PageIosNote),
     ("{{AwakeNote}}", Key::PageAwakeNote),
     ("{{FromComputer}}", Key::PageFromComputer),
@@ -605,23 +861,44 @@ const PAGE_SLOTS: [(&str, Key); 33] = [
 
 /// Страница для телефона на выбранном языке.
 ///
-/// `folder` — имя раздаваемой папки, **только имя**, без пути: страницу
-/// видит любой, у кого есть адрес, и полный путь рассказал бы ему имя
-/// пользователя и устройство диска. Имя нужно затем, чтобы человек с
-/// телефона видел, куда именно уедут его файлы, — «в папку компьютера»
-/// без названия ничего не объясняет.
-fn page(lang: Lang, folder: &str) -> String {
+/// Папки называются **только именами**, без путей: страницу видит любой,
+/// у кого есть адрес, и полный путь рассказал бы ему имя пользователя и
+/// устройство диска. Имя нужно затем, чтобы человек с телефона видел, куда
+/// именно уедут его файлы, — «в папку компьютера» без названия ничего не
+/// объясняет.
+///
+/// Первая из `folders` — папка раздачи. Если других нет, выбора на странице
+/// не будет вовсе: одна кнопка, которую нельзя не выбрать, — не выбор.
+fn page(lang: Lang, folders: &[DropFolder]) -> String {
     let mut out = PAGE.to_owned();
     for (slot, key) in PAGE_SLOTS {
         out = out.replace(slot, i18n::t(lang, key));
     }
     // Имя папки — не строка из таблицы, а данные пользователя, и в разметку
-    // его можно класть только экранированным. Папка по имени `<b>` или
-    // `Tom & Jerry` иначе ломала бы страницу на телефоне, а проверка
-    // `the_phone_page_strings_are_safe_to_paste` про неё не знает: она
-    // смотрит только таблицу строк.
-    let line = i18n::fill(i18n::t(lang, Key::PageFolderLine), &[&escape_html(folder)]);
+    // его можно класть только экранированным (`DropFolder::label` уже такой).
+    // Папка по имени `<b>` или `Tom & Jerry` иначе ломала бы страницу на
+    // телефоне, а проверка `the_phone_page_strings_are_safe_to_paste` про неё
+    // не знает: она смотрит только таблицу строк.
+    let shared = folders.first().map_or("", |folder| folder.label.as_str());
+    let line = i18n::fill(i18n::t(lang, Key::PageFolderLine), &[shared]);
+
+    let mut places = String::new();
+    if folders.len() > 1 {
+        for folder in folders {
+            places.push_str(&format!(
+                "<button type=\"button\" class=\"choice\" data-to=\"{}\" \
+                 aria-pressed=\"false\">{}</button>",
+                folder.which.code(),
+                folder.label
+            ));
+        }
+    }
+
     out.replace("{{FolderLine}}", &line)
+        .replace("{{Places}}", &places)
+        // Версия — в адресе шрифтов: кэш браузера на неделю, а новый шрифт
+        // обязан приехать с новой версией, не дожидаясь срока.
+        .replace("{{Version}}", env!("CARGO_PKG_VERSION"))
 }
 
 /// Экранирует текст для вставки в HTML.
@@ -788,10 +1065,11 @@ fn send_file(
             direction: TransferDirection::ToPhone,
             name: name.to_owned(),
             total: Some(count),
+            folder: Destination::Shared,
         });
     }
 
-    match pump(server, &mut file, writer, count, reported.then_some(id)) {
+    match pump(server, &mut file, writer, count, reported.then_some(id), None) {
         Ok(()) => {
             if reported {
                 server.send(ShareEvent::Finished { id, name: name.to_owned() });
@@ -814,10 +1092,16 @@ fn send_file(
     }
 }
 
+/// Принимает файл с телефона в папку `folder`.
+///
+/// `tag` — метка, по которой телефон может отменить отправку; без неё
+/// отправку отменить нечем, но принять её это не мешает.
 fn receive_file(
     server: &Server,
     head: &Head,
     raw_name: &str,
+    folder: &DropFolder,
+    tag: Option<String>,
     reader: &mut BufReader<TcpStream>,
     writer: &mut TcpStream,
 ) {
@@ -840,14 +1124,56 @@ fn receive_file(
     };
 
     let id = server.shared.next_id();
-    let temp = server.dir.join(format!("{TEMP_PREFIX}{id}.part"));
+
+    // Записаться в идущие — до первого байта на диске: отмена, пришедшая
+    // в эту долю секунды, должна найти либо нас, либо свою метку у нас.
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let _going = match tag {
+        Some(tag) => {
+            let Ok(stream) = writer.try_clone() else {
+                return;
+            };
+            let mut uploads = lock(&server.uploads);
+            if uploads.cancelled.contains(&tag) {
+                drop(uploads);
+                // Отмена обогнала файл. Ни строки на экране компьютера, ни
+                // временного файла: для человека этой отправки не было.
+                let _ = respond_text(writer, 409, server.text(Key::PageCancelled), false);
+                return;
+            }
+            uploads.going.insert(
+                id,
+                Going {
+                    tag,
+                    cancelled: Arc::clone(&cancelled),
+                    stream,
+                },
+            );
+            Some(GoingGuard {
+                uploads: &server.uploads,
+                id,
+            })
+        }
+        None => None,
+    };
+    let is_cancelled = || !server.shared.stopped() && cancelled.load(Ordering::SeqCst);
+
+    // Временный файл — в той же папке, куда файл ляжет: `rename` между
+    // разными дисками не работает, а рабочий стол бывает на другом.
+    let temp = folder.path.join(format!("{TEMP_PREFIX}{id}.part"));
     let mut file = match OpenOptions::new().write(true).create_new(true).open(&temp) {
         Ok(file) => file,
         Err(error) => {
-            let message = i18n::fill(
-                server.text(Key::ShareCannotAcceptDir),
-                &[&name, &error.to_string()],
-            );
+            let message = match folder.which.label(server.lang) {
+                None => i18n::fill(
+                    server.text(Key::ShareCannotAcceptDir),
+                    &[&name, &error.to_string()],
+                ),
+                Some(label) => i18n::fill(
+                    server.text(Key::ShareCannotAcceptFolder),
+                    &[&name, label, &error.to_string()],
+                ),
+            };
             server.send(ShareEvent::Failed { id, message });
             let _ = respond_text(writer, 500, server.text(Key::ShareCannotWriteDir), false);
             return;
@@ -859,12 +1185,21 @@ fn receive_file(
         direction: TransferDirection::ToComputer,
         name: name.clone(),
         total: Some(len),
+        folder: folder.which,
     });
 
-    let pumped = pump(server, reader, &mut file, len, Some(id)).and_then(|()| {
-        file.flush().map_err(Broken::Write)
-    });
+    let pumped = pump(server, reader, &mut file, len, Some(id), Some(&cancelled))
+        .and_then(|()| file.flush().map_err(Broken::Write));
     drop(file);
+
+    // Отмена, пришедшая к последнему байту, всё равно отмена: телефон уже
+    // показал «Отменено», и файл, тихо легший в папку, с ним бы разошёлся.
+    if is_cancelled() {
+        let _ = fs::remove_file(&temp);
+        server.send(ShareEvent::Cancelled { id });
+        // Отвечать некому: подключение оборвала сама отмена.
+        return;
+    }
 
     if let Err(broken) = pumped {
         let _ = fs::remove_file(&temp);
@@ -889,7 +1224,7 @@ fn receive_file(
         return;
     }
 
-    match place(&server.dir, &name, &temp, server.lang) {
+    match place(&folder.path, &name, &temp, server.lang) {
         Ok(saved) => {
             server.send(ShareEvent::Finished { id, name: saved.clone() });
             let body = serde_json::json!({ "name": saved }).to_string();
@@ -966,27 +1301,30 @@ enum Broken {
     Short,
     /// Приёмник отказал.
     Write(io::Error),
-    /// Раздачу остановили.
+    /// Раздачу остановили или эту передачу отменили. Что именно, решает
+    /// тот, кто звал, — по флагам, а не по этому варианту.
     Stopped,
 }
 
 /// Перекачивает ровно `len` байт кусками, глядя на остановку между ними.
 ///
 /// Ничего не копит в памяти: ролик с телефона — это гигабайты (Правило 1).
-/// `id` — о какой передаче рассказывать; `None` — молча.
+/// `id` — о какой передаче рассказывать; `None` — молча. `cancel` — флаг
+/// отмены этой передачи, если её вообще можно отменить.
 fn pump(
     server: &Server,
     from: &mut impl Read,
     to: &mut impl Write,
     len: u64,
     id: Option<u64>,
+    cancel: Option<&AtomicBool>,
 ) -> Result<(), Broken> {
     let mut buf = vec![0u8; CHUNK];
     let mut done = 0u64;
     let mut told = Instant::now();
 
     while done < len {
-        if server.shared.stopped() {
+        if server.shared.stopped() || cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
             return Err(Broken::Stopped);
         }
         let want = usize::try_from(len - done).map_or(CHUNK, |left| left.min(CHUNK));
@@ -1221,6 +1559,9 @@ struct Reply {
     headers: Vec<(&'static str, String)>,
     length: Option<u64>,
     head_only: bool,
+    /// `Cache-Control`. По умолчанию `no-store`: страница несёт ключ, список
+    /// папки меняется, и устаревшая копия хуже лишнего запроса.
+    cache: &'static str,
 }
 
 impl Reply {
@@ -1230,7 +1571,13 @@ impl Reply {
             headers: vec![("Content-Type", content_type.to_owned())],
             length: None,
             head_only,
+            cache: "no-store",
         }
+    }
+
+    fn cache(mut self, cache: &'static str) -> Self {
+        self.cache = cache;
+        self
     }
 
     fn header(mut self, name: &'static str, value: impl Into<String>) -> Self {
@@ -1252,6 +1599,7 @@ fn reason(status: u16) -> &'static str {
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        409 => "Conflict",
         411 => "Length Required",
         416 => "Range Not Satisfiable",
         431 => "Request Header Fields Too Large",
@@ -1272,10 +1620,11 @@ fn respond_head(writer: &mut impl Write, reply: &Reply) -> io::Result<()> {
     text.push_str(&format!(
         "Content-Length: {}\r\n\
          Connection: close\r\n\
-         Cache-Control: no-store\r\n\
+         Cache-Control: {}\r\n\
          X-Content-Type-Options: nosniff\r\n\
          Referrer-Policy: no-referrer\r\n\r\n",
-        reply.length.unwrap_or(0)
+        reply.length.unwrap_or(0),
+        reply.cache
     ));
     writer.write_all(text.as_bytes())
 }

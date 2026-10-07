@@ -17,8 +17,8 @@ use crate::engine::power;
 use crate::engine::share;
 use crate::engine::weather;
 use crate::model::{
-    Appearance, BALANCED_PLAN, CheckStatus, CookieSource, DownloadId, DownloadOptions, Event,
-    FAVORITES_LIMIT,
+    Appearance, BALANCED_PLAN, CheckStatus, CookieSource, Destination, DownloadId,
+    DownloadOptions, Event, FAVORITES_LIMIT,
     Format, GpuInfo, MediaInfo, MetaKind, MetaSummary, Metric, PciId, PerfSample, Place,
     PowerMode, PowerModes,
     PowerState, PressureUnit, Progress, Quality, Request, Section, SectionError, SectionPlan,
@@ -2251,6 +2251,9 @@ enum TransferOutcome {
     Going,
     Done,
     Failed(String),
+    /// Телефон снял отправку сам. Подпись берётся из таблицы в кадре,
+    /// а не хранится строкой: так её переведёт и смена языка.
+    Cancelled,
 }
 
 /// Строка списка передач. Все строки готовые: прогресс приезжает несколько
@@ -2258,6 +2261,9 @@ enum TransferOutcome {
 struct TransferRow {
     id: u64,
     direction: TransferDirection,
+    /// Куда на компьютере лёг файл. Роль, а не готовое название: строку
+    /// пересобирает и смена языка.
+    folder: Destination,
     name: String,
     total: Option<u64>,
     /// Сколько байт уже прошло.
@@ -2282,9 +2288,20 @@ impl TransferRow {
             .map(|total| (done as f32 / total as f32).clamp(0.0, 1.0));
         self.line = format!(
             "{} · {}",
-            self.direction.label(lang),
+            self.heading(lang),
             transfer_line(done, self.total, lang)
         );
+    }
+
+    /// «На компьютер» — или «На компьютер · Рабочий стол», если файл ушёл
+    /// не в папку раздачи. Папку раздачи не называем: она и так написана
+    /// на карточке слева, а у файла, лёгшего на рабочий стол, искать его
+    /// там было бы бесполезно.
+    fn heading(&self, lang: Lang) -> String {
+        match self.folder.label(lang) {
+            Some(folder) => format!("{} · {folder}", self.direction.label(lang)),
+            None => self.direction.label(lang).to_owned(),
+        }
     }
 
     /// Помечает передачу дошедшей.
@@ -2297,7 +2314,7 @@ impl TransferRow {
         self.line = i18n::fill(
             i18n::t(lang, Key::UiShareTransferDone),
             &[
-                self.direction.label(lang),
+                &self.heading(lang),
                 &self
                     .total
                     .map(|total| human_bytes(total, lang))
@@ -2548,7 +2565,13 @@ impl SharePanel {
                     self.visitors_line = self.visitors.join(", ");
                 }
             }
-            ShareEvent::Started { id, direction, name, total } => {
+            ShareEvent::Started {
+                id,
+                direction,
+                name,
+                total,
+                folder,
+            } => {
                 if self.transfers.len() >= TRANSFER_LIMIT {
                     // Уходит старейшая законченная; идущие не трогаем, пока
                     // есть что убрать кроме них.
@@ -2562,6 +2585,7 @@ impl SharePanel {
                 let mut row = TransferRow {
                     id,
                     direction,
+                    folder,
                     name,
                     total,
                     done: 0,
@@ -2589,6 +2613,13 @@ impl SharePanel {
                 // ещё нет, а сказать надо.
                 None => self.note = Some((message, Tone::Bad)),
             },
+            ShareEvent::Cancelled { id } => {
+                // Строки может уже не быть: при потолке списка уходит
+                // старейшая, а в очень длинной раздаче это бывает и идущая.
+                if let Some(row) = self.row(id) {
+                    row.outcome = TransferOutcome::Cancelled;
+                }
+            }
             ShareEvent::Stopped(message) => {
                 self.stop(None, lang);
                 self.note = Some((message, Tone::Bad));
@@ -10124,7 +10155,7 @@ impl SavioApp {
                 let color = match row.outcome {
                     TransferOutcome::Going => pal.text_secondary,
                     TransferOutcome::Done => pal.state_success,
-                    TransferOutcome::Failed(_) => pal.text_muted,
+                    TransferOutcome::Failed(_) | TransferOutcome::Cancelled => pal.text_muted,
                 };
                 note(ui, &row.line, color);
                 match &row.outcome {
@@ -10138,6 +10169,13 @@ impl SavioApp {
                     }
                     TransferOutcome::Done => {}
                     TransferOutcome::Failed(message) => note(ui, message, pal.state_error),
+                    // Приглушённо, а не красным: это решение человека, а не
+                    // беда, — как «Отменено» у загрузки.
+                    TransferOutcome::Cancelled => note(
+                        ui,
+                        i18n::t(lang, Key::UiShareCancelledOnPhone),
+                        pal.text_muted,
+                    ),
                 }
                 ui.add_space(12.0);
             }

@@ -11,6 +11,17 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
+/// Папки для страницы без диска: путь не нужен, нужны код и подпись.
+fn folders_named(list: &[(Destination, &str)]) -> Vec<DropFolder> {
+    list.iter()
+        .map(|(which, label)| DropFolder {
+            which: *which,
+            path: PathBuf::from("unused"),
+            label: escape_html(label),
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Страница для телефона
 // ---------------------------------------------------------------------------
@@ -22,8 +33,12 @@ fn scratch(name: &str) -> PathBuf {
 /// `clippy` такого не ловят: для них это обычная строка.
 #[test]
 fn the_phone_page_has_no_slots_left() {
+    let folders = folders_named(&[
+        (Destination::Shared, "Загрузки"),
+        (Destination::Desktop, "Рабочий стол"),
+    ]);
     for lang in Lang::ALL {
-        let html = page(lang, "Загрузки");
+        let html = page(lang, &folders);
         assert!(
             !html.contains("{{"),
             "{lang:?}: в странице осталось место подстановки"
@@ -36,6 +51,53 @@ fn the_phone_page_has_no_slots_left() {
     }
 }
 
+/// Выбор папки появляется, только когда выбирать есть из чего, и каждая
+/// кнопка несёт код, который сервер потом и разберёт.
+#[test]
+fn the_page_offers_folders_only_when_there_is_a_choice() {
+    let alone = page(Lang::Ru, &folders_named(&[(Destination::Shared, "Загрузки")]));
+    assert!(!alone.contains("class=\"choice\""), "одна папка, а выбор есть");
+
+    let html = page(
+        Lang::Ru,
+        &folders_named(&[
+            (Destination::Shared, "Загрузки"),
+            (Destination::Desktop, "Рабочий стол"),
+            (Destination::Music, "Музыка"),
+        ]),
+    );
+    assert_eq!(html.matches("class=\"choice\"").count(), 3);
+    for which in [Destination::Shared, Destination::Desktop, Destination::Music] {
+        let code = format!("data-to=\"{}\"", which.code());
+        assert!(html.contains(&code), "нет кнопки {code}");
+        // Код, который уйдёт с телефона, сервер обязан узнать.
+        assert_eq!(Destination::from_code(which.code()), Some(which));
+    }
+}
+
+/// Каждый шрифт, который страница просит, сервер отдаёт, — и каждый, что
+/// отдаёт, страница просит.
+///
+/// Разойтись эти два списка могут молча: опечатка в имени файла даёт 404,
+/// браузер берёт системный шрифт, и страница просто выглядит чужой.
+/// А лишний файл в `PAGE_FONTS` — это мёртвый маршрут.
+#[test]
+fn the_page_asks_for_exactly_the_fonts_it_is_given() {
+    let mut asked: Vec<&str> = PAGE
+        .match_indices("/fonts/")
+        .map(|(at, _)| {
+            let rest = &PAGE[at + "/fonts/".len()..];
+            &rest[..rest.find('?').expect("у шрифта есть версия в адресе")]
+        })
+        .collect();
+    asked.sort_unstable();
+    asked.dedup();
+
+    let mut served: Vec<&str> = PAGE_FONTS.iter().map(|(name, _)| *name).collect();
+    served.sort_unstable();
+    assert_eq!(asked, served);
+}
+
 /// Строки страницы попадают и в разметку, и внутрь строковых литералов
 /// JavaScript. Кавычка-лапка закрыла бы литерал раньше времени, `<` —
 /// открыл бы тег, обратная косая съела бы следующий знак. Скрипт при этом
@@ -45,6 +107,8 @@ fn the_phone_page_has_no_slots_left() {
 /// переводом.
 #[test]
 fn the_phone_page_strings_are_safe_to_paste() {
+    // Подпись выбора папки (`{{WhereTo}}`) встаёт ещё и в атрибут
+    // `aria-label`, а там кавычка закрыла бы атрибут — проверка та же.
     for (_, key) in PAGE_SLOTS {
         for lang in Lang::ALL {
             let text = i18n::t(lang, key);
@@ -56,6 +120,58 @@ fn the_phone_page_strings_are_safe_to_paste() {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Папки назначения
+// ---------------------------------------------------------------------------
+
+/// Системная папка, совпавшая с папкой раздачи, не дублируется, а отдаёт
+/// ей своё название; несуществующая не показывается вовсе.
+///
+/// По умолчанию раздаются «Загрузки», и без этого на странице стояли бы две
+/// кнопки в одно место — `Downloads` и «Загрузки».
+#[test]
+fn a_system_folder_lends_its_name_to_the_shared_one() {
+    let dir = scratch("folders");
+    let downloads = dir.join("Downloads");
+    let desktop = dir.join("Desktop");
+    fs::create_dir_all(&downloads).expect("загрузки");
+    fs::create_dir_all(&desktop).expect("рабочий стол");
+
+    let folders = drop_folders(
+        &downloads,
+        Lang::Ru,
+        vec![
+            (Destination::Desktop, desktop.clone()),
+            (Destination::Downloads, downloads.clone()),
+            (Destination::Documents, dir.join("нет такой")),
+            // Две системные в одно место — одна кнопка.
+            (Destination::Pictures, desktop.clone()),
+        ],
+    );
+    let seen: Vec<(Destination, &str)> = folders
+        .iter()
+        .map(|folder| (folder.which, folder.label.as_str()))
+        .collect();
+    assert_eq!(
+        seen,
+        vec![
+            (Destination::Shared, "Загрузки"),
+            (Destination::Desktop, "Рабочий стол"),
+        ]
+    );
+    assert_eq!(folders[0].path, downloads);
+    assert_eq!(folders[1].path, desktop);
+
+    // Своя папка раздачи называется своим именем.
+    let own = dir.join("Отпуск");
+    fs::create_dir_all(&own).expect("своя папка");
+    let folders = drop_folders(&own, Lang::Ru, vec![(Destination::Desktop, desktop)]);
+    assert_eq!(folders[0].label, "Отпуск");
+    assert_eq!(folders.len(), 2);
+
+    let _ = fs::remove_dir_all(&dir);
 }
 
 // ---------------------------------------------------------------------------
@@ -406,6 +522,15 @@ struct Live {
     key: String,
 }
 
+/// «Рабочий стол» для тестов — папка `Desk` внутри папки раздачи. Внутри,
+/// а не рядом: соседние тесты делят общий временный каталог, а файл
+/// с телефона не должен лечь на настоящий рабочий стол того, кто гоняет
+/// тесты. Список файлов вложенных папок не показывает, так что раздаче
+/// она не мешает. Нет папки на диске — нет и кнопки, как у настоящей.
+fn test_folders(dir: &Path) -> Vec<(Destination, PathBuf)> {
+    vec![(Destination::Desktop, dir.join("Desk"))]
+}
+
 fn live(dir: &Path) -> Live {
     let (tx, rx) = channel();
     let handle = start_with(
@@ -413,6 +538,7 @@ fn live(dir: &Path) -> Live {
             bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
             ports: &[0],
             find: loopback,
+            folders: test_folders,
         },
         dir.to_owned(),
         Lang::Ru,
@@ -487,8 +613,11 @@ fn a_phone_sends_lists_and_takes_files() {
     assert!(head.contains("text/html"));
     // Сверяем с собранной страницей, а не с шаблоном `PAGE`: в нём ещё
     // стоят `{{Слоты}}`, и равенство с ним значило бы, что подстановка не
-    // сработала вовсе. Язык — тот, с каким запущен сервер (`live`).
-    assert_eq!(body, page(Lang::Ru, &folder_name(&shared)).as_bytes());
+    // сработала вовсе. Язык — тот, с каким запущен сервер (`live`), папка
+    // одна: `Desk` в этом тесте не создана.
+    let folders = drop_folders(&shared, Lang::Ru, test_folders(&shared));
+    assert_eq!(folders.len(), 1);
+    assert_eq!(body, page(Lang::Ru, &folders).as_bytes());
     // И отдельно: слотов в отданном теле не осталось ни одного. Без этой
     // строки забытый слот выглядел бы как исправная страница — `page`
     // и сервер брали бы его из одного места и сошлись бы на `{{…}}`.
@@ -637,6 +766,187 @@ fn stopping_cuts_an_upload_in_flight() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// Файл ложится в папку, выбранную на телефоне, а не в папку раздачи;
+/// папки, которой нет, сервер не принимает.
+#[test]
+fn a_phone_puts_a_file_into_the_folder_it_chose() {
+    let dir = scratch("dest");
+    let desk = dir.join("Desk");
+    fs::create_dir_all(&desk).expect("рабочий стол для теста");
+    let server = live(&dir);
+    let (port, key) = (server.port, server.key.as_str());
+
+    let body = b"to the desktop";
+    let mut request = format!(
+        "PUT /upload/note.txt?k={key}&to=desktop HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(body);
+    let (status, _, answer) = http(port, &request);
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&answer));
+
+    match next_share(&server.rx) {
+        ShareEvent::Started { folder, .. } => assert_eq!(folder, Destination::Desktop),
+        other => panic!("ждали начала приёма, пришло {other:?}"),
+    }
+    assert!(matches!(next_share(&server.rx), ShareEvent::Finished { .. }));
+    assert_eq!(fs::read(desk.join("note.txt")).expect("файл на столе"), body);
+    assert!(!dir.join("note.txt").exists(), "файл лёг в папку раздачи");
+
+    // Музыки у этого «компьютера» нет, а `bogus` — вовсе не папка.
+    for code in ["music", "bogus", "..%2F..%2Fetc"] {
+        let request = format!(
+            "PUT /upload/x.txt?k={key}&to={code} HTTP/1.1\r\nContent-Length: 1\r\n\r\nx"
+        );
+        let (status, _, answer) = http(port, request.as_bytes());
+        assert_eq!(status, 404, "{code}: {}", String::from_utf8_lossy(&answer));
+    }
+    assert!(!dir.join("x.txt").exists() && !desk.join("x.txt").exists());
+
+    server.handle.stop();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Отмена с телефона обрывает идущий приём, убирает недопринятый файл и
+/// приходит на экран отменой, а не бедой.
+///
+/// Телефон, как и в `stopping_cuts_an_upload_in_flight`, продолжает слать
+/// и после отмены: на Windows `shutdown` не будит уснувший `recv`, и
+/// гарантировано везде только одно — пришедшие после отмены данные файл
+/// уже не пополнят. Объявлено 64 МБ: без отмены передача успела бы доехать.
+#[test]
+fn the_phone_cancels_an_upload_in_flight() {
+    let dir = scratch("cancel");
+    let server = live(&dir);
+    let tag = "a1b2c3d4e5f6a1b2c3d4e5f6";
+
+    let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, server.port)).expect("подключиться");
+    stream.set_read_timeout(Some(Duration::from_secs(5))).expect("таймаут");
+    let head = format!(
+        "PUT /upload/big.mp4?k={}&t={tag} HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+        server.key,
+        64 * 1024 * 1024
+    );
+    stream.write_all(head.as_bytes()).expect("заголовок");
+    stream.write_all(&vec![7u8; 1024 * 1024]).expect("первый мегабайт");
+
+    let id = match next_share(&server.rx) {
+        ShareEvent::Started { id, .. } => id,
+        other => panic!("ждали начала приёма, пришло {other:?}"),
+    };
+
+    let request = format!("POST /api/cancel?k={}&t={tag} HTTP/1.1\r\nContent-Length: 0\r\n\r\n", server.key);
+    let (status, _, answer) = http(server.port, request.as_bytes());
+    assert_eq!(status, 200);
+    let answer: serde_json::Value = serde_json::from_slice(&answer).expect("JSON");
+    assert_eq!(answer["cancelled"], true, "идущая отправка не нашлась");
+
+    let mut sender = stream.try_clone().expect("вторая ручка");
+    let sending = std::thread::spawn(move || {
+        let chunk = vec![7u8; 1024 * 1024];
+        for _ in 0..63 {
+            if sender.write_all(&chunk).is_err() {
+                return;
+            }
+        }
+    });
+
+    match next_share(&server.rx) {
+        ShareEvent::Cancelled { id: cancelled } => assert_eq!(cancelled, id),
+        other => panic!("ждали отмены, пришло {other:?}"),
+    }
+    let mut rest = Vec::new();
+    let _ = stream.read_to_end(&mut rest);
+    let _ = sending.join();
+
+    let leftovers: Vec<String> = fs::read_dir(&dir)
+        .expect("папка")
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(leftovers.is_empty(), "после отмены осталось: {leftovers:?}");
+
+    server.handle.stop();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Отмена, обогнавшая сам файл, не даёт ему начаться: ни строки на экране,
+/// ни временного файла.
+///
+/// Так бывает, когда «Отменить все» нажали в первую долю секунды: запрос
+/// отмены короткий, а `PUT` с гигабайтом ещё в пути.
+#[test]
+fn a_cancel_that_outruns_the_file_stops_it_at_the_door() {
+    let dir = scratch("early");
+    let server = live(&dir);
+    let (port, key) = (server.port, server.key.as_str());
+    let tag = "earlyearlyearly1";
+
+    let (status, _, answer) = http(port, format!("POST /api/cancel?k={key}&t={tag} HTTP/1.1\r\n\r\n").as_bytes());
+    assert_eq!(status, 200);
+    let answer: serde_json::Value = serde_json::from_slice(&answer).expect("JSON");
+    assert_eq!(answer["cancelled"], false, "отменять ещё нечего");
+
+    let request = format!("PUT /upload/late.txt?k={key}&t={tag} HTTP/1.1\r\nContent-Length: 4\r\n\r\nlate");
+    assert_eq!(http(port, request.as_bytes()).0, 409);
+    assert!(
+        matches!(server.rx.recv_timeout(Duration::from_millis(300)), Err(RecvTimeoutError::Timeout)),
+        "отменённая заранее отправка появилась на экране"
+    );
+    assert_eq!(fs::read_dir(&dir).expect("папка").count(), 0, "файл всё же лёг");
+
+    // Чужая метка той же отменой не задета.
+    let request = format!("PUT /upload/other.txt?k={key}&t=otherotherother1 HTTP/1.1\r\nContent-Length: 2\r\n\r\nok");
+    assert_eq!(http(port, request.as_bytes()).0, 200);
+
+    server.handle.stop();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Отмена принимает только `POST` и только настоящую метку.
+#[test]
+fn a_cancel_needs_a_proper_tag() {
+    let dir = scratch("tag");
+    let server = live(&dir);
+    let (port, key) = (server.port, server.key.as_str());
+
+    assert_eq!(http(port, format!("GET /api/cancel?k={key}&t=abcdefgh HTTP/1.1\r\n\r\n").as_bytes()).0, 405);
+    for tag in ["", "short", "has%20space1", "x".repeat(40).as_str(), "%3Cscript%3E1"] {
+        let request = format!("POST /api/cancel?k={key}&t={tag} HTTP/1.1\r\n\r\n");
+        assert_eq!(http(port, request.as_bytes()).0, 400, "{tag:?}");
+    }
+    // И без ключа отменить нельзя, как и всё остальное.
+    assert_eq!(http(port, b"POST /api/cancel?t=abcdefgh HTTP/1.1\r\n\r\n").0, 403);
+
+    server.handle.stop();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Шрифты отдаются без ключа, байт в байт, и браузеру разрешено их хранить.
+#[test]
+fn fonts_are_served_without_the_key() {
+    let dir = scratch("fonts");
+    let server = live(&dir);
+
+    let (status, head, body) = http(server.port, b"GET /fonts/figtree.ttf?v=1 HTTP/1.1\r\n\r\n");
+    assert_eq!(status, 200);
+    assert_eq!(body, crate::fonts::FIGTREE);
+    assert!(head.contains("font/ttf"), "{head}");
+    assert!(head.contains("max-age"), "шрифт запрещено кэшировать: {head}");
+
+    // Страница — по-прежнему без кэша: в ней ключ.
+    let (_, head, _) = http(server.port, format!("GET /?k={} HTTP/1.1\r\n\r\n", server.key).as_bytes());
+    assert!(head.contains("no-store"), "{head}");
+
+    for path in ["/fonts/missing.ttf", "/fonts/../share.rs", "/fonts/"] {
+        assert_eq!(http(server.port, format!("GET {path} HTTP/1.1\r\n\r\n").as_bytes()).0, 404, "{path}");
+    }
+
+    server.handle.stop();
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// Имя раздаваемой папки уходит на страницу экранированным.
 ///
 /// Это не строка из таблицы, а данные пользователя, и проверка
@@ -647,10 +957,15 @@ fn stopping_cuts_an_upload_in_flight() {
 /// Проверено красным: без `escape_html` проверка падает на первом же имени.
 #[test]
 fn the_folder_name_is_escaped_on_the_phone_page() {
-    let html = page(Lang::Ru, "<b>Tom & \"Jerry\"</b>");
+    // Такой папки на диске нет и быть не может (на Windows `<` в имени
+    // запрещён), но `drop_folders` берёт имя из пути, а не с диска. Без
+    // `</b>` на конце: косая черта в нём — разделитель пути, и именем
+    // папки стало бы `b>`.
+    let dir = Path::new("/srv/<b>Tom & \"Jerry\"");
+    let html = page(Lang::Ru, &drop_folders(dir, Lang::Ru, Vec::new()));
     assert!(!html.contains("<b>Tom"), "имя папки попало в разметку как есть");
     assert!(
-        html.contains("&lt;b&gt;Tom &amp; &quot;Jerry&quot;&lt;/b&gt;"),
+        html.contains("&lt;b&gt;Tom &amp; &quot;Jerry&quot;"),
         "имя папки не экранировано"
     );
 }
@@ -664,6 +979,6 @@ fn the_folder_name_is_escaped_on_the_phone_page() {
 fn only_the_folder_name_reaches_the_phone() {
     let dir = std::path::Path::new("C:/Users/Вася/Загрузки");
     assert_eq!(folder_name(dir), "Загрузки");
-    let html = page(Lang::Ru, &folder_name(dir));
+    let html = page(Lang::Ru, &drop_folders(dir, Lang::Ru, Vec::new()));
     assert!(!html.contains("Вася"), "в страницу утёк путь целиком");
 }

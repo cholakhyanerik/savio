@@ -25,6 +25,10 @@ use eframe::egui::{
     Theme, ThemePreference, Ui, Vec2, Visuals, pos2,
 };
 
+use crate::fonts::{
+    ARMENIAN, ARMENIAN_BOLD, ARMENIAN_DISPLAY, CAPRASIMO, FIGTREE, FIGTREE_BOLD, KELLY_SLAB,
+    NUNITO, NUNITO_BOLD,
+};
 use crate::model::Appearance;
 
 // ---------------------------------------------------------------------------
@@ -495,21 +499,10 @@ pub const NAV_LABELS_MIN_HEIGHT: f32 = 460.0;
 // умолчанию, так что переменный файл дал бы светлое начертание вместо
 // обычного — молча, без единой ошибки сборки. Файлы в `assets/fonts` уже
 // приведены к 400 и 700; чем именно — записано в `assets/fonts/README.md`.
+//
+// Сами байты лежат в `crate::fonts`, а не здесь: те же файлы отдаёт странице
+// для телефона движок, а зависеть от слоя оформления ему нельзя.
 // ---------------------------------------------------------------------------
-
-const CAPRASIMO: &[u8] = include_bytes!("../assets/fonts/Caprasimo-Regular.ttf");
-const KELLY_SLAB: &[u8] = include_bytes!("../assets/fonts/KellySlab-Regular.ttf");
-const FIGTREE: &[u8] = include_bytes!("../assets/fonts/Figtree-Regular.ttf");
-const FIGTREE_BOLD: &[u8] = include_bytes!("../assets/fonts/Figtree-Bold.ttf");
-const NUNITO: &[u8] = include_bytes!("../assets/fonts/Nunito-Regular.ttf");
-const NUNITO_BOLD: &[u8] = include_bytes!("../assets/fonts/Nunito-Bold.ttf");
-const ARMENIAN: &[u8] = include_bytes!("../assets/fonts/NotoSansArmenian-Regular.ttf");
-const ARMENIAN_BOLD: &[u8] = include_bytes!("../assets/fonts/NotoSansArmenian-Bold.ttf");
-/// Заголовочный армянский. Serif, а не sans, ровно затем, чтобы заголовок на
-/// армянском оставался заголовком: латиницу и кириллицу там набирают плитные
-/// Caprasimo и Kelly Slab, и сансерифная вставка посреди них читалась бы
-/// обычным текстом, набранным крупнее.
-const ARMENIAN_DISPLAY: &[u8] = include_bytes!("../assets/fonts/NotoSerifArmenian-Regular.ttf");
 
 /// Заголовочное семейство: плитный serif. Им набраны «Savio», названия
 /// карточек и крупные числа монитора.
@@ -1252,6 +1245,101 @@ mod tests {
                 assert!(
                     ctx.fonts_mut(|fonts| fonts.has_glyphs(&font, sample)),
                     "{family}: {alphabet} рисуется пустыми прямоугольниками"
+                );
+            }
+        }
+    }
+
+    /// Цвет из CSS страницы для телефона: `#rrggbb` или `rgba(r, g, b, a)`.
+    fn css_color(value: &str) -> Color32 {
+        if let Some(hex) = value.strip_prefix('#') {
+            let channel = |at: usize| u8::from_str_radix(&hex[at..at + 2], 16).expect("шестнадцатеричный цвет");
+            return Color32::from_rgb(channel(0), channel(2), channel(4));
+        }
+        let inner = value
+            .strip_prefix("rgba(")
+            .and_then(|rest| rest.strip_suffix(')'))
+            .unwrap_or_else(|| panic!("цвет страницы не разобран: {value}"));
+        let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
+        let [r, g, b, a] = parts[..] else {
+            panic!("у rgba не четыре числа: {value}");
+        };
+        let byte = |text: &str| text.parse::<u8>().expect("канал цвета");
+        let alpha: f32 = a.parse().expect("прозрачность");
+        Color32::from_rgba_unmultiplied(byte(r), byte(g), byte(b), (alpha * 255.0).round() as u8)
+    }
+
+    /// Переменные цвета из первого блока `:root { … }` в тексте.
+    fn css_variables(css: &str) -> Vec<(&str, Color32)> {
+        let start = css.find(":root {").expect("блок :root") + ":root {".len();
+        let block = &css[start..start + css[start..].find('}').expect("конец блока")];
+        block
+            .split(';')
+            .filter_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                Some((name.trim(), css_color(value.trim())))
+            })
+            .collect()
+    }
+
+    /// Страница для телефона одета в ту же палитру, что и окно.
+    ///
+    /// Цвета лежат там числами в CSS, то есть копией, а копии расходятся
+    /// молча: поправили оттенок здесь — и страница на телефоне осталась
+    /// прежней, причём уже с непроверенным контрастом, ведь проверки выше
+    /// смотрят палитру, а не её копию. Сравнение точное, по уже умноженным
+    /// на альфу каналам: прозрачность в CSS записана тремя знаками, и это
+    /// ровно тот же байт, что в `from_rgba_unmultiplied`.
+    ///
+    /// И в обратную сторону: каждая переменная страницы обязана быть
+    /// в списке. Цвет, которого нет в палитре, никто не проверял по контрасту.
+    #[test]
+    fn the_phone_page_wears_the_window_palette() {
+        const PAGE: &str = include_str!("../assets/share/index.html");
+        let pairs = |p: Palette| {
+            [
+                ("--bg", p.bg),
+                ("--card-fill", p.card_fill),
+                ("--card-inner", p.card_inner),
+                ("--progress-track", p.progress_track),
+                ("--border-subtle", p.border_subtle),
+                ("--border-strong", p.border_strong),
+                ("--border-hover", p.border_hover),
+                ("--text-primary", p.text_primary),
+                ("--text-secondary", p.text_secondary),
+                ("--text-muted", p.text_muted),
+                ("--text-on-accent", p.text_on_accent),
+                ("--accent", p.accent),
+                ("--accent-hover", p.accent_hover),
+                ("--accent-active", p.accent_active),
+                ("--accent-soft", p.accent_soft),
+                ("--accent-text", p.accent_text),
+                ("--state-success", p.state_success),
+                ("--state-error", p.state_error),
+                ("--state-warning", p.state_warning),
+                ("--gloss-line", p.gloss_line),
+                ("--shadow", p.shadow),
+            ]
+        };
+
+        let (dark, light) = PAGE
+            .split_once("@media (prefers-color-scheme: light)")
+            .expect("светлая тема в стилях страницы");
+        for (theme, css, p) in [("тёмная", dark, Palette::dark()), ("светлая", light, Palette::light())] {
+            let page = css_variables(css);
+            let palette = pairs(p);
+            for (name, color) in &palette {
+                let found = page.iter().find(|(known, _)| known == name);
+                assert_eq!(
+                    found.map(|(_, color)| *color),
+                    Some(*color),
+                    "{theme}: {name} на странице не тот, что в палитре"
+                );
+            }
+            for (name, _) in &page {
+                assert!(
+                    palette.iter().any(|(known, _)| known == name),
+                    "{theme}: у {name} на странице нет пары в палитре"
                 );
             }
         }

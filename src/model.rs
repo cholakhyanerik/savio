@@ -3311,6 +3311,82 @@ impl TransferDirection {
     }
 }
 
+/// В какую папку компьютера телефон кладёт файл.
+///
+/// Список закрытый, и это решение, а не недоделка. Выбирает папку тот, кто
+/// держит телефон, а страницу открывает любой, у кого есть адрес с ключом.
+/// Дай ему путь — и файл с телефона мог бы лечь в автозагрузку
+/// (`…\Start Menu\Programs\Startup`), то есть исполниться при следующем входе
+/// в систему. Поэтому телефон называет **код** одной из папок ниже, а путь
+/// к ней Savio находит сам. Обход дисков с телефона по той же причине не
+/// делается вовсе: страница видна всей сети, а не только хозяину.
+///
+/// Забирать файлы телефон может только из папки раздачи (`Shared`):
+/// остальные папки открыты на запись, а не на чтение.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Destination {
+    /// Папка раздачи — та, что выбрана на экране «Телефон».
+    Shared,
+    Desktop,
+    Downloads,
+    Documents,
+    Pictures,
+    Videos,
+    Music,
+}
+
+impl Destination {
+    /// Системные папки в том порядке, в каком их показывает страница.
+    pub const SYSTEM: [Destination; 6] = [
+        Destination::Desktop,
+        Destination::Downloads,
+        Destination::Documents,
+        Destination::Pictures,
+        Destination::Videos,
+        Destination::Music,
+    ];
+
+    /// Код в адресе запроса.
+    ///
+    /// Латиницей и навсегда, как `Lang::code`: его запоминает страница на
+    /// телефоне, и переименование варианта не должно сбивать запомненный выбор.
+    pub fn code(self) -> &'static str {
+        match self {
+            Destination::Shared => "shared",
+            Destination::Desktop => "desktop",
+            Destination::Downloads => "downloads",
+            Destination::Documents => "documents",
+            Destination::Pictures => "pictures",
+            Destination::Videos => "videos",
+            Destination::Music => "music",
+        }
+    }
+
+    /// Разбирает код из адреса. `None` — код чужой.
+    pub fn from_code(code: &str) -> Option<Self> {
+        std::iter::once(Destination::Shared)
+            .chain(Destination::SYSTEM)
+            .find(|which| which.code() == code)
+    }
+
+    /// Название папки на языке окна.
+    ///
+    /// У папки раздачи своего названия нет — это имя самой папки, и его
+    /// знает только тот, кто знает путь. Поэтому `None`.
+    pub fn label(self, lang: Lang) -> Option<&'static str> {
+        let key = match self {
+            Destination::Shared => return None,
+            Destination::Desktop => Key::FolderDesktop,
+            Destination::Downloads => Key::FolderDownloads,
+            Destination::Documents => Key::FolderDocuments,
+            Destination::Pictures => Key::FolderPictures,
+            Destination::Videos => Key::FolderVideos,
+            Destination::Music => Key::FolderMusic,
+        };
+        Some(i18n::t(lang, key))
+    }
+}
+
 /// Новости раздачи — всё, что UI узнаёт о ней от движка.
 #[derive(Clone, Debug)]
 pub enum ShareEvent {
@@ -3331,6 +3407,9 @@ pub enum ShareEvent {
         /// Сколько байт будет всего. Известно всегда, но `Option` ради
         /// честности: ноль здесь читался бы как «пустой файл».
         total: Option<u64>,
+        /// В какой папке компьютера файл лежит или ляжет. У передачи на
+        /// телефон это всегда папка раздачи.
+        folder: Destination,
     },
     /// Сколько байт уже прошло.
     Progress { id: u64, done: u64 },
@@ -3339,6 +3418,10 @@ pub enum ShareEvent {
     Finished { id: u64, name: String },
     /// Передача оборвалась, и вот почему — словами для человека.
     Failed { id: u64, message: String },
+    /// Телефон сам отменил отправку. Это не беда, а решение человека,
+    /// и показывать его ошибкой нельзя — как и отмену загрузки.
+    /// Недопринятый файл к этому событию уже удалён.
+    Cancelled { id: u64 },
     /// Раздача кончилась не по кнопке: порт не открылся, адресов нет.
     Stopped(String),
 }
@@ -3545,6 +3628,33 @@ mod tests {
         // Имя интерфейса бывает неизвестно (адрес подсказал маршрут, а не
         // список интерфейсов) — тогда без висящей точки.
         assert_eq!(ShareAddress::new(ip, 8080, "abc", "").label, "192.168.1.42");
+    }
+
+    /// Код папки переживает дорогу до телефона и обратно, коды не
+    /// совпадают, и у каждой системной папки есть название на всех языках.
+    /// У папки раздачи названия нет — это имя самой папки.
+    #[test]
+    fn destinations_keep_their_codes_and_names() {
+        let all: Vec<Destination> = std::iter::once(Destination::Shared)
+            .chain(Destination::SYSTEM)
+            .collect();
+        for which in &all {
+            assert_eq!(Destination::from_code(which.code()), Some(*which));
+            assert_eq!(
+                all.iter().filter(|other| other.code() == which.code()).count(),
+                1,
+                "код {} занят дважды",
+                which.code()
+            );
+        }
+        for lang in Lang::ALL {
+            assert_eq!(Destination::Shared.label(lang), None);
+            for which in Destination::SYSTEM {
+                assert!(which.label(lang).is_some_and(|label| !label.is_empty()), "{which:?}");
+            }
+        }
+        assert_eq!(Destination::from_code("Desktop"), None, "код — строчными");
+        assert_eq!(Destination::from_code(""), None);
     }
 
     #[test]
