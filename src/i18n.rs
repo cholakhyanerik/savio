@@ -333,51 +333,8 @@ strings! {
         "«{}» ռեժիմը Windows-ը հիշեց, բայց չկիրառեց։";
 
     // -----------------------------------------------------------------------
-    // Погода: единицы, шкалы, ветер, календарь
+    // Дата съёмки в таблице метаданных: месяцы и порядок числа с месяцем
     // -----------------------------------------------------------------------
-
-    WindMetersPerSecond = "м/с", "m/s", "մ/վ";
-    WindKilometersPerHour = "км/ч", "km/h", "կմ/ժ";
-    PressureMmHg = "мм рт. ст.", "mmHg", "մմ ս.ս.";
-    PressureHectopascal = "гПа", "hPa", "հՊա";
-    UnitMillimetre = "мм", "mm", "մմ";
-    UnitMicrogram = "мкг/м³", "µg/m³", "մկգ/մ³";
-
-    WindCalm = "штиль", "calm", "անհողմ";
-    /// `{}` — скорость порыва, `{}` — единица.
-    WindGusts = "порывы до {} {}", "gusts up to {} {}", "պոռթկումները մինչև {} {}";
-    WindNorth = "северный", "northerly", "հյուսիսային";
-    WindNorthEast = "северо-восточный", "north-easterly", "հյուսիս-արևելյան";
-    WindEast = "восточный", "easterly", "արևելյան";
-    WindSouthEast = "юго-восточный", "south-easterly", "հարավ-արևելյան";
-    WindSouth = "южный", "southerly", "հարավային";
-    WindSouthWest = "юго-западный", "south-westerly", "հարավ-արևմտյան";
-    WindWest = "западный", "westerly", "արևմտյան";
-    WindNorthWest = "северо-западный", "north-westerly", "հյուսիս-արևմտյան";
-
-    UvLow = "низкий", "low", "ցածր";
-    UvModerate = "умеренный", "moderate", "չափավոր";
-    UvHigh = "высокий", "high", "բարձր";
-    UvVeryHigh = "очень высокий", "very high", "շատ բարձր";
-    UvExtreme = "экстремальный", "extreme", "ծայրահեղ";
-
-    AqiGood = "хорошее", "good", "լավ";
-    AqiFair = "удовлетворительное", "fair", "բավարար";
-    AqiModerate = "умеренное", "moderate", "չափավոր";
-    AqiPoor = "плохое", "poor", "վատ";
-    AqiVeryPoor = "очень плохое", "very poor", "շատ վատ";
-    AqiExtreme = "крайне плохое", "extremely poor", "ծայրահեղ վատ";
-
-    /// Число и словесная оценка рядом: «7 — высокий», «33 — удовлетворительное».
-    ValueWithLevel = "{} — {}", "{} — {}", "{} — {}";
-
-    WeekdayMon = "пн", "Mon", "երկ";
-    WeekdayTue = "вт", "Tue", "երք";
-    WeekdayWed = "ср", "Wed", "չրք";
-    WeekdayThu = "чт", "Thu", "հնգ";
-    WeekdayFri = "пт", "Fri", "ուրբ";
-    WeekdaySat = "сб", "Sat", "շբթ";
-    WeekdaySun = "вс", "Sun", "կիր";
 
     MonthJan = "янв", "Jan", "հնվ";
     MonthFeb = "фев", "Feb", "փտվ";
@@ -395,70 +352,6 @@ strings! {
     /// «16 сен»: `{}` — число, `{}` — месяц. Порядок у языков разный, поэтому
     /// подстановка, а не склейка.
     DateDayMonth = "{} {}", "{} {}", "{} {}";
-    /// «ср, 16 сен»: `{}` — день недели, `{}` — дата.
-    DateWeekdayAndDay = "{}, {}", "{}, {}", "{}, {}";
-    DayToday = "Сегодня", "Today", "Այսօր";
-    DayTomorrow = "Завтра", "Tomorrow", "Վաղը";
-
-    WeatherUpdated = "Обновлено", "Updated", "Թարմացվել է";
-    WeatherSavedReport = "Сохранённый отчёт", "Saved report", "Պահպանված հաշվետվություն";
-    /// `{}` — «Обновлено» или «Сохранённый отчёт», `{}` — часы и минуты.
-    WeatherUpdatedAt = "{} в {}", "{} at {}", "{} {}-ին";
-    /// То же, но не сегодня: `{}` — подпись, `{}` — дата, `{}` — время.
-    WeatherUpdatedOn = "{} {} в {}", "{} {} at {}", "{} {} {}-ին";
-    /// Часовой пояс машины система не назвала — говорим время по UTC.
-    WeatherUpdatedUtc = "{} в {} UTC", "{} at {} UTC", "{} {}-ին UTC";
-    WeatherClockBroken =
-        "Когда получен прогноз, неизвестно: часы компьютера показывают дату раньше 1970 года.",
-        "There is no telling when the forecast arrived: the computer clock shows a date \
-         earlier than 1970.",
-        "Երբ է ստացվել կանխատեսումը, հայտնի չէ. համակարգչի ժամացույցը ցույց է տալիս \
-         1970-ից շուտ ամսաթիվ։";
-    WeatherNow = "Сейчас", "Now", "Հիմա";
-    /// `{}` — температура вместе со знаком градуса.
-    WeatherFeelsLike = "ощущается как {}", "feels like {}", "զգացվում է {}";
-    WeatherHumidity = "Влажность", "Humidity", "Խոնավություն";
-    WeatherWind = "Ветер", "Wind", "Քամի";
-    WeatherPressure = "Давление", "Pressure", "Ճնշում";
-    WeatherCloudCover = "Облачность", "Cloud cover", "Ամպամածություն";
-    WeatherPrecipitation = "Осадки", "Precipitation", "Տեղումներ";
-    WeatherUvIndex = "УФ-индекс", "UV index", "ՈՒՄ ինդեքս";
-    WeatherSunrise = "Восход", "Sunrise", "Արևածագ";
-    WeatherSunset = "Закат", "Sunset", "Մայրամուտ";
-    WeatherAir = "Воздух", "Air", "Օդ";
-
-    WmoUnknown = "Погода без описания", "Weather without a description", "Եղանակ առանց նկարագրի";
-    WmoClear = "Ясно", "Clear", "Պարզ";
-    WmoMostlyClear = "Преимущественно ясно", "Mostly clear", "Հիմնականում պարզ";
-    WmoPartlyCloudy = "Переменная облачность", "Partly cloudy", "Փոփոխական ամպամածություն";
-    WmoOvercast = "Пасмурно", "Overcast", "Մառախլապատ ամպամած";
-    WmoFog = "Туман", "Fog", "Մառախուղ";
-    WmoRimeFog = "Туман с изморозью", "Rime fog", "Մառախուղ եղյամով";
-    WmoLightDrizzle = "Слабая морось", "Light drizzle", "Թույլ մաղում";
-    WmoDrizzle = "Морось", "Drizzle", "Մաղում";
-    WmoHeavyDrizzle = "Сильная морось", "Heavy drizzle", "Ուժեղ մաղում";
-    WmoLightFreezingDrizzle =
-        "Слабая ледяная морось", "Light freezing drizzle", "Թույլ սառցե մաղում";
-    WmoFreezingDrizzle = "Ледяная морось", "Freezing drizzle", "Սառցե մաղում";
-    WmoLightRain = "Слабый дождь", "Light rain", "Թույլ անձրև";
-    WmoRain = "Дождь", "Rain", "Անձրև";
-    WmoHeavyRain = "Сильный дождь", "Heavy rain", "Ուժեղ անձրև";
-    WmoLightFreezingRain = "Слабый ледяной дождь", "Light freezing rain", "Թույլ սառցե անձրև";
-    WmoFreezingRain = "Ледяной дождь", "Freezing rain", "Սառցե անձրև";
-    WmoLightSnow = "Слабый снег", "Light snow", "Թույլ ձյուն";
-    WmoSnow = "Снег", "Snow", "Ձյուն";
-    WmoHeavySnow = "Сильный снег", "Heavy snow", "Ուժեղ ձյուն";
-    WmoSnowGrains = "Снежные зёрна", "Snow grains", "Ձյան հատիկներ";
-    WmoLightShowers = "Слабый ливень", "Light showers", "Թույլ տեղատարափ";
-    WmoShowers = "Ливень", "Showers", "Տեղատարափ";
-    WmoHeavyShowers = "Сильный ливень", "Heavy showers", "Ուժեղ տեղատարափ";
-    WmoLightSnowShowers = "Слабый снегопад", "Light snow showers", "Թույլ ձնատեղում";
-    WmoHeavySnowShowers = "Сильный снегопад", "Heavy snow showers", "Ուժեղ ձնատեղում";
-    WmoThunder = "Гроза", "Thunderstorm", "Ամպրոպ";
-    WmoThunderSmallHail =
-        "Гроза с небольшим градом", "Thunderstorm with slight hail", "Ամպրոպ թեթև կարկուտով";
-    WmoThunderHeavyHail =
-        "Гроза с сильным градом", "Thunderstorm with heavy hail", "Ամպրոպ ուժեղ կարկուտով";
 
     // -----------------------------------------------------------------------
     // Раздача файлов на телефон
@@ -682,65 +575,6 @@ strings! {
         "Բացեք հասցեն նորից Savio-ի պատուհանից — դրա բանալին փոխվում է բաշխման յուրաքանչյուր \
          մեկնարկի ժամանակ։";
 
-    // Погода: стадии и отказы серверов.
-    StageLocatingByIp =
-        "Определяю место по IP-адресу…", "Working out the place from the IP address…",
-        "Որոշում եմ վայրն ըստ IP-հասցեի…";
-    StageFetchingForecast =
-        "Запрашиваю прогноз…", "Requesting the forecast…", "Հարցում եմ կանխատեսումը…";
-    WeatherServerForecast = "Сервер погоды", "The weather server", "Եղանակի սերվերը";
-    WeatherServerSearch =
-        "Сервер поиска городов", "The city search server", "Քաղաքների որոնման սերվերը";
-    WeatherServerLocate =
-        "Сервер определения места", "The location server", "Վայրի որոշման սերվերը";
-    /// `{}` — имя сервера из трёх выше.
-    WeatherUnreadableAnswer =
-        "{} прислал ответ, который не удалось дочитать.",
-        "{} sent an answer that could not be read to the end.",
-        "{} ուղարկեց պատասխան, որը չհաջողվեց մինչև վերջ կարդալ։";
-    WeatherUnknownShape =
-        "{} прислал ответ в незнакомом виде. Попробуйте позже.",
-        "{} sent an answer in an unfamiliar shape. Try later.",
-        "{} ուղարկեց պատասխան անծանոթ տեսքով։ Փորձեք ավելի ուշ։";
-    WeatherTimedOut =
-        "{} не ответил вовремя. Проверьте подключение к интернету.",
-        "{} did not answer in time. Check your internet connection.",
-        "{} ժամանակին չպատասխանեց։ Ստուգեք ինտերնետ կապը։";
-    WeatherUnreachable =
-        "{} недоступен. Проверьте подключение к интернету.",
-        "{} is unreachable. Check your internet connection.",
-        "{} հասանելի չէ։ Ստուգեք ինտերնետ կապը։";
-    WeatherBadCoordinates =
-        "У выбранного места неверные координаты. Найдите его заново через поиск.",
-        "The chosen place has wrong coordinates. Find it again through the search.",
-        "Ընտրված վայրի կոորդինատները սխալ են։ Գտեք այն նորից որոնման միջոցով։";
-    /// `{}` — имя сервера, `{}` — код ответа.
-    WeatherServerDown =
-        "{} сейчас не работает (код {}). Попробуйте позже.",
-        "{} is not working right now (code {}). Try later.",
-        "{} այս պահին չի աշխատում (կոդ {})։ Փորձեք ավելի ուշ։";
-    /// `{}` — имя сервера.
-    WeatherTooManyRequests =
-        "{} просит подождать: с вашего адреса слишком много запросов. Попробуйте через минуту.",
-        "{} asks you to wait: too many requests are coming from your address. Try again in \
-         a minute.",
-        "{} խնդրում է սպասել. ձեր հասցեից չափից շատ հարցումներ են գալիս։ Փորձեք մեկ րոպեից։";
-    WeatherLocateFailed =
-        "Не удалось определить место по IP-адресу: серверы определения места не ответили. \
-         Найдите свой город через поиск.",
-        "Could not work out the place from the IP address: the location servers did not \
-         answer. Find your city through the search.",
-        "Չհաջողվեց որոշել վայրն ըստ IP-հասցեի. վայրի որոշման սերվերները չպատասխանեցին։ \
-         Գտեք ձեր քաղաքը որոնման միջոցով։";
-    /// `{}` — имя сервера, `{}` — объяснение от него же.
-    WeatherRefused = "{} отказал: {}", "{} refused: {}", "{} մերժեց՝ {}";
-    WeatherStatusCode =
-        "{} ответил кодом {}.", "{} answered with code {}.", "{} պատասխանեց {} կոդով։";
-    WeatherNoForecast =
-        "Сервер погоды прислал ответ без прогноза. Попробуйте обновить позже.",
-        "The weather server sent an answer without a forecast. Try refreshing later.",
-        "Եղանակի սերվերն ուղարկեց պատասխան առանց կանխատեսման։ Փորձեք թարմացնել ավելի ուշ։";
-
     // -----------------------------------------------------------------------
     // Окно: разделы, состояния, кнопки, подписи полей
     // -----------------------------------------------------------------------
@@ -751,7 +585,6 @@ strings! {
     // `the_rail_labels_fit_their_width`.
     TabDownload = "Загрузка", "Download", "Բեռնում";
     TabMetadata = "Метаданные", "Metadata", "Մետատվյալ";
-    TabWeather = "Погода", "Weather", "Եղանակ";
     TabPhone = "Телефон", "Phone", "Հեռախոս";
 
     // Группы рельса разделов и короткие пояснения к ним. Пояснение стоит
@@ -780,10 +613,6 @@ strings! {
         "сведения о железе этой машины",
         "what hardware this machine has",
         "տեղեկություններ այս մեքենայի սարքավորումների մասին";
-    NavWeatherNote =
-        "сейчас, по часам и на неделю",
-        "now, by the hour and for the week",
-        "հիմա, ժամերով և շաբաթվա համար";
     NavPhoneNote =
         "файлы между телефоном и компьютером по своей сети Wi-Fi",
         "files between the phone and the computer over your own Wi-Fi",
@@ -862,21 +691,20 @@ strings! {
     /// буквами.
     UiAuthor = "Эрик Чолахян", "Erik Cholakhyan", "Էրիկ Չոլախյան";
     UiAboutText =
-        "Savio — настольное приложение для Windows, Linux и macOS: шесть инструментов \
+        "Savio — настольное приложение для Windows, Linux и macOS: пять инструментов \
          в одном окне. Оно скачивает видео и звук по ссылке, показывает и стирает то, что \
-         фотографии и музыка рассказывают о вас, следит за нагрузкой на компьютер \
-         и рассказывает, из чего он собран, показывает погоду и передаёт файлы между \
-         телефоном и компьютером по своей сети Wi-Fi.",
-        "Savio is a desktop application for Windows, Linux and macOS: six tools in one \
+         фотографии и музыка рассказывают о вас, следит за нагрузкой на компьютер, \
+         рассказывает, из чего он собран, и передаёт файлы между телефоном и компьютером \
+         по своей сети Wi-Fi.",
+        "Savio is a desktop application for Windows, Linux and macOS: five tools in one \
          window. It downloads video and audio by link, shows and wipes what your photos and \
-         music tell about you, keeps an eye on the computer's load and tells what it is made \
-         of, shows the weather and moves files between your phone and your computer over \
-         your own Wi-Fi.",
-        "Savio-ն սեղանադիր ծրագիր է Windows-ի, Linux-ի և macOS-ի համար՝ վեց գործիք մեկ \
+         music tell about you, keeps an eye on the computer's load, tells what it is made \
+         of and moves files between your phone and your computer over your own Wi-Fi.",
+        "Savio-ն սեղանադիր ծրագիր է Windows-ի, Linux-ի և macOS-ի համար՝ հինգ գործիք մեկ \
          պատուհանում։ Այն ներբեռնում է տեսանյութ և ձայն հղումով, ցույց է տալիս և ջնջում \
          այն, ինչ լուսանկարներն ու երաժշտությունը պատմում են ձեր մասին, հետևում է \
-         համակարգչի բեռնվածությանը և պատմում, թե ինչից է այն բաղկացած, ցույց է տալիս \
-         եղանակը և ֆայլեր է փոխանցում հեռախոսի և համակարգչի միջև ձեր Wi-Fi ցանցով։";
+         համակարգչի բեռնվածությանը, պատմում, թե ինչից է այն բաղկացած, և ֆայլեր է \
+         փոխանցում հեռախոսի և համակարգչի միջև ձեր Wi-Fi ցանցով։";
 
     // Экран загрузки: поле ссылки, предпросмотр, фрагмент, вшивание.
     UiUrlHint = "Вставьте ссылку: https://…", "Paste a link: https://…", "Տեղադրեք հղում՝ https://…";
@@ -1228,9 +1056,9 @@ strings! {
     // этого новое приветствие увидят только новые люди, а все, кто закрыл
     // прежнее, так и останутся со старым представлением о программе.
     WelcomeTitle =
-        "Шесть инструментов в одном окне",
-        "Six tools in one window",
-        "Վեց գործիք մեկ պատուհանում";
+        "Пять инструментов в одном окне",
+        "Five tools in one window",
+        "Հինգ գործիք մեկ պատուհանում";
     WelcomeNote =
         "Разделы не зависят друг от друга: можно пользоваться одним и ни разу не открыть \
          остальные. Щёлкните по разделу — он откроется.",
@@ -1263,10 +1091,6 @@ strings! {
         "Из чего собран компьютер и в каком он состоянии.",
         "What the computer is made of and what shape it is in.",
         "Ինչից է բաղկացած համակարգիչը և ինչ վիճակում է այն։";
-    WelcomeWeatherPitch =
-        "Что за окном сейчас, по часам и на неделю.",
-        "What is outside now, by the hour and for the week.",
-        "Ինչ է դրսում հիմա, ժամերով և շաբաթվա համար։";
     WelcomePhonePitch =
         "Файлы между телефоном и компьютером по своей сети Wi-Fi.",
         "Files between the phone and the computer over your own Wi-Fi.",
@@ -1353,28 +1177,6 @@ strings! {
         "Ֆոտոխցիկի մոդելը, նկարահանման ամսաթիվը, վայրի կոորդինատները, հեղինակը, շապիկը և \
          մեկ տասնյակ ծառայողական գրառումներ։ Այս ամենը գնում է ֆայլի հետ, երբ ուղարկում եք \
          այն հետագա։";
-    UiWeatherVpnShort =
-        "Место определено по IP. Через VPN это будет чужая страна — тогда найдите свой \
-         город поиском.",
-        "The place was found by IP. Through a VPN that is a foreign country — then find \
-         your city by search.",
-        "Տեղը որոշվել է IP-ով։ VPN-ի միջոցով դա կլինի օտար երկիր՝ այդ դեպքում գտեք ձեր \
-         քաղաքը որոնմամբ։";
-    UiWeatherFavoritesNote =
-        "Переключаться между ними — один щелчок. Убрать место — «В избранном» у его \
-         названия.",
-        "Switching between them is one click. To remove a place, press “In favourites” \
-         next to its name.",
-        "Դրանց միջև անցնելը մեկ սեղմում է։ Տեղը հեռացնելու համար՝ «Ընտրյալներում» \
-         նրա անվան կողքին։";
-    UiWeatherHoursLegend =
-        "Рамкой отмечен текущий час. Синим — вероятность осадков.",
-        "The current hour is marked with a frame. In blue — the chance of precipitation.",
-        "Շրջանակով նշված է ընթացիկ ժամը։ Կապույտով՝ տեղումների հավանականությունը։";
-    UiWeatherDaysLegend =
-        "Наведите на значок — покажет погоду словами.",
-        "Hover the icon — it shows the weather in words.",
-        "Սավառնեք պատկերակի վրա՝ եղանակը ցույց կտա բառերով։";
     /// Название, взятое в кавычки своего языка. Нужно там, где имя приходит
     /// снаружи (название схемы питания от Windows) и кавычки к нему ставит
     /// код: зашитые туда «ёлочки» уехали бы и в английский текст, а проверка
@@ -1668,68 +1470,6 @@ strings! {
          remember the choice, but the machine will keep working as before.",
         "Հիմա ակտիվ է {}-ը, իսկ սնուցման ռեժիմը Windows-ը կիրառում է միայն «{}»-ի դեպքում. \
          ընտրությունը կհիշի, բայց մեքենան կաշխատի նախկինի պես։";
-
-    // Вкладка «Погода».
-    UiWeatherNoPlace = "Место не выбрано", "No place chosen", "Վայրն ընտրված չէ";
-    UiWaitForAnswer = "Сначала дождитесь ответа.", "First wait for the answer.",
-        "Նախ սպասեք պատասխանին։";
-    UiPickPlaceFirst = "Сначала выберите место.", "First choose a place.", "Նախ ընտրեք վայր։";
-    UiWeatherNoPlaceNote =
-        "Место ещё не определено. Найдите свой город поиском ниже или нажмите «Определить \
-         по IP».",
-        "The place has not been worked out yet. Find your city with the search below, or \
-         press “Locate by IP”.",
-        "Վայրը դեռ որոշված չէ։ Գտեք ձեր քաղաքը ներքևի որոնմամբ կամ սեղմեք «Որոշել ըստ IP»։";
-    UiWeatherFindCity = "Найти город", "Find a city", "Գտնել քաղաք";
-    UiWeatherFind = "Найти", "Find", "Գտնել";
-    UiWeatherSearchHint = "Например, Ереван", "For example, Yerevan", "Օրինակ՝ Երևան";
-    UiWeatherSearching = "Ищу…", "Searching…", "Փնտրում եմ…";
-    UiWeatherTwoLetters = "Наберите хотя бы две буквы названия.",
-        "Type at least two letters of the name.", "Մուտքագրեք անվան առնվազն երկու տառ։";
-    /// `{}` — то, что искали.
-    UiWeatherNothingFound =
-        "По запросу «{}» ничего не нашлось. Проверьте написание — и ищите город, а не улицу.",
-        "Nothing was found for “{}”. Check the spelling — and look for a city, not a street.",
-        "«{}» հարցմամբ ոչինչ չգտնվեց։ Ստուգեք ուղղագրությունը — և փնտրեք քաղաք, ոչ թե փողոց։";
-    UiWeatherLocateByIp = "Определить по IP", "Locate by IP", "Որոշել ըստ IP";
-    UiWeatherLocateHint =
-        "Спросит у ipwho.is (запасной — ipapi.co), где находится ваш IP-адрес.",
-        "Asks ipwho.is (with ipapi.co as a fallback) where your IP address is.",
-        "Կհարցնի ipwho.is-ին (պահեստայինը՝ ipapi.co), թե որտեղ է ձեր IP-հասցեն։";
-    UiWeatherInFavorites = "В избранном", "In favourites", "Ընտրյալներում";
-    UiWeatherToFavorites = "В избранное", "To favourites", "Ընտրյալներ";
-    UiWeatherFavoritesFull =
-        "В избранном нет места: откройте одно из избранных мест и уберите его кнопкой \
-         «В избранном».",
-        "There is no room in favourites: open one of the favourite places and remove it \
-         with “In favourites”.",
-        "Ընտրյալներում տեղ չկա. բացեք ընտրյալ վայրերից մեկը և հեռացրեք այն \
-         «Ընտրյալներում» կոճակով։";
-    UiWeatherRemoveFavorite = "Нажмите, чтобы убрать это место из избранного.",
-        "Press to remove this place from favourites.",
-        "Սեղմեք՝ այս վայրը ընտրյալներից հեռացնելու համար։";
-    UiWeatherAddFavorite =
-        "Место появится в карточке «Избранное»: переключаться между ними — один щелчок.",
-        "The place will appear in the “Favourites” card: switching between them is one click.",
-        "Վայրը կհայտնվի «Ընտրյալներ» քարտում. դրանց միջև անցնելը մեկ սեղմում է։";
-    UiWeatherFavorites = "Избранное", "Favourites", "Ընտրյալներ";
-    UiWeatherNoAir =
-        "Сведения о качестве воздуха не пришли — на прогноз это не влияет.",
-        "The air quality data did not arrive — this does not affect the forecast.",
-        "Օդի որակի տվյալները չեկան — սա կանխատեսման վրա չի ազդում։";
-    UiWeatherAirQuality = "Качество воздуха", "Air quality", "Օդի որակ";
-    UiWeatherTwoDays = "Ближайшие двое суток", "The next two days", "Առաջիկա երկու օրը";
-    UiWeatherNoHours = "Почасового прогноза в ответе сервера нет.",
-        "There is no hourly forecast in the server's answer.",
-        "Սերվերի պատասխանում ժամային կանխատեսում չկա։";
-    UiWeatherWeek = "Неделя", "The week", "Շաբաթ";
-    UiWeatherNoDays = "Прогноза по дням в ответе сервера нет.",
-        "There is no daily forecast in the server's answer.",
-        "Սերվերի պատասխանում օրական կանխատեսում չկա։";
-    UiWeatherUnits = "Единицы", "Units", "Միավորներ";
-    UiWeatherTemperature = "Температура", "Temperature", "Ջերմաստիճան";
-    UiWeatherValueMissing = "Сервер погоды не сообщил это значение.",
-        "The weather server did not report this value.", "Եղանակի սերվերն այս արժեքը չհաղորդեց։";
 
     // Экран «Телефон».
     UiShareOff = "Выключена", "Off", "Անջատված է";

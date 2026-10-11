@@ -15,18 +15,17 @@ use crate::i18n::{self, Key, Lang};
 use crate::engine::monitor;
 use crate::engine::power;
 use crate::engine::share;
-use crate::engine::weather;
 use crate::model::{
     Appearance, BALANCED_PLAN, CheckStatus, CookieSource, Destination, DownloadId,
-    DownloadOptions, Event, FAVORITES_LIMIT,
-    Format, GpuInfo, MediaInfo, MetaKind, MetaSummary, Metric, PciId, PerfSample, Place,
+    DownloadOptions, Event,
+    Format, GpuInfo, MediaInfo, MetaKind, MetaSummary, Metric, PciId, PerfSample,
     PowerMode, PowerModes,
-    PowerState, PressureUnit, Progress, Quality, Request, Section, SectionError, SectionPlan,
-    ShareAddress, ShareEvent, Sky, SubLang, SystemReport, TRACE_LIMIT, TRANSFER_LIMIT, TempUnit,
+    PowerState, Progress, Quality, Request, Section, SectionError, SectionPlan,
+    ShareAddress, ShareEvent, SubLang, SystemReport, TRACE_LIMIT, TRANSFER_LIMIT,
     Thumbnail,
-    Trace, TransferDirection, VISITOR_LIMIT, WeatherReport, WeatherUnits, WeatherView, WindUnit,
+    Trace, TransferDirection, VISITOR_LIMIT,
     human_bytes, human_duration, human_speed, looks_like_url, meta_kind, parse_section, pasted_link,
-    qr_modules, transfer_line, weather_view,
+    qr_modules, transfer_line,
 };
 use crate::motion;
 use crate::theme;
@@ -391,30 +390,25 @@ impl Setup {
 /// Вкладки, а не один длинный экран: в окне минимального размера (520×420)
 /// загрузка и работа с метаданными вместе уехали бы в прокрутку целиком.
 ///
-/// В дорожке шапки их три, а не пять, и это выбор макета. Пять коротких
-/// подписей в одной дорожке кончались тем, что «Метаданные» вставали впритык
-/// и шестой вкладке места уже не оставалось. Поэтому «Система» и «Монитор» —
-/// это подвкладки «Машины» (там и там речь об одной и той же машине, только
-/// в разрезе «сейчас» и «состав»), «История» переехала в правую колонку
-/// экрана загрузки, к очереди, а всё, что сверх трёх, живёт в меню «Ещё»
-/// (см. [`MORE_TABS`]).
+/// «Сейчас» и «Состав» — половины одной «Машины», а не два раздела: там и
+/// там речь об одной и той же машине, только в разрезе «сейчас» и «состав»,
+/// и опрос привязан к открытой половине (`machine_tab`). В рельсе они стоят
+/// обычными пунктами (см. [`NAV`]). «История» — не раздел, а правая колонка
+/// экрана загрузки, рядом с очередью.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tab {
     Download,
     Metadata,
     Machine,
-    /// Живёт в меню «Ещё», а не в дорожке.
-    Weather,
-    /// Раздача файлов на телефон. Тоже в меню «Ещё».
+    /// Раздача файлов на телефон.
     Phone,
 }
 
 /// Все разделы — для тех, кто обязан спросить про каждый (см. `tab_arrival`).
-const ALL_TABS: [Tab; 5] = [
+const ALL_TABS: [Tab; 4] = [
     Tab::Download,
     Tab::Metadata,
     Tab::Machine,
-    Tab::Weather,
     Tab::Phone,
 ];
 
@@ -437,8 +431,6 @@ enum NavIcon {
     Gauge,
     /// Кристалл с ножками — из чего машина состоит.
     Chip,
-    /// Облако с солнцем — погода.
-    Sky,
     /// Прямоугольник с кнопкой — телефон.
     Phone,
 }
@@ -466,13 +458,13 @@ impl NavItem {
     }
 }
 
-/// Состав рельса: три группы по смыслу, шесть пунктов на виду.
+/// Состав рельса: три группы по смыслу, пять пунктов на виду.
 ///
-/// «Ещё» больше нет, и это главное, ради чего рельс и заведён: «Погода»
-/// с «Телефоном» жили в меню, то есть не существовали для того, кто в меню
-/// не залез. Половины «Машины» тоже стали обычными пунктами — опрос
-/// по-прежнему привязан к открытой половине (`machine_tab`), меняется только
-/// то, чем она выбирается.
+/// Меню «Ещё» больше нет, и это главное, ради чего рельс и заведён: разделы,
+/// жившие в меню, не существовали для того, кто в меню не залез. Половины
+/// «Машины» тоже стали обычными пунктами — опрос по-прежнему привязан
+/// к открытой половине (`machine_tab`), меняется только то, чем она
+/// выбирается.
 const NAV: [(Key, &[NavItem]); 3] = [
     (
         Key::NavGroupFiles,
@@ -515,13 +507,6 @@ const NAV: [(Key, &[NavItem]); 3] = [
     (
         Key::NavGroupNearby,
         &[
-            NavItem {
-                tab: Tab::Weather,
-                half: None,
-                label: Key::TabWeather,
-                icon: NavIcon::Sky,
-                pitch: Key::WelcomeWeatherPitch,
-            },
             NavItem {
                 tab: Tab::Phone,
                 half: None,
@@ -1451,9 +1436,6 @@ impl MetaPanel {
                 | Event::SystemReport(_)
                 | Event::Power(_)
                 | Event::Perf(_)
-                | Event::WeatherPlace(_)
-                | Event::WeatherPlaces(_)
-                | Event::Weather(_)
                 | Event::Share(_) => {}
             }
         }
@@ -1593,9 +1575,6 @@ impl SystemPanel {
                 | Event::Versions(_)
                 | Event::Power(_)
                 | Event::Perf(_)
-                | Event::WeatherPlace(_)
-                | Event::WeatherPlaces(_)
-                | Event::Weather(_)
                 | Event::Share(_) => {}
             }
         }
@@ -1747,9 +1726,6 @@ impl PowerPanel {
                 | Event::Versions(_)
                 | Event::SystemReport(_)
                 | Event::Perf(_)
-                | Event::WeatherPlace(_)
-                | Event::WeatherPlaces(_)
-                | Event::Weather(_)
                 | Event::Share(_) => {}
             }
         }
@@ -1813,403 +1789,6 @@ fn power_hint(state: &PowerState, lang: Lang) -> String {
     }
 
     String::new()
-}
-
-// ---------------------------------------------------------------------------
-// Погода
-// ---------------------------------------------------------------------------
-
-/// Состояние вкладки «Погода».
-///
-/// Устроена как `SystemPanel`: свой приёмник на каждый запуск, работа в
-/// потоке, готовый отчёт приезжает событием. Приёмников два — у прогноза и
-/// у поиска: искать другой город, пока грузится прогноз этого, законно.
-///
-/// **Опроса в фоне у вкладки нет вовсе.** Автообновление — не поток, а срок:
-/// пока вкладка открыта, кадр просится ровно к нему (`request_repaint_after`),
-/// а закрытая вкладка не просит ничего, и Savio в покое по-прежнему не тратит
-/// ни кадра. Просить кадр на каждом проходе было бы обратной бедой — 60 к/с
-/// ради часов, которые меняются раз в пятнадцать минут.
-struct WeatherPanel {
-    /// Выбранное место. `None` — ещё не выбирали и не определяли.
-    place: Option<Place>,
-    units: WeatherUnits,
-    favorites: Vec<Place>,
-    report: Option<WeatherReport>,
-    /// Прогноз строками. Пересобирается на приёме отчёта и при смене единиц,
-    /// а не в кадре (Правило 1).
-    view: Option<WeatherView>,
-    /// Название выбранного места — для шапки, пока отчёта ещё нет.
-    place_title: String,
-    /// Место определено по IP-адресу в этом запуске. Ради оговорки: через VPN
-    /// это чужая страна, и человек должен видеть, откуда город взялся.
-    located: bool,
-    busy: bool,
-    stage: String,
-    /// Почему не вышло. Живёт до следующей попытки.
-    error: Option<String>,
-    /// Открывали ли вкладку в этом запуске.
-    asked: bool,
-    /// Когда в последний раз ходили за прогнозом, по часам egui.
-    ///
-    /// От этого мгновения, а не от прихода отчёта, считается автообновление —
-    /// и после неудачи тоже: иначе без сети вкладка стучалась бы в сервер
-    /// на каждом кадре.
-    last_attempt: Option<f64>,
-    rx: Option<Receiver<Event>>,
-
-    /// Текст в поле поиска.
-    query: String,
-    /// Что искали — для «по запросу «…» ничего не нашлось». Своей строкой:
-    /// поле к приходу ответа могли уже поправить.
-    searched_for: String,
-    searching: bool,
-    /// Найденное. `None` — не искали, не нашли или уже выбрали.
-    results: Option<Vec<Place>>,
-    /// Вторые строки найденного («область, страна»), готовые к показу.
-    result_details: Vec<String>,
-    /// Что сказать под полем поиска: текст и цвет.
-    search_note: Option<(String, Tone)>,
-    search_rx: Option<Receiver<Event>>,
-}
-
-impl WeatherPanel {
-    fn new(place: Option<Place>, units: WeatherUnits, favorites: Vec<Place>) -> Self {
-        Self {
-            place_title: place.as_ref().map(Place::title).unwrap_or_default(),
-            place,
-            units,
-            favorites,
-            report: None,
-            view: None,
-            located: false,
-            busy: false,
-            stage: String::new(),
-            error: None,
-            asked: false,
-            last_attempt: None,
-            rx: None,
-            query: String::new(),
-            searched_for: String::new(),
-            searching: false,
-            results: None,
-            result_details: Vec::new(),
-            search_note: None,
-            search_rx: None,
-        }
-    }
-
-    /// Ведёт вкладку: первый запрос при первом открытии и обновление по сроку,
-    /// пока открыта.
-    ///
-    /// Зовётся на каждом кадре из `ui`, а не из самой вкладки — по той же
-    /// причине, что и останов опроса монитора: закрытая вкладка не рисуется,
-    /// и сверить срок из неё было бы некому. Работы в обычном кадре здесь нет:
-    /// пара сравнений.
-    /// Пересобирает прогноз на новом языке.
-    ///
-    /// Название места при этом остаётся прежним: оно пришло от сервера и
-    /// переводу не подлежит — придуманное имя города хуже неперевёденного.
-    /// Свежее название приедет со следующим поиском или определением по IP.
-    fn relabel(&mut self, lang: Lang) {
-        self.rebuild_view(lang);
-    }
-
-    fn watch(&mut self, open: bool, lang: Lang, ctx: &egui::Context) {
-        if !open {
-            return;
-        }
-
-        if !self.asked {
-            // Первое открытие. Место по IP определяется здесь, а не при запуске
-            // Savio: запрос отдаёт чужому серверу IP-адрес человека, а
-            // запускал он загрузчик роликов, а не прогноз погоды.
-            self.asked = true;
-            let place = self.place.clone();
-            self.start(place, true, lang, ctx);
-            return;
-        }
-
-        if self.busy {
-            return;
-        }
-        // Без места обновлять нечего: определение по IP после неудачи
-        // повторяется по кнопке, а не само раз в пятнадцать минут.
-        let (Some(place), Some(at)) = (&self.place, self.last_attempt) else {
-            return;
-        };
-        let left = weather::REFRESH_SECS - (ctx.input(|i| i.time) - at);
-        if left > 0.0 {
-            // Кадр к сроку приходится просить: egui рисует по вводу, и
-            // вкладка, оставленная открытой, обновилась бы при первом
-            // движении мыши, а не через пятнадцать минут.
-            ctx.request_repaint_after(std::time::Duration::from_secs_f64(left));
-        } else {
-            let place = place.clone();
-            self.start(Some(place), false, lang, ctx);
-        }
-    }
-
-    /// Идёт за прогнозом. `place` — `None`: сначала определить место по IP.
-    fn start(&mut self, place: Option<Place>, saved: bool, lang: Lang, ctx: &egui::Context) {
-        let (tx, rx) = channel();
-        let notify_ctx = ctx.clone();
-        weather::start(place, saved, lang, tx, move || notify_ctx.request_repaint());
-
-        // Прежний приёмник бросается здесь, и в этом вся развязка: ответ про
-        // прошлое место, пришедший позже нового, лечь в окно уже не сможет.
-        self.rx = Some(rx);
-        self.busy = true;
-        self.error = None;
-        self.stage = i18n::t(lang, Key::StageStarting).to_owned();
-        self.last_attempt = Some(ctx.input(|i| i.time));
-    }
-
-    /// Выбирает место: из найденного, из избранного или заново по IP (`None`).
-    fn pick(&mut self, place: Option<Place>, lang: Lang, ctx: &egui::Context) {
-        self.results = None;
-        self.result_details.clear();
-        self.search_note = None;
-        if let Some(place) = &place {
-            self.set_place(place.clone(), false);
-        }
-        self.start(place, false, lang, ctx);
-    }
-
-    /// Запоминает место. Прежний прогноз убирается, если место другое:
-    /// числа прошлого города под названием нового — прямой повод их перепутать.
-    fn set_place(&mut self, place: Place, located: bool) {
-        if !self.place.as_ref().is_some_and(|old| old.same_as(&place)) {
-            self.report = None;
-            self.view = None;
-        }
-        self.place_title = place.title();
-        self.located = located;
-        self.place = Some(place);
-    }
-
-    /// Ищет места по тексту из поля.
-    fn search(&mut self, lang: Lang, ctx: &egui::Context) {
-        let query = self.query.trim();
-        // Однобуквенный запрос сервер оставляет без ответа (проверено вживую),
-        // и тратить на него поход в сеть незачем.
-        if query.chars().count() < 2 {
-            self.results = None;
-            self.search_note = Some((
-                i18n::t(lang, Key::UiWeatherTwoLetters).to_owned(),
-                Tone::Quiet,
-            ));
-            return;
-        }
-
-        let (tx, rx) = channel();
-        let notify_ctx = ctx.clone();
-        weather::start_search(query.to_owned(), lang, tx, move || notify_ctx.request_repaint());
-        self.searched_for = query.to_owned();
-        self.search_rx = Some(rx);
-        self.searching = true;
-        self.results = None;
-        self.result_details.clear();
-        self.search_note = None;
-    }
-
-    /// Стоит ли выбранное место в избранном.
-    fn is_favorite(&self) -> bool {
-        self.place
-            .as_ref()
-            .is_some_and(|place| self.favorites.iter().any(|fav| fav.same_as(place)))
-    }
-
-    /// Кладёт выбранное место в избранное или убирает оттуда. `true` — список
-    /// изменился и его надо запомнить.
-    fn toggle_favorite(&mut self) -> bool {
-        let Some(place) = &self.place else {
-            return false;
-        };
-        if let Some(index) = self.favorites.iter().position(|fav| fav.same_as(place)) {
-            self.favorites.remove(index);
-            return true;
-        }
-        if self.favorites.len() >= FAVORITES_LIMIT {
-            return false;
-        }
-        self.favorites.push(place.clone());
-        true
-    }
-
-    /// Меняет единицы и пересобирает строки. `true` — поменялось.
-    fn set_units(&mut self, units: WeatherUnits, lang: Lang) -> bool {
-        if units == self.units {
-            return false;
-        }
-        self.units = units;
-        self.rebuild_view(lang);
-        true
-    }
-
-    /// Пересобирает строки прогноза.
-    ///
-    /// Час «сейчас» и сегодняшний день считаются от часов машины на момент
-    /// сборки, поэтому звать надо и тогда, когда отчёт не менялся, а время
-    /// ушло: после неудачной попытки обновления старые числа остаются на
-    /// экране, но прошедший час с них уходит.
-    fn rebuild_view(&mut self, lang: Lang) {
-        self.view = self.report.as_ref().map(|report| {
-            let now = weather::now_unix();
-            weather_view(
-                report,
-                self.units,
-                now,
-                now.and_then(weather::local_offset),
-                lang,
-            )
-        });
-    }
-
-    /// Забирает ответ о прогнозе. `true` — место сменилось, и его надо
-    /// запомнить.
-    fn drain(&mut self, lang: Lang) -> bool {
-        let mut events = Vec::new();
-        let mut disconnected = false;
-
-        if let Some(rx) = &self.rx {
-            loop {
-                match rx.try_recv() {
-                    Ok(event) => events.push(event),
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        disconnected = true;
-                        break;
-                    }
-                }
-            }
-        }
-
-        let mut place_changed = false;
-        let mut dirty = false;
-        for event in events {
-            match event {
-                Event::Stage(stage) => self.stage = stage,
-                Event::WeatherPlace(place) => {
-                    self.set_place(place, true);
-                    place_changed = true;
-                }
-                Event::Weather(report) => {
-                    // Сохранённый отчёт — не конец работы: следом за ним идёт
-                    // свежий, и надпись о запросе должна остаться.
-                    if !report.saved {
-                        self.busy = false;
-                    }
-                    self.report = Some(*report);
-                    dirty = true;
-                }
-                Event::Failed { message, .. } => {
-                    self.error = Some(message);
-                    self.busy = false;
-                    dirty = self.report.is_some();
-                }
-                // Остальное ходит по чужим каналам. Перечислено явно, а не
-                // через `_`, чтобы компилятор и дальше требовал разбирать
-                // новые варианты `Event` во всех приёмниках.
-                Event::Info(_)
-                | Event::Thumbnail(_)
-                | Event::Progress(_)
-                | Event::Log(_)
-                | Event::Done { .. }
-                | Event::Ready
-                | Event::Warning(_)
-                | Event::Notice(_)
-                | Event::Tags(_)
-                | Event::Cleaned(_)
-                | Event::Versions(_)
-                | Event::SystemReport(_)
-                | Event::Power(_)
-                | Event::Perf(_)
-                | Event::WeatherPlaces(_)
-                | Event::Share(_) => {}
-            }
-        }
-
-        if dirty {
-            self.rebuild_view(lang);
-        }
-        if disconnected {
-            self.rx = None;
-            self.busy = false;
-        }
-        place_changed
-    }
-
-    /// Забирает найденное.
-    fn drain_search(&mut self, lang: Lang) {
-        let mut events = Vec::new();
-        let mut disconnected = false;
-
-        if let Some(rx) = &self.search_rx {
-            loop {
-                match rx.try_recv() {
-                    Ok(event) => events.push(event),
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        disconnected = true;
-                        break;
-                    }
-                }
-            }
-        }
-
-        for event in events {
-            match event {
-                Event::WeatherPlaces(places) => {
-                    self.searching = false;
-                    if places.is_empty() {
-                        // Пустой список без слов читался бы как «поиск не
-                        // сработал» — а он сработал, просто не нашёл.
-                        self.search_note = Some((
-                            i18n::fill(
-                                i18n::t(lang, Key::UiWeatherNothingFound),
-                                &[&self.searched_for],
-                            ),
-                            Tone::Quiet,
-                        ));
-                        self.results = None;
-                    } else {
-                        self.result_details = places.iter().map(Place::detail).collect();
-                        self.results = Some(places);
-                    }
-                }
-                Event::Failed { message, .. } => {
-                    self.searching = false;
-                    self.search_note = Some((message, Tone::Bad));
-                }
-                // Остальное по этому каналу не ходит. Ветка выписана явно,
-                // а не через `_`, по той же причине, что и выше.
-                Event::Info(_)
-                | Event::Thumbnail(_)
-                | Event::Stage(_)
-                | Event::Progress(_)
-                | Event::Log(_)
-                | Event::Done { .. }
-                | Event::Ready
-                | Event::Warning(_)
-                | Event::Notice(_)
-                | Event::Tags(_)
-                | Event::Cleaned(_)
-                | Event::Versions(_)
-                | Event::SystemReport(_)
-                | Event::Power(_)
-                | Event::Perf(_)
-                | Event::WeatherPlace(_)
-                | Event::Weather(_)
-                | Event::Share(_) => {}
-            }
-        }
-
-        if disconnected {
-            self.search_rx = None;
-            self.searching = false;
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2513,10 +2092,7 @@ impl SharePanel {
                 | Event::Versions(_)
                 | Event::SystemReport(_)
                 | Event::Perf(_)
-                | Event::Power(_)
-                | Event::WeatherPlace(_)
-                | Event::WeatherPlaces(_)
-                | Event::Weather(_) => {}
+                | Event::Power(_) => {}
             }
         }
 
@@ -2847,9 +2423,6 @@ impl MonitorPanel {
                 | Event::Versions(_)
                 | Event::Power(_)
                 | Event::SystemReport(_)
-                | Event::WeatherPlace(_)
-                | Event::WeatherPlaces(_)
-                | Event::Weather(_)
                 | Event::Share(_) => {}
             }
         }
@@ -3241,7 +2814,7 @@ pub struct SavioApp {
     /// бесплатно.
     ///
     /// Смена языка — не только новые подписи: готовые строки (`meta_line`,
-    /// `progress_line`, `quality_note`, `subs_note`, сводка очереди, прогноз)
+    /// `progress_line`, `quality_note`, `subs_note`, сводка очереди)
     /// собраны заранее и сами не обновятся, а идущие потоки движка говорят
     /// на том языке, с которым их запускали. И то и другое чинит
     /// [`SavioApp::set_lang`].
@@ -3479,8 +3052,6 @@ pub struct SavioApp {
     monitor: MonitorPanel,
     /// Состояние карточки «Питание» на половине «Сейчас».
     power: PowerPanel,
-    /// Состояние вкладки «Погода».
-    weather: WeatherPanel,
     /// Состояние экрана «Телефон».
     share: SharePanel,
     /// Открыто ли меню нижнего блока в свёрнутом рельсе.
@@ -3642,14 +3213,6 @@ impl SavioApp {
             system: SystemPanel::new(),
             monitor: MonitorPanel::new(),
             power: PowerPanel::new(),
-            // Место, единицы и избранное — из прошлого запуска. В сеть здесь
-            // не ходит ничего: прогноз спрашивается при первом открытии
-            // вкладки (см. `WeatherPanel::watch`).
-            weather: WeatherPanel::new(
-                saved.weather_place,
-                saved.weather_units,
-                saved.weather_favorites,
-            ),
             // Своя папка раздачи не запоминается: запоминаемая настройка
             // встречает человека при запуске, а папку, открытую для всей
             // сети, лучше выбирать осознанно, а не находить выбранной неделю
@@ -3925,12 +3488,6 @@ impl SavioApp {
             // обратно, и на закрытии окна эта память обрываться не должна.
             cookie_file: self.cookie_file.clone(),
             smooth: self.smooth,
-            // Каждое поле погоды выписано, а не заткнуто `..Default::default()`:
-            // иначе первый же щелчок по формату записал бы файл с пустой
-            // погодой и молча стёр бы выбранное место и избранное.
-            weather_place: self.weather.place.clone(),
-            weather_units: self.weather.units,
-            weather_favorites: self.weather.favorites.clone(),
             lang: self.lang,
             appearance: self.appearance,
         });
@@ -3990,8 +3547,8 @@ impl SavioApp {
     /// Переключает язык и приводит окно в порядок.
     ///
     /// Одних новых подписей мало, и это главная ловушка задачи. Готовые строки
-    /// (`meta_line`, `progress_line`, сводка очереди, прогноз погоды, строки
-    /// передач) собраны заранее — из кадра они не пересобираются, и половина
+    /// (`meta_line`, `progress_line`, сводка очереди, строки передач) собраны
+    /// заранее — из кадра они не пересобираются, и половина
     /// экрана осталась бы на прежнем языке до следующего события движка.
     /// Поэтому здесь их пересобирают **явно**.
     ///
@@ -4024,7 +3581,6 @@ impl SavioApp {
         self.rebuild_subtitles();
         self.rebuild_advanced_summary();
         self.queue.relabel(lang);
-        self.weather.relabel(lang);
         self.share.relabel(lang);
 
         self.power.relabel(lang);
@@ -4587,9 +4143,6 @@ impl SavioApp {
                 | Event::SystemReport(_)
                 | Event::Power(_)
                 | Event::Perf(_)
-                | Event::WeatherPlace(_)
-                | Event::WeatherPlaces(_)
-                | Event::Weather(_)
                 | Event::Share(_) => {}
             }
         }
@@ -4666,9 +4219,6 @@ impl SavioApp {
                 | Event::SystemReport(_)
                 | Event::Power(_)
                 | Event::Perf(_)
-                | Event::WeatherPlace(_)
-                | Event::WeatherPlaces(_)
-                | Event::Weather(_)
                 | Event::Share(_) => {}
             }
         }
@@ -4969,13 +4519,6 @@ impl eframe::App for SavioApp {
         self.system.drain();
         self.monitor.drain(ui.ctx());
         self.power.drain(self.lang);
-        // Место могло смениться ответом движка (определилось по IP) — тогда
-        // его надо запомнить здесь же, иначе при следующем запуске IP-адрес
-        // снова ушёл бы геолокатору.
-        if self.weather.drain(self.lang) {
-            self.remember();
-        }
-        self.weather.drain_search(self.lang);
         self.share.drain(self.lang, ui.ctx());
         self.drain_versions();
         self.drain_gpu_errors();
@@ -4993,11 +4536,6 @@ impl eframe::App for SavioApp {
         // во вкладке, по той же причине, что и у опроса: закрытая половина
         // не рисуется, и заметить её закрытие из неё самой некому.
         self.power.watch(now_open, self.lang, ui.ctx());
-        // Погода — по той же причине здесь: срок обновления надо сверять и
-        // тогда, когда вкладка ещё не рисовалась, а закрытая вкладка не
-        // должна просить ни кадра.
-        self.weather
-            .watch(self.tab == Tab::Weather, self.lang, ui.ctx());
         // Раздача — по той же причине и строже: ушли с экрана — папка больше
         // не открыта для сети.
         self.share
@@ -5081,7 +4619,6 @@ impl eframe::App for SavioApp {
                         Tab::Download => self.download_tab(ui),
                         Tab::Metadata => self.metadata_tab(ui),
                         Tab::Machine => self.machine_tab(ui),
-                        Tab::Weather => self.weather_tab(ui),
                         Tab::Phone => self.phone_tab(ui),
                     });
             });
@@ -5123,8 +4660,8 @@ impl eframe::App for SavioApp {
 impl SavioApp {
     /// Насколько содержимое показанного раздела уже приехало (приём 04).
     ///
-    /// Коэффициент спрашивается **у всех** разделов, включая живущие в меню
-    /// «Ещё», а не у одного показанного, и это не расточительство.
+    /// Коэффициент спрашивается **у всех** разделов, а не у одного
+    /// показанного, и это не расточительство.
     /// `animate_bool_with_time`, увидев незнакомый идентификатор, отдаёт сразу
     /// конечное значение — то есть раздел, о котором не спрашивали, пока на
     /// нём стояли, вернулся бы уже приехавшим, и приём просто не сработал бы.
@@ -5370,7 +4907,6 @@ impl SavioApp {
                 MachineTab::Now => (i18n::t(lang, Key::MachineNow), Key::NavMachineNowNote),
                 MachineTab::Spec => (i18n::t(lang, Key::MachineSpec), Key::NavMachineSpecNote),
             },
-            Tab::Weather => (i18n::t(lang, Key::TabWeather), Key::NavWeatherNote),
             Tab::Phone => (
                 i18n::t(lang, Key::TabPhone),
                 if self.share.running() {
@@ -7646,8 +7182,8 @@ fn welcome_cells<const N: usize>(ui: &mut egui::Ui, mut add: impl FnMut(&mut egu
 /// Карточка раздела в приветствии: значок, как в рельсе, название и строка
 /// «что это даёт». Щёлкается целиком; возвращает `true`, если щёлкнули.
 ///
-/// Вложенной карточкой, а не кнопкой, — как строка места в погоде: у
-/// кнопки egui одна строка текста, а здесь их несколько. Отклик под
+/// Вложенной карточкой, а не кнопкой: у кнопки egui одна строка текста,
+/// а здесь их несколько. Отклик под
 /// курсором — акцентная кромка: без него карточка читалась бы надписью,
 /// а не переходом.
 ///
@@ -9084,8 +8620,8 @@ fn service_row(ui: &mut egui::Ui, pal: theme::Palette, lang: Lang, fold: Fold, s
         .on_hover_cursor(egui::CursorIcon::PointingHand);
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
 
-    // Отклик под курсором — кромка, как у строки места в погоде: заливку
-    // строка уже несёт, и её усиление читалось бы как выбор.
+    // Отклик под курсором — кромка, а не заливка: заливку строка уже несёт,
+    // и её усиление читалось бы как выбор.
     let touch =
         ui.ctx()
             .animate_bool_with_time(response.id, response.hovered(), motion::TOUCH * speed);
@@ -9129,606 +8665,10 @@ fn service_row(ui: &mut egui::Ui, pal: theme::Palette, lang: Lang, fold: Fold, s
     response.clicked()
 }
 
-// ---------------------------------------------------------------------------
-// Вкладка «Погода»
-// ---------------------------------------------------------------------------
-
-/// Ширина столбика почасового прогноза.
-///
-/// Под самую широкую подпись — «Сейчас» и «−12°»: уже неё столбики налезали
-/// бы подписями друг на друга, а шире — на экран влезало бы меньше часов.
-const HOUR_SLOT_WIDTH: f32 = 60.0;
-
-/// Высота столбика: время, значок, температура и вероятность осадков.
-const HOUR_SLOT_HEIGHT: f32 = 104.0;
-
-/// Сторона значка погоды в столбике и в строке дня.
-const SMALL_ICON: f32 = 30.0;
-
-/// Сторона значка погоды рядом с крупной температурой.
-const BIG_ICON: f32 = 64.0;
-
-impl SavioApp {
-    /// Вкладка «Погода»: место и «сейчас» слева, неделя и единицы справа.
-    ///
-    /// Две колонки по той же причине, что у загрузки: на неделю смотрят рядом
-    /// с сегодняшней погодой, а не под ней, прокрутив экран. Ниже
-    /// [`theme::TWO_COLUMN_MIN`] колонки встают друг под друга.
-    fn weather_tab(&mut self, ui: &mut egui::Ui) {
-        const GAP: f32 = 18.0;
-        if ui.available_width() < theme::TWO_COLUMN_MIN {
-            self.weather_main(ui);
-            ui.add_space(GAP);
-            self.weather_rail(ui);
-            return;
-        }
-
-        let total = ui.available_width();
-        let rail = theme::RAIL_WIDTH;
-        let main = total - rail - GAP;
-
-        ui.horizontal_top(|ui| {
-            ui.spacing_mut().item_spacing.x = GAP;
-            for (width, which) in [(main, true), (rail, false)] {
-                ui.allocate_ui_with_layout(
-                    egui::vec2(width, 0.0),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        // Ширина с обеих сторон — по той же причине, что
-                        // у колонок `download_tab`.
-                        ui.set_min_width(width);
-                        ui.set_max_width(width);
-                        if which {
-                            self.weather_main(ui);
-                        } else {
-                            self.weather_rail(ui);
-                        }
-                    },
-                );
-            }
-        });
-    }
-
-    /// Главная колонка: место, сейчас и ближайшие часы.
-    fn weather_main(&mut self, ui: &mut egui::Ui) {
-        self.weather_place_card(ui);
-        // Пока прогноза нет, карточек под числа нет вовсе: пустые рамки
-        // с прочерками читались бы как «сервер ответил пустотой», а о том,
-        // что происходит на самом деле, говорит карточка места.
-        if self.weather.view.is_some() {
-            ui.add_space(14.0);
-            self.weather_now_card(ui);
-            ui.add_space(14.0);
-            self.weather_hours_card(ui);
-        }
-    }
-
-    /// Правая колонка: неделя, избранное и единицы.
-    fn weather_rail(&mut self, ui: &mut egui::Ui) {
-        if self.weather.view.is_some() {
-            self.weather_days_card(ui);
-            ui.add_space(14.0);
-        }
-        if !self.weather.favorites.is_empty() {
-            self.weather_favorites_card(ui);
-            ui.add_space(14.0);
-        }
-        self.weather_units_card(ui);
-    }
-
-    /// Карточка избранных мест.
-    ///
-    /// Своей карточкой справа, а не хвостом карточки места: избранное —
-    /// это то, между чем переключаются, а не часть поиска, и в карточке
-    /// места оно отодвигало поиск вниз на высоту своего списка.
-    fn weather_favorites_card(&mut self, ui: &mut egui::Ui) {
-        let pal = self.palette;
-        let speed = self.speed;
-        let lang = self.lang;
-        let mut picked: Option<Place> = None;
-
-        theme::card(ui, pal, |ui| {
-            let panel = &self.weather;
-            ui.label(
-                egui::RichText::new(i18n::t(lang, Key::UiWeatherFavorites))
-                    .font(theme::display(17.0))
-                    .color(pal.text_primary),
-            );
-            ui.add_space(8.0);
-            // Своими таблетками с переносом, а не дорожкой: названий бывает
-            // десяток, и в колонку шириной 340 не встают даже три (см.
-            // `choice_pill` про перенос).
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
-                for place in &panel.favorites {
-                    let on = panel
-                        .place
-                        .as_ref()
-                        .is_some_and(|current| current.same_as(place));
-                    if choice_pill(ui, pal, &place.name, on, speed).clicked() && !on {
-                        picked = Some(place.clone());
-                    }
-                }
-            });
-            ui.add_space(8.0);
-            note(ui, i18n::t(lang, Key::UiWeatherFavoritesNote), pal.text_muted);
-        });
-
-        if let Some(place) = picked {
-            let ctx = ui.ctx().clone();
-            self.weather.pick(Some(place), lang, &ctx);
-            self.remember();
-        }
-    }
-
-    /// Карточка места: где, когда обновлено, поиск и избранное.
-    fn weather_place_card(&mut self, ui: &mut egui::Ui) {
-        let pal = self.palette;
-        let speed = self.speed;
-        let mut refresh = false;
-        let mut locate = false;
-        let mut search = false;
-        let mut favorite = false;
-        let mut picked: Option<Place> = None;
-        let lang = self.lang;
-
-        theme::card_rising(ui, pal, self.appear(0), |ui| {
-            let panel = &mut self.weather;
-
-            // Высота ряду задаётся явно, а кнопка кладётся первой справа
-            // налево — обе грабли разобраны у `SavioApp::power_card`.
-            ui.allocate_ui_with_layout(
-                egui::vec2(ui.available_width(), theme::CONTROL_HEIGHT),
-                egui::Layout::right_to_left(egui::Align::Center),
-                |ui| {
-                    // «В избранном» — рядом с «Обновить», у названия места:
-                    // обе кнопки про это место, а не про поиск ниже.
-                    let on = panel.is_favorite();
-                    let full = !on && panel.favorites.len() >= FAVORITES_LIMIT;
-                    let response = ui.add_enabled_ui(panel.place.is_some() && !full, |ui| {
-                        toggle_pill(
-                            ui,
-                            pal,
-                            i18n::t(
-                                lang,
-                                if on {
-                                    Key::UiWeatherInFavorites
-                                } else {
-                                    Key::UiWeatherToFavorites
-                                },
-                            ),
-                            on,
-                            speed,
-                        )
-                    });
-                    favorite = response.inner.clicked();
-                    let hint = i18n::t(
-                        lang,
-                        if full {
-                            Key::UiWeatherFavoritesFull
-                        } else if on {
-                            Key::UiWeatherRemoveFavorite
-                        } else {
-                            Key::UiWeatherAddFavorite
-                        },
-                    );
-                    response.response.on_hover_text(hint);
-
-                    refresh = ui
-                        .add_enabled(
-                            panel.place.is_some() && !panel.busy,
-                            pill(i18n::t(lang, Key::UiRefresh)),
-                        )
-                        .on_disabled_hover_text(i18n::t(
-                            lang,
-                            if panel.busy {
-                                Key::UiWaitForAnswer
-                            } else {
-                                Key::UiPickPlaceFirst
-                            },
-                        ))
-                        .clicked();
-                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                        // Полное название показывает сама обрезанная метка
-                        // (`show_tooltip_when_elided`) — своя подсказка стала
-                        // бы второй коробкой (дефект 22).
-                        let title = if panel.place_title.is_empty() {
-                            i18n::t(lang, Key::UiWeatherNoPlace)
-                        } else {
-                            panel.place_title.as_str()
-                        };
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(title)
-                                    .font(theme::display(21.0))
-                                    .color(pal.text_primary),
-                            )
-                            .truncate(),
-                        );
-                    });
-                },
-            );
-
-            ui.add_space(4.0);
-            // Когда получены числа — всегда, если они есть: без этой строки не
-            // понять, свежий прогноз на экране или вчерашний.
-            if let Some(view) = &panel.view {
-                note(ui, &view.updated, pal.text_muted);
-            }
-            if panel.busy {
-                note(ui, &panel.stage, pal.text_secondary);
-            } else if panel.place.is_none() && panel.error.is_none() {
-                note(
-                    ui,
-                    i18n::t(lang, Key::UiWeatherNoPlaceNote),
-                    pal.text_muted,
-                );
-            }
-            if panel.located {
-                // Молча подставленный чужой город хуже отсутствия функции:
-                // цифры правдоподобны, и им верят. Поэтому откуда место
-                // взялось, сказано прямо — и там же, под названием, а не
-                // ниже у кнопки: читают его, глядя на чужой город.
-                //
-                // Одной строкой, а не прежним абзацем: макет v2 просил
-                // короче, и просьба честная — абзац пролистывали. Но
-                // показывается строка по-прежнему только тогда, когда место
-                // вправду взято по IP: постоянная оговорка у кнопки стала бы
-                // шумом и перестала бы читаться ровно тогда, когда нужна.
-                note(ui, i18n::t(lang, Key::UiWeatherVpnShort), pal.text_muted);
-            }
-            if let Some(error) = &panel.error {
-                ui.add_space(10.0);
-                // Старые числа при этом остаются на экране — жёлтым, а не
-                // красным: работать с ними можно, просто они не свежие, и
-                // строка «Обновлено в …» выше говорит, насколько.
-                let color = if panel.view.is_some() {
-                    pal.state_warning
-                } else {
-                    pal.state_error
-                };
-                banner(ui, pal, error, color);
-            }
-
-            ui.add_space(14.0);
-            field_label(ui, pal, i18n::t(lang, Key::UiWeatherFindCity));
-            ui.allocate_ui_with_layout(
-                egui::vec2(ui.available_width(), theme::CONTROL_HEIGHT),
-                egui::Layout::right_to_left(egui::Align::Center),
-                |ui| {
-                    // Обе кнопки кладутся первыми справа налево, поле — в
-                    // остаток: «Найти» и «Определить по IP» — два способа
-                    // сказать одно и то же «где я», и стоят они одной строкой.
-                    locate = ui
-                        .add_enabled(!panel.busy, pill(i18n::t(lang, Key::UiWeatherLocateByIp)))
-                        .on_hover_text(i18n::t(lang, Key::UiWeatherLocateHint))
-                        .on_disabled_hover_text(i18n::t(lang, Key::UiWaitForAnswer))
-                        .clicked();
-                    search |= ui
-                        .add_enabled(!panel.searching, pill(i18n::t(lang, Key::UiWeatherFind)))
-                        .clicked();
-                    let field = ui.add_sized(
-                        [ui.available_width(), theme::CONTROL_HEIGHT],
-                        egui::TextEdit::singleline(&mut panel.query)
-                            .hint_text(i18n::t(lang, Key::UiWeatherSearchHint))
-                            .text_color(pal.text_primary)
-                            .margin(egui::Margin::symmetric(14, 6)),
-                    );
-                    // Enter в поле — то же, что «Найти»: руки уже на клавиатуре.
-                    if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        search = true;
-                    }
-                },
-            );
-
-            if panel.searching {
-                ui.add_space(8.0);
-                note(ui, i18n::t(lang, Key::UiWeatherSearching), pal.text_secondary);
-            }
-            if let Some((text, tone)) = &panel.search_note {
-                ui.add_space(8.0);
-                note(ui, text, tone.color(pal));
-            }
-            if let Some(results) = &panel.results {
-                ui.add_space(8.0);
-                for (place, detail) in results.iter().zip(&panel.result_details) {
-                    if place_row(ui, pal, &place.name, detail, speed) {
-                        picked = Some(place.clone());
-                    }
-                    ui.add_space(6.0);
-                }
-            }
-
-        });
-
-        // Всё исполняем после карточки: внутри замыкания `self` одолжен,
-        // и завести оттуда поток или записать настройки не выйдет.
-        let ctx = ui.ctx().clone();
-        let lang = self.lang;
-        if refresh {
-            let place = self.weather.place.clone();
-            self.weather.start(place, false, lang, &ctx);
-        }
-        if locate {
-            self.weather.pick(None, lang, &ctx);
-        }
-        if search {
-            self.weather.search(lang, &ctx);
-        }
-        if let Some(place) = picked {
-            self.weather.pick(Some(place), lang, &ctx);
-            self.remember();
-        }
-        if favorite && self.weather.toggle_favorite() {
-            self.remember();
-        }
-    }
-
-    /// Карточка «сейчас»: значок, температура и подробности.
-    fn weather_now_card(&self, ui: &mut egui::Ui) {
-        let pal = self.palette;
-        let lang = self.lang;
-        let missing = i18n::t(lang, WEATHER_MISSING);
-        let Some(view) = &self.weather.view else {
-            return;
-        };
-
-        theme::card_rising(ui, pal, self.appear(1), |ui| {
-            // Температура с описанием — слева, подробности — справа через
-            // разделитель, когда карточке хватает ширины. Списком под
-            // температурой они оставляли пустой всю правую половину широкой
-            // карточки, а глаз, дочитав «пасмурно», упирался в пустоту и
-            // спускался за влажностью на строку ниже. В узком окне порядок
-            // прежний: колонкой.
-            const SIDE: f32 = 280.0;
-            const BESIDE_MIN: f32 = SIDE + 320.0;
-            let beside = ui.available_width() >= BESIDE_MIN;
-
-            let headline = |ui: &mut egui::Ui| {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 14.0;
-                    let (icon, _) = ui.allocate_exact_size(
-                        egui::vec2(BIG_ICON, BIG_ICON),
-                        egui::Sense::hover(),
-                    );
-                    weather_icon(pal, ui.painter(), icon, view.sky, view.night);
-
-                    // Своя вертикальная раскладка: в горизонтальной egui вытянул
-                    // бы описание в одну строку за кромку окна (см. `preview_row`).
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 2.0;
-                        ui.label(
-                            egui::RichText::new(&view.temperature)
-                                .font(theme::display(56.0))
-                                .color(pal.text_primary),
-                        );
-                        if let Some(description) = view.description {
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(description).color(pal.text_primary),
-                                )
-                                .truncate(),
-                            );
-                        }
-                        if let Some(feels) = &view.feels_like {
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(feels)
-                                        .small()
-                                        .color(pal.text_secondary),
-                                )
-                                .truncate(),
-                            );
-                        }
-                    });
-                });
-            };
-            // Воздух — продолжение той же таблицы, а не отдельный блок под
-            // карточкой: положенный под весь ряд, он начинал свою колонку
-            // значений от левого края, и в одной карточке стояли две таблицы
-            // с разными отступами.
-            let details = |ui: &mut egui::Ui| {
-                for (label, value) in &view.rows {
-                    stat_row_with(ui, pal, label, value.as_deref(), missing);
-                }
-                ui.add_space(10.0);
-                if view.air.is_empty() {
-                    // Частичный успех говорит о себе сам: пропавшие строки без
-                    // объяснения выглядели бы недоделкой вкладки.
-                    note(ui, i18n::t(lang, Key::UiWeatherNoAir), pal.text_muted);
-                } else {
-                    field_label(ui, pal, i18n::t(lang, Key::UiWeatherAirQuality));
-                    for (label, value) in &view.air {
-                        stat_row_with(ui, pal, label, value.as_deref(), missing);
-                    }
-                }
-            };
-
-            if beside {
-                ui.horizontal_top(|ui| {
-                    ui.spacing_mut().item_spacing.x = 18.0;
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(SIDE, 0.0),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| {
-                            ui.set_min_width(SIDE);
-                            ui.set_max_width(SIDE);
-                            headline(ui);
-                        },
-                    );
-                    // Разделитель рисуется после колонки подробностей, а не
-                    // `ui.separator()` на своём месте: ряд растёт по ходу
-                    // раскладки, и в ту минуту его высота — высота одной
-                    // температуры. Черта обрывалась у «ощущается как», хотя
-                    // таблица справа шла ещё вдвое ниже.
-                    let (gap, _) =
-                        ui.allocate_exact_size(egui::vec2(1.0, 0.0), egui::Sense::hover());
-                    let column = ui.vertical(|ui| details(ui)).response.rect;
-                    ui.painter().vline(
-                        gap.center().x,
-                        column.y_range(),
-                        ui.visuals().widgets.noninteractive.bg_stroke,
-                    );
-                });
-            } else {
-                headline(ui);
-                ui.add_space(12.0);
-                details(ui);
-            }
-        });
-    }
-
-    /// Карточка почасового прогноза.
-    fn weather_hours_card(&self, ui: &mut egui::Ui) {
-        let pal = self.palette;
-        let lang = self.lang;
-        let Some(view) = &self.weather.view else {
-            return;
-        };
-
-        theme::card_rising(ui, pal, self.appear(2), |ui| {
-            ui.label(
-                egui::RichText::new(i18n::t(lang, Key::UiWeatherTwoDays))
-                    .font(theme::display(17.0))
-                    .color(pal.text_primary),
-            );
-            ui.add_space(10.0);
-
-            if view.hours.is_empty() {
-                note(ui, i18n::t(lang, Key::UiWeatherNoHours), pal.text_muted);
-                return;
-            }
-
-            // Только горизонтальная прокрутка: сорок восемь столбиков в ряд
-            // иначе растянули бы содержимое за кромку окна и утащили за собой
-            // соседние подписи. Вертикальной прокрутки у неё нет, так что
-            // колесо мыши по-прежнему листает саму вкладку, а внутренней
-            // высоты, которая схлопывалась бы (дефект 27), здесь не заводится.
-            egui::ScrollArea::horizontal()
-                .id_salt("weather-hours")
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        for hour in &view.hours {
-                            hour_slot(ui, pal, hour);
-                        }
-                    });
-                });
-
-            // Рамка вокруг текущего часа и синее число под столбиком —
-            // два условных знака подряд, и ни один из них не подписан.
-            // Одна строка снимает оба вопроса разом.
-            ui.add_space(8.0);
-            note(ui, i18n::t(lang, Key::UiWeatherHoursLegend), pal.text_muted);
-        });
-    }
-
-    /// Карточка недельного прогноза.
-    fn weather_days_card(&self, ui: &mut egui::Ui) {
-        let pal = self.palette;
-        let lang = self.lang;
-        let Some(view) = &self.weather.view else {
-            return;
-        };
-
-        theme::card_rising(ui, pal, self.appear(1), |ui| {
-            ui.label(
-                egui::RichText::new(i18n::t(lang, Key::UiWeatherWeek))
-                    .font(theme::display(17.0))
-                    .color(pal.text_primary),
-            );
-            ui.add_space(8.0);
-
-            if view.days.is_empty() {
-                note(ui, i18n::t(lang, Key::UiWeatherNoDays), pal.text_muted);
-                return;
-            }
-            for day in &view.days {
-                day_row(ui, pal, day);
-            }
-            // Что значок под курсором рассказывает погоду словами, из самого
-            // значка не следует: подсказку ищут только у того, что выглядит
-            // недосказанным, а ряд дней выглядит законченным.
-            ui.add_space(8.0);
-            note(ui, i18n::t(lang, Key::UiWeatherDaysLegend), pal.text_muted);
-        });
-    }
-
-    /// Карточка единиц.
-    ///
-    /// Видна без единого щелчка, хотя единицы запоминаются между запусками, —
-    /// но и прятать тут нечего: выбранная единица стоит у каждого числа
-    /// вкладки, и забытым выбором она не станет.
-    fn weather_units_card(&mut self, ui: &mut egui::Ui) {
-        let pal = self.palette;
-        let speed = self.speed;
-        let mut units = self.weather.units;
-        let step = if self.weather.view.is_some() { 2 } else { 1 };
-        let lang = self.lang;
-
-        theme::card_rising(ui, pal, self.appear(step), |ui| {
-            ui.label(
-                egui::RichText::new(i18n::t(lang, Key::UiWeatherUnits))
-                    .font(theme::display(17.0))
-                    .color(pal.text_primary),
-            );
-            ui.add_space(10.0);
-
-            // Подписи сегментов берутся у домена: две копии «мм рт. ст.»
-            // разъехались бы. `map` у массива не выделяет памяти.
-            labelled_row(ui, pal, i18n::t(lang, Key::UiWeatherTemperature), |ui| {
-                if let Some(temp) = segment_track(
-                    ui,
-                    pal,
-                    egui::Id::new("track:weather-temp"),
-                    speed,
-                    units.temp,
-                    &TempUnit::ALL.map(|unit| (unit, unit.label())),
-                    false,
-                ) {
-                    units.temp = temp;
-                }
-            });
-            ui.add_space(10.0);
-            labelled_row(ui, pal, i18n::t(lang, Key::WeatherWind), |ui| {
-                if let Some(wind) = segment_track(
-                    ui,
-                    pal,
-                    egui::Id::new("track:weather-wind"),
-                    speed,
-                    units.wind,
-                    &WindUnit::ALL.map(|unit| (unit, unit.label(lang))),
-                    false,
-                ) {
-                    units.wind = wind;
-                }
-            });
-            ui.add_space(10.0);
-            labelled_row(ui, pal, i18n::t(lang, Key::WeatherPressure), |ui| {
-                if let Some(pressure) = segment_track(
-                    ui,
-                    pal,
-                    egui::Id::new("track:weather-pressure"),
-                    speed,
-                    units.pressure,
-                    &PressureUnit::ALL.map(|unit| (unit, unit.label(lang))),
-                    false,
-                ) {
-                    units.pressure = pressure;
-                }
-            });
-        });
-
-        if self.weather.set_units(units, lang) {
-            self.remember();
-        }
-    }
-}
-
 impl SavioApp {
     /// Экран «Телефон»: раздача слева, передачи справа.
     ///
-    /// Колонки по той же причине, что у погоды: на список передач смотрят
+    /// Колонки по той же причине, что у загрузки: на список передач смотрят
     /// рядом с адресом, пока телефон отправляет, а не под ним, прокрутив
     /// экран. Ниже [`theme::TWO_COLUMN_MIN`] колонки встают друг под друга.
     fn phone_tab(&mut self, ui: &mut egui::Ui) {
@@ -10450,388 +9390,6 @@ fn accent_button(
     .inner
 }
 
-/// Что сказать под прочерком в карточках погоды.
-///
-/// Своя строка, а не общая «Система не сообщила»: числа здесь присылает
-/// не система, а сервер погоды, и отправить человека искать беду в своём
-/// компьютере значило бы соврать.
-const WEATHER_MISSING: Key = Key::UiWeatherValueMissing;
-
-/// Строка найденного места: название и «область, страна». Щелчок выбирает.
-///
-/// Вложенной карточкой, а не кнопкой: у места две строки текста, а у кнопки
-/// egui одна. Отклик под курсором — акцентная кромка: без него строка
-/// выглядела бы надписью, а не выбором.
-fn place_row(ui: &mut egui::Ui, pal: theme::Palette, name: &str, detail: &str, speed: f32) -> bool {
-    let frame = theme::inner_frame(pal).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        // Выделяемые подписи съедали бы щелчок по строке.
-        ui.style_mut().interaction.selectable_labels = false;
-        ui.add(
-            egui::Label::new(
-                egui::RichText::new(name)
-                    .font(theme::bold(14.0))
-                    .color(pal.text_primary),
-            )
-            .truncate(),
-        );
-        if !detail.is_empty() {
-            ui.add(
-                egui::Label::new(egui::RichText::new(detail).small().color(pal.text_muted))
-                    .truncate(),
-            );
-        }
-    });
-
-    let rect = frame.response.rect;
-    let response = ui
-        .interact(rect, frame.response.id.with("pick"), egui::Sense::click())
-        .on_hover_cursor(egui::CursorIcon::PointingHand);
-    let touch =
-        ui.ctx()
-            .animate_bool_with_time(response.id, response.hovered(), motion::TOUCH * speed);
-    if touch > 0.0 {
-        ui.painter().rect_stroke(
-            rect,
-            egui::CornerRadius::same(theme::RADIUS_INNER),
-            egui::Stroke::new(
-                1.0,
-                motion::mix(egui::Color32::TRANSPARENT, pal.accent, touch),
-            ),
-            egui::StrokeKind::Inside,
-        );
-    }
-    response.clicked()
-}
-
-/// Один столбик почасового прогноза.
-///
-/// Кистью в прямоугольнике постоянного размера, а не раскладкой из меток:
-/// столбики обязаны стоять ровно, а у меток ширина своя у каждого числа.
-fn hour_slot(ui: &mut egui::Ui, pal: theme::Palette, hour: &crate::model::HourView) {
-    let (rect, _) = ui.allocate_exact_size(
-        egui::vec2(HOUR_SLOT_WIDTH, HOUR_SLOT_HEIGHT),
-        egui::Sense::hover(),
-    );
-    if !ui.is_rect_visible(rect) {
-        return;
-    }
-
-    let painter = ui.painter();
-    // Текущий час отмечен рамкой, а не одним цветом подписи: в прокрученном
-    // ряду его ищут глазами, и цвета мелкой подписи для этого мало.
-    if hour.now {
-        painter.rect(
-            rect,
-            egui::CornerRadius::same(theme::RADIUS_INNER),
-            pal.accent_soft,
-            egui::Stroke::new(1.0, pal.accent),
-            egui::StrokeKind::Inside,
-        );
-    }
-
-    let small = egui::TextStyle::Small.resolve(ui.style());
-    let x = rect.center().x;
-    painter.text(
-        egui::pos2(x, rect.top() + 8.0),
-        egui::Align2::CENTER_TOP,
-        &hour.time,
-        small.clone(),
-        if hour.now {
-            pal.accent_hover
-        } else {
-            pal.text_muted
-        },
-    );
-    let icon = egui::Rect::from_center_size(
-        egui::pos2(x, rect.top() + 28.0 + SMALL_ICON / 2.0),
-        egui::vec2(SMALL_ICON, SMALL_ICON),
-    );
-    weather_icon(pal, painter, icon, hour.sky, hour.night);
-    painter.text(
-        egui::pos2(x, rect.top() + 62.0),
-        egui::Align2::CENTER_TOP,
-        &hour.temperature,
-        theme::bold(14.0),
-        pal.text_primary,
-    );
-    if let Some(chance) = &hour.chance {
-        painter.text(
-            egui::pos2(x, rect.top() + 82.0),
-            egui::Align2::CENTER_TOP,
-            chance,
-            small,
-            pal.sky_water,
-        );
-    }
-}
-
-/// Строка недельного прогноза: день, значок, температуры, осадки.
-fn day_row(ui: &mut egui::Ui, pal: theme::Palette, day: &crate::model::DayView) {
-    /// Колонка вероятности осадков — постоянной ширины, иначе температуры
-    /// разных дней не встали бы одна под другой.
-    const CHANCE_WIDTH: f32 = 40.0;
-    /// Колонка температур — под «−12° … −3°».
-    const TEMPS_WIDTH: f32 = 92.0;
-
-    // Высота ряда задаётся явно: `with_layout` отдал бы строке весь остаток
-    // экрана (дефект 42, подробности у `SavioApp::power_card`). Колонки справа
-    // кладутся первыми, справа налево, а название дня — во вложенную
-    // `left_to_right`: так обрезаемая метка получает остаток и не налезает
-    // на числа (Правило 4).
-    ui.allocate_ui_with_layout(
-        egui::vec2(ui.available_width(), SMALL_ICON + 6.0),
-        egui::Layout::right_to_left(egui::Align::Center),
-        |ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
-
-            let (chance, _) =
-                ui.allocate_exact_size(egui::vec2(CHANCE_WIDTH, 20.0), egui::Sense::hover());
-            if let Some(text) = &day.chance {
-                ui.painter().text(
-                    chance.right_center(),
-                    egui::Align2::RIGHT_CENTER,
-                    text,
-                    egui::TextStyle::Small.resolve(ui.style()),
-                    pal.sky_water,
-                );
-            }
-
-            let (temps, _) =
-                ui.allocate_exact_size(egui::vec2(TEMPS_WIDTH, 20.0), egui::Sense::hover());
-            ui.painter().text(
-                temps.right_center(),
-                egui::Align2::RIGHT_CENTER,
-                &day.temperatures,
-                egui::TextStyle::Body.resolve(ui.style()),
-                pal.text_primary,
-            );
-
-            let (icon, response) =
-                ui.allocate_exact_size(egui::vec2(SMALL_ICON, SMALL_ICON), egui::Sense::hover());
-            weather_icon(pal, ui.painter(), icon, day.sky, false);
-            // Описание словами — по наведению: в узкой колонке ему нет места,
-            // а значок «дождь» не различает морось и ливень.
-            response.on_hover_text(day.description);
-
-            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                ui.add(
-                    egui::Label::new(egui::RichText::new(&day.label).color(pal.text_primary))
-                        .truncate(),
-                );
-            });
-        },
-    );
-}
-
-/// Значок погоды кистью.
-///
-/// Кистью, а не знаком шрифта, и это не вкусовщина. Ни дождевого облака, ни
-/// солнца за облаком, ни тумана, ни грозы с дождём в шрифтах eframe нет
-/// (проверено разбором cmap при постановке задачи 29), а уцелевшие ☀ и ☁
-/// приезжают из разных файлов с разным масштабом — рядом они вышли бы разного
-/// размера. Пустой прямоугольник на месте погоды не видят ни сборка, ни тесты
-/// (Правило 4).
-///
-/// Рисуется в квадрате, вписанном в `rect`, в долях его стороны: один и тот
-/// же значок годится и для крупного «сейчас», и для столбика часа.
-fn weather_icon(
-    pal: theme::Palette,
-    painter: &egui::Painter,
-    rect: egui::Rect,
-    sky: Sky,
-    night: bool,
-) {
-    let side = rect.width().min(rect.height());
-    let origin = rect.center() - egui::vec2(side, side) / 2.0;
-    let at = |x: f32, y: f32| origin + egui::vec2(x * side, y * side);
-
-    let body = |center: egui::Pos2, radius: f32| {
-        if night {
-            // Месяц крупнее солнца: у серпа нет лучей, и того же радиуса ему
-            // мало, чтобы в столбике часа читаться формой, а не точкой.
-            crescent(painter, center, radius * 1.5, pal.sky_moon());
-        } else {
-            painter.circle_filled(center, radius, pal.sky_sun());
-            let stroke = egui::Stroke::new((side * 0.06).max(1.2), pal.sky_sun());
-            for ray in 0..8 {
-                let angle = ray as f32 * std::f32::consts::FRAC_PI_4;
-                let direction = egui::vec2(angle.cos(), angle.sin());
-                painter.line_segment(
-                    [
-                        center + direction * radius * 1.45,
-                        center + direction * radius * 1.95,
-                    ],
-                    stroke,
-                );
-            }
-        }
-    };
-
-    // Облако: три круга и скруглённое основание. Нижние края кругов и
-    // основания совпадают, поэтому вместе они дают одну ровную фигуру.
-    // `dx`, `dy` — сдвиг в долях стороны, `scale` — масштаб вокруг середины.
-    let cloud = |dx: f32, dy: f32, scale: f32, color: egui::Color32| {
-        let point = |x: f32, y: f32| at(0.5 + (x - 0.5) * scale + dx, 0.5 + (y - 0.5) * scale + dy);
-        let radius = |r: f32| r * scale * side;
-        painter.circle_filled(point(0.36, 0.56), radius(0.17), color);
-        painter.circle_filled(point(0.54, 0.45), radius(0.21), color);
-        painter.circle_filled(point(0.70, 0.58), radius(0.15), color);
-        painter.rect_filled(
-            egui::Rect::from_min_max(point(0.20, 0.56), point(0.84, 0.73)),
-            egui::CornerRadius::same(radius(0.085).clamp(1.0, 255.0) as u8),
-            color,
-        );
-    };
-    // Облако над осадками: поднято, чтобы под ним осталось место.
-    let raised = || cloud(0.0, -0.12, 0.9, pal.sky_cloud());
-
-    match sky {
-        Sky::Clear => body(at(0.5, 0.5), 0.2 * side),
-        Sky::PartlyCloudy => {
-            body(at(0.36, 0.36), 0.15 * side);
-            cloud(0.08, 0.08, 0.85, pal.sky_cloud());
-        }
-        // Незнакомый код — облако: это ни «ясно», ни осадки, и соврать
-        // в какую-то сторону значком хуже, чем нарисовать нейтральное.
-        Sky::Cloudy | Sky::Unknown => {
-            cloud(0.1, -0.1, 0.75, pal.sky_cloud_far());
-            cloud(-0.04, 0.06, 0.95, pal.sky_cloud());
-        }
-        Sky::Fog => {
-            cloud(0.0, -0.12, 0.9, pal.sky_cloud_far());
-            let stroke = egui::Stroke::new((side * 0.06).max(1.2), pal.sky_cloud());
-            for (y, left, right) in [(0.72, 0.18, 0.74), (0.86, 0.28, 0.84)] {
-                painter.line_segment([at(left, y), at(right, y)], stroke);
-            }
-        }
-        Sky::Drizzle => {
-            raised();
-            for x in [0.34, 0.52, 0.70] {
-                painter.circle_filled(at(x, 0.8), side * 0.04, pal.sky_water);
-            }
-        }
-        Sky::Rain => {
-            raised();
-            let stroke = egui::Stroke::new((side * 0.055).max(1.2), pal.sky_water);
-            for x in [0.38, 0.54, 0.70] {
-                painter.line_segment([at(x, 0.68), at(x - 0.07, 0.9)], stroke);
-            }
-        }
-        Sky::Snow => {
-            raised();
-            let stroke = egui::Stroke::new((side * 0.04).max(1.0), pal.sky_snow());
-            for x in [0.34, 0.52, 0.70] {
-                let center = at(x, 0.8);
-                let reach = side * 0.06;
-                for ray in 0..3 {
-                    let angle = ray as f32 * std::f32::consts::FRAC_PI_3;
-                    let direction = egui::vec2(angle.cos(), angle.sin()) * reach;
-                    painter.line_segment([center - direction, center + direction], stroke);
-                }
-            }
-        }
-        Sky::Thunder => {
-            raised();
-            let stroke = egui::Stroke::new((side * 0.06).max(1.2), pal.sky_bolt());
-            let zigzag = [at(0.56, 0.62), at(0.44, 0.78), at(0.58, 0.78), at(0.46, 0.95)];
-            for pair in zigzag.windows(2) {
-                painter.line_segment([pair[0], pair[1]], stroke);
-            }
-        }
-    }
-}
-
-/// Месяц: полоса между двумя дугами — краем луны и краем тени на ней.
-///
-/// Сеткой, а не многоугольником: месяц невыпуклый, а `convex_polygon`
-/// заливает только выпуклое — вышел бы кружок со срезанным краем. Тень —
-/// круг размером с луну, сдвинутый вверх и вправо на полрадиуса.
-///
-/// Числа проверены глазами дважды. С тенью меньше луны серп выходил толщиной
-/// в три четверти радиуса, и в столбике почасового прогноза (30 точек) месяц
-/// читался пятном — ночь от дня отличалась только цветом. Кромка тонкой
-/// линией нужна по второй причине: у сетки egui нет сглаживания, и на такой
-/// величине края рассыпаются ступеньками.
-fn crescent(painter: &egui::Painter, center: egui::Pos2, radius: f32, color: egui::Color32) {
-    let (outer, inner) = crescent_arcs(center, radius);
-
-    let mut mesh = egui::Mesh::default();
-    for (edge, hollow) in outer.iter().zip(&inner) {
-        mesh.colored_vertex(*edge, color);
-        mesh.colored_vertex(*hollow, color);
-    }
-    for step in 0..CRESCENT_STEPS as u32 {
-        let k = step * 2;
-        mesh.add_triangle(k, k + 1, k + 2);
-        mesh.add_triangle(k + 1, k + 3, k + 2);
-    }
-    painter.add(egui::Shape::Mesh(Arc::new(mesh)));
-
-    // Сглаженная кромка по всему контуру: рог к рогу по луне и обратно по тени.
-    let outline: Vec<egui::Pos2> = outer.iter().chain(inner.iter().rev()).copied().collect();
-    painter.add(egui::Shape::closed_line(outline, egui::Stroke::new(1.0, color)));
-}
-
-/// Сколько отрезков в каждой дуге месяца.
-const CRESCENT_STEPS: usize = 16;
-
-/// Обе дуги месяца, от рога к рогу: край луны и край тени на ней.
-///
-/// Отдельно от рисования ради теста `the_crescent_stays_inside_the_moon`:
-/// промах в выборе дуги тени ничего не роняет, а тихо заливает серп в круг.
-/// Ровно так и было — и видно это было только глазами.
-fn crescent_arcs(
-    center: egui::Pos2,
-    radius: f32,
-) -> ([egui::Pos2; CRESCENT_STEPS + 1], [egui::Pos2; CRESCENT_STEPS + 1]) {
-    use std::f32::consts::{PI, TAU};
-    const STEPS: usize = CRESCENT_STEPS;
-
-    let shift = egui::vec2(0.79, -0.61) * (0.5 * radius);
-    let shade_radius = radius;
-    let shade = center + shift;
-    let distance = shift.length();
-    let toward_shade = shift.y.atan2(shift.x);
-    // Половина угла между рогами месяца, от центра луны: теорема косинусов
-    // для треугольника «центр луны — центр тени — рог».
-    let half = ((distance * distance + radius * radius - shade_radius * shade_radius)
-        / (2.0 * distance * radius))
-        .clamp(-1.0, 1.0)
-        .acos();
-
-    let on_moon = |angle: f32| center + egui::vec2(angle.cos(), angle.sin()) * radius;
-    let horn_a = on_moon(toward_shade + half);
-    let horn_b = on_moon(toward_shade - half);
-    let angle_from_shade = |point: egui::Pos2| {
-        let v = point - shade;
-        v.y.atan2(v.x)
-    };
-    let start = angle_from_shade(horn_a);
-    // Дуга тени идёт внутри луны, то есть через сторону, обращённую к её
-    // центру. Из двух путей между рогами берём тот, чья середина ближе к ней.
-    let forward = (angle_from_shade(horn_b) - start).rem_euclid(TAU);
-    let middle = start + forward / 2.0;
-    // Угловое расстояние до направления «к центру луны», свёрнутое в [0, π].
-    // Сворачивается разность с направлением на тень, а не с противоположным:
-    // `(x).rem_euclid(TAU) - PI` переводит совпадение не в ноль, а в ±π, и
-    // выбирался внешний путь — серп заливался в круг (дефект задачи 29).
-    let off = ((middle - toward_shade).rem_euclid(TAU) - PI).abs();
-    let inner_span = if off < PI / 2.0 { forward } else { forward - TAU };
-
-    // Точки обеих дуг — на стеке: они нужны дважды, сетке и кромке.
-    let mut outer = [egui::Pos2::ZERO; STEPS + 1];
-    let mut inner = [egui::Pos2::ZERO; STEPS + 1];
-    for step in 0..=STEPS {
-        let t = step as f32 / STEPS as f32;
-        // Край луны — длинным путём от рога к рогу, в сторону от тени.
-        outer[step] = on_moon(toward_shade + half + t * (TAU - 2.0 * half));
-        let angle = start + t * inner_span;
-        inner[step] = shade + egui::vec2(angle.cos(), angle.sin()) * shade_radius;
-    }
-    (outer, inner)
-}
-
 // ---------------------------------------------------------------------------
 // Мелкие элементы
 // ---------------------------------------------------------------------------
@@ -11431,24 +9989,6 @@ fn nav_icon(painter: &egui::Painter, rect: egui::Rect, icon: NavIcon, color: egu
                     leg,
                 );
             }
-        }
-        NavIcon::Sky => {
-            // Солнце за облаком.
-            painter.circle_stroke(
-                egui::pos2(rect.left() + w * 0.34, rect.top() + h * 0.32),
-                w * 0.19,
-                egui::Stroke::new(1.2, color),
-            );
-            let cloud = egui::Rect::from_min_max(
-                egui::pos2(rect.left() + w * 0.1, c.y),
-                egui::pos2(rect.right() - w * 0.05, rect.bottom() - h * 0.12),
-            );
-            painter.rect_stroke(
-                cloud,
-                egui::CornerRadius::same(255),
-                stroke,
-                egui::StrokeKind::Inside,
-            );
         }
         NavIcon::Phone => {
             // Корпус с кнопкой.
@@ -12747,12 +11287,11 @@ const LABEL_COLUMN: f32 = 96.0;
 /// подпись — та же беда, что и перевести её слишком длинно, так что список
 /// стоит рядом с самой колонкой.
 #[cfg(test)]
-const LABEL_KEYS: [Key; 5] = [
+const LABEL_KEYS: [Key; 4] = [
     Key::UiFormat,
     Key::QualityFieldVideo,
     Key::QualityFieldAudio,
     Key::UiEmbed,
-    Key::UiWeatherTemperature,
 ];
 
 /// Ряд «подпись слева, элемент управления справа».
@@ -13455,8 +11994,9 @@ fn stat_row(ui: &mut egui::Ui, pal: theme::Palette, lang: Lang, label: &str, val
 /// Та же строка, но со своим объяснением прочерка.
 ///
 /// Объяснение — часть смысла прочерка, а не украшение: у снимка системы
-/// значение не сообщила система, у погоды — сервер, и одна общая фраза
-/// соврала бы в одном из двух мест.
+/// значение не сообщила система, а у загрузки видеокарты прочерк бывает и
+/// там, где система ни при чём, — на macOS Savio её не спрашивает вовсе.
+/// Одна общая фраза соврала бы в одном из двух мест.
 fn stat_row_with(
     ui: &mut egui::Ui,
     pal: theme::Palette,
@@ -18005,126 +16545,6 @@ mod tests {
             failures.push("щелчок включил погашенные «Субтитры»");
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
-    }
-
-    /// Строка недельного прогноза занимает свою высоту, а не весь экран.
-    ///
-    /// Та же беда, что дефект 42: центрирующий ряд без заданной высоты
-    /// забирает весь остаток прокрутки. Проверено красным: с `ui.with_layout`
-    /// вместо `allocate_ui_with_layout` в [`day_row`] строка вырастает до
-    /// нижней кромки окна.
-    #[test]
-    fn a_weather_day_row_keeps_its_height() {
-        let pal = theme::Palette::dark();
-        let day = crate::model::DayView {
-            label: "ср, 16 сен".to_owned(),
-            temperatures: "−12° … −3°".to_owned(),
-            chance: Some("40%".to_owned()),
-            sky: Sky::Rain,
-            description: "Дождь",
-        };
-        let height = card_height(|ui| day_row(ui, pal, &day));
-        assert!(height > 20.0, "строка дня обрезана: {height}");
-        assert!(height < 80.0, "строка дня во весь экран: {height}");
-    }
-
-    /// Каждый значок погоды рисуется, днём и ночью, и ни одна фигура не
-    /// уезжает в бесконечность.
-    ///
-    /// Месяц считается тригонометрией (`crescent`), и промах в ней даёт не
-    /// панику, а `NaN` в вершинах — значок просто пропадает с экрана, молча.
-    #[test]
-    fn every_weather_icon_draws_finite_shapes() {
-        let pal = theme::Palette::dark();
-        const SKIES: [Sky; 9] = [
-            Sky::Clear,
-            Sky::PartlyCloudy,
-            Sky::Cloudy,
-            Sky::Fog,
-            Sky::Drizzle,
-            Sky::Rain,
-            Sky::Snow,
-            Sky::Thunder,
-            Sky::Unknown,
-        ];
-        let ctx = egui::Context::default();
-        theme::install_fonts(&ctx);
-        theme::apply(&ctx, pal);
-        let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(1200.0, 420.0),
-            )),
-            ..Default::default()
-        };
-        let mut output = ctx.run_ui(input, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                for night in [false, true] {
-                    for sky in SKIES {
-                        let (rect, _) =
-                            ui.allocate_exact_size(egui::vec2(64.0, 64.0), egui::Sense::hover());
-                        weather_icon(pal, ui.painter(), rect, sky, night);
-                    }
-                }
-            });
-        });
-        output.textures_delta.clear();
-
-        let mut meshes = 0;
-        for clipped in &output.shapes {
-            if let egui::Shape::Mesh(mesh) = &clipped.shape {
-                meshes += 1;
-                assert!(mesh.vertices.len() > 4, "месяц без вершин");
-                for vertex in &mesh.vertices {
-                    assert!(
-                        vertex.pos.x.is_finite() && vertex.pos.y.is_finite(),
-                        "вершина месяца в бесконечности: {:?}",
-                        vertex.pos
-                    );
-                }
-            }
-            let bounds = clipped.shape.visual_bounding_rect();
-            assert!(
-                !bounds.any_nan(),
-                "фигура значка с NaN: {:?}",
-                clipped.shape
-            );
-        }
-        // Месяц есть у ясной ночи и у переменной облачности ночью.
-        assert!(meshes >= 2, "месяц не нарисовался: {meshes}");
-    }
-
-    /// Месяц — серп внутри луны, а не круг.
-    ///
-    /// Дефект найден глазами при задаче 29: из двух путей по краю тени
-    /// выбирался внешний, и полоса между дугами заливала луну целиком —
-    /// в ночных столбиках прогноза стояли круги, неотличимые от солнца без
-    /// лучей. Ни паники, ни `NaN` при этом не было, так что проверка на
-    /// конечность вершин его не видела. Проверено красным: с прежней
-    /// свёрткой угла (`(x).rem_euclid(TAU) - PI`) точка серпа уходит за край
-    /// луны (22.1 при радиусе 20), и тест падает на первой же проверке.
-    #[test]
-    fn the_crescent_stays_inside_the_moon() {
-        let center = egui::pos2(100.0, 100.0);
-        let radius = 20.0;
-        let (outer, inner) = crescent_arcs(center, radius);
-
-        for point in outer.iter().chain(&inner) {
-            let distance = (*point - center).length();
-            assert!(
-                distance <= radius * 1.001,
-                "точка серпа вне луны: {point:?}, {distance} при радиусе {radius}"
-            );
-        }
-
-        // Посередине серп толщиной около полрадиуса: тень сдвинута ровно
-        // на столько. Круг вместо серпа дал бы здесь почти два радиуса.
-        let middle = CRESCENT_STEPS / 2;
-        let thickness = (outer[middle] - inner[middle]).length();
-        assert!(
-            (radius * 0.4..radius * 0.6).contains(&thickness),
-            "толщина серпа посередине {thickness} при радиусе {radius}"
-        );
     }
 
     fn sample_check() -> crate::model::Check {

@@ -15,7 +15,6 @@ pub mod share;
 pub mod sha256;
 pub mod thumbnail;
 mod tree;
-pub mod weather;
 pub mod ytdlp;
 
 use std::io::{BufRead, BufReader, Read};
