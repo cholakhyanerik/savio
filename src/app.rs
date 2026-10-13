@@ -2263,8 +2263,8 @@ const OVERLAY_MARGIN: egui::Margin = egui::Margin::symmetric(12, 10);
 struct MonitorPanel {
     /// Последний замер. `None` — опрос только начался, первого замера ещё нет.
     sample: Option<PerfSample>,
-    /// Когда он пришёл, по часам egui. От этого мгновения считается дробная
-    /// фаза графика: ломаная едет влево ровно на один шаг за такт замера
+    /// Когда он пришёл, по часам egui. От этого мгновения считается сдвиг
+    /// графика: с каждым замером ломаная въезжает влево ровно на один шаг
     /// (приём 13). `None` — замеров ещё не было, ехать нечему.
     sampled_at: Option<f64>,
     /// История загрузки процессора и памяти — для графиков.
@@ -2463,18 +2463,26 @@ impl MonitorPanel {
         self.sample = Some(sample);
     }
 
-    /// Дробная фаза графика: сколько прошло от последнего замера, долей такта.
+    /// Сколько графику ещё ехать: доля шага, от единицы в миг замера до нуля
+    /// в покое.
+    ///
+    /// Едет он `motion::MOVE` — ровно столько, сколько доезжает число над
+    /// ним, — и линейно, как оно: оба трогаются на кадре замера и встают
+    /// вместе, так что кадры у них общие. Ползти весь такт, как прежде, —
+    /// это свои кадры поверх кадров числа, и за движение на четыре точки
+    /// в секунду платила батарея (задача 57, числа — у `trace_plot`).
     ///
     /// Кадры отсюда **не** просятся: сколько их нужно, знает только сам
-    /// график — там известна ширина шага сетки (см. `trace_plot`).
+    /// график — там известна ширина шага сетки.
     ///
-    /// С выключенными «Плавными переходами» отдаёт ноль: график стоит на
-    /// месте и обновляется раз в секунду, как до всех приёмов.
-    fn trace_phase(&self, ctx: &egui::Context, speed: f32) -> f32 {
-        let Some(at) = self.sampled_at.filter(|_| speed > 0.0) else {
+    /// С выключенными «Плавными переходами» отдаёт ноль, то есть покой:
+    /// график встаёт на место сразу и кадров не просит вовсе.
+    fn trace_slide(&self, ctx: &egui::Context, speed: f32) -> f32 {
+        let span = motion::MOVE * speed;
+        let Some(at) = self.sampled_at.filter(|_| span > 0.0) else {
             return 0.0;
         };
-        ((ctx.input(|i| i.time) - at) as f32 / motion::SAMPLE).clamp(0.0, 1.0)
+        1.0 - ((ctx.input(|i| i.time) - at) as f32 / span).clamp(0.0, 1.0)
     }
 
     /// Рисует оверлей, пока он включён.
@@ -7693,9 +7701,9 @@ impl SavioApp {
         let pal = self.palette;
         let speed = self.speed;
         let lang = self.lang;
-        // Фаза считается один раз на вкладку: карточек с графиком две, и
+        // Сдвиг считается один раз на вкладку: карточек с графиком две, и
         // разъехавшись на кадр они ехали бы вразнобой.
-        let phase = self.monitor.trace_phase(ui.ctx(), speed);
+        let slide = self.monitor.trace_slide(ui.ctx(), speed);
 
         let Some(sample) = &self.monitor.sample else {
             note(
@@ -7722,7 +7730,7 @@ impl SavioApp {
                     pal,
                     cpu,
                     &sample.cpu,
-                    Plot::new(&self.monitor.cpu_trace, pal.accent, phase),
+                    Plot::new(&self.monitor.cpu_trace, pal.accent, slide),
                     speed,
                     Some(i18n::t(lang, Key::UiCpuWholeMachine)),
                 );
@@ -7731,7 +7739,7 @@ impl SavioApp {
                     pal,
                     memory,
                     &sample.mem,
-                    Plot::new(&self.monitor.mem_trace, pal.state_success, phase),
+                    Plot::new(&self.monitor.mem_trace, pal.state_success, slide),
                     speed,
                     None,
                 );
@@ -7742,7 +7750,7 @@ impl SavioApp {
                 pal,
                 cpu,
                 &sample.cpu,
-                Plot::new(&self.monitor.cpu_trace, pal.accent, phase),
+                Plot::new(&self.monitor.cpu_trace, pal.accent, slide),
                 speed,
                 Some(i18n::t(lang, Key::UiCpuWholeMachine)),
             );
@@ -7752,7 +7760,7 @@ impl SavioApp {
                 pal,
                 memory,
                 &sample.mem,
-                Plot::new(&self.monitor.mem_trace, pal.state_success, phase),
+                Plot::new(&self.monitor.mem_trace, pal.state_success, slide),
                 speed,
                 None,
             );
@@ -12151,7 +12159,7 @@ fn status_pill(ui: &mut egui::Ui, pal: theme::Palette, label: &str, color: egui:
 /// а способ сказать «нет данных», и он обязан выглядеть одинаково везде.
 const DASH: &str = "—";
 
-/// Ползущий график показателя: сами замеры, цвет и фаза сдвига.
+/// График показателя: сами замеры, цвет и сдвиг.
 ///
 /// Группой, а не тремя аргументами подряд: с палитрой у `metric_card` их
 /// стало восемь, и `clippy` тут прав не только формально — восемь
@@ -12162,13 +12170,14 @@ const DASH: &str = "—";
 struct Plot<'a> {
     trace: &'a Trace,
     color: egui::Color32,
-    /// Фаза ползущего графика: доля шага, на которую он уже сдвинулся.
-    phase: f32,
+    /// Сколько ломаной ещё ехать влево, долей шага: единица в миг замера,
+    /// ноль в покое (`MonitorPanel::trace_slide`).
+    slide: f32,
 }
 
 impl<'a> Plot<'a> {
-    fn new(trace: &'a Trace, color: egui::Color32, phase: f32) -> Self {
-        Self { trace, color, phase }
+    fn new(trace: &'a Trace, color: egui::Color32, slide: f32) -> Self {
+        Self { trace, color, slide }
     }
 }
 
@@ -12243,7 +12252,7 @@ fn metric_card(
             );
 
             ui.add_space(8.0);
-            trace_plot(ui, pal, plot);
+            trace_plot(ui, pal, plot, speed);
 
             if let Some(detail) = &metric.detail {
                 ui.add_space(6.0);
@@ -12270,13 +12279,14 @@ fn metric_card(
 /// Шкала жёстко от нуля до ста, а не «по максимуму в окне». Автомасштаб
 /// нарисовал бы у простаивающей машины ту же гору, что у загруженной, —
 /// график, который врёт ровно в ту сторону, в какую на него смотрят.
-fn trace_plot(ui: &mut egui::Ui, pal: theme::Palette, plot: Plot<'_>) {
+fn trace_plot(ui: &mut egui::Ui, pal: theme::Palette, plot: Plot<'_>, speed: f32) {
     const HEIGHT: f32 = 56.0;
+    const STROKE: f32 = 1.5;
 
     let Plot {
         trace,
         color,
-        phase,
+        slide,
     } = plot;
 
     let (rect, _) = ui.allocate_exact_size(
@@ -12308,22 +12318,37 @@ fn trace_plot(ui: &mut egui::Ui, pal: theme::Palette, plot: Plot<'_>) {
     // Шаг считаем по потолку буфера, а не по числу набранных точек: иначе
     // первые секунды график растягивался бы на всю ширину и «сжимался» по
     // мере наполнения — движение, которого на самом деле не было.
-    let step = rect.width() / (TRACE_LIMIT - 1) as f32;
+    //
+    // И на шаг меньше, чем вмещает потолок: у полного графика самая старая
+    // точка стоит за левой кромкой, под обрезкой. С замером её вытесняет
+    // следующая, и та уезжает под кромку вместе со всей ломаной. При шаге
+    // во весь потолок крайний отрезок в миг замера пропадал скачком, и у
+    // левой кромки на время сдвига открывалась щель в шаг.
+    let step = rect.width() / (TRACE_LIMIT - 2) as f32;
     let newest = filled - 1;
 
-    // Кадры для сдвига просит сам график, и по своему шагу сетки.
+    // Кадры для сдвига просит сам график, по своему шагу сетки, и только
+    // пока едет: в покое и с выключенными переходами `slide` ровно ноль.
+    // Проверять тут надо именно «ещё едет», а не «ещё не доехал»: прежняя
+    // фаза в покое была нулём, проверка `< 1.0` его пропускала, и график
+    // с выключенными переходами будил окно около семи раз в секунду, ни разу
+    // не сдвинувшись (задача 57).
     //
-    // Соблазн поставить тут круглые «тридцать кадров в секунду» велик, и
-    // цена ему замерена: 7,1 с процессорного времени за 10 с работы вместо
-    // 0,6 с — в двенадцать раз больше на ровном месте (отладочная сборка,
-    // окно 1100×780). А ехать ломаной за такт всего один шаг, то есть около
-    // четырёх точек на широкой карточке: тридцати кадров хватило бы на
-    // сдвиг в **одну восьмую точки** за кадр — движение, которого не видит
-    // никто. Поэтому интервал считается от шага, а не выбирается на глаз:
-    // просим кадр на каждые полточки пути. В узком окне шаг вдвое меньше —
-    // и кадров там нужно вдвое меньше, само собой.
-    if phase < 1.0 && step > 0.0 {
-        let seconds = (0.5 / step * motion::SAMPLE).clamp(1.0 / 60.0, 0.5);
+    // Едет ломаная `MOVE` после замера, вместе с доезжающим числом, и кадры
+    // у них общие: число просит их само, на частоте монитора. Прежде она
+    // ползла весь такт, и релизный замер (окно 520×420, монитор 120 Гц,
+    // 2026-10-13, сборки 0.43.0 и 0.43.1 запускались поочерёдно) дал за 10 с
+    // ~355 кадров против ~311 и 0,67–0,80 с процессора против 0,50–0,70 с:
+    // ~45 кадров за движение на четыре точки в секунду.
+    //
+    // Интервал — кадр на каждые полточки пути, а не круглые «тридцать
+    // в секунду»: ехать ломаной всего шаг, около четырёх точек, и лишние
+    // кадры показали бы сдвиг, которого не видит никто. Цена круглого числа
+    // замерялась: 7,1 с процессора за 10 с вместо 3,6 с при полточках
+    // (отладочная сборка, окно 1100×780, 2026-08-23). Эти кадры нужны, когда
+    // число не изменилось и само кадров не просит.
+    if slide > 0.0 && step > 0.0 {
+        let seconds = (0.5 / step * motion::MOVE * speed).clamp(1.0 / 60.0, 0.5);
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_secs_f32(seconds));
     }
@@ -12334,12 +12359,14 @@ fn trace_plot(ui: &mut egui::Ui, pal: theme::Palette, plot: Plot<'_>) {
     let points: Vec<egui::Pos2> = trace
         .iter()
         .enumerate()
-        .map(|(i, value)| motion::trace_point(rect, value, i, newest, step, phase))
+        .map(|(i, value)| motion::trace_point(rect, value, i, newest, step, slide))
         .collect();
-    painter.add(egui::Shape::line(
-        points,
-        egui::Stroke::new(1.5, color),
-    ));
+    // Обрезка по бокам графика: свежая точка въезжает из-за правой кромки
+    // и без обрезки на время сдвига торчала бы на поле карточки. Сверху
+    // и снизу — запас на толщину линии: ноль и сотня лежат ровно на гранях,
+    // и обрезка по ним срезала бы полштриха.
+    ui.painter_at(rect.expand2(egui::vec2(0.0, STROKE)))
+        .add(egui::Shape::line(points, egui::Stroke::new(STROKE, color)));
 }
 
 /// Карточка «Ввод-вывод»: сеть, диски и видеокарта.
@@ -14715,6 +14742,157 @@ mod tests {
             }
         }
         assert!(out.is_empty(), "оверлей не вмещает:\n{}", out.join("\n"));
+    }
+
+    /// Кадр с одним графиком процессора в момент `at`: через сколько
+    /// контекст попросил следующий кадр (`Duration::MAX` — не просил вовсе)
+    /// и что нарисовано.
+    ///
+    /// График стоит в карточке, как в окне, и это не украшение: голый
+    /// занимает весь кадр, обрезка по кадру совпадает с его краями,
+    /// и проверка обрезки проходила без самой обрезки.
+    fn plot_frame(
+        ctx: &egui::Context,
+        panel: &MonitorPanel,
+        at: f64,
+        speed: f32,
+    ) -> (std::time::Duration, Vec<egui::epaint::ClippedShape>) {
+        let pal = theme::Palette::dark();
+        let input = egui::RawInput {
+            time: Some(at),
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(520.0, 420.0),
+            )),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| {
+            let slide = panel.trace_slide(ui.ctx(), speed);
+            theme::card(ui, pal, |ui| {
+                trace_plot(ui, pal, Plot::new(&panel.cpu_trace, pal.accent, slide), speed);
+            });
+        });
+        output.textures_delta.clear();
+        let delay = output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map_or(std::time::Duration::MAX, |v| v.repaint_delay);
+        (delay, output.shapes)
+    }
+
+    /// График просит кадры, только пока едет: с замером — да, доехав — нет,
+    /// а с выключенными «Плавными переходами» не просит их вовсе.
+    ///
+    /// Забытая просьба не видна ни в окне, ни сборке: неподвижный график
+    /// выглядит одинаково, будит он окно или нет. Так и было до задачи 57:
+    /// в покое прежняя фаза была нулём, проверка `< 1.0` его пропускала,
+    /// и с выключенными переходами окно просыпалось около семи раз
+    /// в секунду ради графика, который стоял на месте.
+    ///
+    /// Проверено красным: без условия «ещё едет» проверка падает уже на
+    /// покое.
+    #[test]
+    fn the_trace_asks_for_frames_only_while_it_slides() {
+        let ctx = egui::Context::default();
+        let mut panel = MonitorPanel::new();
+        for value in [10.0, 40.0, 25.0] {
+            panel.cpu_trace.push(value);
+        }
+        panel.sampled_at = Some(0.0);
+
+        // Свежий контекст сам просит несколько проходов: дожидаемся тишины
+        // далеко после замера, чтобы мерить график, а не egui.
+        let mut at = 100.0;
+        let mut quiet = false;
+        for _ in 0..20 {
+            quiet = plot_frame(&ctx, &panel, at, 1.0).0 == std::time::Duration::MAX;
+            if quiet {
+                break;
+            }
+            at += 0.016;
+        }
+        assert!(quiet, "график в покое, а кадры просит");
+
+        // Пришёл замер — едет и просит кадры.
+        panel.sampled_at = Some(at);
+        let (delay, _) = plot_frame(&ctx, &panel, at, 1.0);
+        assert!(delay < std::time::Duration::MAX, "замер пришёл, а кадров не просит");
+
+        // Доехал — замолкает.
+        let at = at + f64::from(motion::MOVE) + 0.01;
+        let (delay, _) = plot_frame(&ctx, &panel, at, 1.0);
+        assert_eq!(delay, std::time::Duration::MAX, "доехал, а будит окно");
+
+        // Переходы выключены — тишина и в самый миг замера.
+        panel.sampled_at = Some(at);
+        let (delay, _) = plot_frame(&ctx, &panel, at, 0.0);
+        assert_eq!(
+            delay,
+            std::time::Duration::MAX,
+            "переходы выключены, а график будит окно"
+        );
+    }
+
+    /// Ломаная обрезана по бокам графика, и выходит она за них с обеих
+    /// сторон: в миг замера свежая точка ещё за правой кромкой, а в покое
+    /// самая старая точка полного графика стоит за левой. Без обрезки то
+    /// и другое торчало бы на поле карточки.
+    ///
+    /// Проверено красным: с `ui.painter()` вместо `painter_at` обрезка равна
+    /// всему кадру, и проверка падает.
+    #[test]
+    fn the_trace_stays_inside_its_plot() {
+        let ctx = egui::Context::default();
+        let pal = theme::Palette::dark();
+        let mut panel = MonitorPanel::new();
+        for i in 0..TRACE_LIMIT {
+            panel.cpu_trace.push((i % 7) as f32 * 10.0);
+        }
+        panel.sampled_at = Some(5.0);
+
+        // Подложка графика, обрезка ломаной и её крайние x.
+        let measure = |at: f64| {
+            let mut shapes = Vec::new();
+            for _ in 0..2 {
+                shapes = plot_frame(&ctx, &panel, at, 1.0).1;
+            }
+            let plot = shapes
+                .iter()
+                .find_map(|s| match &s.shape {
+                    egui::Shape::Rect(r) if r.fill == pal.input_fill => Some(r.rect),
+                    _ => None,
+                })
+                .expect("подложки графика нет");
+            let (clip, xs) = shapes
+                .iter()
+                .find_map(|s| match &s.shape {
+                    egui::Shape::Path(path) => {
+                        Some((s.clip_rect, path.points.iter().map(|p| p.x).collect::<Vec<_>>()))
+                    }
+                    _ => None,
+                })
+                .expect("ломаной нет");
+            let oldest = xs.iter().copied().fold(f32::MAX, f32::min);
+            let newest = xs.iter().copied().fold(f32::MIN, f32::max);
+            (plot, clip, oldest, newest)
+        };
+
+        let (plot, clip, _, newest) = measure(5.0);
+        assert!(
+            newest > plot.right(),
+            "в миг замера свежая точка уже на месте ({newest} при кромке {})",
+            plot.right()
+        );
+        let (_, _, oldest, _) = measure(5.0 + f64::from(motion::MOVE) + 0.01);
+        assert!(
+            oldest < plot.left(),
+            "в покое старая точка внутри графика ({oldest} при кромке {})",
+            plot.left()
+        );
+        assert!(
+            clip.left() >= plot.left() - 0.01 && clip.right() <= plot.right() + 0.01,
+            "ломаная обрезана по {clip:?}, а график занимает {plot:?}"
+        );
     }
 
     /// Перезапущенный опрос забывает и то, что показывал оверлей.
