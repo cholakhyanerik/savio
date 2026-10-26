@@ -304,6 +304,81 @@ fn tinted(flight: &Tint, now: f64, time: f32) -> Color32 {
     mix(flight.from, flight.to, fade((step / time).max(0.0)))
 }
 
+/// Как часто просит кадр доезжающее значение: число в карточке монитора,
+/// график под ним и полоса загрузки.
+///
+/// Тридцать кадров в секунду, а не частота монитора, и это не экономия на
+/// глазах. Число на четверть секунды пути различимо меняется столько раз,
+/// сколько целых процентов между замерами, а штатный
+/// `animate_value_with_time` просил кадр на каждом проходе: на мониторе
+/// 144 Гц — ~35 кадров на замер, то есть ~350 кадров за десять секунд
+/// открытой вкладки (задача 85, замеры — в CLAUDE.md, Правило 1).
+///
+/// Общий у всех, кто едет вместе, и это главное. Каждый кадр egui берёт
+/// наименьшую из просьб `request_repaint_after`, так что свой интервал
+/// у числа и у графика дал бы частоту быстрейшего из них, а не общую.
+pub const DRIFT_FRAME: f32 = 1.0 / 30.0;
+
+/// Число в пути: откуда тронулось, куда едет и когда начало.
+struct Drift {
+    from: f32,
+    to: f32,
+    since: f64,
+}
+
+/// Число, доезжающее до цели за `time` — линейно и с кадрами не чаще
+/// [`DRIFT_FRAME`].
+///
+/// Линейно намеренно: числу вторит график под ним
+/// (`MonitorPanel::trace_slide`), а он обязан ехать ровно — замедление
+/// у цели показало бы на графике изгиб, которого в замерах не было.
+///
+/// Устроено как [`rect`]: своя память в `Context::data`, впервые увиденное
+/// стоит на месте, смена цели на полпути трогает с того места, где число
+/// сейчас. Отличие одно — кадры. Доехавшее отдаёт цель **тем же значением**
+/// и кадров не просит; с нулевым временем встаёт на цель тем же кадром.
+///
+/// Цель не-число (WMI и крейты такое отдают — Правило 6) не едет вовсе:
+/// `NaN != NaN`, и каждая проверка «сменилась ли цель» отвечала бы «да»,
+/// то есть кадры просились бы вечно.
+pub fn number(ctx: &Context, id: Id, target: f32, time: f32) -> f32 {
+    if !target.is_finite() {
+        return target;
+    }
+    let now = ctx.input(|i| i.time);
+
+    let Some(mut drift) = ctx.data(|d| {
+        d.get_temp::<(f32, f32, f64)>(id)
+            .map(|(from, to, since)| Drift { from, to, since })
+    }) else {
+        ctx.data_mut(|d| d.insert_temp(id, (target, target, now)));
+        return target;
+    };
+
+    if drift.to != target {
+        drift = Drift {
+            from: drifted(&drift, now, time),
+            to: target,
+            since: now,
+        };
+        ctx.data_mut(|d| d.insert_temp(id, (drift.from, drift.to, drift.since)));
+    }
+
+    let at = drifted(&drift, now, time);
+    if at != drift.to {
+        ctx.request_repaint_after(std::time::Duration::from_secs_f32(DRIFT_FRAME));
+    }
+    at
+}
+
+fn drifted(drift: &Drift, now: f64, time: f32) -> f32 {
+    let step = (now - drift.since) as f32;
+    if time <= 0.0 || step >= time {
+        return drift.to;
+    }
+    drift.from + (drift.to - drift.from) * (step / time).max(0.0)
+}
+
 /// Таблетка выбора: доезжает до сегмента и вытягивается по ходу.
 ///
 /// Растяжение считается из того, насколько она сейчас далека от цели, а не
@@ -614,6 +689,120 @@ mod tests {
         });
         assert_eq!(seen, second, "не встала на цель тем же кадром");
         assert!(!asked, "движение выключено, а кадры всё равно просятся");
+    }
+
+    /// Доезжающее число просит кадры, но не чаще потолка: штатный лерп просил
+    /// их на каждом проходе, то есть с частотой монитора (задача 85). Беда
+    /// невидима глазу — число на 144 Гц и на 30 Гц доезжает одинаково, —
+    /// и видна только счётом кадров.
+    #[test]
+    fn a_drifting_number_asks_for_frames_no_faster_than_its_ceiling() {
+        let ctx = Context::default();
+        let id = Id::unique("metric");
+        let quiet = settle(&ctx, 0.0, |ctx| {
+            number(ctx, id, 12.0, MOVE);
+        });
+
+        let (asked_now, delay) = frame(&ctx, quiet + 0.016, |ctx| {
+            number(ctx, id, 61.0, MOVE);
+        });
+        assert!(!asked_now, "число в пути просит кадр немедленно");
+        assert!(
+            delay >= std::time::Duration::from_secs_f32(DRIFT_FRAME * 0.99),
+            "число в пути просит кадры чаще потолка: через {delay:?}"
+        );
+        assert!(
+            delay <= std::time::Duration::from_secs_f32(DRIFT_FRAME * 1.01),
+            "число в пути не просит кадров вовсе: {delay:?}"
+        );
+    }
+
+    /// Доехав, число встаёт ровно на цель и перестаёт будить окно, а путь
+    /// занимает столько кадров, сколько велит потолок, — не больше.
+    #[test]
+    fn a_drifting_number_arrives_and_goes_quiet() {
+        let ctx = Context::default();
+        let id = Id::unique("metric");
+        let quiet = settle(&ctx, 0.0, |ctx| {
+            number(ctx, id, 12.0, MOVE);
+        });
+
+        let mut at = quiet + 0.016;
+        let mut frames = 0;
+        let mut seen = f32::NAN;
+        loop {
+            let (_, delay) = frame(&ctx, at, |ctx| {
+                seen = number(ctx, id, 61.0, MOVE);
+            });
+            frames += 1;
+            if delay == std::time::Duration::MAX {
+                break;
+            }
+            assert!(frames < 40, "число не доезжает: {seen}");
+            at += delay.as_secs_f64();
+        }
+        assert_eq!(seen, 61.0, "не встало ровно на цель");
+        let ceiling = (MOVE / DRIFT_FRAME).ceil() as i32 + 2;
+        assert!(
+            frames <= ceiling,
+            "на путь ушло {frames} кадров, а потолок разрешает {ceiling}"
+        );
+    }
+
+    /// Ход линейный: на середине времени — середина пути. Числу вторит график,
+    /// а он едет ровно; замедление у цели нарисовало бы на нём изгиб.
+    #[test]
+    fn a_drifting_number_moves_linearly() {
+        let ctx = Context::default();
+        let id = Id::unique("metric");
+        let quiet = settle(&ctx, 0.0, |ctx| {
+            number(ctx, id, 0.0, MOVE);
+        });
+        frame(&ctx, quiet + 0.016, |ctx| {
+            number(ctx, id, 100.0, MOVE);
+        });
+        let mut halfway = f32::NAN;
+        frame(&ctx, quiet + 0.016 + (MOVE / 2.0) as f64, |ctx| {
+            halfway = number(ctx, id, 100.0, MOVE);
+        });
+        assert!((halfway - 50.0).abs() < 1.0, "на середине времени {halfway}");
+    }
+
+    /// С выключенными «Плавными переходами» число встаёт на цель тем же
+    /// кадром и следующего не просит: иначе на каждый замер приходился бы
+    /// лишний кадр.
+    #[test]
+    fn the_switch_puts_the_number_on_target_at_once() {
+        let ctx = Context::default();
+        let id = Id::unique("metric");
+        let quiet = settle(&ctx, 0.0, |ctx| {
+            number(ctx, id, 12.0, MOVE * scale(false));
+        });
+        let mut seen = f32::NAN;
+        let (_, delay) = frame(&ctx, quiet + 0.016, |ctx| {
+            seen = number(ctx, id, 61.0, MOVE * scale(false));
+        });
+        assert_eq!(seen, 61.0, "не встало на цель тем же кадром");
+        assert_eq!(
+            delay,
+            std::time::Duration::MAX,
+            "движение выключено, а кадры всё равно просятся"
+        );
+    }
+
+    /// Не-число в цели не едет и кадров не просит: `NaN != NaN`, и без этой
+    /// оговорки «цель сменилась» звучало бы на каждом кадре вечно.
+    #[test]
+    fn a_number_that_is_not_a_number_does_not_wake_the_window() {
+        let ctx = Context::default();
+        let id = Id::unique("metric");
+        let quiet = settle(&ctx, 0.0, |ctx| {
+            number(ctx, id, 12.0, MOVE);
+        });
+        let (_, delay) = frame(&ctx, quiet + 0.016, |ctx| {
+            number(ctx, id, f32::NAN, MOVE);
+        });
+        assert_eq!(delay, std::time::Duration::MAX, "не-число будит окно");
     }
 
     /// Второй щелчок на полпути трогает таблетку с того места, где она сейчас,
