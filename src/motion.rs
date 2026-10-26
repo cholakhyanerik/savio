@@ -60,7 +60,7 @@ pub const RISE: f32 = 10.0;
 // провожать взглядом там нечего.
 //
 // Сигнатура у всех трёх — `fn(f32) -> f32`, ровно та, которую ждёт
-// `Context::animate_bool_with_time_and_easing` в egui 0.36. То есть кривую
+// `Context::animate_bool_with_time_and_easing` в egui 0.36–0.37. То есть кривую
 // можно и наложить на готовый коэффициент, и отдать egui целиком.
 // ---------------------------------------------------------------------------
 
@@ -100,12 +100,11 @@ pub fn fade(t: f32) -> f32 {
 /// это настройка Savio: галочка в подвале, которая запоминается вместе
 /// с остальными в `settings.json`.
 ///
-/// Оговорка по egui 0.36, проверенная по исходникам `animation_manager.rs`:
-/// «тем же кадром» верно для `animate_bool_with_time` (деление на ноль даёт
-/// не-число, и egui подставляет цель), а `animate_value_with_time` на нулевом
-/// времени отдаёт цель **следующим** кадром — кадр он при этом просит сам,
-/// так что задержка равна одному кадру и глазом не видна. Городить ради неё
-/// обход не нужно; знать о ней стоит, чтобы не искать несуществующий баг.
+/// «Тем же кадром» у обоих штатных лерпов, но по разным причинам
+/// (по исходникам egui 0.37.0, `animation_manager.rs`): у
+/// `animate_bool_with_time` деление на ноль даёт не-число, и egui подставляет
+/// цель, а у `animate_value_with_time` на нулевое время есть своя ветка,
+/// которая отдаёт цель сразу и кадра не просит.
 pub fn scale(enabled: bool) -> f32 {
     if enabled { 1.0 } else { 0.0 }
 }
@@ -556,7 +555,7 @@ mod tests {
         let target = Rect::from_min_max(pos2(10.0, 4.0), pos2(90.0, 34.0));
         let mut seen = Rect::NOTHING;
         frame(&ctx, 0.0, |ctx| {
-            seen = rect(ctx, Id::new("track"), target, MOVE, liquid);
+            seen = rect(ctx, Id::unique("track"), target, MOVE, liquid);
         });
         assert_eq!(seen, target);
     }
@@ -567,7 +566,7 @@ mod tests {
     #[test]
     fn a_finished_flight_stops_asking_for_frames() {
         let ctx = Context::default();
-        let id = Id::new("track");
+        let id = Id::unique("track");
         let first = Rect::from_min_max(pos2(10.0, 4.0), pos2(90.0, 34.0));
         let second = Rect::from_min_max(pos2(100.0, 4.0), pos2(180.0, 34.0));
 
@@ -602,7 +601,7 @@ mod tests {
     #[test]
     fn the_switch_puts_the_pill_on_target_at_once() {
         let ctx = Context::default();
-        let id = Id::new("track");
+        let id = Id::unique("track");
         let first = Rect::from_min_max(pos2(10.0, 4.0), pos2(90.0, 34.0));
         let second = Rect::from_min_max(pos2(100.0, 4.0), pos2(180.0, 34.0));
 
@@ -622,7 +621,7 @@ mod tests {
     #[test]
     fn a_second_click_does_not_throw_the_pill_back() {
         let ctx = Context::default();
-        let id = Id::new("track");
+        let id = Id::unique("track");
         let left = Rect::from_min_max(pos2(0.0, 4.0), pos2(80.0, 34.0));
         let middle = Rect::from_min_max(pos2(90.0, 4.0), pos2(170.0, 34.0));
         let right = Rect::from_min_max(pos2(180.0, 4.0), pos2(260.0, 34.0));

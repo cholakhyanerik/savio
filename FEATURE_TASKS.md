@@ -1712,10 +1712,10 @@ Sampler::take (engine/monitor.rs, строка 212) — место, куда п�
   с `GWLP_WNDPROC`) и после прежней процедуры передавать
   `WM_WINDOWPOSCHANGING` в `DefWindowProcW`. Дескриптор — в замыкании
   `run_native` через `HasWindowHandle` у `CreationContext` (eframe
-  0.36.2, epi.rs:101); новых зависимостей не нужно, `#[link(name =
+  0.37.0, epi.rs:101); новых зависимостей не нужно, `#[link(name =
   "user32")]` по образцу kernel32 в engine/power.rs:247. Прецедент
   в том же процессе — accesskit перехватывает то же окно так же
-  (accesskit_windows 0.32.1, subclass.rs:44–73 и :111);
+  (accesskit_windows 0.35.2, subclass.rs:44–73 и :111);
 - дать окну верхний предел в 8192 **физических** пикселя: иначе
   потолком станет виртуальный экран, а на нескольких мониторах он шире
   8192, и дефект 13 останется достижим;

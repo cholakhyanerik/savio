@@ -77,7 +77,7 @@ impl ModalArrival {
         let color = motion::mix(egui::Color32::TRANSPARENT, pal.modal_backdrop, self.veil);
         ctx.layer_painter(egui::LayerId::new(
             egui::Order::Middle,
-            egui::Id::new("modal-veil").with(name),
+            egui::Id::unique("modal-veil").with(name),
         ))
         .rect_filled(ctx.content_rect(), 0.0, color);
     }
@@ -2737,7 +2737,7 @@ impl Preview {
 ///
 /// Цепочка ровно такая: `RequestPaste` уходит с кадром N, eframe читает буфер
 /// после отрисовки кадра N+1 (`ActionRequested::Paste` в wgpu_integration.rs
-/// eframe 0.36) и кладёт `Event::Paste` во ввод кадра N+2. Третий кадр — запас
+/// eframe 0.37) и кладёт `Event::Paste` во ввод кадра N+2. Третий кадр — запас
 /// на случай, если кадры на медленной машине лягут не так ровно. Считать надо
 /// кадрами, а не секундами: вставка приезжает с номером кадра, а не по часам,
 /// и за полсекунды ожидания окно успело бы перерисоваться тридцать раз зря.
@@ -3078,11 +3078,8 @@ pub struct SavioApp {
     queue: Queue,
     /// Окно нужно развернуть на первом кадре.
     ///
-    /// Одного `with_maximized(true)` в `main.rs` мало: вместе с
-    /// `with_inner_size` он выставляет окну признак развёрнутого, но не
-    /// применяет саму геометрию — окно открывается прежнего размера, хотя
-    /// `IsZoomed` уже отвечает «развёрнуто». Проверено на Windows 11.
-    /// Команду шлём **однократно**: каждый кадр — и пользователь не смог бы
+    /// Командой, а не флагом `with_maximized` в `main.rs`: почему — сказано
+    /// там же. Команду шлём **однократно**: каждый кадр — и пользователь не смог бы
     /// вернуть окну обычный размер.
     maximize_pending: bool,
     /// Кто запоминает выбор на следующий запуск.
@@ -4480,8 +4477,10 @@ impl eframe::App for SavioApp {
     ///
     /// Здесь дописывается отложенная настройка: переключить формат и тут же
     /// закрыть окно — обычное дело, а окно дебаунса к этому моменту ещё не
-    /// истекло. Полагаться вместо этого на `Drop` нельзя: eframe сразу после
-    /// `on_exit` зовёт `std::process::exit(0)`, и деструкторы не выполняются.
+    /// истекло. Пишет её свой поток, и дождаться его можно только здесь:
+    /// закрыв окно, eframe роняет приложение и возвращается из `run_native`,
+    /// процесс кончается вместе с `main`, а потоки, которых никто не ждёт,
+    /// умирают с ним на полуслове (Правило 3).
     ///
     /// `App::save` не годится по другой причине: он вызывается только с фичей
     /// `persistence`, а она тянет `ron`, `serde` и `home` ради файла, который
@@ -4506,8 +4505,9 @@ impl eframe::App for SavioApp {
         self.preview.stop();
         // Раздачу тоже, и с ожиданием: сокеты закроет и смерть процесса, но
         // недопринятый файл удаляет только поток приёма, увидевший остановку,
-        // а `process::exit` сразу за нами ему этого не дал бы. Ждём не дольше
-        // секунды и только пока что-то передаётся — в покое выход мгновенный.
+        // а процесс, кончающийся сразу за нами, ему этого не дал бы. Ждём
+        // не дольше секунды и только пока что-то передаётся — в покое выход
+        // мгновенный.
         if let Some(handle) = &self.share.handle {
             handle.stop_and_wait(std::time::Duration::from_secs(1));
         }
@@ -4680,7 +4680,7 @@ impl SavioApp {
         for (index, tab) in ALL_TABS.into_iter().enumerate() {
             let here = tab == self.tab;
             let t = ctx.animate_bool_with_time(
-                egui::Id::new("tab-arrive").with(index),
+                egui::Id::unique("tab-arrive").with(index),
                 here,
                 motion::LAYER * self.speed,
             );
@@ -4697,7 +4697,7 @@ impl SavioApp {
     /// приезжает само окно. Так видно, что это слой поверх Savio, а не другое
     /// приложение.
     fn modal_arrival(&self, ctx: &egui::Context, name: &'static str, open: bool) -> ModalArrival {
-        let id = egui::Id::new("modal").with(name);
+        let id = egui::Id::unique("modal").with(name);
         ModalArrival {
             veil: ctx.animate_bool_with_time(id.with("veil"), open, MODAL_VEIL * self.speed),
             rise: motion::glide(ctx.animate_bool_with_time(
@@ -5011,7 +5011,7 @@ impl SavioApp {
         for (index, message) in messages.into_iter().enumerate() {
             let appear = Self::appearing(
                 ui.ctx(),
-                egui::Id::new("banner").with(index),
+                egui::Id::unique("banner").with(index),
                 message.is_some(),
                 self.speed,
             );
@@ -5174,7 +5174,7 @@ impl SavioApp {
             ),
         };
 
-        let modal = egui::Modal::new(egui::Id::new("savio-setup"))
+        let modal = egui::Modal::new(egui::Id::unique("savio-setup"))
             .backdrop_color(egui::Color32::TRANSPARENT)
             .frame(
                 egui::Frame::new()
@@ -5352,7 +5352,7 @@ impl SavioApp {
         let picked = segment_track(
             ui,
             pal,
-            egui::Id::new("track:format"),
+            egui::Id::unique("track:format"),
             self.speed,
             self.format,
             &items,
@@ -5391,7 +5391,7 @@ impl SavioApp {
         let picked = segment_track(
             ui,
             pal,
-            egui::Id::new("track:quality"),
+            egui::Id::unique("track:quality"),
             self.speed,
             self.quality,
             &items,
@@ -5590,7 +5590,7 @@ impl SavioApp {
                     speed,
                 );
 
-                collapsing_body(ui, egui::Id::new("advanced-body"), open, speed, |ui| {
+                collapsing_body(ui, egui::Id::unique("advanced-body"), open, speed, |ui| {
                     egui::Frame::new()
                         .inner_margin(egui::Margin {
                             left: 12,
@@ -6108,7 +6108,7 @@ impl SavioApp {
                 let running = matches!(self.state, State::Running);
                 let color = motion::tint(
                     ui.ctx(),
-                    egui::Id::new("status-dot"),
+                    egui::Id::unique("status-dot"),
                     color,
                     motion::MOVE * speed,
                 );
@@ -6145,7 +6145,7 @@ impl SavioApp {
                             // приходит следующее (приём 09). Показываем при
                             // этом потолок, а не сам замер: см. `progress_peak`.
                             Some(_) => egui::ProgressBar::new(ui.ctx().animate_value_with_time(
-                                egui::Id::new("progress-bar"),
+                                egui::Id::unique("progress-bar"),
                                 self.progress_peak,
                                 PROGRESS_CATCH_UP * speed,
                             )),
@@ -6240,7 +6240,7 @@ impl SavioApp {
                 picked = segment_track(
                     ui,
                     pal,
-                    egui::Id::new("track:rail"),
+                    egui::Id::unique("track:rail"),
                     self.speed,
                     self.rail_tab,
                     &[
@@ -6722,7 +6722,7 @@ impl SavioApp {
             No,
         }
 
-        let answer = egui::Modal::new(egui::Id::new("savio-confirm"))
+        let answer = egui::Modal::new(egui::Id::unique("savio-confirm"))
             .backdrop_color(egui::Color32::TRANSPARENT)
             .frame(
                 egui::Frame::new()
@@ -6904,7 +6904,7 @@ fn welcome_window(
 ) -> egui::ModalResponse<Option<WelcomeAction>> {
     let width = welcome_width(ctx.content_rect().width());
 
-    egui::Modal::new(egui::Id::new("savio-welcome"))
+    egui::Modal::new(egui::Id::unique("savio-welcome"))
         .backdrop_color(egui::Color32::TRANSPARENT)
         .frame(
             egui::Frame::new()
@@ -7260,7 +7260,7 @@ fn welcome_card(
         .on_hover_cursor(egui::CursorIcon::PointingHand);
     // Карточка нарисована рамкой с подписями, и кнопкой для диктора она
     // становится только так. По этому же имени её находит и проверка.
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, name));
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, name));
     let touch =
         ui.ctx()
             .animate_bool_with_time(response.id, response.hovered(), motion::TOUCH * speed);
@@ -7296,7 +7296,7 @@ fn about_window(
     // за кромку окна минимального размера.
     let width = 440.0_f32.min(ctx.content_rect().width() - 48.0);
 
-    egui::Modal::new(egui::Id::new("savio-about"))
+    egui::Modal::new(egui::Id::unique("savio-about"))
         .backdrop_color(egui::Color32::TRANSPARENT)
         .frame(
             egui::Frame::new()
@@ -8442,7 +8442,7 @@ fn meta_table(
 ) -> bool {
     let folded = !summary.service.is_empty();
     let count = summary.rows.len();
-    let tail = egui::Id::new("meta-service").with(key);
+    let tail = egui::Id::unique("meta-service").with(key);
     let mut toggled = false;
 
     let table = ui.scope(|ui| {
@@ -8626,7 +8626,7 @@ fn service_row(ui: &mut egui::Ui, pal: theme::Palette, lang: Lang, fold: Fold, s
     let response = ui
         .interact(rect, id, egui::Sense::click())
         .on_hover_cursor(egui::CursorIcon::PointingHand);
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
 
     // Отклик под курсором — кромка, а не заливка: заливку строка уже несёт,
     // и её усиление читалось бы как выбор.
@@ -9407,7 +9407,7 @@ fn accent_button(
 /// Спрашиваем **до** того, как виджет нарисован, и это не хитрость: egui
 /// решает, кто под курсором, в начале прохода — по прямоугольникам прошлого
 /// кадра, — так что ответ на этот момент уже готов. Ровно так же и ровно тем
-/// же `read_response` берёт свой вид сам `Button` в egui 0.36, поэтому
+/// же `read_response` берёт свой вид сам `Button` в egui 0.36–0.37, поэтому
 /// заливка, кромка и подпись едут одним коэффициентом и не расходятся
 /// (приём 01).
 ///
@@ -9785,7 +9785,7 @@ fn rail_item(
     // Имя и «открыт ли» готовый `Button` сообщает сам; здесь их называют
     // явно (о цене — у `choice_pill`).
     response.widget_info(|| {
-        egui::WidgetInfo::selected(egui::WidgetType::Button, true, open, label)
+        egui::WidgetInfo::selected(egui::Role::Button, true, open, label)
     });
     let id = response.id;
 
@@ -10039,7 +10039,7 @@ fn rail_more_button(
         egui::Sense::click(),
     );
     // Три точки — картинка, и без имени диктору кнопку не назвать.
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
     let touch = touch_at(ui, response.id, state.speed);
     let painter = ui.painter();
     painter.rect_filled(
@@ -10079,7 +10079,7 @@ fn rail_more_button(
     // окно. Держит `the_language_changes_from_the_narrow_rail`.
     let mut open = picks.more_open;
     egui::Popup::new(
-        egui::Id::new("savio-rail-more"),
+        egui::Id::unique("savio-rail-more"),
         ui.ctx().clone(),
         rect,
         ui.layer_id(),
@@ -10196,7 +10196,7 @@ fn rail_block(ui: &mut egui::Ui, state: &RailState<'_>, picks: &mut RailPicks) {
     let picked = segment_track(
         ui,
         pal,
-        egui::Id::new("track:theme"),
+        egui::Id::unique("track:theme"),
         speed,
         state.appearance,
         &themes,
@@ -10219,12 +10219,12 @@ fn rail_block(ui: &mut egui::Ui, state: &RailState<'_>, picks: &mut RailPicks) {
             .on_hover_text(i18n::t(lang, Key::UiLanguageHint));
         let mut open = ui
             .ctx()
-            .data(|d| d.get_temp::<bool>(egui::Id::new("rail-lang")).unwrap_or(false));
+            .data(|d| d.get_temp::<bool>(egui::Id::unique("rail-lang")).unwrap_or(false));
         if response.clicked() {
             open = !open;
         }
         egui::Popup::new(
-            egui::Id::new("savio-rail-lang"),
+            egui::Id::unique("savio-rail-lang"),
             ui.ctx().clone(),
             response.rect,
             ui.layer_id(),
@@ -10243,7 +10243,7 @@ fn rail_block(ui: &mut egui::Ui, state: &RailState<'_>, picks: &mut RailPicks) {
             }
         });
         ui.ctx()
-            .data_mut(|d| d.insert_temp(egui::Id::new("rail-lang"), open));
+            .data_mut(|d| d.insert_temp(egui::Id::unique("rail-lang"), open));
 
         let log = ui.add_enabled_ui(state.has_log, |ui| {
             toggle_pill(ui, pal, i18n::t(lang, Key::UiLog), state.log_open, speed)
@@ -10285,7 +10285,7 @@ fn help_button(ui: &mut egui::Ui, pal: theme::Palette, lang: Lang, speed: f32) -
     let hint = i18n::t(lang, Key::UiHelpButtonHint);
     let (rect, response) = ui.allocate_exact_size(egui::vec2(SIZE, SIZE), egui::Sense::click());
     // Знак вопроса — картинка, и назвать кнопку диктору нечем, кроме подсказки.
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, hint));
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, hint));
     let touch = touch_at(ui, response.id, speed);
     let painter = ui.painter();
     painter.circle_stroke(
@@ -10811,7 +10811,7 @@ fn soft_pill(
     // Плашку читают, а не нажимают, — значит, прочесть её должен и экранный
     // диктор. Нарисованное кистью без имени для него не существует, и
     // «2 личные записи» над таблицей сказаны были бы одним цветом строк.
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, text));
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Label, true, text));
     if !ui.is_rect_visible(rect) {
         return;
     }
@@ -10924,7 +10924,7 @@ fn embed_chips(
 /// в переносе строки (дефект 47). `add_enabled_ui` — это `scope`, то есть
 /// дочерний `Ui`, и заводится он при любом `enabled`. Курсор у потомка стоит
 /// на левой кромке его собственной области, а `horizontal_wrapped` переносит
-/// только то, что просится не с начала строки (egui 0.36.2, layout.rs:517),
+/// только то, что просится не с начала строки (egui 0.37.0, layout.rs:517),
 /// — так что в узком окне чипы не уезжали на вторую строку, а вылезали
 /// за кромку карточки и раздвигали всё, что под ними. `add_enabled` гасит
 /// виджет на том же `Ui` и возвращает прежнее, так что место просится
@@ -10965,7 +10965,7 @@ fn chip(
         // безымянен — как и для проверки, которая ищет его по имени. Состояние
         // называется уже после щелчка: иначе диктор прочёл бы прежнее.
         response.widget_info(|| {
-            egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), *checked, label)
+            egui::WidgetInfo::selected(egui::Role::CheckBox, ui.is_enabled(), *checked, label)
         });
 
         if !ui.is_rect_visible(rect) {
@@ -11200,7 +11200,7 @@ fn disclosure_row(
         // `liquid`, что везёт таблетку выбора: раскрытие — это тоже выбор,
         // и лёгкий перелёт у стрелки читается как одно движение с группой.
         let turn = motion::liquid(ui.ctx().animate_bool_with_time(
-            ui.id().with(title),
+            ui.scope_id().with(title),
             open,
             motion::MOVE * speed,
         ));
@@ -11231,7 +11231,7 @@ fn disclosure_row(
             // на каждом кадре, а не только у горящей сводки: иначе первый
             // вопрос пришёлся бы на кадр, когда вход включили, и точка
             // возникла бы сразу целиком (Правило 6).
-            let id = ui.id().with(title);
+            let id = ui.scope_id().with(title);
             let ink = motion::tint(
                 ui.ctx(),
                 id.with("ink"),
@@ -11276,7 +11276,7 @@ fn disclosure_row(
     });
 
     let rect = inner.response.rect;
-    ui.interact(rect, ui.id().with(title), egui::Sense::click())
+    ui.interact(rect, ui.scope_id().with(title), egui::Sense::click())
         .on_hover_cursor(egui::CursorIcon::PointingHand)
         .clicked()
 }
@@ -11417,7 +11417,7 @@ fn queue_row(
     speed: f32,
 ) -> bool {
     let mut remove = false;
-    let id = egui::Id::new("queue-row").with(item.id);
+    let id = egui::Id::unique("queue-row").with(item.id);
 
     // Строка не возникает и не пропадает, а раздвигает соседей и складывается
     // обратно (приём 10). Вставка едет `MOVE`, удаление — чуть быстрее: уход
@@ -11464,7 +11464,7 @@ fn queue_row_body(
                 // строки, которая вправду идёт (приёмы 10 и 14).
                 let color = motion::tint(
                     ui.ctx(),
-                    egui::Id::new("queue-dot").with(item.id),
+                    egui::Id::unique("queue-dot").with(item.id),
                     item.status.color(pal),
                     motion::MOVE * speed,
                 );
@@ -11538,7 +11538,7 @@ fn queue_row_body(
             ui.label(
                 egui::RichText::new(&item.detail).small().color(motion::tint(
                     ui.ctx(),
-                    egui::Id::new("queue-detail").with(item.id),
+                    egui::Id::unique("queue-detail").with(item.id),
                     item.status.color(pal),
                     motion::MOVE * speed,
                 )),
@@ -11680,7 +11680,7 @@ struct UrlInput {
 /// Слышит кнопка не только щелчок, но и перетаскивание, хотя таскать её
 /// нечего. Поле под ней слышит и то и другое, а кнопке, которая слышит одни
 /// щелчки, egui отдаёт наведение и нажатие **вместе** с полем — как кнопке
-/// поверх прокрутки (hit_test.rs:381 в egui 0.36). Поле тогда зажигает кромку,
+/// поверх прокрутки (hit_test.rs:381 в egui 0.36–0.37). Поле тогда зажигает кромку,
 /// пока курсор над кнопкой, забирает фокус с кареткой, пока кнопка нажата, а
 /// протянутое от кнопки нажатие выделяет в нём текст. Слыша и перетаскивание,
 /// кнопка забирает всё это целиком (hit_test.rs:370).
@@ -11704,8 +11704,8 @@ fn url_input(
     let galley = ui
         .painter()
         .layout_no_wrap(label.to_owned(), font, egui::Color32::PLACEHOLDER);
-    let id = egui::Id::new("savio-url-paste");
-    let slot_id = id.with("slot");
+    let id = egui::Id::unique("savio-url-paste");
+    let slot_id = egui::IdSalt::new("slot");
     let slot = egui::Atom::custom(
         slot_id,
         egui::vec2(galley.size().x + PASTE_PAD * 2.0, galley.size().y),
@@ -11747,7 +11747,7 @@ fn url_input(
             .interact(rect, id, egui::Sense::click_and_drag())
             .on_hover_cursor(egui::CursorIcon::PointingHand);
         response.widget_info(|| {
-            egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+            egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), label)
         });
         paste = response.clicked();
 
@@ -11857,7 +11857,7 @@ fn choice_pill(
     // доступности кто-то читает или по таблетке щёлкнули, так что в обычном
     // кадре аллокации нет.
     response.widget_info(|| {
-        egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), on, label)
+        egui::WidgetInfo::selected(egui::Role::Button, ui.is_enabled(), on, label)
     });
     if !ui.is_rect_visible(rect) {
         return response;
@@ -12228,7 +12228,7 @@ fn metric_card(
                     // о машине (Правило 6).
                     let shown = metric.percent.map(|percent| {
                         ui.ctx().animate_value_with_time(
-                            egui::Id::new("metric").with(title),
+                            egui::Id::unique("metric").with(title),
                             percent,
                             motion::MOVE * speed,
                         )
@@ -12607,7 +12607,7 @@ fn overlay_ui(
             if class != egui::ViewportClass::EmbeddedWindow {
                 let drag = ui.interact(
                     ui.max_rect(),
-                    ui.id().with("savio-overlay-drag"),
+                    ui.scope_id().with("savio-overlay-drag"),
                     egui::Sense::click_and_drag(),
                 );
                 // Спрашиваем «кнопка нажата на нас», а не `drag_started`, и это
@@ -14455,7 +14455,7 @@ mod tests {
             let mut output = ctx.run_ui(input, |ui| {
                 egui::CentralPanel::default().show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        segment_track(ui, pal, egui::Id::new("прямо"), 1.0, 0, &items, false);
+                        segment_track(ui, pal, egui::Id::unique("прямо"), 1.0, 0, &items, false);
                     });
                 });
             });
@@ -14483,7 +14483,7 @@ mod tests {
                             segment_track(
                                 ui,
                                 pal,
-                                egui::Id::new("наоборот"),
+                                egui::Id::unique("наоборот"),
                                 1.0,
                                 0,
                                 &items,
@@ -16296,7 +16296,7 @@ mod tests {
     /// щелчки, egui отдавал бы наведение и нажатие и полю, как прокрутке под
     /// кнопкой: курсор над «Вставить» зажигал бы кромку поля, а пока кнопка
     /// нажата, поле забирало бы фокус и ставило каретку. Отпускание фокус всё
-    /// равно снимает (у egui 0.36 фокус уходит по щелчку, а не по нажатию),
+    /// равно снимает (у egui 0.36–0.37 фокус уходит по щелчку, а не по нажатию),
     /// поэтому смотреть надо на наведение и на само нажатие.
     ///
     /// Проверено красным: с `Sense::click()` у кнопки поле подсвечивается

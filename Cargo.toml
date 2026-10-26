@@ -1,6 +1,6 @@
 [package]
 name = "savio"
-version = "0.43.1"
+version = "0.43.2"
 edition = "2024"
 # Совпадает с системным Rust разработчика, с точностью до минора (CLAUDE.md,
 # Правило 3). Отсюда же берут компилятор CI и сборка выпуска. Отстающее число
@@ -13,7 +13,7 @@ repository = "https://github.com/cholakhyanerik/savio"
 license = "MIT"
 
 [dependencies]
-eframe = "0.36"
+eframe = "0.37"
 rfd = "0.17"
 serde_json = "1"
 # HTTPS средствами стандартной библиотеки не решается, а докачивать yt-dlp и
