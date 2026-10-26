@@ -1,4 +1,4 @@
-# Проверка на каждый push и pull request.
+# Проверка на каждый push и pull request, кроме правок одних документов.
 #
 # Три ОС здесь не для галочки: половина кода установки живёт под `#[cfg]`,
 # и ветки macOS с Linux на машине разработчика под Windows не компилируются
@@ -8,7 +8,23 @@ name: CI
 on:
   push:
     branches: [main]
+    # Коммит, меняющий только эти файлы, CI не запускает: их не читают ни
+    # сборка, ни тесты, а прогон трёх ОС — минуты из общего на все проекты
+    # кошелька аккаунта (CLAUDE.md, Правило 14). README.md здесь нет
+    # намеренно: его вступление сверяет тест, и правка README может его уронить.
+    paths-ignore:
+      - 'CLAUDE.md'
+      - 'CHANGELOG.md'
+      - 'FEATURE_TASKS.md'
+      - 'LICENSE'
+      - 'assets/fonts/README.md'
   pull_request:
+    paths-ignore:
+      - 'CLAUDE.md'
+      - 'CHANGELOG.md'
+      - 'FEATURE_TASKS.md'
+      - 'LICENSE'
+      - 'assets/fonts/README.md'
 
 # Новый push в ту же ветку отменяет предыдущий прогон: держать очередь
 # из устаревших сборок незачем.
