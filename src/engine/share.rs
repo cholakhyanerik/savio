@@ -1856,10 +1856,10 @@ fn device_name(agent: &str, lang: Lang) -> &'static str {
 fn find_addresses(port: u16, key: &str) -> Vec<ShareAddress> {
     let networks = sysinfo::Networks::new_with_refreshed_list();
     let mut found = Vec::new();
-    for (name, data) in &networks {
+    for (name, data) in networks.iter().flatten() {
         for network in data.ip_networks() {
             if let IpAddr::V4(ip) = network.addr {
-                found.push((name.clone(), ip));
+                found.push((name.to_string_lossy().into_owned(), ip));
             }
         }
     }

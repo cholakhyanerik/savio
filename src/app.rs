@@ -336,6 +336,14 @@ const FEEDBACK_EMAIL: &str = "cholakhyanerik@hotmail.com";
 /// Страница проекта. Из `Cargo.toml`, как и версия: у адреса один источник.
 const PROJECT_URL: &str = env!("CARGO_PKG_REPOSITORY");
 
+/// Страница GitHub Sponsors — кнопка «Поддержать Savio».
+///
+/// Единственный адрес окна, записанный руками: выделить имя владельца из
+/// `CARGO_PKG_REPOSITORY` при сборке нечем, `concat!` умеет только складывать.
+/// Опечатка здесь дала бы 404 на щелчке, поэтому адрес с репозиторием сверяет
+/// `the_sponsors_link_belongs_to_the_project_owner`.
+const SPONSORS_URL: &str = "https://github.com/sponsors/cholakhyanerik";
+
 /// Список изменений по версиям — то, что в окне называется «Что изменилось».
 ///
 /// Ветка `main`, а не тег своей версии: человеку со старой сборкой нужно
@@ -6840,6 +6848,7 @@ impl SavioApp {
             }
             Some(AboutAction::Project) => open_url(PROJECT_URL),
             Some(AboutAction::Changelog) => open_url(CHANGELOG_URL),
+            Some(AboutAction::Sponsor) => open_url(SPONSORS_URL),
             // «О программе» при этом закрывается: два окна поверх завесы
             // выглядели бы стопкой, а второе из них — и вовсе загадкой.
             Some(AboutAction::Welcome) => {
@@ -6863,6 +6872,7 @@ enum AboutAction {
     Copy,
     Project,
     Changelog,
+    Sponsor,
     /// Открыть приветствие заново. Второй вход в него помимо кнопки «?»:
     /// человек, которому надо вспомнить, как всё устроено, идёт в
     /// «О программе» — там же и остальные объяснения.
@@ -7342,7 +7352,7 @@ fn about_window(
             ui.scope(|ui| {
                 // Полоса прокрутки видна и в покое — по той же причине, что
                 // у приветствия: в окне 520×420 под кромкой остаются целые
-                // пункты («Показать приветствие» и подпись к кнопкам), а обрез,
+                // пункты (большие кнопки и подпись к кнопкам), а обрез,
                 // пришедшийся на промежуток между строками, выглядел бы концом
                 // окна.
                 ui.spacing_mut().scroll.dormant_handle_opacity = 0.6;
@@ -7373,15 +7383,30 @@ fn about_window(
                             Some(FEEDBACK_EMAIL),
                         );
 
-                        // «Показать приветствие» — своей строкой, а не пятой
-                        // кнопкой в ряду: впятером они не помещаются в окно
-                        // минимальной ширины (проверка
-                        // `the_about_window_fits_the_smallest_window` поймала
-                        // это сразу). Перенос ряда тут не годится —
+                        // «Поддержать Savio» и «Показать приветствие» — каждая
+                        // своей строкой, а не пятой и шестой кнопкой в ряду:
+                        // столько не помещается в окно минимальной ширины
+                        // (проверка `the_about_window_fits_the_smallest_window`
+                        // поймала это сразу). Перенос ряда тут не годится —
                         // `pill_button` заворачивает кнопку в `ui.scope`, а тот
                         // сообщает занятое место задним числом, мимо всей
                         // логики переноса.
                         ui.add_space(12.0);
+                        // Адрес в подсказке — как у ссылок в нижнем ряду.
+                        if accent_response(
+                            ui,
+                            pal,
+                            i18n::t(lang, Key::UiSponsor),
+                            ui.available_width(),
+                            true,
+                            "",
+                        )
+                        .on_hover_text(SPONSORS_URL)
+                        .clicked()
+                        {
+                            action = Some(AboutAction::Sponsor);
+                        }
+                        ui.add_space(8.0);
                         if accent_button(
                             ui,
                             pal,
@@ -9345,6 +9370,19 @@ fn accent_button(
     enabled: bool,
     hint: &str,
 ) -> bool {
+    accent_response(ui, pal, label, width, enabled, hint).clicked()
+}
+
+/// [`accent_button`] с откликом целиком — для кнопки, которой нужна подсказка
+/// и во включённом виде: `hint` там только про то, почему кнопка выключена.
+fn accent_response(
+    ui: &mut egui::Ui,
+    pal: theme::Palette,
+    label: &str,
+    width: f32,
+    enabled: bool,
+    hint: &str,
+) -> egui::Response {
     ui.scope(|ui| {
         let v = ui.visuals_mut();
         // У выключенной кнопки своя подпись, а не та же самая. В тёмной теме
@@ -9396,7 +9434,6 @@ fn accent_button(
                 .min_size(egui::vec2(width, theme::CTA_HEIGHT)),
             )
             .on_disabled_hover_text(hint)
-            .clicked()
         })
         .inner
     })
@@ -15032,6 +15069,61 @@ mod tests {
             "{CHANGELOG_URL}"
         );
         assert_eq!(LICENSE, "MIT");
+    }
+
+    /// «Поддержать Savio» ведёт на страницу владельца репозитория.
+    ///
+    /// Адрес записан руками, и опечатку в нём не увидят ни сборка, ни глаза:
+    /// GitHub ответит страницей 404, и узнать об этом можно, только нажав.
+    /// Пробела в нём не должно быть из-за `open_url`.
+    #[test]
+    fn the_sponsors_link_belongs_to_the_project_owner() {
+        let owner = PROJECT_URL
+            .strip_prefix("https://github.com/")
+            .and_then(|path| path.split('/').next())
+            .unwrap_or_default();
+        assert!(!owner.is_empty(), "{PROJECT_URL}");
+        assert_eq!(SPONSORS_URL, format!("https://github.com/sponsors/{owner}"));
+        assert!(!SPONSORS_URL.contains(' '), "{SPONSORS_URL}");
+    }
+
+    /// «Поддержать Savio» стоит своей строкой и не шире окна «О программе».
+    ///
+    /// Кнопка лежит в прокрутке, и в окне 520×420 её место по высоте зависит
+    /// от длины текста над ней, поэтому целиком внутри модалки она обязана
+    /// быть там, где прокрутка не нужна, а в наименьшем окне проверяется
+    /// только ширина: подпись длиннее колонки растянула бы кнопку за кромку.
+    #[test]
+    fn the_sponsor_button_stands_on_its_own_row() {
+        let windows = [egui::vec2(520.0, 420.0), egui::vec2(1280.0, 900.0)];
+
+        let mut failures = Vec::new();
+        for window in windows {
+            for lang in Lang::ALL {
+                let ctx = rail_test_ctx();
+                let (modal, buttons) = about_frames(&ctx, lang, window);
+                let find = |key| {
+                    let name = i18n::t(lang, key);
+                    buttons.iter().find(|(n, _)| n == name).map(|(_, rect)| *rect)
+                };
+                let (Some(sponsor), Some(welcome)) =
+                    (find(Key::UiSponsor), find(Key::UiShowWelcome))
+                else {
+                    failures.push(format!("{lang:?}, окно {window}: кнопки нет"));
+                    continue;
+                };
+                if sponsor.left() < modal.left() || sponsor.right() > modal.right() {
+                    failures.push(format!("{lang:?}, окно {window}: шире окна {sponsor:?}"));
+                }
+                if sponsor.bottom() > welcome.top() {
+                    failures.push(format!("{lang:?}, окно {window}: строка не своя"));
+                }
+                if window.y > 420.0 && !modal.contains_rect(sponsor) {
+                    failures.push(format!("{lang:?}, окно {window}: вне окна {sponsor:?}"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
     }
 
     /// Окно «О программе» целиком помещается в окно минимального размера.

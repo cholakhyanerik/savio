@@ -1333,6 +1333,7 @@ strings! {
     UiCopyAddress = "Скопировать адрес", "Copy the address", "Պատճենել հասցեն";
     UiProjectPage = "Страница проекта", "Project page", "Նախագծի էջ";
     UiWhatChanged = "Что изменилось", "What changed", "Ինչ է փոխվել";
+    UiSponsor = "Поддержать Savio", "Support Savio", "Աջակցել Savio-ին";
 
     // Разделы «Сейчас» и «Состав»: монитор и снимок.
     UiSystemNoAnswer =

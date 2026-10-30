@@ -90,23 +90,29 @@ pub fn start(
 /// Порядок пунктов — порядок карточек на экране: сначала то, что есть у
 /// всех и всегда, потом то, чего на конкретной машине может не быть.
 pub fn collect(gpu: Option<&GpuInfo>, lang: Lang) -> SystemReport {
+    // `None` — `sysinfo` не завёлся: на наших трёх системах этого не бывает
+    // (по исходникам sysinfo 0.40.1), но и карточки при этом не пропадают —
+    // процессор и память приходят «без данных», как при молчании системы.
     let mut sys = sysinfo::System::new_with_specifics(
         sysinfo::RefreshKind::nothing()
             .with_cpu(sysinfo::CpuRefreshKind::everything())
             .with_memory(sysinfo::MemoryRefreshKind::everything()),
-    );
+    )
+    .ok();
 
     // Загрузка процессора — это разница между двумя замерами, и первый из
     // них ничего не значит. Без паузы второй замер на Linux и macOS вообще
     // пропускается (крейт сверяет `last_update.elapsed()`), а на Windows
     // даёт мусор. Пауза здесь законна: поток свой, UI её не видит.
-    std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
-    sys.refresh_cpu_all();
+    if let Some(sys) = &mut sys {
+        std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+        sys.refresh_cpu_all();
+    }
 
     let mut checks = vec![
         system_check(lang),
-        cpu_check(&sys, lang),
-        memory_check(&sys, lang),
+        cpu_check(sys.as_ref(), lang),
+        memory_check(sys.as_ref(), lang),
     ];
     checks.extend(disk_checks(lang));
     checks.push(network_check(lang));
@@ -124,19 +130,24 @@ fn system_check(lang: Lang) -> Check {
     let name_of = |key| i18n::t(lang, key);
     // Все эти — ассоциированные функции, а не методы: экземпляр `System`
     // им не нужен, и каждая пересчитывается при вызове.
-    let name = sysinfo::System::long_os_version().or_else(sysinfo::System::name);
-    let uptime = sysinfo::System::uptime();
+    let name = sysinfo::System::long_os_version()
+        .or_else(|_| sysinfo::System::name())
+        .ok();
+    let uptime = sysinfo::System::uptime().ok();
 
     // Названия системы среди строк нет намеренно: оно уже стоит итогом
     // карточки, и повторённое слово в слово читается как задвоение вёрстки.
     let rows = vec![
-        CheckRow::maybe(name_of(Key::HwKernel), sysinfo::System::kernel_version()),
-        CheckRow::maybe(name_of(Key::HwHostName), sysinfo::System::host_name()),
+        CheckRow::maybe(name_of(Key::HwKernel), sysinfo::System::kernel_version().ok()),
+        CheckRow::maybe(name_of(Key::HwHostName), sysinfo::System::host_name().ok()),
         // `cpu_arch` не возвращает `Option`: не ответившая система подменяется
         // архитектурой, под которую собран сам Savio. Врать этим нельзя,
         // но и отличить подмену нечем — берём как есть, оговорки не будет.
         CheckRow::new(name_of(Key::HwBitness), sysinfo::System::cpu_arch()),
-        CheckRow::new(name_of(Key::HwUptime), human_uptime(uptime, lang)),
+        CheckRow::maybe(
+            name_of(Key::HwUptime),
+            uptime.map(|secs| human_uptime(secs, lang)),
+        ),
     ];
 
     // Пустой `System::name()` бывает на неизвестной платформе. Пункт при этом
@@ -158,11 +169,11 @@ fn system_check(lang: Lang) -> Check {
     }
 }
 
-fn cpu_check(sys: &sysinfo::System, lang: Lang) -> Check {
+fn cpu_check(sys: Option<&sysinfo::System>, lang: Lang) -> Check {
     let name_of = |key| i18n::t(lang, key);
-    let cpus = sys.cpus();
+    let cpus = sys.map_or(&[][..], sysinfo::System::cpus);
     let logical = cpus.len();
-    let physical = sysinfo::System::physical_core_count();
+    let physical = sysinfo::System::physical_core_count().ok();
     let first = cpus.first();
 
     // `brand` бывает пустой строкой — это `String`, а не `Option`, и «нет
@@ -182,7 +193,7 @@ fn cpu_check(sys: &sysinfo::System, lang: Lang) -> Check {
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
 
-    let usage = sys.global_cpu_usage();
+    let usage = sys.map(sysinfo::System::global_cpu_usage);
     // Модели здесь нет по той же причине, что и названия системы выше: она
     // и есть итог карточки.
     let rows = vec![
@@ -191,7 +202,11 @@ fn cpu_check(sys: &sysinfo::System, lang: Lang) -> Check {
             name_of(Key::HwPhysicalCores),
             physical.map(|n| n.to_string()),
         ),
-        CheckRow::new(name_of(Key::HwLogicalCores), logical.to_string()),
+        // Ноль ядер — не измерение, а пустой список: выглядел бы настоящим.
+        CheckRow::maybe(
+            name_of(Key::HwLogicalCores),
+            (logical > 0).then(|| logical.to_string()),
+        ),
         // Частота приезжает нулём и когда её не спросили, и когда система
         // не ответила, — `human_mhz` превращает такой ноль в прочерк.
         CheckRow::maybe(
@@ -200,7 +215,7 @@ fn cpu_check(sys: &sysinfo::System, lang: Lang) -> Check {
                 .map(sysinfo::Cpu::frequency)
                 .and_then(|mhz| human_mhz(mhz, lang)),
         ),
-        CheckRow::maybe(name_of(Key::HwLoad), human_percent(usage)),
+        CheckRow::maybe(name_of(Key::HwLoad), usage.and_then(human_percent)),
     ];
 
     let (status, summary) = match &brand {
@@ -222,18 +237,11 @@ fn cpu_check(sys: &sysinfo::System, lang: Lang) -> Check {
     }
 }
 
-fn memory_check(sys: &sysinfo::System, lang: Lang) -> Check {
+fn memory_check(sys: Option<&sysinfo::System>, lang: Lang) -> Check {
     let name_of = |key| i18n::t(lang, key);
-    // Все значения памяти у `sysinfo` — в байтах. В версии 0.30 единицы
-    // сменились с килобайт на байты, и делить на 1024 самим не надо:
-    // получилось бы ровно в тысячу раз меньше правды.
-    let total = sys.total_memory();
-    let available = sys.available_memory();
-    let used = sys.used_memory();
-    let total_swap = sys.total_swap();
 
     // Ноль здесь означал бы, что обновления памяти не было, — но оно было.
-    if total == 0 {
+    let Some(sys) = sys.filter(|sys| sys.total_memory() != 0) else {
         return Check {
             name: name_of(Key::HwMemory).to_owned(),
             status: CheckStatus::Unknown,
@@ -241,7 +249,15 @@ fn memory_check(sys: &sysinfo::System, lang: Lang) -> Check {
             rows: vec![CheckRow::missing(name_of(Key::HwTotal))],
             advice: None,
         };
-    }
+    };
+
+    // Все значения памяти у `sysinfo` — в байтах. В версии 0.30 единицы
+    // сменились с килобайт на байты, и делить на 1024 самим не надо:
+    // получилось бы ровно в тысячу раз меньше правды.
+    let total = sys.total_memory();
+    let available = sys.available_memory();
+    let used = sys.used_memory();
+    let total_swap = sys.total_swap();
 
     let free_share = available as f64 / total as f64;
     let rows = vec![
@@ -293,8 +309,8 @@ fn disk_checks(lang: Lang) -> Vec<Check> {
     let name_of = |key| i18n::t(lang, key);
     let volume = |mount: &str| i18n::fill(name_of(Key::HwVolume), &[mount]);
 
-    let disks = sysinfo::Disks::new_with_refreshed_list();
-    if disks.is_empty() {
+    let disks = sysinfo::Disks::new_with_refreshed_list().ok();
+    let Some(disks) = disks.filter(|disks| !disks.is_empty()) else {
         return vec![Check {
             name: name_of(Key::HwDisks).to_owned(),
             status: CheckStatus::Unknown,
@@ -302,7 +318,7 @@ fn disk_checks(lang: Lang) -> Vec<Check> {
             rows: Vec::new(),
             advice: None,
         }];
-    }
+    };
 
     disks
         .iter()
@@ -380,14 +396,14 @@ fn network_check(lang: Lang) -> Check {
 
     let mut rows = Vec::new();
     let mut count = 0usize;
-    for (name, data) in &networks {
+    for (name, data) in networks.iter().flatten() {
         count += 1;
         // Неизвестный MAC приезжает не пустым значением, а адресом из одних
         // нулей, который печатается как совершенно правдоподобный
         // «00:00:00:00:00:00». Без этой проверки в отчёт уехал бы фальшивый
         // адрес — тот самый молчаливый отказ.
         let mac = (!data.mac_address().is_unspecified()).then(|| data.mac_address().to_string());
-        rows.push(CheckRow::maybe(name.as_str(), mac));
+        rows.push(CheckRow::maybe(name.to_string_lossy(), mac));
     }
 
     if count == 0 {

@@ -132,7 +132,17 @@ pub fn start(
         // дескрипторы системы (запрос PDH на Windows), а сырые указатели
         // не `Send` — снаружи сюда его и не передать. Заодно заведение,
         // спрашивающее DXGI и счётчики, не ложится на кадр.
-        let mut sampler = Sampler::new(lang, gpu);
+        //
+        // На Windows, Linux и macOS конструкторы `sysinfo` не отказывают: `Err`
+        // у них — это `Unsupported` чужих платформ (по исходникам sysinfo
+        // 0.40.1). Отказ всё равно не молчит: без единого замера экран так
+        // и писал бы «Измеряю…», а пустой замер показывает прочерки.
+        let Ok(mut sampler) = Sampler::new(lang, gpu) else {
+            if tx.send(Event::Perf(PerfSample::default())).is_ok() {
+                notify();
+            }
+            return;
+        };
 
         loop {
             if mine.wait(INTERVAL) {
@@ -186,26 +196,26 @@ impl Sampler {
     /// с загрузки машины. Поэтому его снимаем здесь и выбрасываем. Счётчик
     /// загрузки видеокарты — такой же разностный, и его нулевую точку
     /// `gpu::Probe::new` снимает сам.
-    fn new(lang: Lang, gpu: Option<PciId>) -> Self {
+    fn new(lang: Lang, gpu: Option<PciId>) -> Result<Self, sysinfo::Error> {
         let mut sys = sysinfo::System::new_with_specifics(
             sysinfo::RefreshKind::nothing()
                 .with_cpu(cpu_kind())
                 .with_memory(sysinfo::MemoryRefreshKind::everything()),
-        );
+        )?;
         sys.refresh_processes_specifics(
             sysinfo::ProcessesToUpdate::All,
             true,
             process_kind(),
         );
 
-        Self {
+        Ok(Self {
             sys,
-            nets: sysinfo::Networks::new_with_refreshed_list(),
-            disks: sysinfo::Disks::new_with_refreshed_list_specifics(disk_kind()),
+            nets: sysinfo::Networks::new_with_refreshed_list()?,
+            disks: sysinfo::Disks::new_with_refreshed_list_specifics(disk_kind())?,
             last: Instant::now(),
             lang,
             gpu: gpu::Probe::new(gpu),
-        }
+        })
     }
 
     /// Снимает свежие показания.
@@ -335,7 +345,7 @@ impl Sampler {
         let mut up = 0u64;
         let mut counters = 0u64;
 
-        for data in self.nets.list().values() {
+        for data in self.nets.values() {
             down += data.received();
             up += data.transmitted();
             // Накопленное с загрузки: по нему и отличаем «тихо» от «нечем
@@ -365,7 +375,7 @@ impl Sampler {
         let mut written = 0u64;
         let mut counters = 0u64;
 
-        for disk in self.disks.list() {
+        for disk in self.disks.iter() {
             let usage = disk.usage();
             read += usage.read_bytes;
             written += usage.written_bytes;
@@ -433,7 +443,7 @@ impl Sampler {
 /// раз в минуту незачем.
 fn cpu_kind() -> sysinfo::CpuRefreshKind {
     sysinfo::CpuRefreshKind::nothing()
-        .with_cpu_usage()
+        .with_usage()
         .with_frequency()
 }
 
@@ -524,7 +534,7 @@ mod tests {
     fn real_sample_from_this_machine() {
         // Видеокарта без чисел адаптера: на машине с одной настоящей картой
         // это она и есть, на машине с двумя — честный прочерк.
-        let mut sampler = Sampler::new(Lang::Ru, None);
+        let mut sampler = Sampler::new(Lang::Ru, None).expect("опрос не завёлся");
         std::thread::sleep(INTERVAL);
         let sample = sampler.take();
 
