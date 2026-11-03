@@ -4,6 +4,7 @@
 //! Благодаря этому движок можно прицепить к CLI или к тестам, не трогая код.
 
 pub mod binaries;
+pub mod capture;
 mod cut;
 pub mod hardware;
 pub mod metadata;

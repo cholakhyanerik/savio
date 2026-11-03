@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use eframe::egui;
 
 use crate::engine::binaries;
+use crate::engine::capture;
 use crate::engine::settings;
 use crate::engine::setup;
 use crate::engine::{self, Handle, MetaTask, metadata};
@@ -16,7 +17,8 @@ use crate::engine::monitor;
 use crate::engine::power;
 use crate::engine::share;
 use crate::model::{
-    Appearance, BALANCED_PLAN, CheckStatus, CookieSource, Destination, DownloadId,
+    Appearance, BALANCED_PLAN, CaptureKind, CaptureProgress, CaptureTrouble, CheckStatus,
+    CookieSource, Destination, DownloadId, SoundSource,
     DownloadOptions, Event,
     Format, GpuInfo, MediaInfo, MetaKind, MetaSummary, Metric, PciId, PerfSample,
     PowerMode, PowerModes,
@@ -406,6 +408,8 @@ impl Setup {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tab {
     Download,
+    /// Запись экрана и звука.
+    Record,
     Metadata,
     Machine,
     /// Раздача файлов на телефон.
@@ -413,8 +417,9 @@ enum Tab {
 }
 
 /// Все разделы — для тех, кто обязан спросить про каждый (см. `tab_arrival`).
-const ALL_TABS: [Tab; 4] = [
+const ALL_TABS: [Tab; 5] = [
     Tab::Download,
+    Tab::Record,
     Tab::Metadata,
     Tab::Machine,
     Tab::Phone,
@@ -433,6 +438,8 @@ const ALL_TABS: [Tab; 4] = [
 enum NavIcon {
     /// Стрелка вниз в поддон — загрузка.
     Download,
+    /// Экран с точкой записи посередине.
+    Record,
     /// Ярлык с отверстием — метаданные.
     Metadata,
     /// Стрелка на шкале — что происходит сейчас.
@@ -466,7 +473,7 @@ impl NavItem {
     }
 }
 
-/// Состав рельса: три группы по смыслу, пять пунктов на виду.
+/// Состав рельса: три группы по смыслу, шесть пунктов на виду.
 ///
 /// Меню «Ещё» больше нет, и это главное, ради чего рельс и заведён: разделы,
 /// жившие в меню, не существовали для того, кто в меню не залез. Половины
@@ -483,6 +490,13 @@ const NAV: [(Key, &[NavItem]); 3] = [
                 label: Key::TabDownload,
                 icon: NavIcon::Download,
                 pitch: Key::WelcomeDownloadPitch,
+            },
+            NavItem {
+                tab: Tab::Record,
+                half: None,
+                label: Key::TabRecord,
+                icon: NavIcon::Record,
+                pitch: Key::WelcomeRecordPitch,
             },
             NavItem {
                 tab: Tab::Metadata,
@@ -634,6 +648,8 @@ struct RailState<'a> {
     /// Занят ли единственный канал событий: обновляться нечем.
     busy: bool,
     more_open: bool,
+    /// Идёт ли запись экрана — для точки на её пункте.
+    recording: bool,
 }
 
 /// Какая половина вкладки «Машина» показана.
@@ -2217,6 +2233,399 @@ impl SharePanel {
 }
 
 // ---------------------------------------------------------------------------
+// Запись экрана
+// ---------------------------------------------------------------------------
+
+/// Сколько предупреждений идущей записи помним. Потолок по Правилу 1:
+/// предупреждения шлёт движок, и конец их списку задаём мы.
+const RECORD_WARNING_LIMIT: usize = 4;
+
+/// Сколько ждать при закрытии окна, пока запись допишется.
+///
+/// Обычно это доли секунды (замер — 0.16 с). Потолок — с запасом на пути
+/// движка «„q“ → обрыв звука → убийство» (`STOP_LIMIT` + `DRAIN_LIMIT`
+/// в `engine::capture`): на Unix ffmpeg, не убитый движком, пережил бы
+/// Savio и писал бы экран дальше, а Job Object, который убивает его на
+/// Windows сам, там не помощник.
+const RECORD_EXIT_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Что сейчас с записью.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RecordState {
+    Idle,
+    /// ffmpeg запущен и пишет.
+    Recording,
+    /// Остановить попросили, ffmpeg дописывает файл.
+    Saving,
+}
+
+/// Чем кончилась прошлая запись.
+#[derive(Clone, Debug)]
+enum RecordOutcome {
+    Saved {
+        path: PathBuf,
+        progress: CaptureProgress,
+        trouble: Option<CaptureTrouble>,
+    },
+    Failed(CaptureTrouble),
+}
+
+/// Экран «Запись»: проба, ход записи и её итог.
+///
+/// Причины бед хранятся причинами (`CaptureTrouble`), а не строками: строки
+/// собирает [`RecordPanel::rebuild`] на языке окна, и смена языка переводит
+/// их вместе со всем остальным (Правило 4).
+struct RecordPanel {
+    kind: CaptureKind,
+    /// Что ответила проба. `None` — ещё не спрашивали или ждём ответа.
+    plan: Option<capture::Plan>,
+    probe: Option<Receiver<capture::Event>>,
+    /// Спрашивали ли уже. Отдельно от `probe`: ответ, потерянный по дороге,
+    /// иначе запускал бы пробу заново на каждом кадре.
+    asked: bool,
+    state: RecordState,
+    handle: Option<capture::Handle>,
+    rx: Option<Receiver<capture::Event>>,
+    progress: CaptureProgress,
+    /// Имя файла идущей записи — готовой строкой (Правило 1).
+    file_name: String,
+    warnings: Vec<CaptureTrouble>,
+    outcome: Option<RecordOutcome>,
+    swap_pause: SwapPause,
+    lines: RecordLines,
+}
+
+/// Строки экрана записи, собранные заранее (Правило 1).
+#[derive(Default)]
+struct RecordLines {
+    /// Значения строк сводки. `None` рисуется прочерком, а пояснение
+    /// прочерка — рядом, в `*_missing`.
+    screen: Option<String>,
+    screen_missing: String,
+    encoder: Option<String>,
+    encoder_missing: String,
+    sound: Option<String>,
+    sound_missing: String,
+    /// Что мешает записи выбранного вида или что в ней будет не так.
+    troubles: Vec<String>,
+    /// Почему «Начать запись» не нажать, если дело в пробе. Про папку здесь
+    /// нет: её меняют на экране загрузки, мимо `rebuild`.
+    not_ready: Option<String>,
+    progress: String,
+    outcome: Option<(String, Tone)>,
+}
+
+impl RecordPanel {
+    fn new() -> Self {
+        Self {
+            kind: CaptureKind::default(),
+            plan: None,
+            probe: None,
+            asked: false,
+            state: RecordState::Idle,
+            handle: None,
+            rx: None,
+            progress: CaptureProgress::default(),
+            file_name: String::new(),
+            warnings: Vec::new(),
+            outcome: None,
+            swap_pause: SwapPause::default(),
+            lines: RecordLines::default(),
+        }
+    }
+
+    fn running(&self) -> bool {
+        self.state != RecordState::Idle
+    }
+
+    /// Спрашивает, чем писать, когда раздел открыли впервые.
+    ///
+    /// Зовётся на каждом кадре из `ui`, а не из экрана: так проба начинается
+    /// в том же кадре, что и показ раздела. Не при запуске Savio — проба
+    /// запускает полдюжины ffmpeg, а записью пользуется не каждый (Правило 1).
+    fn watch(&mut self, open: bool, lang: Lang, ctx: &egui::Context) {
+        if open && !self.asked {
+            self.recheck(lang, ctx);
+        }
+    }
+
+    /// Спрашивает заново: после установки ffmpeg или по кнопке.
+    fn recheck(&mut self, lang: Lang, ctx: &egui::Context) {
+        if self.running() {
+            return;
+        }
+        let notify = ctx.clone();
+        self.probe = Some(capture::probe(move || notify.request_repaint()));
+        self.asked = true;
+        self.plan = None;
+        self.rebuild(lang);
+    }
+
+    /// Забывает ответ пробы: спросят при следующем открытии раздела.
+    fn forget(&mut self, lang: Lang) {
+        if !self.running() && self.probe.is_none() {
+            self.asked = false;
+            self.plan = None;
+            self.rebuild(lang);
+        }
+    }
+
+    fn start(&mut self, dir: PathBuf, lang: Lang, ctx: &egui::Context) {
+        let Some(plan) = &self.plan else {
+            return;
+        };
+        let notify = ctx.clone();
+        let (rx, handle) = capture::start(plan, self.kind, dir, lang, move || {
+            notify.request_repaint()
+        });
+        self.rx = Some(rx);
+        self.handle = Some(handle);
+        self.state = RecordState::Recording;
+        self.progress = CaptureProgress::default();
+        self.file_name.clear();
+        self.warnings.clear();
+        self.outcome = None;
+        self.rebuild(lang);
+    }
+
+    fn stop(&mut self, lang: Lang) {
+        if let Some(handle) = &self.handle {
+            handle.stop();
+            self.state = RecordState::Saving;
+            self.rebuild(lang);
+        }
+    }
+
+    fn set_kind(&mut self, kind: CaptureKind, lang: Lang) {
+        if kind != self.kind && !self.running() {
+            self.kind = kind;
+            self.rebuild(lang);
+        }
+    }
+
+    /// Забирает новости движка. Возвращает строки для журнала окна.
+    fn drain(&mut self, lang: Lang) -> Vec<String> {
+        let mut log = Vec::new();
+        let mut changed = false;
+
+        if let Some(rx) = &self.probe {
+            match rx.try_recv() {
+                Ok(capture::Event::Probed(plan)) => {
+                    self.plan = Some(plan);
+                    self.probe = None;
+                    changed = true;
+                }
+                // Других событий проба не шлёт, но `match` обязан быть
+                // исчерпывающим (Правило 2): пропущенный вариант поймает
+                // компилятор, а не человек.
+                Ok(
+                    capture::Event::Started(_)
+                    | capture::Event::Progress(_)
+                    | capture::Event::Warning(_)
+                    | capture::Event::Log(_)
+                    | capture::Event::Saved { .. }
+                    | capture::Event::Failed(_),
+                )
+                | Err(TryRecvError::Empty) => {}
+                // Поток пробы погиб, не ответив. Снова спросят по кнопке.
+                Err(TryRecvError::Disconnected) => {
+                    self.probe = None;
+                    changed = true;
+                }
+            }
+        }
+
+        let mut disconnected = false;
+        if let Some(rx) = &self.rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(event) => match event {
+                        capture::Event::Probed(_) => {}
+                        // Имя называет движок: только он знает, свободно ли
+                        // оно и не дописан ли к нему номер.
+                        capture::Event::Started(path) => {
+                            self.file_name = file_name_of(&path);
+                        }
+                        capture::Event::Progress(progress) => {
+                            self.progress = progress;
+                            changed = true;
+                        }
+                        capture::Event::Warning(trouble) => {
+                            if self.warnings.len() < RECORD_WARNING_LIMIT
+                                && !self.warnings.contains(&trouble)
+                            {
+                                self.warnings.push(trouble);
+                                changed = true;
+                            }
+                        }
+                        capture::Event::Log(line) => log.push(line),
+                        capture::Event::Saved {
+                            path,
+                            progress,
+                            trouble,
+                        } => {
+                            self.outcome = Some(RecordOutcome::Saved {
+                                path,
+                                progress,
+                                trouble,
+                            });
+                            disconnected = true;
+                        }
+                        capture::Event::Failed(trouble) => {
+                            self.outcome = Some(RecordOutcome::Failed(trouble));
+                            disconnected = true;
+                        }
+                    },
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        // Итог не пришёл — поток погиб. Это не «сохранено».
+                        if self.outcome.is_none() {
+                            self.outcome = Some(RecordOutcome::Failed(CaptureTrouble::Broke {
+                                code: None,
+                                tail: String::new(),
+                            }));
+                        }
+                        disconnected = true;
+                        break;
+                    }
+                }
+                if disconnected {
+                    break;
+                }
+            }
+        }
+        if disconnected {
+            self.rx = None;
+            self.handle = None;
+            self.state = RecordState::Idle;
+            changed = true;
+        }
+        if changed {
+            self.rebuild(lang);
+        }
+        log
+    }
+
+    /// Пересобирает все строки экрана. Зовётся по событию, а не в кадре.
+    fn rebuild(&mut self, lang: Lang) {
+        let mut lines = RecordLines {
+            progress: self.progress.line(lang),
+            not_ready: match &self.plan {
+                None => Some(i18n::t(lang, Key::UiRecordWaitProbe).to_owned()),
+                Some(plan) => plan.ready(self.kind).err().map(|trouble| trouble.explain(lang)),
+            },
+            ..RecordLines::default()
+        };
+
+        if let Some(plan) = &self.plan {
+            let screen = plan.screen();
+            lines.screen = screen.map(|mode| mode.line(lang));
+            lines.screen_missing = i18n::fill(
+                i18n::t(lang, Key::UiRecordScreenUnknown),
+                &[&capture::FALLBACK_RATE.to_string()],
+            );
+            match self.kind {
+                CaptureKind::Video => match plan.encoder() {
+                    Ok(encoder) => lines.encoder = Some(encoder.line(lang)),
+                    Err(trouble) => {
+                        lines.encoder_missing = trouble.explain(lang);
+                        lines.troubles.push(trouble.explain(lang));
+                    }
+                },
+                CaptureKind::Audio => {
+                    lines.encoder = Some(i18n::t(lang, Key::UiRecordMp3).to_owned());
+                }
+            }
+            match plan.sound() {
+                Ok(source) => lines.sound = Some(source.label(lang).to_owned()),
+                Err(trouble) => {
+                    let why = trouble.explain(lang);
+                    lines.sound_missing = why.clone();
+                    // Нет звука — для MP3 это отказ, для видео оговорка,
+                    // и сказать надо, чем она обернётся. Про отсутствие
+                    // ffmpeg уже сказано строкой выше — второй раз незачем.
+                    if self.kind == CaptureKind::Audio {
+                        lines.troubles.push(why);
+                    } else if plan.encoder().is_ok() {
+                        lines.troubles.push(format!(
+                            "{why} {}",
+                            i18n::t(lang, Key::UiRecordWithoutSound)
+                        ));
+                    }
+                }
+            }
+            if self.kind == CaptureKind::Video
+                && let Some(caveat) = plan.caveat()
+            {
+                lines.troubles.push(caveat.explain(lang));
+            }
+        }
+        lines
+            .troubles
+            .extend(self.warnings.iter().map(|trouble| trouble.explain(lang)));
+
+        lines.outcome = self.outcome.as_ref().map(|outcome| match outcome {
+            RecordOutcome::Saved {
+                path,
+                progress,
+                trouble,
+            } => {
+                let name = format!("{} · {}", file_name_of(path), progress.line(lang));
+                match trouble {
+                    None => (
+                        i18n::fill(i18n::t(lang, Key::UiRecordSaved), &[&name]),
+                        Tone::Good,
+                    ),
+                    Some(trouble) => (
+                        i18n::fill(
+                            i18n::t(lang, Key::UiRecordSavedBroken),
+                            &[&trouble.explain(lang), &name],
+                        ),
+                        Tone::Warn,
+                    ),
+                }
+            }
+            RecordOutcome::Failed(trouble) => (
+                i18n::fill(i18n::t(lang, Key::UiRecordFailed), &[&trouble.explain(lang)]),
+                Tone::Bad,
+            ),
+        });
+        self.lines = lines;
+    }
+
+    /// Есть ли смысл в кнопке «Проверить снова».
+    ///
+    /// Есть, когда в ответе пробы беды, — и когда ответа нет вовсе, а проба
+    /// уже не идёт: её поток погиб, не ответив, и сам раздел спросить
+    /// заново уже не решится (`asked`). Без кнопки на этот случай экран
+    /// застревал бы в «подготовке» до перезапуска Savio.
+    fn can_recheck(&self) -> bool {
+        !self.running()
+            && self.probe.is_none()
+            && (self.plan.is_none() && self.asked || !self.lines.troubles.is_empty())
+    }
+
+    /// Папка последней сохранённой записи — для «Открыть папку».
+    ///
+    /// Только сохранённой: идущая запись лежит там же, но открыть папку
+    /// посреди записи значит увидеть файл, который ещё пишется.
+    fn saved_dir(&self) -> Option<&Path> {
+        match &self.outcome {
+            Some(RecordOutcome::Saved { path, .. }) => path.parent(),
+            Some(RecordOutcome::Failed(_)) | None => None,
+        }
+    }
+}
+
+/// Имя файла из пути — или весь путь, если имени у него нет.
+fn file_name_of(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Монитор производительности
 // ---------------------------------------------------------------------------
 
@@ -3071,6 +3480,7 @@ pub struct SavioApp {
     power: PowerPanel,
     /// Состояние экрана «Телефон».
     share: SharePanel,
+    record: RecordPanel,
     /// Открыто ли меню нижнего блока в свёрнутом рельсе.
     more_open: bool,
     /// Чем eframe рисует это окно.
@@ -3232,6 +3642,7 @@ impl SavioApp {
             // сети, лучше выбирать осознанно, а не находить выбранной неделю
             // назад. По умолчанию — папка сохранения.
             share: SharePanel::new(),
+            record: RecordPanel::new(),
             more_open: false,
             gpu: None,
             history: History::default(),
@@ -3403,6 +3814,9 @@ impl SavioApp {
         self.progress = Progress::default();
         self.progress_peak = 0.0;
         self.progress_line.clear();
+        // Запись тоже: «нет ffmpeg» проба запомнила до установки. Спросят
+        // снова при следующем показе раздела — а если он открыт, то сразу.
+        self.record.forget(self.lang);
         // Предпросмотр мог споткнуться ровно о то, чего до этой минуты не было:
         // без yt-dlp спрашивать сайт нечем, а молчит он об этом одинаково — и
         // про отсутствие инструмента, и про незнакомый сайт. Раз инструменты
@@ -3596,6 +4010,7 @@ impl SavioApp {
         self.rebuild_advanced_summary();
         self.queue.relabel(lang);
         self.share.relabel(lang);
+        self.record.rebuild(lang);
 
         self.power.relabel(lang);
 
@@ -4521,6 +4936,13 @@ impl eframe::App for SavioApp {
             handle.stop_and_wait(std::time::Duration::from_secs(1));
         }
         self.share.stop(None, self.lang);
+        // Запись — с ожиданием обязательно: ffmpeg, которому не дали
+        // дописать, оставил бы файл без последнего фрагмента, а на Unix ещё
+        // и пережил бы Savio, продолжая писать экран. Обычно это доли
+        // секунды; потолок — у `RECORD_EXIT_WAIT`.
+        if let Some(handle) = &self.record.handle {
+            handle.stop_and_wait(RECORD_EXIT_WAIT);
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -4537,6 +4959,9 @@ impl eframe::App for SavioApp {
         self.monitor.drain(ui.ctx());
         self.power.drain(self.lang);
         self.share.drain(self.lang, ui.ctx());
+        for line in self.record.drain(self.lang) {
+            self.push_log(line);
+        }
         self.drain_versions();
         self.drain_gpu_errors();
 
@@ -4557,6 +4982,10 @@ impl eframe::App for SavioApp {
         // не открыта для сети.
         self.share
             .watch(self.tab == Tab::Phone, self.lang, ui.ctx());
+        // Запись, в отличие от раздачи, уход с экрана переживает: её затем и
+        // сворачивают. Здесь только первая проба — при первом открытии.
+        self.record
+            .watch(self.tab == Tab::Record, self.lang, ui.ctx());
 
         if self.maximize_pending {
             self.maximize_pending = false;
@@ -4634,6 +5063,7 @@ impl eframe::App for SavioApp {
                 }
                 scroll.show(ui, |ui| match self.tab {
                         Tab::Download => self.download_tab(ui),
+                        Tab::Record => self.record_tab(ui),
                         Tab::Metadata => self.metadata_tab(ui),
                         Tab::Machine => self.machine_tab(ui),
                         Tab::Phone => self.phone_tab(ui),
@@ -4682,7 +5112,7 @@ impl SavioApp {
     /// `animate_bool_with_time`, увидев незнакомый идентификатор, отдаёт сразу
     /// конечное значение — то есть раздел, о котором не спрашивали, пока на
     /// нём стояли, вернулся бы уже приехавшим, и приём просто не сработал бы.
-    /// Четыре сравнения в кадре — цена того, что уходящий раздел успевает
+    /// Пять сравнений в кадре — цена того, что уходящий раздел успевает
     /// погаснуть.
     fn tab_arrival(&self, ctx: &egui::Context) -> f32 {
         let mut arrive = 1.0;
@@ -4843,6 +5273,7 @@ impl SavioApp {
             // и загрузка, и установка ходят через тот же `rx`.
             busy: matches!(self.state, State::Running) || self.setup.busy(),
             more_open: self.more_open,
+            recording: self.record.running(),
         };
         let picks = rail_body(ui, &state, layout);
 
@@ -4917,6 +5348,14 @@ impl SavioApp {
                     Key::NavDownloadBusyNote
                 } else {
                     Key::NavDownloadNote
+                },
+            ),
+            Tab::Record => (
+                i18n::t(lang, Key::TabRecord),
+                if self.record.running() {
+                    Key::NavRecordOnNote
+                } else {
+                    Key::NavRecordNote
                 },
             ),
             Tab::Metadata => (i18n::t(lang, Key::TabMetadata), Key::NavMetadataNote),
@@ -6064,7 +6503,10 @@ impl SavioApp {
     fn primary_button(&mut self, ui: &mut egui::Ui, width: f32) -> bool {
         let lang = self.lang;
         let cta = if matches!(self.state, State::Running) {
-            Cta::Cancel
+            Cta::Cancel {
+                label: i18n::t(lang, Key::UiCancel),
+                hint: i18n::t(lang, Key::UiCancelHint),
+            }
         } else {
             // Подсказка выключенной кнопке нужна не меньше, чем соседней: до
             // очереди она молча гасла, и понять почему было неоткуда.
@@ -6081,11 +6523,12 @@ impl SavioApp {
                 },
             );
             Cta::Download {
+                label: i18n::t(lang, Key::UiDownload),
                 enabled: self.can_start(),
                 hint,
             }
         };
-        cta_button(ui, self.palette, lang, width, cta, &mut self.swap_pause)
+        cta_button(ui, self.palette, width, cta, &mut self.swap_pause)
     }
 
     /// Карточка хода работы: что сейчас происходит с загрузкой.
@@ -6889,8 +7332,9 @@ enum AboutAction {
 /// показ стоит человеку лишнего окна на запуске.
 ///
 /// Первое издание — три шага загрузки (до 0.37.0), второе — обзор всех
-/// разделов.
-const WELCOME_EDITION: u32 = 2;
+/// разделов, третье — тот же обзор с «Записью» (0.45.0): шестого раздела
+/// не увидел бы никто из тех, кто закрыл второе.
+const WELCOME_EDITION: u32 = 3;
 
 /// Что нажали в приветствии.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -7087,14 +7531,40 @@ fn welcome_sections(
 
     let margin = theme::inner_frame(pal).total_margin().sum().x;
     let columns =
-        welcome_cell_width(ui.available_width(), NAV.len()) - margin >= PITCH_MIN_WIDTH;
+        welcome_cell_width(ui.available_width(), WELCOME_COLUMNS) - margin >= PITCH_MIN_WIDTH;
     if columns {
-        welcome_cells::<{ NAV.len() }>(ui, |ui, g| nav_group_label(ui, pal, &groups[g]));
-        let rows = NAV.iter().map(|(_, items)| items.len()).max().unwrap_or(0);
-        for row in 0..rows {
-            ui.add_space(if row == 0 { 6.0 } else { WELCOME_GAP });
-            let cells = std::array::from_fn::<_, { NAV.len() }, _>(|g| NAV[g].1.get(row));
-            picked = picked.or(welcome_row(ui, pal, lang, cells, speed));
+        // Карточки идут по порядку рельса, по три в ряд, а подпись группы
+        // стоит над первой карточкой своей группы. Колонками по группам, как
+        // было при пяти разделах, третья карточка «Файлов» добавила бы целый
+        // ряд, и в окне 720×560 приветствие ушло бы под прокрутку — по-армянски
+        // на 91 точку. Так шесть разделов ложатся в два ряда, а цена — одна
+        // строка подписей.
+        let mut flat = NAV.iter().enumerate().flat_map(|(g, (_, items))| {
+            items
+                .iter()
+                .enumerate()
+                .map(move |(i, item)| (g, i == 0, item))
+        });
+        let mut first_row = true;
+        loop {
+            let cells = std::array::from_fn::<_, WELCOME_COLUMNS, _>(|_| flat.next());
+            if cells[0].is_none() {
+                break;
+            }
+            if !first_row {
+                ui.add_space(WELCOME_GAP);
+            }
+            first_row = false;
+            if cells.iter().flatten().any(|&(_, first, _)| first) {
+                welcome_cells::<WELCOME_COLUMNS>(ui, |ui, i| {
+                    if let Some((g, true, _)) = cells[i] {
+                        nav_group_label(ui, pal, &groups[g]);
+                    }
+                });
+                ui.add_space(6.0);
+            }
+            let cards = cells.map(|cell| cell.map(|(_, _, item)| item));
+            picked = picked.or(welcome_row(ui, pal, lang, cards, speed));
         }
     } else {
         for (g, (group, (_, items))) in groups.iter().zip(NAV).enumerate() {
@@ -7111,6 +7581,9 @@ fn welcome_sections(
     }
     picked
 }
+
+/// Сколько карточек в ряду, когда окно широкое.
+const WELCOME_COLUMNS: usize = 3;
 
 /// Сколько карточек в ряду, когда группы разделов стоят строками.
 ///
@@ -9161,6 +9634,326 @@ impl SavioApp {
     }
 }
 
+impl SavioApp {
+    /// Экран «Запись»: запись слева, что попадёт в кадр — справа.
+    ///
+    /// Колонки по той же причине, что у телефона: список «что попадёт в
+    /// запись» читают до нажатия, рядом с кнопкой, а не прокрутив под неё.
+    /// Ниже [`theme::TWO_COLUMN_MIN`] колонки встают друг под друга.
+    fn record_tab(&mut self, ui: &mut egui::Ui) {
+        const GAP: f32 = 18.0;
+
+        if ui.available_width() < theme::TWO_COLUMN_MIN {
+            self.record_card(ui);
+            ui.add_space(GAP);
+            self.record_checklist(ui);
+            return;
+        }
+
+        let total = ui.available_width();
+        let rail = theme::RAIL_WIDTH;
+        let main = total - rail - GAP;
+
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = GAP;
+            for (width, which) in [(main, true), (rail, false)] {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(width, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        // Ширина с обеих сторон — по той же причине, что
+                        // у колонок `download_tab`.
+                        ui.set_min_width(width);
+                        ui.set_max_width(width);
+                        if which {
+                            self.record_card(ui);
+                        } else {
+                            self.record_checklist(ui);
+                        }
+                    },
+                );
+            }
+        });
+    }
+
+    /// Карточка записи: что писать, чем, куда, кнопка и итог.
+    fn record_card(&mut self, ui: &mut egui::Ui) {
+        let pal = self.palette;
+        let lang = self.lang;
+        let speed = self.speed;
+        let mut picked_kind = None;
+        let mut pressed = false;
+        let mut recheck = false;
+        let mut open_saved = false;
+
+        theme::card_rising(ui, pal, self.appear(0), |ui| {
+            let state = self.record.state;
+            let probing = self.record.probe.is_some();
+
+            // Высота ряду задаётся явно, а плашка кладётся первой справа
+            // налево — обе грабли разобраны у `SavioApp::power_card`.
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), theme::CONTROL_HEIGHT),
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
+                    // Идущая запись — красным, как точка в рельсе: тот же
+                    // знак в обоих местах читается одним и тем же.
+                    let (key, color) = match (state, probing) {
+                        (RecordState::Recording, _) => (Key::UiRecordOn, pal.state_error),
+                        (RecordState::Saving, _) => (Key::UiRecordSaving, pal.text_secondary),
+                        (RecordState::Idle, true) => (Key::UiRecordPreparing, pal.text_secondary),
+                        (RecordState::Idle, false) => (Key::UiRecordIdle, pal.text_muted),
+                    };
+                    status_pill(ui, pal, i18n::t(lang, key), color);
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(i18n::t(lang, Key::TabRecord))
+                                    .font(theme::display(21.0))
+                                    .color(pal.text_primary),
+                            )
+                            .truncate(),
+                        );
+                    });
+                },
+            );
+            ui.add_space(4.0);
+            let about = match self.record.kind {
+                CaptureKind::Video => Key::UiRecordNote,
+                CaptureKind::Audio => Key::UiRecordNoteAudio,
+            };
+            note(ui, i18n::t(lang, about), pal.text_secondary);
+
+            ui.add_space(16.0);
+            step_header(ui, pal, 1, i18n::t(lang, Key::UiRecordWhat), None, |_| {});
+            ui.add_space(8.0);
+            let items = CaptureKind::ALL.map(|kind| (kind, kind.label(lang)));
+            // Посреди записи вид не меняют: файл уже пишется в своём формате.
+            ui.add_enabled_ui(!self.record.running(), |ui| {
+                picked_kind = segment_track(
+                    ui,
+                    pal,
+                    egui::Id::unique("track:capture-kind"),
+                    speed,
+                    self.record.kind,
+                    &items,
+                    true,
+                );
+            });
+
+            ui.add_space(12.0);
+            if probing {
+                working(ui, pal, i18n::t(lang, Key::UiRecordProbing));
+            } else if self.record.plan.is_some() {
+                let lines = &self.record.lines;
+                if self.record.kind == CaptureKind::Video {
+                    stat_row_with(
+                        ui,
+                        pal,
+                        i18n::t(lang, Key::UiRecordScreen),
+                        lines.screen.as_deref(),
+                        &lines.screen_missing,
+                    );
+                }
+                stat_row_with(
+                    ui,
+                    pal,
+                    i18n::t(lang, Key::UiRecordEncoder),
+                    lines.encoder.as_deref(),
+                    &lines.encoder_missing,
+                );
+                stat_row_with(
+                    ui,
+                    pal,
+                    i18n::t(lang, Key::UiRecordSound),
+                    lines.sound.as_deref(),
+                    &lines.sound_missing,
+                );
+                for trouble in &lines.troubles {
+                    ui.add_space(8.0);
+                    note(ui, trouble, pal.state_warning);
+                }
+            } else if self.record.asked {
+                note(ui, i18n::t(lang, Key::UiRecordProbeLost), pal.state_warning);
+            }
+            // Спросить заново стоит только тогда, когда есть о чём: после
+            // установки ffmpeg Savio спросит и сам, а кнопка — для смены
+            // видеокарты или звука, о которой ему никто не скажет, и для
+            // пробы, не вернувшей ответа.
+            if self.record.can_recheck() {
+                ui.add_space(8.0);
+                recheck = pill_button(ui, i18n::t(lang, Key::UiRecordRecheck), speed)
+                    .on_hover_text(i18n::t(lang, Key::UiRecordRecheckHint))
+                    .clicked();
+            }
+
+            ui.add_space(16.0);
+            step_header(ui, pal, 2, i18n::t(lang, Key::UiRecordWhere), None, |_| {});
+            ui.add_space(8.0);
+            // Папка та же, что у загрузок: «куда Savio кладёт файлы» — одна
+            // настройка, и вторая такая же разошлась бы с ней в первый день.
+            self.folder_row(ui);
+
+            ui.add_space(14.0);
+            let width = ui.available_width();
+            let lines = &self.record.lines;
+            let cta = match self.record.state {
+                RecordState::Recording => Cta::Cancel {
+                    label: i18n::t(lang, Key::UiRecordStop),
+                    hint: i18n::t(lang, Key::UiRecordStopHint),
+                },
+                // Пока ffmpeg дописывает файл, останавливать уже нечего,
+                // а начинать ещё рано.
+                RecordState::Saving => Cta::Download {
+                    label: i18n::t(lang, Key::UiRecordStart),
+                    enabled: false,
+                    hint: i18n::t(lang, Key::UiRecordSaving),
+                },
+                RecordState::Idle => {
+                    let hint = match &lines.not_ready {
+                        Some(why) => Some(why.as_str()),
+                        None if self.out_dir.is_none() => {
+                            Some(i18n::t(lang, Key::UiPickFolderFirst))
+                        }
+                        None => None,
+                    };
+                    Cta::Download {
+                        label: i18n::t(lang, Key::UiRecordStart),
+                        enabled: hint.is_none(),
+                        hint: hint.unwrap_or(""),
+                    }
+                }
+            };
+            // В `ui.horizontal`, как «Скачать» в своём ряду: растянутая
+            // `min_size` кнопка кладёт подпись по выравниванию раскладки,
+            // и в колонке `top_down(Min)` «Начать запись» прижималась к левому
+            // краю (видно на снимке глазного прогона, задача 64).
+            let pause = &mut self.record.swap_pause;
+            ui.horizontal(|ui| pressed = cta_button(ui, pal, width, cta, pause));
+            ui.add_space(6.0);
+            // Что будет после нажатия — видно без единого щелчка: запись,
+            // переживающая уход с экрана, — поведение, о которое спотыкаются.
+            note(
+                ui,
+                i18n::t(
+                    lang,
+                    if self.record.running() {
+                        Key::UiRecordOnNote
+                    } else {
+                        Key::UiRecordStartNote
+                    },
+                ),
+                pal.text_muted,
+            );
+
+            if self.record.running() {
+                ui.add_space(12.0);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(&self.record.lines.progress)
+                            .font(theme::bold(17.0))
+                            .color(pal.text_primary),
+                    )
+                    .wrap(),
+                );
+                if !self.record.file_name.is_empty() {
+                    ui.add_space(4.0);
+                    note(ui, &self.record.file_name, pal.text_muted);
+                }
+            }
+
+            if let Some((text, tone)) = &self.record.lines.outcome {
+                ui.add_space(12.0);
+                banner(ui, pal, text, tone.color(pal));
+                if self.record.saved_dir().is_some() {
+                    ui.add_space(8.0);
+                    open_saved = pill_button(ui, i18n::t(lang, Key::UiOpenFolder), speed).clicked();
+                }
+            }
+        });
+
+        // Всё исполняем после карточки: внутри замыкания `self` одолжен.
+        let ctx = ui.ctx().clone();
+        if let Some(kind) = picked_kind {
+            self.record.set_kind(kind, lang);
+        }
+        if recheck {
+            self.record.recheck(lang, &ctx);
+        }
+        if open_saved && let Some(dir) = self.record.saved_dir() {
+            open_dir(dir);
+        }
+        if pressed {
+            if self.record.state == RecordState::Recording {
+                self.record.stop(lang);
+            } else if let Some(dir) = self.out_dir.clone() {
+                self.record.start(dir, lang, &ctx);
+            }
+        }
+    }
+
+    /// Что попадёт в запись — до нажатия, а не после первой испорченной.
+    fn record_checklist(&self, ui: &mut egui::Ui) {
+        let pal = self.palette;
+        let lang = self.lang;
+        theme::card_rising(ui, pal, self.appear(1), |ui| {
+            // Заголовок, а не шаг с номером, как у правых карточек соседей:
+            // это справка, а не действие, и в узком окне она стоит под
+            // кнопкой — шаг «3» после «Начать запись» читался бы как то, что
+            // делают уже после нажатия.
+            ui.label(
+                egui::RichText::new(i18n::t(lang, Key::UiRecordChecklist))
+                    .font(theme::display(17.0))
+                    .color(pal.text_primary),
+            );
+            ui.add_space(8.0);
+            // Звук — по ответу пробы: что именно попадёт в файл, знает только
+            // она. Пока ответа нет, строка о звуке говорит о том, о чём
+            // спросили, но без галочки.
+            let sound = self.record.plan.as_ref().map(capture::Plan::sound);
+            let (sound_ok, sound_text) = match sound {
+                Some(Ok(SoundSource::System)) => {
+                    (true, Some(i18n::t(lang, Key::UiRecordCheckSystemSound)))
+                }
+                Some(Ok(SoundSource::Microphone)) => {
+                    (true, Some(i18n::t(lang, Key::UiRecordCheckMicrophone)))
+                }
+                Some(Err(_)) => (false, Some(self.record.lines.sound_missing.as_str())),
+                None => (false, None),
+            };
+            // У одного звука экрана нет, и обещать «весь экран» и «окно
+            // Savio в кадре» значило бы описывать не тот файл.
+            let video = self.record.kind == CaptureKind::Video;
+            let (screen, screen_note) = if video {
+                (Key::UiRecordCheckScreen, Key::UiRecordCheckScreenNote)
+            } else {
+                (Key::UiRecordCheckNoScreen, Key::UiRecordCheckNoScreenNote)
+            };
+            let savio = video.then(|| {
+                (
+                    false,
+                    i18n::t(lang, Key::UiRecordCheckSavio),
+                    Some(i18n::t(lang, Key::UiRecordCheckSavioNote)),
+                )
+            });
+            for (ok, title, text) in [
+                (
+                    true,
+                    i18n::t(lang, screen),
+                    Some(i18n::t(lang, screen_note)),
+                ),
+                (sound_ok, i18n::t(lang, Key::UiRecordSound), sound_text),
+            ]
+            .into_iter()
+            .chain(savio)
+            {
+                checklist_row(ui, pal, ok, title, text);
+                ui.add_space(6.0);
+            }
+        });
+    }
+}
+
 /// QR-код адреса. Пока текстуры нет (строка не влезла в код — у адреса так
 /// не бывает), место под код остаётся пустым, а не прыгает.
 fn qr_image(ui: &mut egui::Ui, texture: Option<&egui::TextureHandle>) {
@@ -9235,33 +10028,37 @@ impl SwapPause {
     }
 }
 
-/// Что стоит на главной кнопке ряда загрузки.
+/// Что стоит на главной кнопке-перевёртыше: у загрузки «Скачать» и
+/// «Отмена», у записи «Начать запись» и «Остановить».
 enum Cta<'a> {
-    /// Идёт загрузка — «Отмена».
-    Cancel,
-    /// Всё остальное время — «Скачать»: можно ли нажать и, если нельзя,
-    /// почему.
-    Download { enabled: bool, hint: &'a str },
+    /// Работа идёт — кнопка её останавливает.
+    Cancel { label: &'a str, hint: &'a str },
+    /// Всё остальное время — кнопка её начинает: можно ли нажать и, если
+    /// нельзя, почему.
+    Download {
+        label: &'a str,
+        enabled: bool,
+        hint: &'a str,
+    },
 }
 
-/// Главная кнопка ряда загрузки: «Отмена» во время загрузки, «Скачать»
-/// в остальное время. Возвращает `true`, когда её нажали.
+/// Главная кнопка-перевёртыш: «Скачать» / «Отмена» на загрузке, «Начать
+/// запись» / «Остановить» на записи. Возвращает `true`, когда её нажали.
 ///
 /// Свободной функцией, а не методом `SavioApp`, ради проверки кадром без
 /// окна: щелчок сквозь смену смысла виден только на живой кнопке, а
-/// `SavioApp` в тесте не собрать. Что на ней показать, решает
-/// `SavioApp::primary_button`.
+/// `SavioApp` в тесте не собрать. Что на ней показать, решают
+/// `SavioApp::primary_button` и `SavioApp::record_card`.
 fn cta_button(
     ui: &mut egui::Ui,
     pal: theme::Palette,
-    lang: Lang,
     width: f32,
     cta: Cta<'_>,
     pause: &mut SwapPause,
 ) -> bool {
     let now = ui.input(|i| i.time);
     let pass = ui.ctx().cumulative_pass_nr();
-    let left = pause.left(matches!(cta, Cta::Cancel), now, pass);
+    let left = pause.left(matches!(cta, Cta::Cancel { .. }), now, pass);
     if let Some(left) = left {
         // Оживает кнопка только на кадре, а кадр без ввода egui не рисует:
         // без этой строки она ожила бы при первом движении мыши, а если
@@ -9271,23 +10068,24 @@ fn cta_button(
     }
     let settled = left.is_none();
 
-    let (enabled, hint) = match cta {
-        Cta::Cancel => {
+    let (label, enabled, hint) = match cta {
+        Cta::Cancel { label, hint } => {
             // Выключенный вид у «Отмены» штатный, тот же, что у выключенной
             // «В очередь»: контурная таблетка, приглушённая прозрачностью.
             // Свой понадобился только акцентной заливке ниже.
             return ui
                 .add_enabled_ui(settled, |ui| {
-                    ui.add_sized(
-                        [width, theme::CTA_HEIGHT],
-                        egui::Button::new(i18n::t(lang, Key::UiCancel)),
-                    )
-                    .on_hover_text(i18n::t(lang, Key::UiCancelHint))
-                    .clicked()
+                    ui.add_sized([width, theme::CTA_HEIGHT], egui::Button::new(label))
+                        .on_hover_text(hint)
+                        .clicked()
                 })
                 .inner;
         }
-        Cta::Download { enabled, hint } => (enabled && settled, hint),
+        Cta::Download {
+            label,
+            enabled,
+            hint,
+        } => (label, enabled && settled, hint),
     };
 
     ui.scope(|ui| {
@@ -9340,7 +10138,7 @@ fn cta_button(
         let response = ui.add_enabled(
             enabled,
             egui::Button::new(
-                egui::RichText::new(i18n::t(lang, Key::UiDownload))
+                egui::RichText::new(label)
                     .font(theme::display(17.0))
                     .color(ink),
             )
@@ -9868,16 +10666,26 @@ fn rail_item(
         pal.text_primary,
         shown,
     );
-    if wide {
-        let icon = egui::Rect::from_center_size(
+    let icon = if wide {
+        egui::Rect::from_center_size(
             egui::pos2(rect.left() + NAV_ICON_CENTER, rect.center().y),
             egui::vec2(16.0, 16.0),
-        );
-        nav_icon(painter, icon, item.icon, ink);
-        paint_rail_label(ui, rect, label, ink);
+        )
     } else {
-        let icon = egui::Rect::from_center_size(rect.center(), egui::vec2(18.0, 18.0));
-        nav_icon(painter, icon, item.icon, ink);
+        egui::Rect::from_center_size(rect.center(), egui::vec2(18.0, 18.0))
+    };
+    nav_icon(painter, icon, item.icon, ink);
+    if wide {
+        paint_rail_label(ui, rect, label, ink);
+    }
+    // Идущая запись видна из любого раздела: её затем и оставляют идти,
+    // уходя с экрана, — и забыть о ней, не видя, проще простого. Точка на
+    // значке, а не подпись: в свёрнутом рельсе подписи нет вовсе. Кольцо
+    // цветом рельса отделяет её от штрихов значка.
+    if item.tab == Tab::Record && state.recording {
+        let dot = icon.right_top() + egui::vec2(-1.0, 1.0);
+        painter.circle_filled(dot, 4.5, pal.rail_fill);
+        painter.circle_filled(dot, 3.2, pal.state_error);
     }
 
     // В свёрнутом рельсе подпись прячется, и без подсказки пункт превратился
@@ -9925,6 +10733,28 @@ fn nav_icon(painter: &egui::Painter, rect: egui::Rect, icon: NavIcon, color: egu
     let (c, w, h) = (rect.center(), rect.width(), rect.height());
 
     match icon {
+        NavIcon::Record => {
+            // Экран на подставке и точка записи посередине. Точка залита,
+            // а не обведена: обведённая на 16 точках читалась бы буквой «о».
+            let screen = egui::Rect::from_min_max(
+                egui::pos2(rect.left(), rect.top() + h * 0.08),
+                egui::pos2(rect.right(), rect.top() + h * 0.72),
+            );
+            painter.rect_stroke(
+                screen,
+                egui::CornerRadius::same(2),
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            painter.circle_filled(screen.center(), w * 0.14, color);
+            painter.line_segment(
+                [
+                    egui::pos2(c.x - w * 0.22, rect.bottom() - h * 0.06),
+                    egui::pos2(c.x + w * 0.22, rect.bottom() - h * 0.06),
+                ],
+                stroke,
+            );
+        }
         NavIcon::Download => {
             // Стрелка вниз и поддон под ней.
             painter.line_segment(
@@ -10223,10 +11053,21 @@ fn rail_block(ui: &mut egui::Ui, state: &RailState<'_>, picks: &mut RailPicks) {
                 setup::Component::Ffmpeg,
             ),
         ] {
-            if wide_pill(ui, i18n::t(lang, key), speed)
-                .on_hover_text(i18n::t(lang, hint))
-                .clicked()
-            {
+            // ffmpeg, которым идёт запись, не обновить: Windows не даёт
+            // перезаписать работающий ffmpeg.exe, распаковка падает, а уборка
+            // после неё стирает ffprobe — и до следующего запуска его нет ни
+            // у загрузки, ни у «Метаданных». Обновление движка записи не
+            // мешает и остаётся доступным.
+            let locked = state.recording && what == setup::Component::Ffmpeg;
+            let response = ui
+                .add_enabled_ui(!locked, |ui| wide_pill(ui, i18n::t(lang, key), speed))
+                .inner;
+            let response = if locked {
+                response.on_disabled_hover_text(i18n::t(lang, Key::UiUpdateFfmpegRecording))
+            } else {
+                response.on_hover_text(i18n::t(lang, hint))
+            };
+            if response.clicked() {
                 picks.update = Some(what);
             }
         }
@@ -15483,36 +16324,51 @@ mod tests {
     /// половину. Карточка ищется по имени в дереве доступности, как её
     /// найдёт экранный диктор, и на всех трёх языках: имя — это перевод.
     ///
-    /// Раскладки обе, и какая где — проверяется тут же: у колонок и у строк
+    /// Раскладки обе, и какая где — проверяется тут же: у широкой и у узкой
     /// свой обход `NAV`, потерять пункт может любой, а после правки порога
-    /// два окна молча проверяли бы одну и ту же раскладку. Узкое окно
-    /// высокое, чтобы ни одна карточка не ушла под прокрутку: щелчок по
-    /// спрятанной пришёлся бы не в неё.
+    /// два окна молча проверяли бы одну и ту же раскладку. Различает их
+    /// третья карточка «Файлов»: в широком окне карточки идут по три в ряд,
+    /// и «Метаданные» стоят в ряду «Загрузки», а в узком группа разложена
+    /// по две, и «Метаданные» уходят под неё. Узкое окно высокое, чтобы ни
+    /// одна карточка не ушла под прокрутку: щелчок по спрятанной пришёлся бы
+    /// не в неё.
     ///
-    /// Проверено красным трижды: с одним рядом карточек в колонках пропадают
+    /// Проверено красным: с одним рядом карточек в колонках пропадают
     /// «Метаданные», со строками по одной карточке из пары — тоже, а без
     /// половины в ответе карточка «Сейчас» открывает «Машину» вообще, а не
-    /// свою половину.
+    /// свою половину. Широкий ряд по две вместо трёх роняет проверку
+    /// третьей карточки.
     #[test]
     fn every_rail_item_is_named_and_opened_by_the_welcome() {
-        // Окно и пункт, который в этой раскладке стоит рядом с «Загрузкой».
+        // Окно и то, стоят ли там «Метаданные» в одном ряду с «Загрузкой».
         let cases = [
-            (egui::vec2(1280.0, 800.0), Key::MachineNow),
-            (egui::vec2(600.0, 1000.0), Key::TabMetadata),
+            (egui::vec2(1280.0, 800.0), true),
+            (egui::vec2(600.0, 1000.0), false),
         ];
-        for (window, beside) in cases {
+        for (window, one_row) in cases {
             for lang in Lang::ALL {
                 let what = format!("{lang:?}, окно {window:?}");
                 let ctx = rail_test_ctx();
                 let (_, _, buttons) = welcome_frames(&ctx, lang, window, vec![Vec::new(); 6]);
 
                 let first = button_rect(&buttons, i18n::t(lang, Key::TabDownload), &what);
-                let next = button_rect(&buttons, i18n::t(lang, beside), &what);
+                let next = button_rect(&buttons, i18n::t(lang, Key::TabRecord), &what);
+                let third = button_rect(&buttons, i18n::t(lang, Key::TabMetadata), &what);
                 assert!(
                     (first.top() - next.top()).abs() < 0.5 && next.left() > first.right(),
-                    "{what}: рядом с «Загрузкой» не «{}» — раскладка не та: {first:?} и {next:?}",
-                    i18n::t(lang, beside)
+                    "{what}: рядом с «Загрузкой» не «Запись» — раскладка не та:                      {first:?} и {next:?}"
                 );
+                if one_row {
+                    assert!(
+                        (first.top() - third.top()).abs() < 0.5 && third.left() > next.right(),
+                        "{what}: «Метаданные» не в ряду «Загрузки»: {third:?}"
+                    );
+                } else {
+                    assert!(
+                        third.top() > first.bottom() && (third.left() - first.left()).abs() < 0.5,
+                        "{what}: «Метаданные» не под «Загрузкой»: {first:?} и {third:?}"
+                    );
+                }
 
                 for item in NAV.iter().flat_map(|(_, items)| items.iter()) {
                     let name = i18n::t(lang, item.label);
@@ -15943,6 +16799,19 @@ mod tests {
         more_open: bool,
         events: Vec<egui::Event>,
     ) -> (RailPicks, Vec<(String, egui::Rect)>) {
+        rail_test_frame_with(ctx, lang, window, layout, more_open, false, events)
+    }
+
+    /// То же, что [`rail_test_frame`], но с идущей записью или без неё.
+    fn rail_test_frame_with(
+        ctx: &egui::Context,
+        lang: Lang,
+        window: egui::Vec2,
+        layout: RailLayout,
+        more_open: bool,
+        recording: bool,
+        events: Vec<egui::Event>,
+    ) -> (RailPicks, Vec<(String, egui::Rect)>) {
         let pal = theme::Palette::dark();
         let groups = nav_groups(lang);
         let input = egui::RawInput {
@@ -15966,6 +16835,7 @@ mod tests {
                 log_open: false,
                 busy: false,
                 more_open,
+                recording,
             };
             egui::Panel::left("рельс")
                 .resizable(false)
@@ -16043,6 +16913,79 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Пока идёт запись, «Обновить ffmpeg» не нажимается, а «Обновить
+    /// движок» — как прежде.
+    ///
+    /// Дефект: обновление ffmpeg посреди записи на Windows не может
+    /// перезаписать работающий ffmpeg.exe, распаковка падает, и уборка после
+    /// неё стирает ffprobe — загрузка и «Метаданные» остаются без него до
+    /// следующего запуска, и ни слова об этом. Проверено красным: без
+    /// запрета щелчок во время записи заказывает обновление.
+    #[test]
+    fn ffmpeg_is_not_updated_under_a_running_recording() {
+        let lang = Lang::Ru;
+        let window = egui::vec2(theme::NAV_WIDE_MIN, theme::NAV_WIDE_MIN_HEIGHT + 100.0);
+        for recording in [false, true] {
+            let press = |label: Key| {
+                let ctx = rail_test_ctx();
+                let mut named = Vec::new();
+                for _ in 0..3 {
+                    named = rail_test_frame_with(
+                        &ctx,
+                        lang,
+                        window,
+                        RailLayout::Full,
+                        false,
+                        recording,
+                        Vec::new(),
+                    )
+                    .1;
+                }
+                let at = center_of(&named, i18n::t(lang, label))
+                    .unwrap_or_else(|| panic!("в блоке рельса нет «{}»", i18n::t(lang, label)));
+                let mut picked = None;
+                for events in click_at(at) {
+                    let picks = rail_test_frame_with(
+                        &ctx,
+                        lang,
+                        window,
+                        RailLayout::Full,
+                        false,
+                        recording,
+                        events,
+                    )
+                    .0;
+                    picked = picked.or(picks.update);
+                }
+                picked
+            };
+            let ffmpeg = press(Key::UiUpdateFfmpeg);
+            let engine = press(Key::UiUpdateEngine);
+            assert_eq!(
+                ffmpeg,
+                (!recording).then_some(setup::Component::Ffmpeg),
+                "запись идёт: {recording}"
+            );
+            assert_eq!(engine, Some(setup::Component::Ytdlp), "запись идёт: {recording}");
+        }
+    }
+
+    /// Проба, погибшая без ответа, не запирает раздел: «Проверить снова»
+    /// есть и тогда. Пока проба идёт или идёт запись, кнопки нет.
+    #[test]
+    fn a_lost_probe_can_be_asked_again() {
+        let mut panel = RecordPanel::new();
+        assert!(!panel.can_recheck(), "ещё не спрашивали — спрашивать заново нечего");
+        panel.asked = true;
+        assert!(panel.can_recheck(), "ответ пропал, а кнопки нет");
+        let (_tx, rx) = channel();
+        panel.probe = Some(rx);
+        assert!(!panel.can_recheck(), "проба ещё идёт");
+        panel.probe = None;
+        panel.state = RecordState::Recording;
+        assert!(!panel.can_recheck(), "посреди записи пробу не перезапускают");
     }
 
     /// В окне минимальной ширины язык меняется из меню свёрнутого рельса.
@@ -16145,14 +17088,18 @@ mod tests {
                 egui::CentralPanel::default().show(ui, |ui| {
                     ui.horizontal(|ui| {
                         let cta = if running {
-                            Cta::Cancel
+                            Cta::Cancel {
+                                label: i18n::t(Lang::Ru, Key::UiCancel),
+                                hint: "",
+                            }
                         } else {
                             Cta::Download {
+                                label: i18n::t(Lang::Ru, Key::UiDownload),
                                 enabled: true,
                                 hint: "",
                             }
                         };
-                        clicked = cta_button(ui, theme::Palette::dark(), Lang::Ru, 300.0, cta, pause);
+                        clicked = cta_button(ui, theme::Palette::dark(), 300.0, cta, pause);
                     });
                 });
             });

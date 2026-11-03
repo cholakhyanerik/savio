@@ -2581,6 +2581,322 @@ pub fn qr_modules(text: &str) -> Option<(usize, Vec<bool>)> {
     Some((width, dark))
 }
 
+// ---------------------------------------------------------------------------
+// Запись экрана и звука
+//
+// Здесь только то, что записывать, и слова о ходе работы. Чем пишет ffmpeg,
+// какие у него ключи и откуда берётся звук системы, знает `engine::capture`;
+// домен не знает ни про то, ни про другое.
+// ---------------------------------------------------------------------------
+
+/// Что записывать.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum CaptureKind {
+    /// Экран целиком вместе со звуком — MP4.
+    #[default]
+    Video,
+    /// Только звук — MP3.
+    Audio,
+}
+
+impl CaptureKind {
+    /// Оба вида в том порядке, в каком их показывает переключатель.
+    pub const ALL: [CaptureKind; 2] = [CaptureKind::Video, CaptureKind::Audio];
+
+    /// Расширение файла. По нему ffmpeg и выбирает мультиплексор.
+    pub fn extension(self) -> &'static str {
+        match self {
+            CaptureKind::Video => "mp4",
+            CaptureKind::Audio => "mp3",
+        }
+    }
+
+    /// Подпись на переключателе.
+    pub fn label(self, lang: Lang) -> &'static str {
+        i18n::t(
+            lang,
+            match self {
+                CaptureKind::Video => Key::CaptureKindVideo,
+                CaptureKind::Audio => Key::CaptureKindAudio,
+            },
+        )
+    }
+}
+
+/// Экран, который будет записан: размер в его собственных точках и частота.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ScreenMode {
+    pub width: u32,
+    pub height: u32,
+    /// Частота обновления, Гц. С ней же идёт и запись: «максимум, который
+    /// может экран», а не придуманные заранее 30 или 60.
+    pub refresh: u32,
+}
+
+impl ScreenMode {
+    /// «2560 × 1440, 144 Гц».
+    pub fn line(self, lang: Lang) -> String {
+        i18n::fill(
+            i18n::t(lang, Key::CaptureScreenMode),
+            &[
+                &self.width.to_string(),
+                &self.height.to_string(),
+                &self.refresh.to_string(),
+            ],
+        )
+    }
+}
+
+/// Чем сжимается видео.
+///
+/// Видеокарта впереди процессора не ради красоты: кодировщик на процессоре
+/// при 1440p и 144 Гц съедает несколько ядер, а записывают обычно то, чему
+/// эти ядра нужны самому, — игру, созвон, программу.
+///
+/// Часть вариантов на «чужой» системе не возникает никогда (NVENC на macOS,
+/// VideoToolbox на Windows), и `dead_code` выключен ровно у них и ровно там —
+/// как у `Key` в `i18n.rs`: иначе `-D warnings` ронял бы сборку соседней
+/// системы. Убрать варианты под `#[cfg]` значило бы развести по системам
+/// и объяснения в окне, а их полноту держат тесты на всех трёх.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VideoEncoder {
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Nvenc,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Amf,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    QuickSync,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    VideoToolbox,
+    X264,
+}
+
+impl VideoEncoder {
+    /// Сжимает ли видеокарта.
+    pub fn on_gpu(self) -> bool {
+        !matches!(self, VideoEncoder::X264)
+    }
+
+    /// «AMD AMF — видеокарта». Имена кодировщиков — названия, а не слова,
+    /// и не переводятся.
+    pub fn line(self, lang: Lang) -> String {
+        let name = match self {
+            VideoEncoder::Nvenc => "NVIDIA NVENC",
+            VideoEncoder::Amf => "AMD AMF",
+            VideoEncoder::QuickSync => "Intel Quick Sync",
+            VideoEncoder::VideoToolbox => "Apple VideoToolbox",
+            VideoEncoder::X264 => "x264",
+        };
+        let place = i18n::t(
+            lang,
+            if self.on_gpu() {
+                Key::CaptureOnGpu
+            } else {
+                Key::CaptureOnCpu
+            },
+        );
+        format!("{name} — {place}")
+    }
+}
+
+/// Откуда берётся звук.
+///
+/// У каждой системы источник один, и `dead_code` выключен у второго — по той
+/// же причине, что у [`VideoEncoder`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SoundSource {
+    /// То, что играет на компьютере: ролик, созвон, музыка.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    System,
+    /// Микрофон. Так только на macOS: звук системы там без стороннего
+    /// виртуального устройства не снять ничем.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Microphone,
+}
+
+impl SoundSource {
+    pub fn label(self, lang: Lang) -> &'static str {
+        i18n::t(
+            lang,
+            match self {
+                SoundSource::System => Key::CaptureSoundSystem,
+                SoundSource::Microphone => Key::CaptureSoundMicrophone,
+            },
+        )
+    }
+}
+
+/// Сколько уже записано.
+///
+/// Числа берутся у самого ffmpeg (`-progress`), а не у часов Savio: идущие
+/// часы при вставшем кодировщике врали бы, что запись идёт (Правило 6), а
+/// растущие время и размер — это и есть доказательство, что она идёт.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CaptureProgress {
+    /// Сколько секунд в файле.
+    pub secs: f64,
+    /// Сколько байт в файле.
+    pub bytes: u64,
+    /// Сколько кадров. `None` — видео в записи нет.
+    pub frames: Option<u64>,
+}
+
+impl CaptureProgress {
+    /// Кадров в секунду в среднем — сколько вышло на самом деле.
+    ///
+    /// Запись заказывает частоту экрана, но держит её не всякая машина:
+    /// выгрузка кадров с видеокарты и сжатие упираются в железо, и на
+    /// встроенной графике 144 Гц превращаются в 80–95 кадров (замер
+    /// 2026-11-03, Radeon 780M, 2560×1440). Неподвижный экран к тому же
+    /// пишется реже: захват отдаёт кадр, когда на экране что-то сменилось,
+    /// и повторов в файле нет. Поэтому окно показывает получившееся число,
+    /// а не заказанное. Первую секунду не считаем: по долям секунды среднее
+    /// скачет.
+    pub fn fps(&self) -> Option<f64> {
+        let frames = self.frames?;
+        (self.secs >= 1.0).then(|| frames as f64 / self.secs)
+    }
+
+    /// «1:23 · 35.2 МБ · 88 к/с». Собирается на приёме события, а не
+    /// в кадре: ход приходит раз в секунду, кадров — шестьдесят (Правило 1).
+    pub fn line(&self, lang: Lang) -> String {
+        let time = human_duration(self.secs as u64);
+        let size = human_bytes(self.bytes, lang);
+        match self.fps() {
+            Some(fps) => i18n::fill(
+                i18n::t(lang, Key::CaptureProgressVideo),
+                &[&time, &size, &format!("{fps:.0}")],
+            ),
+            None => i18n::fill(i18n::t(lang, Key::CaptureProgressAudio), &[&time, &size]),
+        }
+    }
+}
+
+/// Что ответил ffmpeg, отказав на пробе.
+///
+/// Причиной, а не строкой, по той же причине, что и [`CaptureTrouble`]:
+/// слова ffmpeg приводятся как есть, а всё, что говорит сам Savio, — ключами
+/// таблицы на языке окна. Свои «exit code 1» и «no answer in 15 s» иначе
+/// выдавались бы по-английски за ответ ffmpeg на всех трёх языках.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FfmpegTail {
+    /// Первые строки его ругани — без перевода.
+    Said(String),
+    /// Вышел с ошибкой молча. `None` — кода нет: процесс убит сигналом.
+    Code(Option<i32>),
+    /// Не ответил за столько секунд и остановлен.
+    Silence(u64),
+    /// Не запустился вовсе: что ответила система.
+    Launch(String),
+}
+
+impl FfmpegTail {
+    /// Предложение для человека — хвост к объяснению беды.
+    pub fn explain(&self, lang: Lang) -> String {
+        match self {
+            FfmpegTail::Said(text) => i18n::fill(i18n::t(lang, Key::CaptureFfmpegSaid), &[text]),
+            FfmpegTail::Code(Some(code)) => {
+                i18n::fill(i18n::t(lang, Key::CaptureFfmpegCode), &[&code.to_string()])
+            }
+            FfmpegTail::Code(None) => i18n::t(lang, Key::CaptureFfmpegQuit).to_owned(),
+            FfmpegTail::Silence(secs) => {
+                i18n::fill(i18n::t(lang, Key::CaptureFfmpegSilence), &[&secs.to_string()])
+            }
+            FfmpegTail::Launch(why) => i18n::fill(i18n::t(lang, Key::CaptureLaunch), &[why]),
+        }
+    }
+}
+
+/// Почему записать не вышло или вышло не всё.
+///
+/// Причиной, а не готовой строкой: строку собирает окно на своём языке,
+/// и смена языка переводит её вместе со всем остальным. Хвосты ругани
+/// ffmpeg внутри — его слова, их не переводят (см. шапку `i18n`).
+///
+/// Причины, которые бывают только на одной системе, помечены, как варианты
+/// [`VideoEncoder`], и по той же причине.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CaptureTrouble {
+    /// ffmpeg на машине нет.
+    NoFfmpeg,
+    /// Ни один способ захватить экран не заработал. Внутри — что ответил
+    /// ffmpeg на последний.
+    NoScreen(FfmpegTail),
+    /// Linux без сеанса X11: `DISPLAY` пуст, и x11grab нечего открыть.
+    #[cfg_attr(any(windows, target_os = "macos"), allow(dead_code))]
+    NoDisplay,
+    /// Сеанс Wayland: x11grab откроется, но увидит только окна X11.
+    #[cfg_attr(any(windows, target_os = "macos"), allow(dead_code))]
+    Wayland,
+    /// Экран захватывается, но сжать его нечем.
+    NoEncoder(FfmpegTail),
+    /// Звук системы не открылся: что ответил WASAPI (код `HRESULT`) или
+    /// ничего, если поток звука погиб, не ответив. Бывает только на
+    /// Windows — там звук снимает сам Savio.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    NoSound(String),
+    /// Звуковое устройство не открыл ffmpeg — так бывает на Linux, где его
+    /// пробуют заранее. На macOS устройство заранее не пробуют (см.
+    /// `engine::capture`), а на Windows звук снимает сам Savio.
+    #[cfg_attr(any(windows, target_os = "macos"), allow(dead_code))]
+    NoSoundInput(FfmpegTail),
+    /// Устройства вывода звука нет вовсе — снимать звук системы неоткуда.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    NoSpeakers,
+    /// Звук прерывался посреди записи: пропало устройство вывода. Пока
+    /// писать было не с чего, в файле тишина. Звук, который снимает сам
+    /// Savio, бывает только на Windows.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    SoundLost(String),
+    /// Звук ушёл на другое устройство вывода, а формат у того другой: ffmpeg
+    /// уже читает сэмплы в прежнем, и с нового эту запись не написать.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    SoundMoved,
+    /// ffmpeg не запустился вовсе.
+    Launch(String),
+    /// ffmpeg кончился сам, без просьбы остановиться.
+    Broke { code: Option<i32>, tail: String },
+    /// ffmpeg отчитался успехом, а файла нет или он пуст (Правило 6).
+    Empty,
+    /// ffmpeg не закрыл файл по просьбе и остановлен силой.
+    Hung,
+}
+
+impl CaptureTrouble {
+    /// Объяснение для человека: что случилось и что с этим делать.
+    pub fn explain(&self, lang: Lang) -> String {
+        let with = |key: Key, tail: &str| i18n::fill(i18n::t(lang, key), &[tail]);
+        match self {
+            CaptureTrouble::NoFfmpeg => i18n::t(lang, Key::CaptureNoFfmpeg).to_owned(),
+            CaptureTrouble::NoScreen(tail) => with(Key::CaptureNoScreen, &tail.explain(lang)),
+            CaptureTrouble::NoDisplay => i18n::t(lang, Key::CaptureNoDisplay).to_owned(),
+            CaptureTrouble::Wayland => i18n::t(lang, Key::CaptureWayland).to_owned(),
+            CaptureTrouble::NoEncoder(tail) => with(Key::CaptureNoEncoder, &tail.explain(lang)),
+            CaptureTrouble::NoSound(tail) if tail.is_empty() => {
+                i18n::t(lang, Key::CaptureNoSoundBare).to_owned()
+            }
+            CaptureTrouble::NoSound(tail) => with(Key::CaptureNoSound, tail),
+            CaptureTrouble::NoSoundInput(tail) => {
+                with(Key::CaptureNoSoundInput, &tail.explain(lang))
+            }
+            CaptureTrouble::NoSpeakers => i18n::t(lang, Key::CaptureNoSpeakers).to_owned(),
+            CaptureTrouble::SoundLost(tail) => with(Key::CaptureSoundLost, tail),
+            CaptureTrouble::SoundMoved => i18n::t(lang, Key::CaptureSoundMoved).to_owned(),
+            CaptureTrouble::Launch(tail) => with(Key::CaptureLaunch, tail),
+            CaptureTrouble::Broke { code, tail } => {
+                let code = code.map_or_else(|| "?".to_owned(), |code| code.to_string());
+                if tail.is_empty() {
+                    i18n::fill(i18n::t(lang, Key::CaptureBroke), &[&code])
+                } else {
+                    i18n::fill(i18n::t(lang, Key::CaptureBrokeWithTail), &[&code, tail])
+                }
+            }
+            CaptureTrouble::Empty => i18n::t(lang, Key::CaptureEmpty).to_owned(),
+            CaptureTrouble::Hung => i18n::t(lang, Key::CaptureHung).to_owned(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3962,5 +4278,37 @@ mod tests {
             ..state
         };
         assert_eq!(lost.active_name(), None);
+    }
+    /// Отказ ffmpeg на пробе объясняется на языке окна, а его собственные
+    /// слова приводятся как есть. Дефект: «exit code 1» и «no answer in
+    /// 15 s» писал сам Savio, по-английски, и выдавал за ответ ffmpeg на
+    /// всех трёх языках. Проверка собирает провалы по языкам, а не падает на
+    /// первом (Правило 2).
+    #[test]
+    fn a_probe_failure_speaks_the_window_language() {
+        let mut failures = Vec::new();
+        for lang in Lang::ALL {
+            let silence = CaptureTrouble::NoScreen(FfmpegTail::Silence(15)).explain(lang);
+            let code = CaptureTrouble::NoEncoder(FfmpegTail::Code(Some(1))).explain(lang);
+            let said =
+                CaptureTrouble::NoScreen(FfmpegTail::Said("Invalid argument".into())).explain(lang);
+            // Хвост — фраза таблицы на языке окна, с числом на своём месте.
+            let silence_tail = i18n::fill(i18n::t(lang, Key::CaptureFfmpegSilence), &["15"]);
+            let code_tail = i18n::fill(i18n::t(lang, Key::CaptureFfmpegCode), &["1"]);
+            if !silence.contains(&silence_tail) || !code.contains(&code_tail) {
+                failures.push(format!("{lang:?}: хвост не из таблицы: {silence} / {code}"));
+            }
+            if lang != Lang::En {
+                for text in [&silence, &code] {
+                    if text.contains("no answer") || text.contains("exit code") {
+                        failures.push(format!("{lang:?}: английские слова Savio: {text}"));
+                    }
+                }
+            }
+            if !said.contains("Invalid argument") {
+                failures.push(format!("{lang:?}: слова ffmpeg потерялись: {said}"));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 }

@@ -585,6 +585,9 @@ strings! {
     // `the_rail_labels_fit_their_width`.
     TabDownload = "Загрузка", "Download", "Բեռնում";
     TabMetadata = "Метаданные", "Metadata", "Մետատվյալ";
+    /// Запись экрана и звука. По-армянски «Գրանցում» — «запись» вообще, а не
+    /// «видеозапись» («Տեսագրում»): раздел пишет и один звук.
+    TabRecord = "Запись", "Record", "Գրանցում";
     TabPhone = "Телефон", "Phone", "Հեռախոս";
 
     // Группы рельса разделов и короткие пояснения к ним. Пояснение стоит
@@ -605,6 +608,14 @@ strings! {
         "что файл рассказывает о вас — и как это стереть",
         "what the file tells about you — and how to wipe it",
         "ինչ է ֆայլը պատմում ձեր մասին և ինչպես ջնջել այն";
+    NavRecordNote =
+        "весь экран со звуком — или только звук",
+        "the whole screen with sound — or the sound alone",
+        "ամբողջ էկրանը ձայնով — կամ միայն ձայնը";
+    NavRecordOnNote =
+        "идёт запись — красная точка в рельсе видна из любого раздела",
+        "recording — the red dot in the rail shows it from any section",
+        "ընթանում է գրանցում — ռելսի կարմիր կետը երևում է ցանկացած բաժնից";
     NavMachineNowNote =
         "замер раз в секунду, пока открыт этот раздел",
         "measured once a second while this section is open",
@@ -691,17 +702,19 @@ strings! {
     /// буквами.
     UiAuthor = "Эрик Чолахян", "Erik Cholakhyan", "Էրիկ Չոլախյան";
     UiAboutText =
-        "Savio — настольное приложение для Windows, Linux и macOS: пять инструментов \
-         в одном окне. Оно скачивает видео и звук по ссылке, показывает и стирает то, что \
-         фотографии и музыка рассказывают о вас, следит за нагрузкой на компьютер, \
-         рассказывает, из чего он собран, и передаёт файлы между телефоном и компьютером \
-         по своей сети Wi-Fi.",
-        "Savio is a desktop application for Windows, Linux and macOS: five tools in one \
-         window. It downloads video and audio by link, shows and wipes what your photos and \
-         music tell about you, keeps an eye on the computer's load, tells what it is made \
-         of and moves files between your phone and your computer over your own Wi-Fi.",
-        "Savio-ն սեղանադիր ծրագիր է Windows-ի, Linux-ի և macOS-ի համար՝ հինգ գործիք մեկ \
-         պատուհանում։ Այն ներբեռնում է տեսանյութ և ձայն հղումով, ցույց է տալիս և ջնջում \
+        "Savio — настольное приложение для Windows, Linux и macOS: шесть инструментов \
+         в одном окне. Оно скачивает видео и звук по ссылке, записывает экран со звуком, \
+         показывает и стирает то, что фотографии и музыка рассказывают о вас, следит за \
+         нагрузкой на компьютер, рассказывает, из чего он собран, и передаёт файлы между \
+         телефоном и компьютером по своей сети Wi-Fi.",
+        "Savio is a desktop application for Windows, Linux and macOS: six tools in one \
+         window. It downloads video and audio by link, records the screen with sound, shows \
+         and wipes what your photos and music tell about you, keeps an eye on the computer's \
+         load, tells what it is made of and moves files between your phone and your \
+         computer over your own Wi-Fi.",
+        "Savio-ն սեղանադիր ծրագիր է Windows-ի, Linux-ի և macOS-ի համար՝ վեց գործիք մեկ \
+         պատուհանում։ Այն ներբեռնում է տեսանյութ և ձայն հղումով, գրանցում է էկրանը \
+         ձայնով, ցույց է տալիս և ջնջում \
          այն, ինչ լուսանկարներն ու երաժշտությունը պատմում են ձեր մասին, հետևում է \
          համակարգչի բեռնվածությանը, պատմում, թե ինչից է այն բաղկացած, և ֆայլեր է \
          փոխանցում հեռախոսի և համակարգչի միջև ձեր Wi-Fi ցանցով։";
@@ -1056,9 +1069,9 @@ strings! {
     // этого новое приветствие увидят только новые люди, а все, кто закрыл
     // прежнее, так и останутся со старым представлением о программе.
     WelcomeTitle =
-        "Пять инструментов в одном окне",
-        "Five tools in one window",
-        "Հինգ գործիք մեկ պատուհանում";
+        "Шесть инструментов в одном окне",
+        "Six tools in one window",
+        "Վեց գործիք մեկ պատուհանում";
     WelcomeNote =
         "Разделы не зависят друг от друга: можно пользоваться одним и ни разу не открыть \
          остальные. Щёлкните по разделу — он откроется.",
@@ -1079,6 +1092,10 @@ strings! {
         "Видео и звук по ссылке: вставьте её и нажмите «Скачать».",
         "Video and audio by link: paste it and press “Download”.",
         "Տեսանյութ և ձայն հղումով՝ տեղադրեք այն և սեղմեք «Ներբեռնել»։";
+    WelcomeRecordPitch =
+        "Экран со звуком в MP4 или один звук в MP3 — в размере и с частотой экрана.",
+        "The screen with sound to MP4 or the sound alone to MP3 — at the screen's size and rate.",
+        "Էկրանը ձայնով՝ MP4, կամ միայն ձայնը՝ MP3 — էկրանի չափով և հաճախականությամբ։";
     WelcomeMetadataPitch =
         "Что фото и MP3 рассказывают о вас — и как это стереть.",
         "What your photos and MP3s tell about you — and how to wipe it.",
@@ -2484,6 +2501,270 @@ strings! {
     CoverDecodeFailed =
         "не удалось разобрать обложку ({})", "could not decode the thumbnail ({})",
         "չհաջողվեց վերծանել շապիկը ({})";
+    // -----------------------------------------------------------------------
+    // Запись экрана и звука
+    //
+    // Хвосты ругани ffmpeg (`{}` в объяснениях отказа) — его слова, и они
+    // не переводятся: по ним ищут беду в интернете.
+    // -----------------------------------------------------------------------
+
+    CaptureKindVideo = "MP4 — экран и звук", "MP4 — screen and sound", "MP4 — էկրան և ձայն";
+    CaptureKindAudio = "MP3 — только звук", "MP3 — sound only", "MP3 — միայն ձայն";
+    /// Ширина, высота, частота: «2560 × 1440, 144 Гц».
+    CaptureScreenMode = "{} × {}, {} Гц", "{} × {}, {} Hz", "{} × {}, {} Հց";
+    CaptureOnGpu = "видеокарта", "graphics card", "վիդեոքարտ";
+    CaptureOnCpu = "процессор", "processor", "պրոցեսոր";
+    CaptureSoundSystem =
+        "звук системы — то, что играет на компьютере",
+        "system sound — whatever the computer plays",
+        "համակարգի ձայնը՝ այն, ինչ հնչում է համակարգչում";
+    CaptureSoundMicrophone =
+        "микрофон: звук системы macOS снять не даёт",
+        "microphone: macOS does not let the system sound be captured",
+        "խոսափող՝ macOS-ը թույլ չի տալիս գրավել համակարգի ձայնը";
+    /// Время, размер, кадров в секунду в среднем.
+    CaptureProgressVideo = "{} · {} · {} кадр/с", "{} · {} · {} fps", "{} · {} · {} կադր/վ";
+    /// Время и размер.
+    CaptureProgressAudio = "{} · {}", "{} · {}", "{} · {}";
+    /// Начало имени файла. Дату и время к нему дописывает движок.
+    CaptureFileVideo = "Запись экрана", "Screen recording", "Էկրանի գրանցում";
+    CaptureFileAudio = "Запись звука", "Sound recording", "Ձայնի գրանցում";
+    /// Строка журнала: частота, каналы, формат сэмплов, тишина в начале.
+    CaptureLogSound =
+        "звук системы: {} Гц, каналов: {}, {}; тишина в начале — {} с",
+        "system sound: {} Hz, {} channels, {}; lead-in silence {} s",
+        "համակարգի ձայն՝ {} Հց, ալիքներ՝ {}, {}; լռություն սկզբում՝ {} վ";
+    CaptureNoFfmpeg =
+        "Для записи нужен ffmpeg, а его не нашлось. Поставьте его кнопкой «Обновить ffmpeg» \
+         внизу рельса и нажмите «Проверить снова».",
+        "Recording needs ffmpeg, and it was not found. Install it with the “Update ffmpeg” \
+         button at the bottom of the rail, then press “Check again”.",
+        "Գրանցման համար անհրաժեշտ է ffmpeg, բայց այն չգտնվեց։ Տեղադրեք այն ռելսի ներքևի \
+         «Թարմացնել ffmpeg-ը» կոճակով և սեղմեք «Կրկին ստուգել»։";
+    /// `{}` — что ответил ffmpeg, целым предложением (`CaptureFfmpeg…`).
+    CaptureNoScreen =
+        "Экран не удалось захватить. {}",
+        "The screen could not be captured. {}",
+        "Չհաջողվեց գրավել էկրանը։ {}";
+    /// Хвосты отказа ffmpeg на пробе. В первом `{}` — его слова как есть.
+    CaptureFfmpegSaid = "ffmpeg ответил: «{}».", "ffmpeg said: “{}”.", "ffmpeg-ը պատասխանեց՝ «{}»։";
+    CaptureFfmpegCode =
+        "ffmpeg вышел с кодом {} и ничего не сказал.",
+        "ffmpeg exited with code {} and said nothing.",
+        "ffmpeg-ը դուրս եկավ {} կոդով և ոչինչ չասաց։";
+    CaptureFfmpegQuit =
+        "ffmpeg завершился, не назвав причины.",
+        "ffmpeg ended without giving a reason.",
+        "ffmpeg-ն ավարտվեց՝ առանց պատճառը նշելու։";
+    CaptureFfmpegSilence =
+        "ffmpeg не ответил за {} с.",
+        "ffmpeg gave no answer in {} s.",
+        "ffmpeg-ը չպատասխանեց {} վ-ում։";
+    CaptureNoDisplay =
+        "Записывать нечего: нет сеанса X11 (переменная DISPLAY пуста).",
+        "Nothing to record: there is no X11 session (DISPLAY is empty).",
+        "Գրանցելու բան չկա՝ X11 աշխատաշրջան չկա (DISPLAY փոփոխականը դատարկ է)։";
+    CaptureWayland =
+        "Сеанс Wayland: ffmpeg видит только окна X11, остальное в записи будет чёрным.",
+        "Wayland session: ffmpeg sees only X11 windows, the rest of the recording will be black.",
+        "Wayland աշխատաշրջան՝ ffmpeg-ը տեսնում է միայն X11 պատուհանները, մնացածը գրանցման \
+         մեջ սև կլինի։";
+    CaptureNoEncoder =
+        "Экран захватывается, но сжать видео нечем. {}",
+        "The screen is captured, but there is nothing to encode the video with. {}",
+        "Էկրանը գրավվում է, բայց տեսանյութը սեղմելու միջոց չկա։ {}";
+    /// `{}` — что ответила система: код `HRESULT` или её собственные слова.
+    CaptureNoSound =
+        "Звук не открылся: {}",
+        "The sound did not open: {}",
+        "Ձայնը չբացվեց՝ {}";
+    CaptureNoSoundBare = "Звук не открылся.", "The sound did not open.", "Ձայնը չբացվեց։";
+    /// `{}` — что ответил ffmpeg, целым предложением.
+    CaptureNoSoundInput =
+        "Звук не открылся. {}",
+        "The sound did not open. {}",
+        "Ձայնը չբացվեց։ {}";
+    CaptureNoSpeakers =
+        "На компьютере нет устройства вывода звука — звук системы снимать неоткуда.",
+        "The computer has no sound output device — there is nowhere to take the system sound \
+         from.",
+        "Համակարգիչը ձայնի ելքի սարք չունի — համակարգի ձայնը վերցնելու տեղ չկա։";
+    CaptureSoundLost =
+        "Звук прерывался посреди записи ({}): похоже, пропало устройство вывода. Пока его не \
+         было, в файле тишина.",
+        "The sound broke off mid-recording ({}): the output device seems to have gone. While it \
+         was missing, the file is silent.",
+        "Ձայնը կտրվել էր գրանցման ընթացքում ({})՝ թվում է՝ ելքի սարքն անհետացել էր։ Քանի դեռ \
+         այն չկար, ֆայլում լռություն է։";
+    CaptureSoundMoved =
+        "Звук ушёл на другое устройство вывода с другим форматом, и с него эту запись не \
+         написать. Пока звук идёт туда, в файле тишина; вернёте прежнее устройство — звук \
+         продолжится.",
+        "The sound moved to another output device with a different format, and this recording \
+         cannot take it from there. While the sound goes there, the file is silent; switch back \
+         and the sound continues.",
+        "Ձայնը տեղափոխվեց այլ ձևաչափով ելքի այլ սարք, և այս գրանցումը չի կարող այն վերցնել \
+         այնտեղից։ Քանի դեռ ձայնը գնում է այնտեղ, ֆայլում լռություն է։ Վերադարձրեք նախկին \
+         սարքը, և ձայնը կշարունակվի։";
+    /// Строка журнала: звук перешёл на новое устройство по умолчанию.
+    CaptureLogSoundMoved =
+        "устройство вывода сменилось — звук системы пишется уже с нового",
+        "the output device changed — the system sound now comes from the new one",
+        "ելքի սարքը փոխվեց — համակարգի ձայնն այժմ գրանցվում է նորից";
+    CaptureLaunch =
+        "ffmpeg не запустился: {}",
+        "ffmpeg did not start: {}",
+        "ffmpeg-ը չգործարկվեց՝ {}";
+    /// `{}` — код выхода ffmpeg.
+    CaptureBroke =
+        "Запись оборвалась: ffmpeg вышел с кодом {}.",
+        "The recording broke off: ffmpeg exited with code {}.",
+        "Գրանցումն ընդհատվեց՝ ffmpeg-ը դուրս եկավ {} կոդով։";
+    /// `{}` — код выхода ffmpeg, `{}` — его последние слова.
+    CaptureBrokeWithTail =
+        "Запись оборвалась: ffmpeg вышел с кодом {} и сказал: {}",
+        "The recording broke off: ffmpeg exited with code {} and said: {}",
+        "Գրանցումն ընդհատվեց՝ ffmpeg-ը դուրս եկավ {} կոդով և ասաց՝ {}";
+    CaptureEmpty =
+        "ffmpeg закончил работу, но файл пуст — записать не вышло.",
+        "ffmpeg finished, but the file is empty — nothing was recorded.",
+        "ffmpeg-ն ավարտեց աշխատանքը, բայց ֆայլը դատարկ է — գրանցել չհաջողվեց։";
+    CaptureHung =
+        "ffmpeg не закрыл файл по просьбе и был остановлен силой: последние секунды могли \
+         потеряться.",
+        "ffmpeg did not close the file when asked and was stopped by force: the last seconds \
+         may be lost.",
+        "ffmpeg-ը խնդրանքով չփակեց ֆայլը և կանգնեցվեց ուժով՝ վերջին վայրկյանները կարող էին \
+         կորչել։";
+
+    UiRecordIdle = "Не идёт", "Idle", "Չի ընթանում";
+    UiRecordPreparing = "Подготовка", "Preparing", "Նախապատրաստում";
+    UiRecordOn = "Идёт запись", "Recording", "Գրանցվում է";
+    UiRecordSaving = "Сохраняется", "Saving", "Պահպանվում է";
+    UiRecordNote =
+        "Пишется весь главный экран вместе с курсором — в его настоящем размере и с его \
+         частотой — и звук. Окно Savio тоже попадёт в кадр: начав запись, сверните его.",
+        "The whole main screen is recorded with the pointer — at its real size and rate — \
+         together with the sound. The Savio window gets into the frame too: once recording, \
+         minimise it.",
+        "Գրանցվում է ամբողջ հիմնական էկրանը՝ նշիչի հետ, իր իրական չափով և \
+         հաճախականությամբ, ինչպես նաև ձայնը։ Savio-ի պատուհանը նույնպես կընկնի կադր՝ \
+         գրանցումը սկսելուց հետո փոքրացրեք այն։";
+    UiRecordNoteAudio =
+        "Пишется только звук — в MP3 с наибольшим для формата качеством, 320 кбит/с. Экран \
+         в файл не попадает.",
+        "Only the sound is recorded — as MP3 at the best quality the format has, 320 kbit/s. \
+         The screen does not go into the file.",
+        "Գրանցվում է միայն ձայնը՝ MP3-ով, այս ձևաչափի լավագույն որակով՝ 320 կբիթ/վ։ Էկրանը \
+         ֆայլ չի ընկնում։";
+    UiRecordWhat = "Что записать", "What to record", "Ինչ գրանցել";
+    UiRecordWhere = "Куда сохранить", "Where to save", "Ուր պահպանել";
+    UiRecordScreen = "Экран", "Screen", "Էկրան";
+    UiRecordEncoder = "Сжатие", "Encoding", "Սեղմում";
+    UiRecordSound = "Звук", "Sound", "Ձայն";
+    UiRecordProbing =
+        "Проверяем, чем записывать на этом компьютере…",
+        "Checking what this computer can record with…",
+        "Ստուգում ենք, թե ինչով կարելի է գրանցել այս համակարգչում…";
+    /// `{}` — частота, с которой пойдёт запись.
+    UiRecordScreenUnknown =
+        "размер и частоту система не назвала — запись пойдёт с {} кадр/с",
+        "the system did not name the size and rate — recording at {} fps",
+        "համակարգը չանվանեց չափը և հաճախականությունը — գրանցումը կլինի {} կադր/վ";
+    UiRecordMp3 = "MP3, 320 кбит/с, 48 кГц", "MP3, 320 kbit/s, 48 kHz", "MP3, 320 կբիթ/վ, 48 կՀց";
+    UiRecordWithoutSound =
+        "Видео запишется без звука.",
+        "The video will be recorded without sound.",
+        "Տեսանյութը կգրանցվի առանց ձայնի։";
+    UiRecordStart = "Начать запись", "Start recording", "Սկսել գրանցումը";
+    UiRecordStop = "Остановить", "Stop", "Կանգնեցնել";
+    UiRecordStopHint =
+        "ffmpeg допишет файл и положит его в папку сохранения.",
+        "ffmpeg will finish the file and put it into the save folder.",
+        "ffmpeg-ը կավարտի ֆայլը և կդնի այն պահպանման թղթապանակում։";
+    UiRecordWaitProbe =
+        "Сначала Savio проверит, чем записывать, — это пара секунд.",
+        "First Savio checks what to record with — a couple of seconds.",
+        "Նախ Savio-ն կստուգի, թե ինչով գրանցել — մի երկու վայրկյան։";
+    UiRecordStartNote =
+        "Запись не прерывается ни сменой раздела, ни свёрнутым окном. Остановить её — здесь же.",
+        "Recording carries on through switching sections and a minimised window. Stop it here.",
+        "Գրանցումը չի ընդհատվում ո՛չ բաժինը փոխելիս, ո՛չ պատուհանը փոքրացնելիս։ Կանգնեցնել \
+         այն կարելի է այստեղ։";
+    UiRecordOnNote =
+        "Savio можно свернуть — запись идёт. Закрыть Savio — значит остановить её: файл при \
+         этом будет дописан.",
+        "Savio can be minimised — the recording goes on. Closing Savio stops it, and the file \
+         is finished properly.",
+        "Savio-ն կարելի է փոքրացնել — գրանցումը շարունակվում է։ Savio-ն փակելը կանգնեցնում է \
+         այն, և ֆայլը պատշաճ կավարտվի։";
+    /// `{}` — имя файла.
+    UiRecordSaved = "Сохранено: {}", "Saved: {}", "Պահպանված է՝ {}";
+    /// `{}` — что случилось, `{}` — имя файла.
+    UiRecordSavedBroken =
+        "{} То, что успело записаться, сохранено: {}",
+        "{} What was recorded so far is saved: {}",
+        "{} Այն, ինչ հասցրեց գրանցվել, պահպանված է՝ {}";
+    /// `{}` — почему.
+    UiRecordFailed = "Не записалось. {}", "Nothing was recorded. {}", "Ոչինչ չգրանցվեց։ {}";
+    UiRecordRecheck = "Проверить снова", "Check again", "Կրկին ստուգել";
+    UiRecordProbeLost =
+        "Проверка не вернула ответа. Запустите её снова.",
+        "The check returned no answer. Run it again.",
+        "Ստուգումը պատասխան չվերադարձրեց։ Գործարկեք այն կրկին։";
+    UiUpdateFfmpegRecording =
+        "Идёт запись экрана, и ffmpeg занят ею: обновить его можно, когда запись кончится.",
+        "A screen recording is running and ffmpeg is busy with it: update it once the \
+         recording ends.",
+        "Ընթանում է էկրանի գրանցում, և ffmpeg-ը զբաղված է դրանով՝ թարմացնել կարելի է \
+         գրանցումն ավարտվելուց հետո։";
+    UiRecordRecheckHint =
+        "Снова спросить систему, чем записывать: после установки ffmpeg, смены видеокарты или \
+         устройства звука.",
+        "Ask the system again what to record with: after installing ffmpeg or changing the \
+         graphics card or sound device.",
+        "Կրկին հարցնել համակարգին, թե ինչով գրանցել՝ ffmpeg-ը տեղադրելուց, վիդեոքարտը կամ \
+         ձայնային սարքը փոխելուց հետո։";
+    UiRecordChecklist =
+        "Что попадёт в запись", "What goes into the recording", "Ինչ կընկնի գրանցման մեջ";
+    UiRecordCheckScreen =
+        "Весь главный экран с курсором",
+        "The whole main screen with the pointer",
+        "Ամբողջ հիմնական էկրանը նշիչով";
+    UiRecordCheckScreenNote =
+        "С частотой самого экрана, пока на нём что-то меняется: неподвижное повторять \
+         незачем, и тогда кадров пишется меньше. Сколько вышло в среднем, окно покажет во \
+         время записи.",
+        "At the screen's own rate while something on it changes: a still picture needs no \
+         repeating, so fewer frames are written then. The window shows the average while \
+         recording.",
+        "Էկրանի իսկ հաճախականությամբ, քանի դեռ դրա վրա ինչ-որ բան փոխվում է՝ անշարժ \
+         պատկերը կրկնելու կարիք չկա, և այդ ժամանակ ավելի քիչ կադր է գրանցվում։ Միջինը \
+         պատուհանը ցույց կտա գրանցման ընթացքում։";
+    UiRecordCheckSystemSound =
+        "То, что играет на компьютере: ролик, созвон, музыка. Микрофон не пишется.",
+        "Whatever the computer plays: a video, a call, music. The microphone is not recorded.",
+        "Այն, ինչ հնչում է համակարգչում՝ տեսանյութ, զանգ, երաժշտություն։ Խոսափողը չի \
+         գրանցվում։";
+    UiRecordCheckMicrophone =
+        "Микрофон: звук системы macOS снять не даёт.",
+        "The microphone: macOS does not let the system sound be captured.",
+        "Խոսափողը՝ macOS-ը թույլ չի տալիս գրավել համակարգի ձայնը։";
+    UiRecordCheckNoScreen =
+        "Экрана в файле не будет", "No screen in the file", "Ֆայլում էկրան չի լինի";
+    UiRecordCheckNoScreenNote =
+        "Только звук: MP3 в 320 кбит/с и 48 кГц — больше формат не умеет.",
+        "Sound only: MP3 at 320 kbit/s and 48 kHz — the format can do no more.",
+        "Միայն ձայն՝ MP3, 320 կբիթ/վ և 48 կՀց — ձևաչափն ավելին չի կարող։";
+    UiRecordCheckSavio =
+        "Окно Savio тоже в кадре",
+        "The Savio window is in the frame too",
+        "Savio-ի պատուհանը նույնպես կադրում է";
+    UiRecordCheckSavioNote =
+        "Начав запись, сверните его — запись продолжится.",
+        "Once recording, minimise it — the recording carries on.",
+        "Գրանցումը սկսելուց հետո փոքրացրեք այն — գրանցումը կշարունակվի։";
+
     // -----------------------------------------------------------------------
     // Почему загрузка не удалась
     //
